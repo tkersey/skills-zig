@@ -400,8 +400,8 @@ fn structuralAllocationFailure(allocator: std.mem.Allocator) !void {
     var output = std.Io.Writer.fixed(&bytes);
     var result: Audit = .{};
     try source(allocator, &output, "allocation.zig",
-        \\fn Outer(comptime T: type) type {
-        \\    return struct { fn run(self: *@This()) void { self.run(); } };
+        \\fn @"Outer"(comptime T: type) type {
+        \\    return struct { fn @"r\x75n"(@"self": *@This()) void { (self).@"run"(); } };
         \\}
     , &result);
     try std.testing.expectEqual(@as(u32, 1), result.diagnostics);
@@ -495,4 +495,50 @@ test "optional and error-wrapped type results remain compiler-only" {
         \\fn another(n: usize) (?u8) { return another(n); }
     , &result);
     try std.testing.expectEqual(@as(u32, 2), result.diagnostics);
+}
+
+test "direct recursion normalizes identifier spelling and redundant parentheses" {
+    var output = std.Io.Writer.Allocating.init(std.testing.allocator);
+    defer output.deinit();
+    var result: Audit = .{};
+    try source(std.testing.allocator, &output.writer, "names.zig",
+        \\fn @"foo"() void { foo(); }
+        \\fn bar() void { @"bar"(); }
+        \\fn @"b\x61z"() void { @"b\u{61}z"(); }
+        \\fn grouped() void { (((grouped)))(); }
+        \\const S = struct {
+        \\    fn @"r\x75n"(@"self": *@This()) void { ((self)).@"run"(); }
+        \\    fn walk(self: *@This()) void { (self.@"walk")(); }
+        \\};
+    , &result);
+    try std.testing.expectEqual(@as(u32, 6), result.diagnostics);
+}
+
+test "normalized names preserve other targets and compiler-only type results" {
+    var output = std.Io.Writer.Allocating.init(std.testing.allocator);
+    defer output.deinit();
+    var result: Audit = .{};
+    try source(std.testing.allocator, &output.writer, "other-names.zig",
+        \\fn @"Factory"(comptime n: usize) (error{NoType}!?type) {
+        \\    if (n == 0) return u8;
+        \\    return try Factory(n - 1);
+        \\}
+        \\fn foo() void { @"f\x6fp"(); }
+        \\const S = struct {
+        \\    fn run(self: *@This(), other: *@This()) void { (other).@"run"(); }
+        \\    fn walk(self: *@This()) void { (self).@"walk_other"(); }
+        \\};
+    , &result);
+    try std.testing.expectEqual(@as(u32, 0), result.diagnostics);
+}
+
+test "quoted primitive spelling does not imply a compiler-only result" {
+    var output = std.Io.Writer.Allocating.init(std.testing.allocator);
+    defer output.deinit();
+    var result: Audit = .{};
+    try source(std.testing.allocator, &output.writer, "quoted-type.zig",
+        \\const @"type" = u32;
+        \\fn run(n: u32) @"type" { return if (n == 0) 0 else run(n - 1); }
+    , &result);
+    try std.testing.expectEqual(@as(u32, 1), result.diagnostics);
 }

@@ -204,9 +204,9 @@ zig run tools/tiger_style/main.zig -- audit-diff --base <base> --head <head>
 ```
 
 Whole-file structural checks use Zig's parser and reject invalid syntax. They
-resolve nested declaration boundaries and multiline calls; added-line diff checks
-remain lexical. Parsing is not semantic analysis, so indirect calls and
-specialization still need source review.
+resolve nested declaration boundaries, multiline calls, quoted identifiers, and
+redundant parentheses; added-line diff checks remain lexical. Parsing is not
+semantic analysis, so indirect calls and specialization still need source review.
 
 The auditor is intentionally bounded. It caps diff bytes, file bytes, file
 count, line count, and diagnostic count. A tool failure is a failed gate, not a

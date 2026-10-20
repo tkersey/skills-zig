@@ -44,11 +44,13 @@ pub fn run(
     }
     const lines = try tokenLines(allocator, tree);
     defer allocator.free(lines);
-    var functions = try declarations(allocator, tree, lines);
+    var names = std.heap.ArenaAllocator.init(allocator);
+    defer names.deinit();
+    var functions = try declarations(allocator, names.allocator(), tree, lines);
     defer functions.deinit(allocator);
     establishParents(functions.items);
     countOwnedLines(tree.source, functions.items);
-    collectCalls(tree, lines, functions.items);
+    try collectCalls(names.allocator(), tree, lines, functions.items);
     for (functions.items) |function| {
         if (function.own_lines > limits.function_lines_max) {
             try audit.record(
@@ -86,9 +88,12 @@ fn tokenLines(allocator: std.mem.Allocator, tree: Ast) ![]u32 {
     return lines;
 }
 
-fn declarations(allocator: std.mem.Allocator, tree: Ast, lines: []const u32) !std.ArrayList(
-    Function,
-) {
+fn declarations(
+    allocator: std.mem.Allocator,
+    names: std.mem.Allocator,
+    tree: Ast,
+    lines: []const u32,
+) !std.ArrayList(Function) {
     var result: std.ArrayList(Function) = .empty;
     errdefer result.deinit(allocator);
     for (0..tree.nodes.len) |i| {
@@ -107,15 +112,22 @@ fn declarations(allocator: std.mem.Allocator, tree: Ast, lines: []const u32) !st
             .first_line = lines[first],
         };
         var buffer: [1]Ast.Node.Index = undefined;
-        if (tree.fullFnProto(&buffer, node)) |proto| setSignature(&function, tree, proto);
+        if (tree.fullFnProto(&buffer, node)) |proto| {
+            try setSignature(names, &function, tree, proto);
+        }
         try result.append(allocator, function);
     }
     std.mem.sort(Function, result.items, {}, Function.before);
     return result;
 }
 
-fn setSignature(function: *Function, tree: Ast, proto: Ast.full.FnProto) void {
-    if (proto.name_token) |token| function.name = tree.tokenSlice(token);
+fn setSignature(
+    allocator: std.mem.Allocator,
+    function: *Function,
+    tree: Ast,
+    proto: Ast.full.FnProto,
+) !void {
+    if (proto.name_token) |token| function.name = try identifier(allocator, tree, token);
     if (proto.extern_export_inline_token) |token| {
         function.inlined = tree.tokenTag(token) == .keyword_inline;
     }
@@ -125,7 +137,7 @@ fn setSignature(function: *Function, tree: Ast, proto: Ast.full.FnProto) void {
     var parameters = proto.iterate(&tree);
     const first = parameters.next() orelse return;
     const token = first.name_token orelse return;
-    const name = tree.tokenSlice(token);
+    const name = try identifier(allocator, tree, token);
     if (std.mem.eql(u8, name, "self")) function.receiver = name;
 }
 
@@ -140,6 +152,22 @@ fn typeResult(tree: Ast, root: Ast.Node.Index) bool {
         };
     }
     return std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(node)), "type");
+}
+
+fn identifier(allocator: std.mem.Allocator, tree: Ast, token: Ast.TokenIndex) ![]const u8 {
+    const bytes = tree.tokenSlice(token);
+    if (std.mem.startsWith(u8, bytes, "@\"")) {
+        return std.zig.string_literal.parseAlloc(allocator, bytes[1..]);
+    }
+    return bytes;
+}
+
+fn ungroup(tree: Ast, root: Ast.Node.Index) Ast.Node.Index {
+    var node = root;
+    while (tree.nodeTag(node) == .grouped_expression) {
+        node = tree.nodeData(node).node_and_token[0];
+    }
+    return node;
 }
 
 fn establishParents(functions: []Function) void {
@@ -204,7 +232,12 @@ fn ownerAt(functions: []const Function, offset: u32) ?usize {
     return null;
 }
 
-fn collectCalls(tree: Ast, lines: []const u32, functions: []Function) void {
+fn collectCalls(
+    allocator: std.mem.Allocator,
+    tree: Ast,
+    lines: []const u32,
+    functions: []Function,
+) !void {
     for (0..tree.nodes.len) |i| {
         const node: Ast.Node.Index = @fromBackingInt(@as(u32, @intCast(i)));
         var buffer: [1]Ast.Node.Index = undefined;
@@ -214,21 +247,37 @@ fn collectCalls(tree: Ast, lines: []const u32, functions: []Function) void {
         const function = &functions[owner];
         if (function.type_factory or function.inlined or function.recursion_line != null) continue;
         const name = function.name orelse continue;
-        if (callsSelf(tree, call.ast.fn_expr, name, function.receiver)) {
+        if (try callsSelf(allocator, tree, call.ast.fn_expr, name, function.receiver)) {
             function.recursion_line = lines[token];
         }
     }
 }
 
-fn callsSelf(tree: Ast, node: Ast.Node.Index, name: []const u8, receiver: ?[]const u8) bool {
+fn callsSelf(
+    allocator: std.mem.Allocator,
+    tree: Ast,
+    root: Ast.Node.Index,
+    name: []const u8,
+    receiver: ?[]const u8,
+) !bool {
+    const node = ungroup(tree, root);
     switch (tree.nodeTag(node)) {
-        .identifier => return std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(node)), name),
+        .identifier => return std.mem.eql(
+            u8,
+            try identifier(allocator, tree, tree.nodeMainToken(node)),
+            name,
+        ),
         .field_access => {
             const expected = receiver orelse return false;
             const object, const field = tree.nodeData(node).node_and_token;
-            if (tree.nodeTag(object) != .identifier) return false;
-            return std.mem.eql(u8, tree.tokenSlice(field), name) and
-                std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(object)), expected);
+            const target = ungroup(tree, object);
+            if (tree.nodeTag(target) != .identifier) return false;
+            return std.mem.eql(u8, try identifier(allocator, tree, field), name) and
+                std.mem.eql(
+                    u8,
+                    try identifier(allocator, tree, tree.nodeMainToken(target)),
+                    expected,
+                );
         },
         else => return false,
     }
