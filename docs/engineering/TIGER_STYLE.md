@@ -49,6 +49,10 @@ Ordinary work loops must be structurally bounded.
 
 Production algorithms must not use recursion. Replace recursive traversal with
 an explicit stack or queue whose capacity is visible and checked.
+Finite type-driven expansion may use explicitly `inline` functions: Zig must
+expand these calls and rejects recursive inline calls that cannot be resolved
+across specializations. Such expansion has no recursive native call frames.
+This does not permit runtime recursion through an ordinary helper.
 
 Source lines are limited to 100 columns. Zig multiline-string data lines are
 exempt because wrapping passive JSON or text changes data layout and inflates
@@ -102,7 +106,10 @@ Declare values close to their first use. Avoid aliases to mutable state. Keep
 one owner for state transitions and make helpers compute results rather than
 mutating unrelated state.
 
-New functions and test blocks are limited to 70 physical lines. Push branching
+New functions and test blocks are limited to 70 physical lines of their own
+scope. Nested function declarations are measured independently and excluded from
+the enclosing scope's length. A line containing code from both scopes counts for
+both; blank lines count for their containing scope. Push branching
 up into the owning function and push iteration down into focused helpers. New
 Zig lines are limited to 100 columns.
 
@@ -177,7 +184,11 @@ measure correctness or replace this document's limits.
 - No unresolved `TODO`, `FIXME`, or `HACK` comments.
 - No discarded errors through `catch {}` or `catch unreachable`.
 - No unmarked `while (true)` loops.
-- No direct recursion, including calls through a `self` receiver, in fully audited files.
+- No direct runtime recursion, including calls through a `self` receiver, in fully
+  audited files. Functions returning `type`, including optional and error-union
+  wrappers, construct compile-time types; their
+  nested runtime methods remain independently checked. Explicitly `inline`
+  functions rely on the compiler's mandatory expansion check.
 - No function or test block longer than 70 lines in fully audited files.
 
 Pull request CI audits every tracked Zig file, including tests and build tools.
@@ -191,6 +202,11 @@ zig test tools/tiger_style/main.zig
 zig run tools/tiger_style/main.zig -- audit-files path/to/file.zig
 zig run tools/tiger_style/main.zig -- audit-diff --base <base> --head <head>
 ```
+
+Whole-file structural checks use Zig's parser and reject invalid syntax. They
+resolve nested declaration boundaries, multiline calls, quoted identifiers, and
+redundant parentheses; added-line diff checks remain lexical. Parsing is not
+semantic analysis, so indirect calls and specialization still need source review.
 
 The auditor is intentionally bounded. It caps diff bytes, file bytes, file
 count, line count, and diagnostic count. A tool failure is a failed gate, not a
