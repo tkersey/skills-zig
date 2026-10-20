@@ -108,7 +108,8 @@ mutating unrelated state.
 
 New functions and test blocks are limited to 70 physical lines of their own
 scope. Nested function declarations are measured independently and excluded from
-the enclosing scope's length. Push branching
+the enclosing scope's length. A line containing code from both scopes counts for
+both; blank lines count for their containing scope. Push branching
 up into the owning function and push iteration down into focused helpers. New
 Zig lines are limited to 100 columns.
 
@@ -184,7 +185,8 @@ measure correctness or replace this document's limits.
 - No discarded errors through `catch {}` or `catch unreachable`.
 - No unmarked `while (true)` loops.
 - No direct runtime recursion, including calls through a `self` receiver, in fully
-  audited files. Functions returning `type` construct compile-time types; their
+  audited files. Functions returning `type`, including optional and error-union
+  wrappers, construct compile-time types; their
   nested runtime methods remain independently checked. Explicitly `inline`
   functions rely on the compiler's mandatory expansion check.
 - No function or test block longer than 70 lines in fully audited files.

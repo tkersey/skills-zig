@@ -426,3 +426,73 @@ test "structural diagnostic output failure propagates" {
         &result,
     ));
 }
+
+test "shared nested declaration lines retain enclosing code at the length boundary" {
+    for ([_]usize{ 68, 69 }) |count| {
+        var input = std.Io.Writer.Allocating.init(std.testing.allocator);
+        defer input.deinit();
+        try input.writer.writeAll("fn outer() void {\n");
+        for (0..count) |_| {
+            try input.writer.writeAll("_ = struct { fn inner() void {} };\n");
+        }
+        try input.writer.writeAll("}\n");
+        var output = std.Io.Writer.Allocating.init(std.testing.allocator);
+        defer output.deinit();
+        var result: Audit = .{};
+        try source(std.testing.allocator, &output.writer, "shared.zig", input.written(), &result);
+        try std.testing.expectEqual(@as(u32, @intFromBool(count == 69)), result.diagnostics);
+    }
+}
+
+test "sibling declarations sharing lines do not become enclosing code" {
+    var input = std.Io.Writer.Allocating.init(std.testing.allocator);
+    defer input.deinit();
+    try input.writer.writeAll("fn Factory() type {\nreturn struct {\n");
+    for (0..69) |index| {
+        try input.writer.print("fn a{d}() void {{}} fn b{d}() void {{}}\n", .{ index, index });
+    }
+    try input.writer.writeAll("};\n}\n");
+    var output = std.Io.Writer.Allocating.init(std.testing.allocator);
+    defer output.deinit();
+    var result: Audit = .{};
+    try source(std.testing.allocator, &output.writer, "siblings.zig", input.written(), &result);
+    try std.testing.expectEqual(@as(u32, 0), result.diagnostics);
+}
+
+test "blank physical lines retain their containing function" {
+    for ([_]usize{ 68, 69 }) |count| {
+        var input = std.Io.Writer.Allocating.init(std.testing.allocator);
+        defer input.deinit();
+        try input.writer.writeAll("fn outer() void {\n");
+        for (0..count) |_| try input.writer.writeAll("\n");
+        try input.writer.writeAll("}\n");
+        var output = std.Io.Writer.Allocating.init(std.testing.allocator);
+        defer output.deinit();
+        var result: Audit = .{};
+        try source(std.testing.allocator, &output.writer, "blank.zig", input.written(), &result);
+        try std.testing.expectEqual(@as(u32, @intFromBool(count == 69)), result.diagnostics);
+    }
+}
+
+test "optional and error-wrapped type results remain compiler-only" {
+    var output = std.Io.Writer.Allocating.init(std.testing.allocator);
+    defer output.deinit();
+    var result: Audit = .{};
+    try source(std.testing.allocator, &output.writer, "results.zig",
+        \\fn errors(comptime n: usize) error{NoType}!type {
+        \\    if (n == 0) return u8;
+        \\    return try errors(n - 1);
+        \\}
+        \\fn optional(comptime n: usize) ?type {
+        \\    if (n == 0) return u8;
+        \\    return optional(n - 1);
+        \\}
+        \\fn grouped(comptime n: usize) (error{NoType}!(?type)) {
+        \\    if (n == 0) return u8;
+        \\    return try grouped(n - 1);
+        \\}
+        \\fn runtime(n: usize) error{Bad}!?u8 { return try runtime(n); }
+        \\fn another(n: usize) (?u8) { return another(n); }
+    , &result);
+    try std.testing.expectEqual(@as(u32, 2), result.diagnostics);
+}

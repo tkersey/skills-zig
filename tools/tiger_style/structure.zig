@@ -7,9 +7,8 @@ const Function = struct {
     body: u32,
     end: u32,
     first_line: u32,
-    last_line: u32,
-    own_lines: u32,
-    excluded_until: u32 = 0,
+    own_lines: u32 = 0,
+    counted_line: u32 = 0,
     name: ?[]const u8 = null,
     receiver: ?[]const u8 = null,
     parent: ?usize = null,
@@ -48,6 +47,7 @@ pub fn run(
     var functions = try declarations(allocator, tree, lines);
     defer functions.deinit(allocator);
     establishParents(functions.items);
+    countOwnedLines(tree.source, functions.items);
     collectCalls(tree, lines, functions.items);
     for (functions.items) |function| {
         if (function.own_lines > limits.function_lines_max) {
@@ -105,8 +105,6 @@ fn declarations(allocator: std.mem.Allocator, tree: Ast, lines: []const u32) !st
             .body = tree.tokenStart(tree.firstToken(body)),
             .end = tree.tokenStart(last) + @as(u32, @intCast(tree.tokenSlice(last).len)),
             .first_line = lines[first],
-            .last_line = lines[last],
-            .own_lines = lines[last] - lines[first] + 1,
         };
         var buffer: [1]Ast.Node.Index = undefined;
         if (tree.fullFnProto(&buffer, node)) |proto| setSignature(&function, tree, proto);
@@ -122,14 +120,26 @@ fn setSignature(function: *Function, tree: Ast, proto: Ast.full.FnProto) void {
         function.inlined = tree.tokenTag(token) == .keyword_inline;
     }
     if (proto.ast.return_type.unwrap()) |node| {
-        function.type_factory = tree.nodeTag(node) == .identifier and
-            std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(node)), "type");
+        function.type_factory = typeResult(tree, node);
     }
     var parameters = proto.iterate(&tree);
     const first = parameters.next() orelse return;
     const token = first.name_token orelse return;
     const name = tree.tokenSlice(token);
     if (std.mem.eql(u8, name, "self")) function.receiver = name;
+}
+
+fn typeResult(tree: Ast, root: Ast.Node.Index) bool {
+    var node = root;
+    while (tree.nodeTag(node) != .identifier) {
+        node = switch (tree.nodeTag(node)) {
+            .error_union => tree.nodeData(node).node_and_node[1],
+            .optional_type => tree.nodeData(node).node,
+            .grouped_expression => tree.nodeData(node).node_and_token[0],
+            else => return false,
+        };
+    }
+    return std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(node)), "type");
 }
 
 fn establishParents(functions: []Function) void {
@@ -141,16 +151,40 @@ fn establishParents(functions: []Function) void {
             parent = functions[candidate].parent;
         }
         function.parent = parent;
-        if (parent) |owner| {
-            const outer = &functions[owner];
-            const first = @max(function.first_line, outer.first_line + 1);
-            const last = @min(function.last_line, outer.last_line - 1);
-            const start = @max(first, outer.excluded_until);
-            if (start <= last) outer.own_lines -= last - start + 1;
-            outer.excluded_until = @max(outer.excluded_until, last + 1);
-        }
         previous = index;
     }
+}
+
+fn countOwnedLines(source: []const u8, functions: []Function) void {
+    var next: usize = 0;
+    var owner: ?usize = null;
+    var line: u32 = 1;
+    var occupied = false;
+    for (source, 0..) |byte, offset| {
+        while (owner) |index| {
+            if (offset < functions[index].end) break;
+            owner = functions[index].parent;
+        }
+        if (next < functions.len and offset == functions[next].start) {
+            owner = next;
+            next += 1;
+        }
+        if (byte == '\n') {
+            if (!occupied) countLine(functions, owner, line);
+            occupied = false;
+            line += 1;
+        } else if (!std.ascii.isWhitespace(byte)) {
+            occupied = true;
+            countLine(functions, owner, line);
+        }
+    }
+}
+
+fn countLine(functions: []Function, owner: ?usize, line: u32) void {
+    const function = &functions[owner orelse return];
+    if (function.counted_line == line) return;
+    function.counted_line = line;
+    function.own_lines += 1;
 }
 
 fn ownerAt(functions: []const Function, offset: u32) ?usize {
