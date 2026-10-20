@@ -26,17 +26,6 @@ pub const Audit = struct {
     }
 };
 
-const FunctionState = struct {
-    active: bool = false,
-    body_started: bool = false,
-    brace_depth: i32 = 0,
-    name: ?[]const u8 = null,
-    receiver: ?[]const u8 = null,
-    first_parameter_seen: bool = false,
-    recursion_reported: bool = false,
-    start_line: u32 = 0,
-};
-
 pub fn countFile(audit: *Audit) !void {
     if (audit.files == limits.files_max) return error.FileLimitExceeded;
     audit.files += 1;
@@ -60,7 +49,7 @@ pub fn file(
     );
     defer allocator.free(input);
 
-    try source(writer, path, input, audit);
+    try source(allocator, writer, path, input, audit);
 }
 
 test "file auditing uses the supplied directory" {
@@ -68,7 +57,7 @@ test "file auditing uses the supplied directory" {
     defer tmp.cleanup();
     try tmp.dir.writeFile(std.testing.io, .{
         .sub_path = "supplied.zig",
-        .data = "while (true) {}\n",
+        .data = "fn run() void { while (true) {} }\n",
     });
     var output = std.Io.Writer.Allocating.init(std.testing.allocator);
     defer output.deinit();
@@ -88,12 +77,12 @@ test "file auditing uses the supplied directory" {
 }
 
 pub fn source(
+    allocator: std.mem.Allocator,
     writer: anytype,
     path: []const u8,
     input: []const u8,
     audit: *Audit,
 ) !void {
-    var function = FunctionState{};
     var line_number: u32 = 0;
     var lines = std.mem.splitScalar(u8, input, '\n');
 
@@ -102,18 +91,9 @@ pub fn source(
         line_number += 1;
         audit.lines += 1;
         try line(writer, path, line_number, source_line, audit);
-        try functionLine(writer, path, line_number, source_line, &function, audit);
     }
 
-    if (function.active) {
-        try audit.record(
-            writer,
-            path,
-            function.start_line,
-            "function-closure",
-            "function or test block does not close within the file",
-        );
-    }
+    try @import("structure.zig").run(allocator, writer, path, input, audit);
 }
 
 pub fn addedLine(
@@ -204,113 +184,12 @@ fn lineSemantics(
     }
 }
 
-fn functionLine(
-    writer: anytype,
-    path: []const u8,
-    line_number: u32,
-    source_line: []const u8,
-    function: *FunctionState,
-    audit: *Audit,
-) !void {
-    if (!function.active) function.* = functionStart(source_line, line_number) orelse return;
-
-    if (!function.body_started and !function.first_parameter_seen) {
-        const parameters = if (line_number == function.start_line)
-            lex.codeAfter(source_line, "(") orelse ""
-        else
-            source_line;
-        if (lex.parameterName(parameters)) |parameter| {
-            function.first_parameter_seen = true;
-            if (std.mem.eql(u8, parameter, "self")) function.receiver = parameter;
-        }
-    }
-
-    const delta = lex.braceDelta(source_line);
-    function.brace_depth += @as(i32, @intCast(delta.open));
-    function.brace_depth -= @as(i32, @intCast(delta.close));
-    if (delta.open > 0) function.body_started = true;
-    if (!function.body_started and lex.codeContains(source_line, ";")) {
-        function.* = .{};
-        return;
-    }
-
-    try recursion(writer, path, line_number, source_line, function, audit);
-    if (function.body_started and function.brace_depth == 0) {
-        try functionClose(writer, path, line_number, function, audit);
-    } else if (function.brace_depth < 0) {
-        try audit.record(
-            writer,
-            path,
-            line_number,
-            "brace-balance",
-            "function brace depth became negative",
-        );
-        function.* = .{};
-    }
-}
-
-fn functionStart(source_line: []const u8, line_number: u32) ?FunctionState {
-    if (lex.functionName(source_line)) |name| {
-        return .{ .active = true, .name = name, .start_line = line_number };
-    }
-    if (lex.isTestStart(source_line)) {
-        return .{ .active = true, .name = null, .start_line = line_number };
-    }
-    return null;
-}
-
-fn functionClose(
-    writer: anytype,
-    path: []const u8,
-    line_number: u32,
-    function: *FunctionState,
-    audit: *Audit,
-) !void {
-    const line_count = line_number - function.start_line + 1;
-    if (line_count > limits.function_lines_max) {
-        try audit.record(
-            writer,
-            path,
-            function.start_line,
-            "function-length",
-            "function or test block exceeds 70 lines",
-        );
-    }
-    function.* = .{};
-}
-
-fn recursion(
-    writer: anytype,
-    path: []const u8,
-    line_number: u32,
-    source_line: []const u8,
-    function: *FunctionState,
-    audit: *Audit,
-) !void {
-    if (!function.body_started or function.recursion_reported) return;
-    const name = function.name orelse return;
-    const body_line = if (line_number == function.start_line)
-        lex.codeAfter(source_line, "{") orelse return
-    else
-        source_line;
-    if (!lex.codeCallsFunctionOnReceiver(body_line, name, function.receiver)) return;
-
-    try audit.record(
-        writer,
-        path,
-        line_number,
-        "recursion",
-        "replace direct recursion with an explicitly bounded iteration",
-    );
-    function.recursion_reported = true;
-}
-
 test "line audit covers expected and unexpected space" {
     var output = std.Io.Writer.Allocating.init(std.testing.allocator);
     defer output.deinit();
     var result = Audit{};
 
-    try source(&output.writer, "valid.zig",
+    try source(std.testing.allocator, &output.writer, "valid.zig",
         \\fn bounded() void {
         \\    var index: u32 = 0;
         \\    while (index < 2) : (index += 1) {}
@@ -318,7 +197,7 @@ test "line audit covers expected and unexpected space" {
     , &result);
     try std.testing.expectEqual(@as(u32, 0), result.diagnostics);
 
-    try source(&output.writer, "invalid.zig",
+    try source(std.testing.allocator, &output.writer, "invalid.zig",
         \\fn unbounded() void {
         \\    while (true) {}
         \\    action() catch {};
@@ -333,17 +212,25 @@ test "strings and justified event loops do not trigger code rules" {
     defer output.deinit();
     var result = Audit{};
 
-    try source(&output.writer, "strings.zig",
+    try source(
+        std.testing.allocator,
+        &output.writer,
+        "strings.zig",
         \\fn server() void {
         \\    const example = "while (true) catch {}";
+        \\    const data =
         \\    \\{"passive_definition":"compact machine data is exempt from source layout width because it is not executable Zig"}
+        \\    ;
+        \\    _ = data;
         \\    _ = example;
         \\    while (true) {} // tiger: event-loop
         \\}
-    , &result);
+    ,
+        &result,
+    );
     try std.testing.expectEqual(@as(u32, 0), result.diagnostics);
 
-    try source(&output.writer, "fake-marker.zig",
+    try source(std.testing.allocator, &output.writer, "fake-marker.zig",
         \\fn server() void {
         \\    while (true) { const marker = "tiger: event-loop"; }
         \\}
@@ -356,7 +243,7 @@ test "declarations close and one-line recursion is rejected" {
     defer output.deinit();
     var result = Audit{};
 
-    try source(&output.writer, "declarations.zig",
+    try source(std.testing.allocator, &output.writer, "declarations.zig",
         \\extern fn write(fd: c_int, buffer: [*]const u8, count: usize) isize;
         \\fn recurse() void { recurse(); }
     , &result);
@@ -376,7 +263,7 @@ test "full file audit rejects long functions and direct recursion" {
     var output = std.Io.Writer.Allocating.init(std.testing.allocator);
     defer output.deinit();
     var result = Audit{};
-    try source(&output.writer, "invalid.zig", input.written(), &result);
+    try source(std.testing.allocator, &output.writer, "invalid.zig", input.written(), &result);
     try std.testing.expectEqual(@as(u32, 2), result.diagnostics);
 }
 
@@ -384,7 +271,7 @@ test "receiver recursion is rejected across multiline declarations and calls" {
     var output = std.Io.Writer.Allocating.init(std.testing.allocator);
     defer output.deinit();
     var result = Audit{};
-    try source(&output.writer, "receiver.zig",
+    try source(std.testing.allocator, &output.writer, "receiver.zig",
         \\fn visit(
         \\    self: *Builder,
         \\    child: Child,
@@ -404,7 +291,7 @@ test "receiver recursion is rejected with comptime and noalias parameters" {
     var output = std.Io.Writer.Allocating.init(std.testing.allocator);
     defer output.deinit();
     var result = Audit{};
-    try source(&output.writer, "modifiers.zig",
+    try source(std.testing.allocator, &output.writer, "modifiers.zig",
         \\fn visit(comptime self: Builder) void { self.visit(); }
         \\fn walk(
         \\    noalias self: *Builder,
@@ -419,4 +306,123 @@ test "receiver recursion is rejected with comptime and noalias parameters" {
         \\}
     , &result);
     try std.testing.expectEqual(@as(u32, 2), result.diagnostics);
+}
+
+test "generic factories and nested methods have independent structural limits" {
+    var input = std.Io.Writer.Allocating.init(std.testing.allocator);
+    defer input.deinit();
+    try input.writer.writeAll("fn Factory(comptime T: type) type {\nreturn struct {\n");
+    for (0..3) |i| {
+        try input.writer.print("fn method{d}() void {{\n", .{i});
+        for (0..38) |_| try input.writer.writeAll("_ = Factory(u8);\n");
+        try input.writer.writeAll("}\n");
+    }
+    try input.writer.writeAll("};\n}\n");
+    var output = std.Io.Writer.Allocating.init(std.testing.allocator);
+    defer output.deinit();
+    var result: Audit = .{};
+    try source(std.testing.allocator, &output.writer, "factory.zig", input.written(), &result);
+    try std.testing.expectEqual(@as(u32, 0), result.diagnostics);
+}
+
+test "nested methods cannot conceal excessive length or runtime recursion" {
+    var input = std.Io.Writer.Allocating.init(std.testing.allocator);
+    defer input.deinit();
+    try input.writer.writeAll("fn Factory(comptime T: type) type {\nreturn struct {\n");
+    try input.writer.writeAll("fn large() void {\n");
+    for (0..69) |_| try input.writer.writeAll("_ = 0;\n");
+    try input.writer.writeAll("}\nfn walk(self: *@This()) void { self.walk(); }\n};\n}\n");
+    var output = std.Io.Writer.Allocating.init(std.testing.allocator);
+    defer output.deinit();
+    var result: Audit = .{};
+    try source(std.testing.allocator, &output.writer, "factory.zig", input.written(), &result);
+    try std.testing.expectEqual(@as(u32, 2), result.diagnostics);
+    try std.testing.expect(std.mem.indexOf(u8, output.written(), "function-length") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output.written(), "recursion") != null);
+}
+
+test "multiline calls and nested declaration signatures retain their actual owner" {
+    var output = std.Io.Writer.Allocating.init(std.testing.allocator);
+    defer output.deinit();
+    var result: Audit = .{};
+    try source(std.testing.allocator, &output.writer, "owners.zig",
+        \\fn Outer(comptime T: type) type {
+        \\    return struct {
+        \\        fn create() Outer(u8) { return undefined; }
+        \\        fn run(self: *@This()) void {
+        \\            self
+        \\                .run();
+        \\        }
+        \\    };
+        \\}
+        \\fn normal() void { const S = struct { fn normal() void {} }; _ = S; normal(); }
+    , &result);
+    try std.testing.expectEqual(@as(u32, 2), result.diagnostics);
+}
+
+test "whole file syntax errors cannot pass structural auditing" {
+    var output = std.Io.Writer.Allocating.init(std.testing.allocator);
+    defer output.deinit();
+    var result: Audit = .{};
+    try source(
+        std.testing.allocator,
+        &output.writer,
+        "syntax.zig",
+        "fn incomplete() void {",
+        &result,
+    );
+    try std.testing.expectEqual(@as(u32, 1), result.diagnostics);
+    try std.testing.expect(std.mem.indexOf(u8, output.written(), "tiger-style/syntax") != null);
+}
+
+test "mandatory inline expansion has no native frame and nested functions remain checked" {
+    var output = std.Io.Writer.Allocating.init(std.testing.allocator);
+    defer output.deinit();
+    var result: Audit = .{};
+    try source(std.testing.allocator, &output.writer, "inline.zig",
+        \\inline fn descend(comptime T: type, value: T) usize {
+        \\    return switch (@typeInfo(T)) {
+        \\        .optional => |info| if (value) |item| descend(info.child, item) else 0,
+        \\        else => 1,
+        \\    };
+        \\}
+        \\inline fn outer() void {
+        \\    const S = struct { fn run() void { run(); } };
+        \\    _ = S;
+        \\}
+        \\noinline fn direct() void { direct(); }
+    , &result);
+    try std.testing.expectEqual(@as(u32, 2), result.diagnostics);
+}
+
+fn structuralAllocationFailure(allocator: std.mem.Allocator) !void {
+    var bytes: [1024]u8 = undefined;
+    var output = std.Io.Writer.fixed(&bytes);
+    var result: Audit = .{};
+    try source(allocator, &output, "allocation.zig",
+        \\fn Outer(comptime T: type) type {
+        \\    return struct { fn run(self: *@This()) void { self.run(); } };
+        \\}
+    , &result);
+    try std.testing.expectEqual(@as(u32, 1), result.diagnostics);
+}
+
+test "structural audit releases every partial allocation" {
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        structuralAllocationFailure,
+        .{},
+    );
+}
+
+test "structural diagnostic output failure propagates" {
+    var output = std.Io.Writer.fixed(&.{});
+    var result: Audit = .{};
+    try std.testing.expectError(error.WriteFailed, source(
+        std.testing.allocator,
+        &output,
+        "output.zig",
+        "fn recursive() void { recursive(); }",
+        &result,
+    ));
 }
