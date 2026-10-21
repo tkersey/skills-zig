@@ -137,24 +137,11 @@ const Job = struct {
             std.crypto.secureZero(u8, value);
             self.allocator.free(value);
         };
-        var headers: [1]std.http.Header = undefined;
-        if (bearer) |value| headers[0] = .{ .name = "Authorization", .value = value };
         const payload = self.request.body();
         var request = try client.request(
             if (payload != null) .POST else .GET,
             try std.Uri.parse(self.request.url()),
-            .{
-                .redirect_behavior = .unhandled,
-                .keep_alive = false,
-                .headers = .{
-                    .content_type = if (payload != null)
-                        .{ .override = "application/x-www-form-urlencoded" }
-                    else
-                        .omit,
-                    .accept_encoding = .omit,
-                },
-                .privileged_headers = if (bearer != null) &headers else &.{},
-            },
+            requestOptions(payload, bearer),
         );
         defer request.deinit();
         if (payload) |value| {
@@ -171,6 +158,21 @@ const Job = struct {
         self.response = .{ .allocator = self.allocator, .status = status, .body = body };
     }
 };
+
+fn requestOptions(payload: ?[]const u8, bearer: ?[]const u8) std.http.Client.RequestOptions {
+    return .{
+        .redirect_behavior = .unhandled,
+        .keep_alive = false,
+        .headers = .{
+            .authorization = if (bearer) |value| .{ .override = value } else .omit,
+            .content_type = if (payload != null)
+                .{ .override = "application/x-www-form-urlencoded" }
+            else
+                .omit,
+            .accept_encoding = .omit,
+        },
+    };
+}
 
 fn sendRequestBody(request: *std.http.Client.Request, body: []const u8) !void {
     request.transfer_encoding = .{ .content_length = body.len };
@@ -315,6 +317,31 @@ const BodyTestConnection = struct {
         });
     }
 };
+
+test "request serialization emits only the explicit bearer authorization" {
+    for ([_]?[]const u8{ "Bearer synthetic-access", null }) |bearer| {
+        var client = std.http.Client{ .allocator = std.testing.allocator, .io = std.testing.io };
+        defer client.deinit();
+        var buffer: [512]u8 = undefined;
+        var sink = BodyTestConnection.init(&client, &buffer);
+        defer sink.wire.deinit();
+        var options = requestOptions(null, bearer);
+        options.connection = &sink.connection;
+        var request = try client.request(.GET, try std.Uri.parse(models_url), options);
+        try std.testing.expectEqual(.unhandled, request.redirect_behavior);
+        try request.sendBodiless();
+        const wire = sink.wire.written();
+        try std.testing.expect(std.mem.startsWith(u8, wire, "GET /v1/models HTTP/1.1\r\n"));
+        try std.testing.expect(std.mem.endsWith(u8, wire, "\r\n\r\n"));
+        try std.testing.expectEqual(
+            @as(usize, if (bearer != null) 1 else 0),
+            std.mem.count(u8, wire, "authorization:"),
+        );
+        if (bearer != null) try std.testing.expect(
+            std.mem.indexOf(u8, wire, "\r\nauthorization: Bearer synthetic-access\r\n") != null,
+        );
+    }
+}
 
 test "request body streaming preserves readonly bytes across short writes and flushes" {
     var client = std.http.Client{ .allocator = std.testing.allocator, .io = std.testing.io };
