@@ -92,6 +92,15 @@ pub const Store = struct {
         directory.deinit();
         directory = .{ .io = io, .directory = iterable };
         try validateNativeOwner(directory.directory.handle);
+        if (mode == .create) {
+            const file = try root.directory.openFile(io, ".", .{
+                .allow_directory = true,
+                .follow_symlinks = false,
+                .path_only = false,
+            });
+            defer file.close(io);
+            try file.sync(io);
+        }
         return .{
             .io = io,
             .allocator = allocator,
@@ -547,6 +556,79 @@ fn connectedRecord(app: []const u8, label: []const u8) Record {
             .expires_at = 3600,
         },
     };
+}
+
+test "mutable store admission syncs the app parent and retries existing entries after failure" {
+    const io = std.testing.io;
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDir(io, "auth", .fromMode(0o700));
+    var root = try tmp.dir.openDir(io, "auth", .{ .follow_symlinks = false });
+    defer root.close(io);
+    const path = try root.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(path);
+    const Hooks = struct {
+        var root_directory: std.Io.Dir = undefined;
+        var root_inode: std.Io.File.INode = undefined;
+        var app: []const u8 = undefined;
+        var root_syncs: usize = 0;
+        var other_syncs: usize = 0;
+        var fail_root: bool = false;
+
+        fn sync(userdata: ?*anyopaque, file: std.Io.File) std.Io.File.SyncError!void {
+            const stat = file.stat(std.testing.io) catch return error.InputOutput;
+            if (stat.kind == .directory and stat.inode == root_inode) {
+                const child = root_directory.statFile(std.testing.io, app, .{
+                    .follow_symlinks = false,
+                }) catch return error.InputOutput;
+                if (child.kind != .directory) return error.InputOutput;
+                root_syncs += 1;
+                if (fail_root) return error.InputOutput;
+            } else {
+                other_syncs += 1;
+            }
+            return std.testing.io.vtable.fileSync(userdata, file);
+        }
+    };
+    Hooks.root_directory = root;
+    Hooks.root_inode = (try root.stat(io)).inode;
+    Hooks.app = "created";
+    Hooks.root_syncs = 0;
+    Hooks.other_syncs = 0;
+    Hooks.fail_root = false;
+    var vtable = io.vtable.*;
+    vtable.fileSync = Hooks.sync;
+    const injected: std.Io = .{ .userdata = io.userdata, .vtable = &vtable };
+
+    var created = try Store.open(injected, allocator, path, Hooks.app, .create);
+    defer created.deinit();
+    try std.testing.expectEqual(@as(usize, 1), Hooks.root_syncs);
+
+    Hooks.app = "retry";
+    Hooks.fail_root = true;
+    try std.testing.expectError(
+        error.InputOutput,
+        Store.open(injected, allocator, path, Hooks.app, .create),
+    );
+    try std.testing.expectEqual(@as(usize, 2), Hooks.root_syncs);
+    const failed_child = try root.statFile(io, Hooks.app, .{ .follow_symlinks = false });
+    try std.testing.expectEqual(.directory, failed_child.kind);
+
+    Hooks.fail_root = false;
+    var retried = try Store.open(injected, allocator, path, Hooks.app, .create);
+    defer retried.deinit();
+    try std.testing.expectEqual(@as(usize, 3), Hooks.root_syncs);
+    try std.testing.expectEqual(
+        failed_child.inode,
+        (try retried.directory.directory.stat(io)).inode,
+    );
+
+    Hooks.fail_root = true;
+    var read_only = try Store.open(injected, allocator, path, Hooks.app, .read_only);
+    defer read_only.deinit();
+    try std.testing.expectEqual(@as(usize, 3), Hooks.root_syncs);
+    try std.testing.expectEqual(@as(usize, 0), Hooks.other_syncs);
 }
 
 test "account records preserve pending connected refreshing and signed-out phases" {

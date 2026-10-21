@@ -126,7 +126,7 @@ pub const Manager = struct {
         var record = try account.load();
         errdefer record.deinit();
         const host_id = try self.store.getOrCreateHostId();
-        defer self.allocator.free(host_id);
+        defer self.store.allocator.free(host_id);
         var random: [96]u8 = undefined;
         try self.random_fn(self.io, &random);
         defer std.crypto.secureZero(u8, &random);
@@ -188,10 +188,11 @@ pub const Manager = struct {
             }
             return error.ReauthenticationRequired;
         }
-        var reply = try oauth.parseTokenReply(
+        var reply = try oauth.parseRefreshTokenReply(
             self.allocator,
             response.body,
             try self.clock.now(self.io),
+            tokens.scope,
         );
         defer reply.deinit();
         var identity: ?jwt.Identity = null;

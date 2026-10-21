@@ -138,7 +138,7 @@ const Job = struct {
             self.existing_client_id,
         ) catch |err| switch (err) {
             error.OutOfMemory => return err,
-            error.AccessDenied => {
+            error.AccessDenied, error.AuthorizationRejected => {
                 _ = try reply(io, stream, .received, deadline);
                 return err;
             },
@@ -479,6 +479,35 @@ test "only an OAuth denial with the expected state ends the attempt" {
     }, "HTTP/1.1 200 OK\r\n");
     try std.testing.expectError(error.AccessDenied, worker.await(std.testing.io));
     try std.testing.expect(fixture.callback == null);
+}
+
+test "provider errors end only the matching well-formed authorization attempt" {
+    for ([_][]const u8{ "server_error", "temporarily_unavailable", "invalid_request" }) |failure| {
+        var fixture = try TestServer.open();
+        defer fixture.deinit();
+        var worker = try std.testing.io.concurrent(TestServer.run, .{&fixture});
+        defer _ = worker.cancel(std.testing.io) catch null;
+        for ([_][]const u8{ "wrong", "expected&code=secret-code" }) |state| {
+            const target = try std.testing.allocator.print(
+                callback_path ++ "?error={s}&state={s}",
+                .{ failure, state },
+            );
+            defer std.testing.allocator.free(target);
+            try expectTestStatus(
+                &fixture.listener,
+                .{ .target = target },
+                "HTTP/1.1 400 Bad Request\r\n",
+            );
+        }
+        const target = try std.testing.allocator.print(
+            callback_path ++ "?error={s}&state=expected",
+            .{failure},
+        );
+        defer std.testing.allocator.free(target);
+        try expectTestStatus(&fixture.listener, .{ .target = target }, "HTTP/1.1 200 OK\r\n");
+        try std.testing.expectError(error.AuthorizationRejected, worker.await(std.testing.io));
+        try std.testing.expect(fixture.callback == null);
+    }
 }
 
 test "callback timer cancels both idle acceptance and a stalled client" {

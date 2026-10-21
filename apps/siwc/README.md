@@ -300,10 +300,10 @@ compatibility. CI does not substitute for this provider-facing smoke check.
 This implementation follows the public Sign in with ChatGPT preview documentation:
 
 - [Quickstart](https://developers.openai.com/siwc/quickstart)
-- [Sign-in flow](https://developers.openai.com/siwc/sign-in)
-- [Profiles and sessions](https://developers.openai.com/siwc/profiles-and-sessions)
-- [Tokens](https://developers.openai.com/siwc/token-reference)
-- [Models and inference](https://developers.openai.com/siwc/models-and-inference)
-- [Errors and recovery](https://developers.openai.com/siwc/errors-and-recovery)
+- [Sign-in flow](https://developers.openai.com/siwc/token-sharing-open-source/sign-in)
+- [Profiles and sessions](https://developers.openai.com/siwc/token-sharing-open-source/profiles-and-sessions)
+- [Tokens](https://developers.openai.com/siwc/token-sharing-open-source/token-reference)
+- [Models and inference](https://developers.openai.com/siwc/token-sharing-open-source/models-and-inference)
+- [Errors and recovery](https://developers.openai.com/siwc/token-sharing-open-source/errors-and-recovery)
 - [Open-source token sharing](https://developers.openai.com/siwc/token-sharing-open-source)
-- [Preview limitations](https://developers.openai.com/siwc/preview-limitations)
+- [Preview limitations](https://developers.openai.com/siwc/token-sharing-open-source/preview-limitations)

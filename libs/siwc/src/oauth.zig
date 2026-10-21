@@ -270,6 +270,24 @@ pub fn parseTokenReply(
     body: []const u8,
     now_sec: i64,
 ) !TokenReply {
+    return parseTokenReplyWithScope(allocator, body, now_sec, null);
+}
+
+pub fn parseRefreshTokenReply(
+    allocator: std.mem.Allocator,
+    body: []const u8,
+    now_sec: i64,
+    previous_scope: []const u8,
+) !TokenReply {
+    return parseTokenReplyWithScope(allocator, body, now_sec, previous_scope);
+}
+
+fn parseTokenReplyWithScope(
+    allocator: std.mem.Allocator,
+    body: []const u8,
+    now_sec: i64,
+    previous_scope: ?[]const u8,
+) !TokenReply {
     if (body.len > reply_bytes_max or now_sec < 0) return error.InvalidTokenReply;
     const parsed = try std.json.parseFromSlice(std.json.Value, allocator, body, .{
         .allocate = .alloc_always,
@@ -289,20 +307,94 @@ pub fn parseTokenReply(
     var earliest: ?i64 = null;
     if (object.get("earliest_refresh_at")) |value| {
         if (value != .null) {
-            if (value != .integer or value.integer < 0 or value.integer >= deadline)
-                return error.InvalidRefreshTime;
-            earliest = value.integer;
+            const seconds = switch (value) {
+                .integer => value.integer,
+                .string => try parseRefreshTimestamp(value.string),
+                else => return error.InvalidRefreshTime,
+            };
+            if (seconds < 0 or seconds >= deadline) return error.InvalidRefreshTime;
+            earliest = seconds;
         }
     }
+    const scope = if (object.contains("scope"))
+        try requiredString(object, "scope", 4096)
+    else if (previous_scope) |previous| blk: {
+        try validateText(previous, 4096);
+        break :blk try parsed.arena.allocator().dupe(u8, previous);
+    } else return error.MissingTokenField;
     return .{
         .parsed = parsed,
         .access_token = try requiredString(object, "access_token", token_bytes_max),
         .refresh_token = try optionalString(object, "refresh_token", token_bytes_max),
         .id_token = try optionalString(object, "id_token", token_bytes_max),
-        .scope = try requiredString(object, "scope", 4096),
+        .scope = scope,
         .expires_at = deadline,
         .earliest_refresh_at = earliest,
     };
+}
+
+fn parseRefreshTimestamp(text: []const u8) !i64 {
+    if (text.len < 20 or text.len > token_bytes_max) return error.InvalidRefreshTime;
+    if (text[4] != '-' or text[7] != '-' or
+        (text[10] != 'T' and text[10] != 't') or
+        text[13] != ':' or text[16] != ':') return error.InvalidRefreshTime;
+    const year = try timestampDigits(text[0..4]);
+    const month = try timestampDigits(text[5..7]);
+    const day = try timestampDigits(text[8..10]);
+    const hour = try timestampDigits(text[11..13]);
+    const minute = try timestampDigits(text[14..16]);
+    const second = try timestampDigits(text[17..19]);
+    const leap = @mod(year, 4) == 0 and (@mod(year, 100) != 0 or @mod(year, 400) == 0);
+    const month_days: i64 = switch (month) {
+        1, 3, 5, 7, 8, 10, 12 => 31,
+        4, 6, 9, 11 => 30,
+        2 => if (leap) 29 else 28,
+        else => return error.InvalidRefreshTime,
+    };
+    if (day < 1 or day > month_days or hour > 23 or minute > 59 or second > 59)
+        return error.InvalidRefreshTime;
+    var index: usize = 19;
+    var round_up: i64 = 0;
+    if (text[index] == '.') {
+        index += 1;
+        const start = index;
+        while (index < text.len and std.ascii.isDigit(text[index])) : (index += 1) {
+            if (text[index] != '0') round_up = 1;
+        }
+        if (index == start) return error.InvalidRefreshTime;
+    }
+    const offset = try timestampOffset(text[index..]);
+    const adjusted_year = year - @as(i64, if (month <= 2) 1 else 0);
+    const era = @divFloor(adjusted_year, 400);
+    const year_of_era = adjusted_year - era * 400;
+    const shifted_month = month + @as(i64, if (month > 2) -3 else 9);
+    const day_of_year = @divFloor(153 * shifted_month + 2, 5) + day - 1;
+    const day_of_era = year_of_era * 365 + @divFloor(year_of_era, 4) -
+        @divFloor(year_of_era, 100) + day_of_year;
+    const days = era * 146097 + day_of_era - 719468;
+    const seconds = days * 86400 + hour * 3600 + minute * 60 + second - offset;
+    if (seconds < 0) return error.InvalidRefreshTime;
+    return seconds + round_up;
+}
+
+fn timestampDigits(text: []const u8) !i64 {
+    var value: i64 = 0;
+    for (text) |byte| {
+        if (!std.ascii.isDigit(byte)) return error.InvalidRefreshTime;
+        value = value * 10 + byte - '0';
+    }
+    return value;
+}
+
+fn timestampOffset(text: []const u8) !i64 {
+    if (std.mem.eql(u8, text, "Z") or std.mem.eql(u8, text, "z")) return 0;
+    if (text.len != 6 or (text[0] != '+' and text[0] != '-') or text[3] != ':')
+        return error.InvalidRefreshTime;
+    const hours = try timestampDigits(text[1..3]);
+    const minutes = try timestampDigits(text[4..6]);
+    if (hours > 23 or minutes > 59) return error.InvalidRefreshTime;
+    const seconds = hours * 3600 + minutes * 60;
+    return if (text[0] == '-') -seconds else seconds;
 }
 
 fn requiredString(object: std.json.ObjectMap, key: []const u8, maximum: usize) ![]const u8 {
@@ -500,4 +592,151 @@ test "token expiry accepts exact bounds and detects overflow" {
         "{\"token_type\":\"Bearer\",\"expires_in\":1}",
         std.math.maxInt(i64),
     ));
+}
+
+test "only refresh replies inherit owned previously granted scopes" {
+    const allocator = std.testing.allocator;
+    const body =
+        \\{"access_token":"new","token_type":"Bearer","expires_in":3600}
+    ;
+    try std.testing.expectError(error.MissingTokenField, parseTokenReply(allocator, body, 100));
+    var previous = "openid chatgpt.tokens.use.direct".*;
+    var reply = try parseRefreshTokenReply(allocator, body, 100, &previous);
+    defer reply.deinit();
+    @memset(&previous, 'x');
+    try std.testing.expectEqualStrings("openid chatgpt.tokens.use.direct", reply.scope);
+    try std.testing.expect(hasPlanScope(reply.scope));
+    var limited = try parseRefreshTokenReply(allocator, body, 100, "openid");
+    defer limited.deinit();
+    try std.testing.expectEqualStrings("openid", limited.scope);
+    try std.testing.expect(!hasPlanScope(limited.scope));
+}
+
+test "refresh replies retain explicit downscopes and reject invalid explicit scopes" {
+    const allocator = std.testing.allocator;
+    const body =
+        \\{"access_token":"new","token_type":"Bearer","scope":"openid","expires_in":3600}
+    ;
+    var reply = try parseRefreshTokenReply(allocator, body, 100, scopes);
+    defer reply.deinit();
+    try std.testing.expectEqualStrings("openid", reply.scope);
+    try std.testing.expect(!hasPlanScope(reply.scope));
+    for ([_][]const u8{ "null", "5", "false" }) |scope| {
+        const invalid = try std.fmt.allocPrint(allocator,
+            \\{{"access_token":"new","token_type":"Bearer","scope":{s},"expires_in":3600}}
+        , .{scope});
+        defer allocator.free(invalid);
+        try std.testing.expectError(error.InvalidTokenField, parseRefreshTokenReply(
+            allocator,
+            invalid,
+            100,
+            scopes,
+        ));
+    }
+}
+
+test "refresh timestamps normalize UTC offsets leap days and nonzero fractions upward" {
+    const allocator = std.testing.allocator;
+    const cases = [_]struct { text: []const u8, seconds: i64 }{
+        .{ .text = "1970-01-01T00:00:00Z", .seconds = 0 },
+        .{ .text = "1970-01-01T00:00:01.000Z", .seconds = 1 },
+        .{ .text = "1970-01-01T00:00:01.001Z", .seconds = 2 },
+        .{ .text = "1970-01-01T00:00:01.000000000000000000001Z", .seconds = 2 },
+        .{ .text = "1970-01-01T00:00:59.999Z", .seconds = 60 },
+        .{ .text = "1970-01-01T00:00:01+00:00", .seconds = 1 },
+        .{ .text = "1970-01-01T01:30:01+01:30", .seconds = 1 },
+        .{ .text = "1969-12-31T22:30:01-01:30", .seconds = 1 },
+        .{ .text = "1970-01-01T01:30:01.1+01:30", .seconds = 2 },
+        .{ .text = "1970-01-01t00:00:01z", .seconds = 1 },
+        .{ .text = "2000-02-29T00:00:00Z", .seconds = 951782400 },
+        .{ .text = "2024-02-29T00:00:00Z", .seconds = 1709164800 },
+    };
+    for (cases) |case| {
+        const body = try std.fmt.allocPrint(allocator,
+            \\{{"access_token":"a","token_type":"Bearer","scope":"openid","expires_in":3600,"earliest_refresh_at":"{s}"}}
+        , .{case.text});
+        defer allocator.free(body);
+        var reply = try parseTokenReply(allocator, body, case.seconds);
+        defer reply.deinit();
+        try std.testing.expectEqual(case.seconds, reply.earliest_refresh_at.?);
+    }
+}
+
+test "refresh timestamps reject malformed calendars clocks offsets and text" {
+    for ([_][]const u8{
+        "",
+        "1970-01-01",
+        "1970-01-01T00:00:00",
+        "1970-01-01T00:00:00.Z",
+        "1970-01-01T00:00:00.1",
+        "1970-01-01T00:00:00ZZ",
+        "1970-01-01T00:00:00Z ",
+        "1970-01-01T00:00:00+00",
+        "1970-01-01T00:00:00+00:00Z",
+        "1970-01-01T00:00:00+24:00",
+        "1970-01-01T00:00:00-00:60",
+        "1970-01-01T00:00:00++1:00",
+        "1970-01-01T00:00:00+00:+1",
+        "1970-00-01T00:00:00Z",
+        "1970-13-01T00:00:00Z",
+        "1970-01-00T00:00:00Z",
+        "1970-04-31T00:00:00Z",
+        "2001-02-29T00:00:00Z",
+        "2100-02-29T00:00:00Z",
+        "2000-02-30T00:00:00Z",
+        "1970-01-01T24:00:00Z",
+        "1970-01-01T00:60:00Z",
+        "1970-01-01T00:00:60Z",
+        "1970-01-01T+1:00:00Z",
+        "1970-01-01T00:-1:00Z",
+        "1970-01-01T00:00:+1Z",
+        "+970-01-01T00:00:00Z",
+        "1970-+1-01T00:00:00Z",
+        "1970-01-+1T00:00:00Z",
+        "1970/01/01T00:00:00Z",
+        "1970-01-01 00:00:00Z",
+        "1969-12-31T23:59:59.9Z",
+        "1970-01-01T00:00:00+00:01",
+        "0000-01-01T00:00:00Z",
+    }) |invalid| {
+        try std.testing.expectError(error.InvalidRefreshTime, parseRefreshTimestamp(invalid));
+    }
+}
+
+test "refresh time retains integer and null support and validates rounded deadline" {
+    const allocator = std.testing.allocator;
+    for ([_][]const u8{ "0", "59", "null", "\"1970-01-01T00:00:59.000Z\"" }) |time| {
+        const body = try std.fmt.allocPrint(allocator,
+            \\{{"access_token":"a","token_type":"Bearer","scope":"openid","expires_in":60,"earliest_refresh_at":{s}}}
+        , .{time});
+        defer allocator.free(body);
+        var reply = try parseTokenReply(allocator, body, 0);
+        defer reply.deinit();
+        if (std.mem.eql(u8, time, "null")) {
+            try std.testing.expect(reply.earliest_refresh_at == null);
+        } else {
+            try std.testing.expectEqual(
+                @as(i64, if (time[0] == '0') 0 else 59),
+                reply.earliest_refresh_at.?,
+            );
+        }
+    }
+    for ([_][]const u8{
+        "-1",
+        "60",
+        "1.5",
+        "true",
+        "[]",
+        "{}",
+        "\"59\"",
+        "\"1970-01-01T00:00:59.0001Z\"",
+        "\"1970-01-01T00:01:00Z\"",
+        "\"9999-12-31T23:59:59Z\"",
+    }) |time| {
+        const body = try std.fmt.allocPrint(allocator,
+            \\{{"access_token":"a","token_type":"Bearer","scope":"openid","expires_in":60,"earliest_refresh_at":{s}}}
+        , .{time});
+        defer allocator.free(body);
+        try std.testing.expectError(error.InvalidRefreshTime, parseTokenReply(allocator, body, 0));
+    }
 }

@@ -198,6 +198,30 @@ fn completeLogin(manager: *manager_module.Manager, new_account: bool) !void {
     try std.testing.expectError(error.LoginAlreadyConsumed, login.complete(callback));
 }
 
+test "login frees new and stored host identifiers with the store allocator" {
+    var fixture = try Fixture.init();
+    defer fixture.deinit();
+    var memory = std.heap.ArenaAllocator.init(allocator);
+    defer memory.deinit();
+    var script = fixture.script(&.{});
+    var manager = fixture.manager(&script);
+    manager.allocator = memory.allocator();
+    for ([_]bool{ true, false }) |new_account| {
+        var login = try manager.beginLogin(.{
+            .label = label,
+            .new_account = new_account,
+            .redirect_uri = redirect_uri,
+        });
+        defer login.deinit();
+        try std.testing.expect(std.mem.indexOf(
+            u8,
+            login.authorization_url,
+            "ext_agent_host_id=",
+        ) != null);
+    }
+    try script.expectConsumed();
+}
+
 test "initial login persists issued registration before exchange and verifies identity" {
     var fixture = try Fixture.init();
     defer fixture.deinit();
@@ -343,6 +367,59 @@ test "rotation marks pending before request and publishes the entire new set onc
     var second = try manager.credential(label);
     defer second.deinit();
     try std.testing.expectEqualStrings(first.value.access_token, second.value.access_token);
+    try script.expectConsumed();
+}
+
+test "refresh omission retains saved grants and persists rotated credentials" {
+    var fixture = try Fixture.init();
+    defer fixture.deinit();
+    var previous = connectedRecord();
+    previous.tokens.?.expires_at = fixture.now - 1;
+    previous.tokens.?.scope = "openid chatgpt.tokens.use.direct";
+    try fixture.seed(previous);
+    const steps = [_]Step{.{
+        .kind = .token,
+        .body =
+        \\{"access_token":"new-access","refresh_token":"new-refresh","token_type":"Bearer",
+        \\"expires_in":3600,"earliest_refresh_at":"2023-11-14T22:15:01.5Z"}
+        ,
+        .persisted = .refresh_pending,
+    }};
+    var script = fixture.script(&steps);
+    var manager = fixture.manager(&script);
+    var lease = try manager.credential(label);
+    defer lease.deinit();
+    try std.testing.expectEqualStrings(previous.tokens.?.scope, lease.value.scope);
+    var persisted = try fixture.store.load(label);
+    defer persisted.deinit();
+    try std.testing.expect(!persisted.value.refresh_pending);
+    try std.testing.expectEqualStrings("new-refresh", persisted.value.tokens.?.refresh_token);
+    try std.testing.expectEqualStrings(previous.tokens.?.scope, persisted.value.tokens.?.scope);
+    try std.testing.expectEqual(
+        @as(?i64, 1_700_000_102),
+        persisted.value.tokens.?.earliest_refresh_at,
+    );
+    try script.expectConsumed();
+}
+
+test "refresh downscope persists the narrower grant without exporting a credential" {
+    var fixture = try Fixture.init();
+    defer fixture.deinit();
+    var previous = connectedRecord();
+    previous.tokens.?.expires_at = fixture.now - 1;
+    try fixture.seed(previous);
+    const reply = try replyBytes(.{ .scope = "openid" });
+    defer allocator.free(reply);
+    const steps = [_]Step{.{ .kind = .token, .body = reply, .persisted = .refresh_pending }};
+    var script = fixture.script(&steps);
+    var manager = fixture.manager(&script);
+    try std.testing.expectError(error.PlanUsageNotEnabled, manager.credential(label));
+    var persisted = try fixture.store.load(label);
+    defer persisted.deinit();
+    try std.testing.expect(!persisted.value.refresh_pending);
+    try std.testing.expectEqualStrings("openid", persisted.value.tokens.?.scope);
+    try std.testing.expectEqualStrings("new-refresh", persisted.value.tokens.?.refresh_token);
+    try std.testing.expectError(error.PlanUsageNotEnabled, manager.credential(label));
     try script.expectConsumed();
 }
 
