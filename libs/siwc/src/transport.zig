@@ -158,8 +158,7 @@ const Job = struct {
         );
         defer request.deinit();
         if (payload) |value| {
-            request.transfer_encoding = .{ .content_length = value.len };
-            try request.sendBodyComplete(@constCast(value));
+            try sendRequestBody(&request, value);
         } else try request.sendBodiless();
         var response = try request.receiveHead(&.{});
         const status: u16 = @backingInt(response.head.status);
@@ -172,6 +171,14 @@ const Job = struct {
         self.response = .{ .allocator = self.allocator, .status = status, .body = body };
     }
 };
+
+fn sendRequestBody(request: *std.http.Client.Request, body: []const u8) !void {
+    request.transfer_encoding = .{ .content_length = body.len };
+    var writer = try request.sendBodyUnflushed(&.{});
+    try writer.writer.writeAll(body);
+    try writer.end();
+    try request.connection.?.flush();
+}
 
 pub const Discovery = struct {
     parsed: std.json.Parsed(Value),
@@ -226,4 +233,121 @@ test "transport validates bearer bytes before invoking an implementation" {
         error.InvalidAccessToken,
         (Request{ .models = "token\r\nInjected: yes" }).validate(),
     );
+}
+
+const body_test_bytes = blk: {
+    @setEvalBranchQuota(100000);
+    var bytes: [8192]u8 = undefined;
+    for (&bytes, 0..) |*byte, index| {
+        byte.* = '!' + @as(u8, @intCast((index * 37 + index / 97) % 94));
+    }
+    break :blk bytes;
+};
+
+const BodyTestConnection = struct {
+    connection: std.http.Client.Connection,
+    wire: std.Io.Writer.Allocating,
+    flushes: usize = 0,
+    fail_write: bool = false,
+    fail_final_flush: bool = false,
+
+    fn init(client: *std.http.Client, buffer: []u8) BodyTestConnection {
+        return .{
+            .connection = .{
+                .client = client,
+                .stream_writer = .{
+                    .io = client.io,
+                    .stream = undefined,
+                    .interface = .{
+                        .buffer = buffer,
+                        .vtable = &.{ .drain = drain, .flush = flush },
+                    },
+                },
+                .stream_reader = undefined,
+                .pool_node = .{},
+                .port = 80,
+                .host_len = 0,
+                .proxied = false,
+                .closing = false,
+                .protocol = .plain,
+            },
+            .wire = .init(std.testing.allocator),
+        };
+    }
+
+    fn fromWriter(writer: *std.Io.Writer) *BodyTestConnection {
+        const stream: *std.Io.net.Stream.Writer = @fieldParentPtr("interface", writer);
+        const connection: *std.http.Client.Connection = @fieldParentPtr("stream_writer", stream);
+        return @fieldParentPtr("connection", connection);
+    }
+
+    fn drain(writer: *std.Io.Writer, data: []const []const u8, splat: usize) !usize {
+        const self = fromWriter(writer);
+        if (self.fail_write and self.wire.written().len >= 256) return error.WriteFailed;
+        if (writer.end != 0) {
+            const count = @min(writer.end, 7);
+            try self.wire.writer.writeAll(writer.buffered()[0..count]);
+            return writer.consume(count);
+        }
+        for (data, 0..) |bytes, index| {
+            if (index == data.len - 1 and splat == 0) break;
+            if (bytes.len == 0) continue;
+            const count = @min(bytes.len, 7);
+            try self.wire.writer.writeAll(bytes[0..count]);
+            return count;
+        }
+        return 0;
+    }
+
+    fn flush(writer: *std.Io.Writer) !void {
+        const self = fromWriter(writer);
+        self.flushes += 1;
+        if (self.fail_final_flush and self.flushes == 2) return error.WriteFailed;
+        try std.Io.Writer.defaultFlush(writer);
+    }
+
+    fn request(self: *BodyTestConnection) !std.http.Client.Request {
+        const uri = try std.Uri.parse("http://example.invalid/token");
+        return self.connection.client.request(.POST, uri, .{
+            .connection = &self.connection,
+            .keep_alive = false,
+            .redirect_behavior = .unhandled,
+        });
+    }
+};
+
+test "request body streaming preserves readonly bytes across short writes and flushes" {
+    var client = std.http.Client{ .allocator = std.testing.allocator, .io = std.testing.io };
+    defer client.deinit();
+    var buffer: [512]u8 = undefined;
+    var sink = BodyTestConnection.init(&client, &buffer);
+    defer sink.wire.deinit();
+    var request = try sink.request();
+    const expected = try std.testing.allocator.dupe(u8, &body_test_bytes);
+    defer std.testing.allocator.free(expected);
+    try sendRequestBody(&request, &body_test_bytes);
+    try std.testing.expectEqualSlices(u8, expected, &body_test_bytes);
+    const wire = sink.wire.written();
+    const body_start = (std.mem.indexOf(u8, wire, "\r\n\r\n") orelse
+        return error.MissingHeaderTerminator) + 4;
+    try std.testing.expect(
+        std.mem.indexOf(u8, wire[0..body_start], "content-length: 8192\r\n") != null,
+    );
+    try std.testing.expectEqualSlices(u8, expected, wire[body_start..]);
+    try std.testing.expectEqual(@as(usize, 2), sink.flushes);
+}
+
+test "request body streaming propagates short write and final flush failures" {
+    for ([_]bool{ true, false }) |fail_write| {
+        var client = std.http.Client{ .allocator = std.testing.allocator, .io = std.testing.io };
+        defer client.deinit();
+        var buffer: [512]u8 = undefined;
+        var sink = BodyTestConnection.init(&client, &buffer);
+        defer sink.wire.deinit();
+        sink.fail_write = fail_write;
+        sink.fail_final_flush = !fail_write;
+        var request = try sink.request();
+        try std.testing.expectError(error.WriteFailed, sendRequestBody(&request, &body_test_bytes));
+        try std.testing.expectEqual(@as(usize, if (fail_write) 0 else 2), sink.flushes);
+    }
 }

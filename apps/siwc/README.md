@@ -207,6 +207,17 @@ user. Records contain plaintext credentials protected by filesystem permissions;
 this version does not use an OS keychain or encrypt the store. Exclude the store
 from source control, shared directories, logs, and unprotected backups.
 
+Creating a directory reserves `.siwc-directory-UID.lock` in its parent, where
+`UID` is the effective user ID. This private, stable lock records interrupted
+directory publication; it contains no credentials. A pending publication blocks
+mutation through that parent until the child and parent can be synchronized.
+Restore the parent's read permission or resolve the storage error, then retry;
+do not remove or replace the lock. Contention reports `DirectoryBusy`. Completed
+and externally supplied ancestors need only search permission. Preexisting
+directories without a marker are supplied namespace, not proof of recovery from
+an older version's interrupted creation. Read-only commands do not create locks
+or synchronize directories.
+
 An account's client ID and verified subject cannot be changed or cleared through
 record replacement. Logout retains that mapping so a later login uses the same
 registration. Sign-in requires a verified ID token. A response without plan

@@ -1,5 +1,6 @@
 const std = @import("std");
 const builtin = @import("builtin");
+const core_io = @import("core_io");
 const durable_store = @import("durable_store");
 const oauth = @import("oauth.zig");
 
@@ -13,6 +14,7 @@ pub const identity_bytes_max = 1024;
 pub const scope_bytes_max = 4096;
 const host_id_bytes = 45;
 const owner_lookup_attempts_max = 4;
+const root_path_bytes_max = 4096;
 
 pub const TokenSet = struct {
     access_token: []const u8,
@@ -420,7 +422,7 @@ fn labelLessThan(_: void, a: []u8, b: []u8) bool {
 }
 
 fn validateRootPath(path: []const u8) !void {
-    if (!std.fs.path.isAbsolute(path) or path.len <= 1 or path.len > 4096 or
+    if (!std.fs.path.isAbsolute(path) or path.len <= 1 or path.len > root_path_bytes_max or
         std.mem.indexOfScalar(u8, path, 0) != null) return error.InvalidPath;
     var parts = std.mem.tokenizeScalar(u8, path, std.fs.path.sep);
     while (parts.next()) |part| {
@@ -432,15 +434,15 @@ fn validateRootPath(path: []const u8) !void {
 fn openRoot(io: std.Io, path: []const u8, mode: Store.Mode) !durable_store.PrivateDirectory {
     if (mode == .read_only)
         return durable_store.PrivateDirectory.open(.init(io, .cwd()), path, .read_only);
-    var directory = try std.Io.Dir.openDirAbsolute(io, "/", .{ .follow_symlinks = false });
+    var directory = try core_io.openSearchDirectory(io, .cwd(), "/", .{
+        .follow_symlinks = false,
+    });
     errdefer directory.close(io);
     var components = std.mem.tokenizeScalar(u8, path, std.fs.path.sep);
     while (components.next()) |component| {
         const child = try openDirectory(io, directory, component, mode);
         errdefer child.close(io);
         if (components.peek() == null) try admitPrivateDirectory(io, child);
-        try syncDirectory(io, child);
-        try syncDirectory(io, directory);
         directory.close(io);
         directory = child;
     }
@@ -456,10 +458,6 @@ fn openChild(
     const child = try openDirectory(root.io, root.directory, app, mode);
     errdefer child.close(root.io);
     try admitPrivateDirectory(root.io, child);
-    if (mode == .create) {
-        try syncDirectory(root.io, child);
-        try syncDirectory(root.io, root.directory);
-    }
     return .{ .io = root.io, .directory = child };
 }
 
@@ -469,17 +467,193 @@ fn openDirectory(
     leaf: []const u8,
     mode: Store.Mode,
 ) !std.Io.Dir {
-    return parent.openDir(io, leaf, .{ .follow_symlinks = false }) catch |err| switch (err) {
+    const child = core_io.openSearchDirectory(io, parent, leaf, .{
+        .follow_symlinks = false,
+    }) catch |err| switch (err) {
         error.FileNotFound => {
             if (mode == .read_only) return err;
-            parent.createDir(io, leaf, .fromMode(0o700)) catch |create_err| switch (create_err) {
-                error.PathAlreadyExists => {},
-                else => return create_err,
-            };
-            return parent.openDir(io, leaf, .{ .follow_symlinks = false });
+            return createDirectory(io, parent, leaf);
         },
         else => return err,
     };
+    errdefer child.close(io);
+    if (mode == .create) {
+        if (try DirectoryPublication.openExisting(io, parent)) |publication| {
+            defer publication.file.close(io);
+            try publication.recover(io, parent);
+        }
+        try syncExistingDirectory(io, child);
+        try syncExistingDirectory(io, parent);
+    }
+    return child;
+}
+
+fn createDirectory(io: std.Io, parent: std.Io.Dir, leaf: []const u8) !std.Io.Dir {
+    const parent_sync = try openDirectorySync(io, parent);
+    defer parent_sync.close(io);
+    const publication = try DirectoryPublication.create(io, parent);
+    defer publication.file.close(io);
+    try publication.recover(io, parent);
+    const existing = core_io.openSearchDirectory(io, parent, leaf, .{
+        .follow_symlinks = false,
+    }) catch |err| switch (err) {
+        error.FileNotFound => null,
+        else => return err,
+    };
+    if (existing) |child| {
+        errdefer child.close(io);
+        try syncDirectory(io, child);
+        try parent_sync.sync(io);
+        return child;
+    }
+    try publication.begin(io, leaf);
+    try parent_sync.sync(io);
+    parent.createDir(io, leaf, .fromMode(0o700)) catch |err| switch (err) {
+        error.PathAlreadyExists => {},
+        else => return err,
+    };
+    const child = try core_io.openSearchDirectory(io, parent, leaf, .{
+        .follow_symlinks = false,
+    });
+    errdefer child.close(io);
+    try syncDirectory(io, child);
+    try parent_sync.sync(io);
+    try publication.setState(io, .idle);
+    return child;
+}
+
+const DirectoryPublication = struct {
+    file: std.Io.File,
+
+    const magic = "SIWC-DIRECTORY-1\n";
+    const State = enum(u8) { idle, pending };
+    const payload_offset = magic.len + 1 + 2;
+    const bytes_max = payload_offset + root_path_bytes_max;
+
+    fn name(buffer: []u8) ![]const u8 {
+        return std.fmt.bufPrint(buffer, ".siwc-directory-{d}.lock", .{std.c.geteuid()});
+    }
+
+    fn openExisting(io: std.Io, parent: std.Io.Dir) !?DirectoryPublication {
+        var buffer: [64]u8 = undefined;
+        const leaf = try name(&buffer);
+        const stat = parent.statFile(io, leaf, .{ .follow_symlinks = false }) catch |err|
+            switch (err) {
+                error.FileNotFound => return null,
+                else => return err,
+            };
+        try validatePrivateFile(stat);
+        const file = parent.openFile(io, leaf, .{
+            .mode = .read_write,
+            .allow_directory = false,
+            .follow_symlinks = false,
+            .lock = .exclusive,
+            .lock_nonblocking = true,
+        }) catch |err| switch (err) {
+            error.WouldBlock => return error.DirectoryBusy,
+            else => return err,
+        };
+        errdefer file.close(io);
+        try validateNativeOwner(file.handle);
+        try validatePrivateFile(try file.stat(io));
+        return .{ .file = file };
+    }
+
+    fn create(io: std.Io, parent: std.Io.Dir) !DirectoryPublication {
+        var buffer: [64]u8 = undefined;
+        const leaf = try name(&buffer);
+        const outcome = durable_store.publishCreateNew(io, parent, parent, leaf, &.{
+            magic ++ "\x00",
+        }, .{
+            .permissions = .fromMode(0o600),
+            .durability = .file_and_directories_synced,
+        });
+        switch (outcome) {
+            .complete => {},
+            .not_published, .publication_unknown => |failure| {
+                if (failure.cause != error.PathAlreadyExists) return failure.cause;
+            },
+            .published_unsynced => |err| return err,
+        }
+        return try openExisting(io, parent) orelse error.DirectoryPublicationMissing;
+    }
+
+    fn begin(self: DirectoryPublication, io: std.Io, leaf: []const u8) !void {
+        try validateDirectoryLeaf(leaf);
+        try self.setState(io, .idle);
+        var length: [2]u8 = undefined;
+        std.mem.writeInt(u16, &length, @intCast(leaf.len), .little);
+        try self.file.setLength(io, payload_offset + leaf.len);
+        try self.file.writePositionalAll(io, &length, magic.len + 1);
+        try self.file.writePositionalAll(io, leaf, payload_offset);
+        try self.file.sync(io);
+        try self.setState(io, .pending);
+    }
+
+    fn setState(self: DirectoryPublication, io: std.Io, state: State) !void {
+        try self.file.writePositionalAll(io, &.{@backingInt(state)}, magic.len);
+        try self.file.sync(io);
+    }
+
+    fn pending(self: DirectoryPublication, io: std.Io, buffer: []u8) !?[]const u8 {
+        const stat = try self.file.stat(io);
+        if (stat.size < magic.len + 1 or stat.size > bytes_max)
+            return error.InvalidDirectoryPublication;
+        var header: [magic.len + 1]u8 = undefined;
+        if (try self.file.readPositionalAll(io, &header, 0) != header.len or
+            !std.mem.eql(u8, header[0..magic.len], magic))
+            return error.InvalidDirectoryPublication;
+        if (header[magic.len] == @backingInt(State.idle)) return null;
+        if (header[magic.len] != @backingInt(State.pending))
+            return error.InvalidDirectoryPublication;
+        var length: [2]u8 = undefined;
+        if (try self.file.readPositionalAll(io, &length, magic.len + 1) != length.len)
+            return error.InvalidDirectoryPublication;
+        const size = std.mem.readInt(u16, &length, .little);
+        if (size > buffer.len or stat.size != payload_offset + size)
+            return error.InvalidDirectoryPublication;
+        const leaf = buffer[0..size];
+        if (try self.file.readPositionalAll(io, leaf, payload_offset) != size)
+            return error.InvalidDirectoryPublication;
+        try validateDirectoryLeaf(leaf);
+        return leaf;
+    }
+
+    fn recover(self: DirectoryPublication, io: std.Io, parent: std.Io.Dir) !void {
+        var buffer: [root_path_bytes_max]u8 = undefined;
+        const leaf = try self.pending(io, &buffer) orelse return;
+        const parent_sync = try openDirectorySync(io, parent);
+        defer parent_sync.close(io);
+        const child = core_io.openSearchDirectory(io, parent, leaf, .{
+            .follow_symlinks = false,
+        }) catch |err| switch (err) {
+            error.FileNotFound => null,
+            else => return err,
+        };
+        if (child) |directory| {
+            defer directory.close(io);
+            try syncDirectory(io, directory);
+        }
+        try parent_sync.sync(io);
+        try self.setState(io, .idle);
+    }
+};
+
+fn validateDirectoryLeaf(leaf: []const u8) !void {
+    if (leaf.len == 0 or leaf.len > root_path_bytes_max or
+        std.mem.eql(u8, leaf, ".") or std.mem.eql(u8, leaf, "..") or
+        std.mem.indexOfAny(u8, leaf, "/\x00") != null)
+        return error.InvalidDirectoryPublication;
+}
+
+fn syncExistingDirectory(io: std.Io, directory: std.Io.Dir) !void {
+    const file = openDirectorySync(io, directory) catch |err| {
+        const native_opener = comptime std.Io.Threaded.io(undefined).vtable.dirOpenFile;
+        if (err == error.AccessDenied and io.vtable.dirOpenFile == native_opener) return;
+        return err;
+    };
+    defer file.close(io);
+    try file.sync(io);
 }
 
 fn admitPrivateDirectory(io: std.Io, directory: std.Io.Dir) !void {
@@ -490,13 +664,17 @@ fn admitPrivateDirectory(io: std.Io, directory: std.Io.Dir) !void {
 }
 
 fn syncDirectory(io: std.Io, directory: std.Io.Dir) !void {
-    const file = try directory.openFile(io, ".", .{
+    const file = try openDirectorySync(io, directory);
+    defer file.close(io);
+    try file.sync(io);
+}
+
+fn openDirectorySync(io: std.Io, directory: std.Io.Dir) !std.Io.File {
+    return directory.openFile(io, ".", .{
         .allow_directory = true,
         .follow_symlinks = false,
         .path_only = false,
     });
-    defer file.close(io);
-    try file.sync(io);
 }
 
 fn validatePrivateFile(stat: std.Io.File.Stat) !void {
@@ -672,7 +850,7 @@ test "mutable store admission syncs the app parent and retries existing entries 
     Hooks.fail_root = false;
     var retried = try Store.open(injected, allocator, path, Hooks.app, .create);
     defer retried.deinit();
-    try std.testing.expectEqual(@as(usize, 4), Hooks.root_syncs);
+    try std.testing.expectEqual(@as(usize, 5), Hooks.root_syncs);
     try std.testing.expectEqual(
         failed_child.inode,
         (try retried.directory.directory.stat(io)).inode,
@@ -683,7 +861,7 @@ test "mutable store admission syncs the app parent and retries existing entries 
     try std.testing.expect(other_syncs > 0);
     var read_only = try Store.open(injected, allocator, path, Hooks.app, .read_only);
     defer read_only.deinit();
-    try std.testing.expectEqual(@as(usize, 4), Hooks.root_syncs);
+    try std.testing.expectEqual(@as(usize, 5), Hooks.root_syncs);
     try std.testing.expectEqual(other_syncs, Hooks.other_syncs);
 }
 
@@ -784,6 +962,295 @@ test "nested private ancestry survives parent sync failures without weakening cr
         defer read_only.deinit();
         try std.testing.expectEqual(syncs, Hooks.syncs);
         try std.testing.expectEqual(@as(usize, 4), Hooks.created_count);
+    }
+}
+
+test "mutable stores traverse search-only completed and externally supplied ancestry" {
+    if (std.c.geteuid() == 0) return error.SkipZigTest;
+    const io = std.testing.io;
+    const allocator = std.testing.allocator;
+    for ([_]bool{ false, true }) |completed| {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        try tmp.dir.createDir(io, "ancestor", .fromMode(0o700));
+        const ancestor = try tmp.dir.openDir(io, "ancestor", .{});
+        defer ancestor.close(io);
+        const parent = try ancestor.realPathFileAlloc(io, ".", allocator);
+        defer allocator.free(parent);
+        const path = try std.fs.path.join(allocator, &.{ parent, "auth" });
+        defer allocator.free(path);
+        if (completed) {
+            var initial = try Store.open(io, allocator, path, "example", .create);
+            initial.deinit();
+        } else {
+            try ancestor.createDir(io, "auth", .fromMode(0o700));
+            const root = try ancestor.openDir(io, "auth", .{});
+            defer root.close(io);
+            try root.createDir(io, "example", .fromMode(0o700));
+        }
+        try ancestor.setPermissions(io, .fromMode(0o100));
+        defer ancestor.setPermissions(io, .fromMode(0o700)) catch |err| {
+            std.debug.panic("restore ancestor permissions: {s}", .{@errorName(err)});
+        };
+        var store = try Store.open(io, allocator, path, "example", .create);
+        defer store.deinit();
+        const host = try store.getOrCreateHostId();
+        defer allocator.free(host);
+        var account = try store.lock("default");
+        defer account.deinit();
+        try account.reserveNew();
+        try account.save(connectedRecord("example", "default"));
+        var read_only = try Store.open(io, allocator, path, "example", .read_only);
+        defer read_only.deinit();
+        var record = try read_only.load("default");
+        defer record.deinit();
+        try std.testing.expectEqualStrings("subject-test", record.value.subject.?);
+    }
+}
+
+test "pending directory publication survives closed handles and fences sibling mutation" {
+    if (std.c.geteuid() == 0) return error.SkipZigTest;
+    const io = std.testing.io;
+    const allocator = std.testing.allocator;
+    var fixture = try TestStore.init("existing");
+    defer fixture.deinit();
+    const root = try fixture.tmp.dir.openDir(io, "auth", .{});
+    defer root.close(io);
+    const Hooks = struct {
+        var root_directory: std.Io.Dir = undefined;
+        var inode: std.Io.File.INode = 0;
+
+        fn sync(userdata: ?*anyopaque, file: std.Io.File) std.Io.File.SyncError!void {
+            const stat = file.stat(std.testing.io) catch return error.InputOutput;
+            if (stat.kind == .directory and stat.inode == inode) {
+                _ = root_directory.statFile(std.testing.io, "created", .{}) catch
+                    return std.testing.io.vtable.fileSync(userdata, file);
+                return error.InputOutput;
+            }
+            return std.testing.io.vtable.fileSync(userdata, file);
+        }
+    };
+    Hooks.root_directory = root;
+    Hooks.inode = (try root.stat(io)).inode;
+    var vtable = io.vtable.*;
+    vtable.fileSync = Hooks.sync;
+    const injected: std.Io = .{ .userdata = io.userdata, .vtable = &vtable };
+    try std.testing.expectError(error.InputOutput, Store.open(
+        injected,
+        allocator,
+        fixture.path,
+        "created",
+        .create,
+    ));
+    const failed_inode = (try root.statFile(io, "created", .{})).inode;
+    try root.setPermissions(io, .fromMode(0o100));
+    defer root.setPermissions(io, .fromMode(0o700)) catch |err| {
+        std.debug.panic("restore root permissions: {s}", .{@errorName(err)});
+    };
+    try std.testing.expectError(error.AccessDenied, Store.open(
+        io,
+        allocator,
+        fixture.path,
+        "created",
+        .create,
+    ));
+    try std.testing.expectError(error.AccessDenied, Store.open(
+        io,
+        allocator,
+        fixture.path,
+        "existing",
+        .create,
+    ));
+    if (root.statFile(io, "Created", .{})) |alias| {
+        if (alias.inode == failed_inode) try std.testing.expectError(
+            error.AccessDenied,
+            openDirectory(io, root, "Created", .create),
+        );
+    } else |err| try std.testing.expectEqual(error.FileNotFound, err);
+    var read_only = try Store.open(injected, allocator, fixture.path, "existing", .read_only);
+    read_only.deinit();
+    try root.setPermissions(io, .fromMode(0o700));
+    var recovered = try Store.open(io, allocator, fixture.path, "created", .create);
+    defer recovered.deinit();
+    try std.testing.expectEqual(failed_inode, (try recovered.directory.directory.stat(io)).inode);
+    try root.setPermissions(io, .fromMode(0o100));
+    var completed = try Store.open(io, allocator, fixture.path, "existing", .create);
+    completed.deinit();
+}
+
+test "unreadable parents reject missing children before creating publication state" {
+    if (std.c.geteuid() == 0) return error.SkipZigTest;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.setPermissions(io, .fromMode(0o100));
+    defer tmp.dir.setPermissions(io, .fromMode(0o700)) catch |err| {
+        std.debug.panic("restore temporary permissions: {s}", .{@errorName(err)});
+    };
+    try std.testing.expectError(error.AccessDenied, openDirectory(io, tmp.dir, "missing", .create));
+    try std.testing.expectError(error.FileNotFound, tmp.dir.statFile(io, "missing", .{}));
+    var name_buffer: [64]u8 = undefined;
+    const name = try DirectoryPublication.name(&name_buffer);
+    try std.testing.expectError(error.FileNotFound, tmp.dir.statFile(io, name, .{}));
+}
+
+test "directory publication keeps its locked inode and rejects malformed pending records" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const publication = try DirectoryPublication.create(io, tmp.dir);
+    defer publication.file.close(io);
+    const inode = (try publication.file.stat(io)).inode;
+    try std.testing.expectError(
+        error.DirectoryBusy,
+        DirectoryPublication.openExisting(io, tmp.dir),
+    );
+    try std.testing.expectError(error.DirectoryBusy, createDirectory(io, tmp.dir, "blocked"));
+    try std.testing.expectError(error.FileNotFound, tmp.dir.statFile(io, "blocked", .{}));
+    var buffer: [root_path_bytes_max]u8 = undefined;
+    try publication.file.writePositionalAll(io, "unfinished", DirectoryPublication.magic.len + 1);
+    try std.testing.expectEqual(null, try publication.pending(io, &buffer));
+    try publication.begin(io, "child");
+    try std.testing.expectEqualStrings("child", (try publication.pending(io, &buffer)).?);
+    try publication.recover(io, tmp.dir);
+    try std.testing.expectEqual(null, try publication.pending(io, &buffer));
+    try std.testing.expectEqual(inode, (try publication.file.stat(io)).inode);
+    for ([_][]const u8{ "", ".", "..", "../escape", "bad/leaf", "bad\x00leaf" }) |bad| {
+        try std.testing.expectError(error.InvalidDirectoryPublication, publication.begin(io, bad));
+    }
+    try publication.begin(io, "child");
+    try publication.file.writePositionalAll(io, "../xx", DirectoryPublication.payload_offset);
+    try std.testing.expectError(
+        error.InvalidDirectoryPublication,
+        publication.recover(io, tmp.dir),
+    );
+    try publication.file.writePositionalAll(io, &.{99}, DirectoryPublication.magic.len);
+    try std.testing.expectError(
+        error.InvalidDirectoryPublication,
+        publication.recover(io, tmp.dir),
+    );
+    try publication.file.writePositionalAll(io, "BROKEN", 0);
+    try std.testing.expectError(
+        error.InvalidDirectoryPublication,
+        publication.recover(io, tmp.dir),
+    );
+}
+
+test "directory publication state sync failures cannot acknowledge an incomplete edge" {
+    const io = std.testing.io;
+    const Hooks = struct {
+        var marker_inode: std.Io.File.INode = 0;
+        var fail_pending: bool = false;
+        var saw_pending: bool = false;
+        var creates: usize = 0;
+
+        fn sync(userdata: ?*anyopaque, file: std.Io.File) std.Io.File.SyncError!void {
+            const stat = file.stat(std.testing.io) catch return error.InputOutput;
+            if (stat.kind == .file and stat.inode == marker_inode) {
+                var state: [1]u8 = undefined;
+                const count = file.readPositionalAll(
+                    std.testing.io,
+                    &state,
+                    DirectoryPublication.magic.len,
+                ) catch return error.InputOutput;
+                if (count != 1) return error.InputOutput;
+                if (state[0] == 1) {
+                    saw_pending = true;
+                    if (fail_pending) return error.InputOutput;
+                } else if (saw_pending and !fail_pending) return error.InputOutput;
+            }
+            return std.testing.io.vtable.fileSync(userdata, file);
+        }
+
+        fn create(
+            userdata: ?*anyopaque,
+            parent: std.Io.Dir,
+            leaf: []const u8,
+            permissions: std.Io.Dir.Permissions,
+        ) std.Io.Dir.CreateDirError!void {
+            creates += 1;
+            return std.testing.io.vtable.dirCreateDir(userdata, parent, leaf, permissions);
+        }
+    };
+    var vtable = io.vtable.*;
+    vtable.fileSync = Hooks.sync;
+    vtable.dirCreateDir = Hooks.create;
+    const injected: std.Io = .{ .userdata = io.userdata, .vtable = &vtable };
+    for ([_]bool{ true, false }) |fail_pending| {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        const publication = try DirectoryPublication.create(io, tmp.dir);
+        Hooks.marker_inode = (try publication.file.stat(io)).inode;
+        publication.file.close(io);
+        Hooks.fail_pending = fail_pending;
+        Hooks.saw_pending = false;
+        Hooks.creates = 0;
+        try std.testing.expectError(error.InputOutput, createDirectory(injected, tmp.dir, "child"));
+        try std.testing.expect(Hooks.saw_pending);
+        if (fail_pending) {
+            try std.testing.expectEqual(@as(usize, 0), Hooks.creates);
+            try std.testing.expectError(error.FileNotFound, tmp.dir.statFile(io, "child", .{}));
+        } else try std.testing.expectEqual(@as(usize, 1), Hooks.creates);
+        const child = try openDirectory(io, tmp.dir, "child", .create);
+        child.close(io);
+        const reopened = (try DirectoryPublication.openExisting(io, tmp.dir)).?;
+        defer reopened.file.close(io);
+        try std.testing.expectEqual(Hooks.marker_inode, (try reopened.file.stat(io)).inode);
+        var buffer: [root_path_bytes_max]u8 = undefined;
+        try std.testing.expectEqual(null, try reopened.pending(io, &buffer));
+    }
+}
+
+test "directory sync admission propagates substituted permission errors" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var vtable = io.vtable.*;
+    vtable.dirOpenFile = struct {
+        fn open(
+            _: ?*anyopaque,
+            _: std.Io.Dir,
+            _: []const u8,
+            _: std.Io.Dir.OpenFileOptions,
+        ) std.Io.File.OpenError!std.Io.File {
+            return error.AccessDenied;
+        }
+    }.open;
+    const injected: std.Io = .{ .userdata = io.userdata, .vtable = &vtable };
+    try std.testing.expectError(error.AccessDenied, syncExistingDirectory(injected, tmp.dir));
+}
+
+test "directory publication rejects reserved name collisions without replacing them" {
+    const io = std.testing.io;
+    var buffer: [64]u8 = undefined;
+    const name = try DirectoryPublication.name(&buffer);
+    const Kind = enum { malformed, shared, symlink, hardlink };
+    for ([_]Kind{ .malformed, .shared, .symlink, .hardlink }) |kind| {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        const file = try tmp.dir.createFile(io, "original", .{
+            .read = true,
+            .permissions = .fromMode(0o600),
+        });
+        defer file.close(io);
+        try file.writePositionalAll(io, "reserved user content", 0);
+        switch (kind) {
+            .malformed, .shared => try tmp.dir.rename("original", tmp.dir, name, io),
+            .symlink => try tmp.dir.symLink(io, "original", name, .{}),
+            .hardlink => try tmp.dir.hardLink("original", tmp.dir, name, io, .{}),
+        }
+        if (kind == .shared) try file.setPermissions(io, .fromMode(0o644));
+        const expected = switch (kind) {
+            .malformed => error.InvalidDirectoryPublication,
+            .shared => error.InsecurePrivateFile,
+            .symlink => error.SymLinkLoop,
+            .hardlink => error.HardlinkTarget,
+        };
+        try std.testing.expectError(expected, createDirectory(io, tmp.dir, "child"));
+        try std.testing.expectError(error.FileNotFound, tmp.dir.statFile(io, "child", .{}));
+        var contents: [64]u8 = undefined;
+        const length = try file.readPositionalAll(io, &contents, 0);
+        try std.testing.expectEqualStrings("reserved user content", contents[0..length]);
     }
 }
 
