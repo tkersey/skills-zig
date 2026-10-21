@@ -973,7 +973,7 @@ test "mutable stores traverse search-only completed and externally supplied ance
         var tmp = std.testing.tmpDir(.{});
         defer tmp.cleanup();
         try tmp.dir.createDir(io, "ancestor", .fromMode(0o700));
-        const ancestor = try tmp.dir.openDir(io, "ancestor", .{});
+        const ancestor = try tmp.dir.openDir(io, "ancestor", .{ .iterate = true });
         defer ancestor.close(io);
         const parent = try ancestor.realPathFileAlloc(io, ".", allocator);
         defer allocator.free(parent);
@@ -1014,7 +1014,7 @@ test "pending directory publication survives closed handles and fences sibling m
     const allocator = std.testing.allocator;
     var fixture = try TestStore.init("existing");
     defer fixture.deinit();
-    const root = try fixture.tmp.dir.openDir(io, "auth", .{});
+    const root = try fixture.tmp.dir.openDir(io, "auth", .{ .iterate = true });
     defer root.close(io);
     const Hooks = struct {
         var root_directory: std.Io.Dir = undefined;
@@ -1081,7 +1081,7 @@ test "pending directory publication survives closed handles and fences sibling m
 test "unreadable parents reject missing children before creating publication state" {
     if (std.c.geteuid() == 0) return error.SkipZigTest;
     const io = std.testing.io;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
     try tmp.dir.setPermissions(io, .fromMode(0o100));
     defer tmp.dir.setPermissions(io, .fromMode(0o700)) catch |err| {
