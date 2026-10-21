@@ -1,6 +1,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const durable_store = @import("durable_store");
+const oauth = @import("oauth.zig");
 
 pub const label_bytes_max = 64;
 pub const token_bytes_max = 32 * 1024;
@@ -15,7 +16,7 @@ const owner_lookup_attempts_max = 4;
 
 pub const TokenSet = struct {
     access_token: []const u8,
-    refresh_token: []const u8,
+    refresh_token: ?[]const u8 = null,
     id_token: []const u8,
     scope: []const u8,
     expires_at: i64,
@@ -23,12 +24,14 @@ pub const TokenSet = struct {
 
     pub fn validate(self: TokenSet) !void {
         try validateText(self.access_token, token_bytes_max, false);
-        try validateText(self.refresh_token, token_bytes_max, false);
-        try validateText(self.id_token, token_bytes_max, false);
         try validateText(self.scope, scope_bytes_max, true);
+        if (self.refresh_token) |token| {
+            try validateText(token, token_bytes_max, false);
+        } else if (oauth.hasPlanScope(self.scope)) return error.RefreshTokenMissing;
+        try validateText(self.id_token, token_bytes_max, false);
         if (self.expires_at <= 0) return error.InvalidExpiry;
         if (self.earliest_refresh_at) |earliest| {
-            if (earliest < 0 or earliest > self.expires_at) return error.InvalidExpiry;
+            if (earliest < 0) return error.InvalidExpiry;
         }
     }
 };
@@ -58,6 +61,8 @@ pub const Record = struct {
         if (self.tokens) |tokens| {
             if (self.client_id == null or self.subject == null) return error.InvalidRegistration;
             try tokens.validate();
+            if (self.refresh_pending and tokens.refresh_token == null)
+                return error.InvalidRefreshState;
         } else if (self.refresh_pending) return error.InvalidRefreshState;
     }
 };
@@ -92,15 +97,6 @@ pub const Store = struct {
         directory.deinit();
         directory = .{ .io = io, .directory = iterable };
         try validateNativeOwner(directory.directory.handle);
-        if (mode == .create) {
-            const file = try root.directory.openFile(io, ".", .{
-                .allow_directory = true,
-                .follow_symlinks = false,
-                .path_only = false,
-            });
-            defer file.close(io);
-            try file.sync(io);
-        }
         return .{
             .io = io,
             .allocator = allocator,
@@ -182,7 +178,11 @@ pub const Store = struct {
         if (self.mode != .create) return error.ReadOnlyStore;
         const file = try self.openLock(".host.lock");
         defer file.close(self.io);
-        if (try self.readHostId()) |host_id| return host_id;
+        if (try self.readHostId()) |host_id| {
+            errdefer self.allocator.free(host_id);
+            try syncDirectory(self.io, self.directory.directory);
+            return host_id;
+        }
         var bytes: [16]u8 = undefined;
         try self.io.randomSecure(&bytes);
         bytes[6] = (bytes[6] & 0x0f) | 0x40;
@@ -430,14 +430,21 @@ fn validateRootPath(path: []const u8) !void {
 }
 
 fn openRoot(io: std.Io, path: []const u8, mode: Store.Mode) !durable_store.PrivateDirectory {
-    const fs = durable_store.Fs.init(io, .cwd());
-    return durable_store.PrivateDirectory.open(fs, path, .read_only) catch |err| switch (err) {
-        error.FileNotFound => if (mode == .create)
-            durable_store.PrivateDirectory.open(fs, path, .create)
-        else
-            err,
-        else => err,
-    };
+    if (mode == .read_only)
+        return durable_store.PrivateDirectory.open(.init(io, .cwd()), path, .read_only);
+    var directory = try std.Io.Dir.openDirAbsolute(io, "/", .{ .follow_symlinks = false });
+    errdefer directory.close(io);
+    var components = std.mem.tokenizeScalar(u8, path, std.fs.path.sep);
+    while (components.next()) |component| {
+        const child = try openDirectory(io, directory, component, mode);
+        errdefer child.close(io);
+        if (components.peek() == null) try admitPrivateDirectory(io, child);
+        try syncDirectory(io, child);
+        try syncDirectory(io, directory);
+        directory.close(io);
+        directory = child;
+    }
+    return .{ .io = io, .directory = directory };
 }
 
 fn openChild(
@@ -445,10 +452,51 @@ fn openChild(
     app: []const u8,
     mode: Store.Mode,
 ) !durable_store.PrivateDirectory {
-    return root.openChild(app, .read_only) catch |err| switch (err) {
-        error.FileNotFound => if (mode == .create) root.openChild(app, .create) else err,
-        else => err,
+    try admitPrivateDirectory(root.io, root.directory);
+    const child = try openDirectory(root.io, root.directory, app, mode);
+    errdefer child.close(root.io);
+    try admitPrivateDirectory(root.io, child);
+    if (mode == .create) {
+        try syncDirectory(root.io, child);
+        try syncDirectory(root.io, root.directory);
+    }
+    return .{ .io = root.io, .directory = child };
+}
+
+fn openDirectory(
+    io: std.Io,
+    parent: std.Io.Dir,
+    leaf: []const u8,
+    mode: Store.Mode,
+) !std.Io.Dir {
+    return parent.openDir(io, leaf, .{ .follow_symlinks = false }) catch |err| switch (err) {
+        error.FileNotFound => {
+            if (mode == .read_only) return err;
+            parent.createDir(io, leaf, .fromMode(0o700)) catch |create_err| switch (create_err) {
+                error.PathAlreadyExists => {},
+                else => return create_err,
+            };
+            return parent.openDir(io, leaf, .{ .follow_symlinks = false });
+        },
+        else => return err,
     };
+}
+
+fn admitPrivateDirectory(io: std.Io, directory: std.Io.Dir) !void {
+    try validateNativeOwner(directory.handle);
+    const stat = try directory.stat(io);
+    if (stat.kind != .directory) return error.NotDir;
+    if (stat.permissions.toMode() & 0o077 != 0) return error.InsecurePrivateDirectory;
+}
+
+fn syncDirectory(io: std.Io, directory: std.Io.Dir) !void {
+    const file = try directory.openFile(io, ".", .{
+        .allow_directory = true,
+        .follow_symlinks = false,
+        .path_only = false,
+    });
+    defer file.close(io);
+    try file.sync(io);
 }
 
 fn validatePrivateFile(stat: std.Io.File.Stat) !void {
@@ -581,7 +629,13 @@ test "mutable store admission syncs the app parent and retries existing entries 
             if (stat.kind == .directory and stat.inode == root_inode) {
                 const child = root_directory.statFile(std.testing.io, app, .{
                     .follow_symlinks = false,
-                }) catch return error.InputOutput;
+                }) catch |err| switch (err) {
+                    error.FileNotFound => {
+                        other_syncs += 1;
+                        return std.testing.io.vtable.fileSync(userdata, file);
+                    },
+                    else => return error.InputOutput,
+                };
                 if (child.kind != .directory) return error.InputOutput;
                 root_syncs += 1;
                 if (fail_root) return error.InputOutput;
@@ -618,17 +672,175 @@ test "mutable store admission syncs the app parent and retries existing entries 
     Hooks.fail_root = false;
     var retried = try Store.open(injected, allocator, path, Hooks.app, .create);
     defer retried.deinit();
-    try std.testing.expectEqual(@as(usize, 3), Hooks.root_syncs);
+    try std.testing.expectEqual(@as(usize, 4), Hooks.root_syncs);
     try std.testing.expectEqual(
         failed_child.inode,
         (try retried.directory.directory.stat(io)).inode,
     );
 
     Hooks.fail_root = true;
+    const other_syncs = Hooks.other_syncs;
+    try std.testing.expect(other_syncs > 0);
     var read_only = try Store.open(injected, allocator, path, Hooks.app, .read_only);
     defer read_only.deinit();
-    try std.testing.expectEqual(@as(usize, 3), Hooks.root_syncs);
-    try std.testing.expectEqual(@as(usize, 0), Hooks.other_syncs);
+    try std.testing.expectEqual(@as(usize, 4), Hooks.root_syncs);
+    try std.testing.expectEqual(other_syncs, Hooks.other_syncs);
+}
+
+test "nested private ancestry survives parent sync failures without weakening creation modes" {
+    const io = std.testing.io;
+    const allocator = std.testing.allocator;
+    const Hooks = struct {
+        var created: [4]std.Io.File.INode = undefined;
+        var created_count: usize = 0;
+        var private_from_creation: bool = true;
+        var fail_on_creation: usize = 0;
+        var failure_parent: std.Io.File.INode = 0;
+        var failure_child: std.Io.File.INode = 0;
+        var fail: bool = true;
+        var syncs: usize = 0;
+        var last_sync: std.Io.File.INode = 0;
+
+        fn create(
+            userdata: ?*anyopaque,
+            parent: std.Io.Dir,
+            leaf: []const u8,
+            permissions: std.Io.Dir.Permissions,
+        ) std.Io.Dir.CreateDirError!void {
+            try std.testing.io.vtable.dirCreateDir(userdata, parent, leaf, permissions);
+            const stat = parent.statFile(std.testing.io, leaf, .{
+                .follow_symlinks = false,
+            }) catch return error.Unexpected;
+            private_from_creation = private_from_creation and
+                permissions.toMode() & 0o777 == 0o700 and
+                stat.permissions.toMode() & 0o777 == 0o700;
+            if (created_count >= created.len) return error.Unexpected;
+            created[created_count] = stat.inode;
+            if (created_count == fail_on_creation) {
+                failure_child = stat.inode;
+                failure_parent = (parent.stat(std.testing.io) catch
+                    return error.Unexpected).inode;
+            }
+            created_count += 1;
+        }
+
+        fn sync(userdata: ?*anyopaque, file: std.Io.File) std.Io.File.SyncError!void {
+            const stat = file.stat(std.testing.io) catch return error.InputOutput;
+            const previous = last_sync;
+            last_sync = stat.inode;
+            syncs += 1;
+            if (fail and failure_child != 0 and stat.inode == failure_parent and
+                previous == failure_child) return error.InputOutput;
+            return std.testing.io.vtable.fileSync(userdata, file);
+        }
+    };
+    var vtable = io.vtable.*;
+    vtable.dirCreateDir = Hooks.create;
+    vtable.fileSync = Hooks.sync;
+    const injected: std.Io = .{ .userdata = io.userdata, .vtable = &vtable };
+    const previous_mask = std.c.umask(0o022);
+    defer _ = std.c.umask(previous_mask);
+    for ([_]usize{ 0, 2 }) |fail_on_creation| {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        const parent = try tmp.dir.realPathFileAlloc(io, ".", allocator);
+        defer allocator.free(parent);
+        const path = try std.fs.path.join(allocator, &.{ parent, "outer", "inner", "auth" });
+        defer allocator.free(path);
+        Hooks.created_count = 0;
+        Hooks.private_from_creation = true;
+        Hooks.fail_on_creation = fail_on_creation;
+        Hooks.failure_child = 0;
+        Hooks.fail = true;
+        Hooks.syncs = 0;
+        Hooks.last_sync = 0;
+        try std.testing.expectError(
+            error.InputOutput,
+            Store.open(injected, allocator, path, "example", .create),
+        );
+        try std.testing.expectEqual(fail_on_creation + 1, Hooks.created_count);
+        try std.testing.expect(Hooks.private_from_creation);
+        const failed_inode = Hooks.failure_child;
+        try std.testing.expectError(
+            error.InputOutput,
+            Store.open(injected, allocator, path, "example", .create),
+        );
+        try std.testing.expectEqual(fail_on_creation + 1, Hooks.created_count);
+        try std.testing.expectEqual(failed_inode, Hooks.failure_child);
+        Hooks.fail = false;
+        var store = try Store.open(injected, allocator, path, "example", .create);
+        defer store.deinit();
+        try std.testing.expectEqual(@as(usize, 4), Hooks.created_count);
+        try std.testing.expect(Hooks.private_from_creation);
+        Hooks.failure_parent = Hooks.created[1];
+        Hooks.failure_child = Hooks.created[2];
+        Hooks.fail = true;
+        try std.testing.expectError(
+            error.InputOutput,
+            Store.open(injected, allocator, path, "example", .create),
+        );
+        const syncs = Hooks.syncs;
+        var read_only = try Store.open(injected, allocator, path, "example", .read_only);
+        defer read_only.deinit();
+        try std.testing.expectEqual(syncs, Hooks.syncs);
+        try std.testing.expectEqual(@as(usize, 4), Hooks.created_count);
+    }
+}
+
+test "host publication retries cannot return an identifier before directory durability" {
+    const io = std.testing.io;
+    const allocator = std.testing.allocator;
+    var fixture = try TestStore.init("example");
+    defer fixture.deinit();
+    const Hooks = struct {
+        var app_inode: std.Io.File.INode = 0;
+        var fail: bool = true;
+        var file_syncs: usize = 0;
+        var app_syncs: usize = 0;
+
+        fn sync(userdata: ?*anyopaque, file: std.Io.File) std.Io.File.SyncError!void {
+            const stat = file.stat(std.testing.io) catch return error.InputOutput;
+            if (stat.kind == .directory and stat.inode == app_inode) {
+                app_syncs += 1;
+                if (fail) return error.InputOutput;
+            } else if (stat.kind == .file) {
+                file_syncs += 1;
+            }
+            return std.testing.io.vtable.fileSync(userdata, file);
+        }
+    };
+    Hooks.app_inode = (try fixture.store.directory.directory.stat(io)).inode;
+    Hooks.fail = true;
+    Hooks.file_syncs = 0;
+    Hooks.app_syncs = 0;
+    var vtable = io.vtable.*;
+    vtable.fileSync = Hooks.sync;
+    const injected: std.Io = .{ .userdata = io.userdata, .vtable = &vtable };
+    fixture.store.io = injected;
+    try std.testing.expectError(error.DurabilityUnconfirmed, fixture.store.getOrCreateHostId());
+    try std.testing.expectEqual(@as(usize, 1), Hooks.file_syncs);
+    try std.testing.expectEqual(@as(usize, 1), Hooks.app_syncs);
+    const published = (try fixture.store.readHostId()).?;
+    defer allocator.free(published);
+    try std.testing.expectError(error.InputOutput, fixture.store.getOrCreateHostId());
+    try std.testing.expectEqual(@as(usize, 2), Hooks.app_syncs);
+    try std.testing.expectError(
+        error.InputOutput,
+        Store.open(injected, allocator, fixture.path, "example", .create),
+    );
+    Hooks.fail = false;
+    const retried = try fixture.store.getOrCreateHostId();
+    defer allocator.free(retried);
+    try std.testing.expectEqualStrings(published, retried);
+    var reopened = try Store.open(injected, allocator, fixture.path, "example", .create);
+    defer reopened.deinit();
+    Hooks.fail = true;
+    try std.testing.expectError(error.InputOutput, reopened.getOrCreateHostId());
+    Hooks.fail = false;
+    const stable = try reopened.getOrCreateHostId();
+    defer allocator.free(stable);
+    try std.testing.expectEqualStrings(published, stable);
+    try std.testing.expectEqual(@as(usize, 1), Hooks.file_syncs);
 }
 
 test "account records preserve pending connected refreshing and signed-out phases" {
@@ -651,7 +863,7 @@ test "account records preserve pending connected refreshing and signed-out phase
     var refreshing = try account.load();
     defer refreshing.deinit();
     try std.testing.expect(refreshing.value.refresh_pending);
-    try std.testing.expectEqualStrings("test-refresh", refreshing.value.tokens.?.refresh_token);
+    try std.testing.expectEqualStrings("test-refresh", refreshing.value.tokens.?.refresh_token.?);
     var signed_out = connected;
     signed_out.tokens = null;
     signed_out.refresh_pending = false;
@@ -931,7 +1143,7 @@ test "record validation rejects invalid phases fields and byte boundaries" {
     record.tokens.?.expires_at = 0;
     try std.testing.expectError(error.InvalidExpiry, record.validate());
     record = connectedRecord("example", "personal");
-    record.tokens.?.earliest_refresh_at = 3601;
+    record.tokens.?.earliest_refresh_at = -1;
     try std.testing.expectError(error.InvalidExpiry, record.validate());
     var maximum: [label_bytes_max]u8 = undefined;
     @memset(&maximum, 'a');

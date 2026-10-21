@@ -168,16 +168,19 @@ pub const Manager = struct {
                 (tokens.earliest_refresh_at orelse 0) > now)
                 return Lease.init(self.allocator, record.value);
         }
+        if ((tokens.earliest_refresh_at orelse 0) > now) return error.CredentialExpired;
         return self.refresh(&account, record.value);
     }
 
     fn refresh(self: *Manager, account: *store_module.Account, old: store_module.Record) !Lease {
         const tokens = old.tokens orelse return error.NotSignedIn;
-        const form = try oauth.refreshForm(self.allocator, old.client_id.?, tokens.refresh_token);
+        const refresh_token = tokens.refresh_token orelse return error.RefreshTokenMissing;
+        const form = try oauth.refreshForm(self.allocator, old.client_id.?, refresh_token);
         defer erase(self.allocator, form);
         var pending = old;
         pending.refresh_pending = true;
         try account.save(pending);
+        const started_at = try self.clock.now(self.io);
         var response = try self.request(.{ .token = form });
         defer response.deinit();
         if (response.status != 200) {
@@ -188,13 +191,16 @@ pub const Manager = struct {
             }
             return error.ReauthenticationRequired;
         }
+        const received_at = try self.clock.now(self.io);
         var reply = try oauth.parseRefreshTokenReply(
             self.allocator,
             response.body,
-            try self.clock.now(self.io),
+            received_at,
             tokens.scope,
         );
         defer reply.deinit();
+        reply.expires_at -= received_at - @min(started_at, received_at);
+        if (reply.refresh_token == null) return error.RefreshTokenMissing;
         var identity: ?jwt.Identity = null;
         defer if (identity) |*value| value.deinit();
         if (reply.id_token) |id_token| {
@@ -223,10 +229,12 @@ pub const Manager = struct {
         signed_out.refresh_pending = false;
         try account.save(signed_out);
         if (record.value.tokens) |tokens| {
-            self.revoke(record.value.client_id.?, tokens.refresh_token) catch |err| {
-                result.revocation_error = @errorName(err);
-            };
-            result.revoked = result.revocation_error == null;
+            if (tokens.refresh_token) |refresh_token| {
+                self.revoke(record.value.client_id.?, refresh_token) catch |err| {
+                    result.revocation_error = @errorName(err);
+                };
+                result.revoked = result.revocation_error == null;
+            }
         }
         return result;
     }
@@ -241,7 +249,7 @@ pub const Manager = struct {
             .form = form,
         } });
         defer response.deinit();
-        if (response.status < 200 or response.status >= 300) return error.RevocationFailed;
+        if (response.status != 200) return error.RevocationFailed;
     }
 
     pub fn models(self: *Manager, label: []const u8) !Catalogue {
@@ -337,15 +345,18 @@ pub const Login = struct {
             self.redirect_uri,
         );
         defer erase(manager.allocator, form);
+        const started_at = try manager.clock.now(manager.io);
         var response = try manager.request(.{ .token = form });
         defer response.deinit();
         if (response.status != 200) return error.TokenExchangeRejected;
+        const received_at = try manager.clock.now(manager.io);
         var reply = try oauth.parseTokenReply(
             manager.allocator,
             response.body,
-            try manager.clock.now(manager.io),
+            received_at,
         );
         defer reply.deinit();
+        reply.expires_at -= received_at - @min(started_at, received_at);
         const id_token = reply.id_token orelse return error.IdTokenMissing;
         var identity = try manager.verifyIdentity(
             id_token,
@@ -361,6 +372,8 @@ pub const Login = struct {
         updated.tokens = try tokenSet(reply, null);
         updated.refresh_pending = false;
         try self.account.save(updated);
+        if (oauth.hasPlanScope(reply.scope) and
+            reply.expires_at <= try manager.clock.now(manager.io)) return error.CredentialExpired;
     }
 };
 
@@ -415,9 +428,11 @@ pub const Catalogue = struct {
 };
 
 fn tokenSet(reply: oauth.TokenReply, previous_id: ?[]const u8) !store_module.TokenSet {
+    if (oauth.hasPlanScope(reply.scope) and reply.refresh_token == null)
+        return error.RefreshTokenMissing;
     return .{
         .access_token = reply.access_token,
-        .refresh_token = reply.refresh_token orelse return error.RefreshTokenMissing,
+        .refresh_token = reply.refresh_token,
         .id_token = reply.id_token orelse previous_id orelse return error.IdTokenMissing,
         .scope = reply.scope,
         .expires_at = reply.expires_at,

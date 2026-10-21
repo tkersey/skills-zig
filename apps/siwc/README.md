@@ -136,7 +136,8 @@ siwc credential --app example --account personal --json
 
 The versioned result contains `provider`, `app`, `account`, `issuer`, `client_id`,
 `subject`, `access_token`, `token_type`, `resource`, `scope`, and `expires_at`.
-`expires_at` is a Unix timestamp in seconds. The schema version is `1`.
+`expires_at` is a Unix timestamp in seconds and conservatively includes time spent
+exchanging tokens. The schema version is `1`.
 Refresh tokens and ID tokens are never included. Check the command's exit status
 before accepting its output, retain access tokens only as long as needed, and
 exclude stdout from logs or telemetry. `--json` is required to make the secret
@@ -208,9 +209,10 @@ from source control, shared directories, logs, and unprotected backups.
 
 An account's client ID and verified subject cannot be changed or cleared through
 record replacement. Logout retains that mapping so a later login uses the same
-registration. Initial sessions require both an ID token and an offline refresh
-token; a provider response without the required renewable grant does not produce
-a usable saved session.
+registration. Sign-in requires a verified ID token. A response without plan
+permission can retain the signed-in identity without an offline refresh token;
+it replaces any previous grant and remains `plan_usage_disabled`. Inference
+credentials require a renewable grant.
 
 Each credential operation takes a nonblocking kernel lock for the selected
 account. Contention reports `AccountBusy`. Replacement never deletes the lock
@@ -231,6 +233,10 @@ use `login --account LABEL` to recover. This favors a visible reauthentication
 over accidentally invalidating a token family. Definitive `invalid_grant` or
 `invalid_client` responses clear unusable tokens while retaining registration.
 There are no automatic refresh retries.
+
+The provider's earliest refresh time remains binding even if the conservative
+access-token deadline has passed. Until refresh is permitted, an expired
+credential is unavailable.
 
 Logout durably clears local tokens before any remote request. If remote
 revocation fails or its result cannot be confirmed, the local account stays

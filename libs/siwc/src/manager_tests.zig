@@ -123,7 +123,7 @@ const Script = struct {
             },
             .refresh_pending => {
                 try std.testing.expect(record.refresh_pending);
-                try std.testing.expectEqualStrings("old-refresh", record.tokens.?.refresh_token);
+                try std.testing.expectEqualStrings("old-refresh", record.tokens.?.refresh_token.?);
                 try std.testing.expectEqualStrings("old-access", record.tokens.?.access_token);
             },
             .signed_out => {
@@ -172,6 +172,7 @@ const Reply = struct {
     token_type: []const u8 = "Bearer",
     scope: []const u8 = oauth.scopes,
     expires_in: i64 = 3600,
+    earliest_refresh_at: ?i64 = null,
 };
 
 fn replyBytes(reply: Reply) ![]u8 {
@@ -245,7 +246,7 @@ test "initial login persists issued registration before exchange and verifies id
     defer parsed.deinit();
     try std.testing.expectEqualStrings("subject", parsed.value.subject.?);
     try std.testing.expectEqualStrings("test@example.invalid", parsed.value.email.?);
-    try std.testing.expectEqualStrings("new-refresh", parsed.value.tokens.?.refresh_token);
+    try std.testing.expectEqualStrings("new-refresh", parsed.value.tokens.?.refresh_token.?);
     try std.testing.expectEqual(
         manager_module.Phase.ready,
         manager_module.status(parsed.value, fixture.now).phase,
@@ -318,7 +319,7 @@ test "rejected signature nonce or subject cannot replace an established identity
         defer parsed.deinit();
         try std.testing.expectEqualStrings(case.subject, parsed.value.subject.?);
         try std.testing.expectEqualStrings("oaiapp_test", parsed.value.client_id.?);
-        try std.testing.expectEqualStrings("old-refresh", parsed.value.tokens.?.refresh_token);
+        try std.testing.expectEqualStrings("old-refresh", parsed.value.tokens.?.refresh_token.?);
         try std.testing.expectEqualStrings("old-access", parsed.value.tokens.?.access_token);
         try script.expectConsumed();
     }
@@ -362,7 +363,7 @@ test "rotation marks pending before request and publishes the entire new set onc
     defer parsed.deinit();
     try std.testing.expect(!parsed.value.refresh_pending);
     try std.testing.expectEqualStrings("new-access", parsed.value.tokens.?.access_token);
-    try std.testing.expectEqualStrings("new-refresh", parsed.value.tokens.?.refresh_token);
+    try std.testing.expectEqualStrings("new-refresh", parsed.value.tokens.?.refresh_token.?);
     try std.testing.expectEqualStrings(vectors.login, parsed.value.tokens.?.id_token);
     var second = try manager.credential(label);
     defer second.deinit();
@@ -393,7 +394,7 @@ test "refresh omission retains saved grants and persists rotated credentials" {
     var persisted = try fixture.store.load(label);
     defer persisted.deinit();
     try std.testing.expect(!persisted.value.refresh_pending);
-    try std.testing.expectEqualStrings("new-refresh", persisted.value.tokens.?.refresh_token);
+    try std.testing.expectEqualStrings("new-refresh", persisted.value.tokens.?.refresh_token.?);
     try std.testing.expectEqualStrings(previous.tokens.?.scope, persisted.value.tokens.?.scope);
     try std.testing.expectEqual(
         @as(?i64, 1_700_000_102),
@@ -418,7 +419,7 @@ test "refresh downscope persists the narrower grant without exporting a credenti
     defer persisted.deinit();
     try std.testing.expect(!persisted.value.refresh_pending);
     try std.testing.expectEqualStrings("openid", persisted.value.tokens.?.scope);
-    try std.testing.expectEqualStrings("new-refresh", persisted.value.tokens.?.refresh_token);
+    try std.testing.expectEqualStrings("new-refresh", persisted.value.tokens.?.refresh_token.?);
     try std.testing.expectError(error.PlanUsageNotEnabled, manager.credential(label));
     try script.expectConsumed();
 }
@@ -445,7 +446,7 @@ test "uncertain network and server failures never replay a refresh token" {
         var parsed = try fixture.store.load(label);
         defer parsed.deinit();
         try std.testing.expect(parsed.value.refresh_pending);
-        try std.testing.expectEqualStrings("old-refresh", parsed.value.tokens.?.refresh_token);
+        try std.testing.expectEqualStrings("old-refresh", parsed.value.tokens.?.refresh_token.?);
         try std.testing.expectError(error.ReauthenticationRequired, manager.credential(label));
         try script.expectConsumed();
     }
@@ -507,7 +508,7 @@ test "logout clears local state before revocation and reports confirmation separ
             .{ .kind = .discovery, .body = discovery, .persisted = .signed_out },
             .{
                 .kind = .revoke,
-                .status = 204,
+                .status = 200,
                 .persisted = .signed_out,
                 .form_contains = "token=old-refresh",
                 .failure = if (confirmed) null else error.SyntheticNetworkFailure,
@@ -553,7 +554,240 @@ test "a refreshed credential expiring during verification preserves rotation wit
     var parsed = try fixture.store.load(label);
     defer parsed.deinit();
     try std.testing.expect(!parsed.value.refresh_pending);
-    try std.testing.expectEqualStrings("new-refresh", parsed.value.tokens.?.refresh_token);
+    try std.testing.expectEqualStrings("new-refresh", parsed.value.tokens.?.refresh_token.?);
     try std.testing.expect(parsed.value.tokens.?.expires_at <= fixture.now);
     try script.expectConsumed();
+}
+
+test "identity-only login without offline access replaces grants and logs out locally" {
+    for ([_]bool{ true, false }) |new_account| {
+        var fixture = try Fixture.init();
+        defer fixture.deinit();
+        if (!new_account) try fixture.seed(connectedRecord());
+        const reply = try replyBytes(.{
+            .id_token = vectors.login,
+            .scope = "openid profile email",
+            .refresh_token = null,
+            .expires_in = 1,
+        });
+        defer allocator.free(reply);
+        const steps = [_]Step{
+            .{ .kind = .token, .body = reply, .advance_seconds = 2 },
+            .{ .kind = .discovery, .body = discovery },
+            .{ .kind = .keys, .body = vectors.jwks },
+        };
+        var script = fixture.script(&steps);
+        var manager = fixture.manager(&script);
+        try completeLogin(&manager, new_account);
+        var parsed = try fixture.store.load(label);
+        defer parsed.deinit();
+        try std.testing.expectEqualStrings("subject", parsed.value.subject.?);
+        try std.testing.expectEqualStrings("oaiapp_test", parsed.value.client_id.?);
+        try std.testing.expectEqualStrings("openid profile email", parsed.value.tokens.?.scope);
+        try std.testing.expectEqualStrings("new-access", parsed.value.tokens.?.access_token);
+        try std.testing.expect(parsed.value.tokens.?.refresh_token == null);
+        try std.testing.expectEqual(now_seconds + 1, parsed.value.tokens.?.expires_at);
+        try std.testing.expectEqual(
+            manager_module.Phase.plan_usage_disabled,
+            manager_module.status(parsed.value, fixture.now).phase,
+        );
+        try std.testing.expectError(error.PlanUsageNotEnabled, manager.credential(label));
+        try std.testing.expectError(error.PlanUsageNotEnabled, manager.models(label));
+        const result = try manager.logout(label);
+        try std.testing.expect(result.had_session and !result.revoked);
+        try std.testing.expect(result.revocation_error == null);
+        var signed_out = try fixture.store.load(label);
+        defer signed_out.deinit();
+        try std.testing.expect(signed_out.value.tokens == null);
+        try std.testing.expectEqualStrings("subject", signed_out.value.subject.?);
+        try script.expectConsumed();
+    }
+}
+
+test "stored identity-only sessions cannot enter renewable or pending states" {
+    var record = connectedRecord();
+    record.tokens.?.refresh_token = null;
+    try std.testing.expectError(error.RefreshTokenMissing, record.validate());
+    record.tokens.?.scope = "openid profile email";
+    try record.validate();
+    record.refresh_pending = true;
+    try std.testing.expectError(error.InvalidRefreshState, record.validate());
+    record.tokens.?.refresh_token = "refresh";
+    try record.validate();
+    record.tokens.?.earliest_refresh_at = record.tokens.?.expires_at + 10;
+    try record.validate();
+    record.tokens.?.earliest_refresh_at = -1;
+    try std.testing.expectError(error.InvalidExpiry, record.validate());
+}
+
+test "plan login and every refresh rotation require a new refresh token" {
+    const login_reply = try replyBytes(.{ .id_token = vectors.login, .refresh_token = null });
+    defer allocator.free(login_reply);
+    {
+        var fixture = try Fixture.init();
+        defer fixture.deinit();
+        const steps = [_]Step{
+            .{ .kind = .token, .body = login_reply },
+            .{ .kind = .discovery, .body = discovery },
+            .{ .kind = .keys, .body = vectors.jwks },
+        };
+        var script = fixture.script(&steps);
+        var manager = fixture.manager(&script);
+        try std.testing.expectError(error.RefreshTokenMissing, completeLogin(&manager, true));
+        var parsed = try fixture.store.load(label);
+        defer parsed.deinit();
+        try std.testing.expect(parsed.value.tokens == null);
+        try script.expectConsumed();
+    }
+    for ([_][]const u8{ oauth.scopes, "openid" }) |scope| {
+        var fixture = try Fixture.init();
+        defer fixture.deinit();
+        var previous = connectedRecord();
+        previous.tokens.?.expires_at = fixture.now - 1;
+        try fixture.seed(previous);
+        const reply = try replyBytes(.{ .refresh_token = null, .scope = scope });
+        defer allocator.free(reply);
+        var script = fixture.script(&.{.{ .kind = .token, .body = reply }});
+        var manager = fixture.manager(&script);
+        try std.testing.expectError(error.RefreshTokenMissing, manager.credential(label));
+        var parsed = try fixture.store.load(label);
+        defer parsed.deinit();
+        try std.testing.expect(parsed.value.refresh_pending);
+        try std.testing.expectEqualStrings("old-refresh", parsed.value.tokens.?.refresh_token.?);
+        try std.testing.expectError(error.ReauthenticationRequired, manager.credential(label));
+        try script.expectConsumed();
+    }
+}
+
+test "logout rejects unconfirmed HTTP successes without retrying cleared credentials" {
+    for ([_]u16{ 201, 202, 204, 299, 400, 503 }) |status_code| {
+        var fixture = try Fixture.init();
+        defer fixture.deinit();
+        try fixture.seed(connectedRecord());
+        const steps = [_]Step{
+            .{ .kind = .discovery, .body = discovery, .persisted = .signed_out },
+            .{ .kind = .revoke, .status = status_code, .persisted = .signed_out },
+        };
+        var script = fixture.script(&steps);
+        var manager = fixture.manager(&script);
+        const result = try manager.logout(label);
+        try std.testing.expect(result.had_session and !result.revoked);
+        try std.testing.expectEqualStrings("RevocationFailed", result.revocation_error.?);
+        var parsed = try fixture.store.load(label);
+        defer parsed.deinit();
+        try std.testing.expect(parsed.value.tokens == null and !parsed.value.refresh_pending);
+        const repeated = try manager.logout(label);
+        try std.testing.expect(!repeated.had_session and !repeated.revoked);
+        try script.expectConsumed();
+    }
+}
+
+test "token request latency never extends login or refreshed access validity" {
+    for ([_]bool{ true, false }) |login_flow| {
+        for ([_]i64{ 1, 120 }) |lifetime| {
+            var fixture = try Fixture.init();
+            defer fixture.deinit();
+            if (!login_flow) {
+                var previous = connectedRecord();
+                previous.tokens.?.expires_at = fixture.now - 1;
+                try fixture.seed(previous);
+            }
+            const reply = try replyBytes(.{
+                .id_token = if (login_flow) vectors.login else null,
+                .expires_in = lifetime,
+            });
+            defer allocator.free(reply);
+            const steps = [_]Step{
+                .{ .kind = .token, .body = reply, .advance_seconds = 2 },
+                .{ .kind = .discovery, .body = discovery },
+                .{ .kind = .keys, .body = vectors.jwks },
+            };
+            var script = fixture.script(if (login_flow) &steps else steps[0..1]);
+            var manager = fixture.manager(&script);
+            if (login_flow) {
+                if (lifetime == 1) {
+                    try std.testing.expectError(
+                        error.CredentialExpired,
+                        completeLogin(&manager, true),
+                    );
+                } else try completeLogin(&manager, true);
+            } else if (lifetime == 1) {
+                try std.testing.expectError(error.CredentialExpired, manager.credential(label));
+            } else {
+                var lease = try manager.credential(label);
+                defer lease.deinit();
+                try std.testing.expectEqual(now_seconds + lifetime, lease.value.expires_at);
+            }
+            var parsed = try fixture.store.load(label);
+            defer parsed.deinit();
+            try std.testing.expect(!parsed.value.refresh_pending);
+            try std.testing.expectEqualStrings(
+                "new-refresh",
+                parsed.value.tokens.?.refresh_token.?,
+            );
+            try std.testing.expectEqual(now_seconds + lifetime, parsed.value.tokens.?.expires_at);
+            try std.testing.expectEqual(
+                if (lifetime == 1) manager_module.Phase.refresh_required else .ready,
+                manager_module.status(parsed.value, fixture.now).phase,
+            );
+            if (lifetime > 1) {
+                var lease = try manager.credential(label);
+                defer lease.deinit();
+                try std.testing.expectEqualStrings("new-access", lease.value.access_token);
+            }
+            try script.expectConsumed();
+        }
+    }
+}
+
+test "absolute refresh restriction survives a conservative expiry and gates the successor" {
+    for ([_]bool{ true, false }) |login_flow| {
+        var fixture = try Fixture.init();
+        defer fixture.deinit();
+        if (!login_flow) {
+            var previous = connectedRecord();
+            previous.tokens.?.expires_at = fixture.now - 1;
+            try fixture.seed(previous);
+        }
+        const reply = try replyBytes(.{
+            .id_token = if (login_flow) vectors.login else null,
+            .expires_in = 10,
+            .earliest_refresh_at = now_seconds + 25,
+        });
+        defer allocator.free(reply);
+        const successor = try replyBytes(.{});
+        defer allocator.free(successor);
+        const exchange = Step{ .kind = .token, .body = reply, .advance_seconds = 20 };
+        const rotation = Step{
+            .kind = .token,
+            .body = successor,
+            .form_contains = "refresh_token=new-refresh",
+        };
+        const login_steps = [_]Step{
+            exchange,
+            .{ .kind = .discovery, .body = discovery },
+            .{ .kind = .keys, .body = vectors.jwks },
+            rotation,
+        };
+        const refresh_steps = [_]Step{ exchange, rotation };
+        var script = fixture.script(if (login_flow) &login_steps else &refresh_steps);
+        var manager = fixture.manager(&script);
+        if (login_flow) {
+            try std.testing.expectError(error.CredentialExpired, completeLogin(&manager, true));
+        } else try std.testing.expectError(error.CredentialExpired, manager.credential(label));
+        var parsed = try fixture.store.load(label);
+        defer parsed.deinit();
+        try std.testing.expect(!parsed.value.refresh_pending);
+        try std.testing.expectEqual(now_seconds + 10, parsed.value.tokens.?.expires_at);
+        try std.testing.expectEqual(now_seconds + 25, parsed.value.tokens.?.earliest_refresh_at.?);
+        const requests = script.next;
+        try std.testing.expectError(error.CredentialExpired, manager.credential(label));
+        try std.testing.expectError(error.CredentialExpired, manager.models(label));
+        try std.testing.expectEqual(requests, script.next);
+        fixture.now = now_seconds + 25;
+        var lease = try manager.credential(label);
+        defer lease.deinit();
+        try std.testing.expectEqual(fixture.now + 3600, lease.value.expires_at);
+        try script.expectConsumed();
+    }
 }
