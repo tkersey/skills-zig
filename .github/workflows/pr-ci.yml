@@ -37,6 +37,7 @@ jobs:
       cas: ${{ steps.classify.outputs.cas }}
       ledger: ${{ steps.classify.outputs.ledger }}
       memory_note: ${{ steps.classify.outputs.memory_note }}
+      siwc: ${{ steps.classify.outputs.siwc }}
       perf: ${{ steps.classify.outputs.perf }}
     steps:
       - uses: actions/checkout@v4
@@ -61,7 +62,7 @@ jobs:
             selected[cas]=true
           fi
 
-          for app in seq lift cas ledger memory-note; do
+          for app in seq lift cas ledger memory-note siwc; do
             output_name="${app//-/_}"
             echo "${output_name}=${selected[$app]:-false}" >> "$GITHUB_OUTPUT"
           done
@@ -479,3 +480,35 @@ jobs:
         run: zig build test-memory-note
       - name: Verify memory-note selected layout and immutable migration
         run: bash apps/memory-note/scripts/test-cli.sh zig-out/bin/memory-note
+
+  siwc:
+    needs: changes
+    if: needs.changes.outputs.siwc == 'true'
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-linux-musl
+          - os: macos-15
+            target: aarch64-macos.15.0
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.17.0
+      - name: Build SIWC release surface
+        run: zig build build-siwc -Dtarget=${{ matrix.target }} -Dcpu=baseline -Doptimize=fast
+      - name: Test SIWC in Debug
+        run: zig build test-siwc -Dtarget=${{ matrix.target }} -Dcpu=baseline -Doptimize=debug
+      - name: Test SIWC in ReleaseSafe
+        run: zig build test-siwc -Dtarget=${{ matrix.target }} -Dcpu=baseline -Doptimize=safe
+      - name: Verify SIWC version and help
+        shell: bash
+        run: |
+          set -euo pipefail
+          expected="$(tr -d '[:space:]' < apps/siwc/VERSION)"
+          test "$(zig-out/bin/siwc --version)" = "$expected"
+          zig-out/bin/siwc --help

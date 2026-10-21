@@ -9,7 +9,7 @@ fi
 mode=$1
 base_ref=$2
 head_ref=$3
-apps=(seq lift cas ledger memory-note)
+apps=(seq lift cas ledger memory-note siwc)
 
 resolve_ref() {
   local ref=$1
@@ -61,6 +61,7 @@ case "$mode" in
       mark_app cas
       mark_app ledger
       mark_app memory-note
+      mark_app siwc
     }
 
     # Disable rename collapsing so both the previous and current owners are
@@ -113,6 +114,9 @@ case "$mode" in
         libs/durable_store/*|libs/jsonl_core/*)
           mark_store_consumers
           ;;
+        libs/siwc/*)
+          mark_app siwc
+          ;;
         libs/*)
           # New shared owners fail closed until their consumers are explicit.
           mark_all
@@ -143,6 +147,9 @@ case "$mode" in
           ;;
         .github/workflows/release-memory-note.yml)
           mark_app memory-note
+          ;;
+        .github/workflows/release-siwc.yml)
+          mark_app siwc
           ;;
         apps/*)
           matched=0

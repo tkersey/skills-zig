@@ -9,10 +9,13 @@ Monorepo for Zig CLIs with shared internal libraries and independent release str
 - `cas` (`cas_smoke_check`, `cas_instance_runner`, `cas_review_session`, and Codex automation)
 - `ledger` (passive artifact definitions, validation, transactions, replay, and projections)
 - `memory-note` (`memory-note`)
+- `siwc` (Sign in with ChatGPT credentials and application launching)
 
-The five Homebrew formulas expose 14 executable names: one each for Seq, Lift,
-Ledger, and memory-note, plus CAS and its nine functional siblings. A clean root
-`zig build` additionally installs the local `perf_hub`, for 15 names in `zig-out/bin`.
+The established five Homebrew formulas expose 14 executable names: one each for
+Seq, Lift, Ledger, and memory-note, plus CAS and its nine functional siblings.
+SIWC's initial tap formula follows its first tagged release. A clean root
+`zig build` installs those names, `siwc`, and the local `perf_hub`, for 16 names
+in `zig-out/bin`.
 There is no umbrella `lift` executable.
 
 TypeSafe and `perf_report` are retired; see [migration](docs/release/README.md#cli-retirement-migration)
@@ -28,10 +31,12 @@ separate compatibility alias.
 - `apps/cas`
 - `apps/ledger`
 - `apps/memory-note`
+- `apps/siwc`
 - `libs/core`
 - `libs/definition_core`
 - `libs/durable_store`
 - `libs/trace_core`
+- `libs/siwc`
 - `.github/workflows`
 - `docs/release`
 
@@ -42,6 +47,11 @@ canonical JSON, closure digests, parameters, cache headers, and shared result
 metadata. `libs/trace_core` owns physical execution-trace normalization.
 `libs/durable_store` owns bounded custody, revision, and atomic store mechanics.
 None of these shared libraries contains skill or workflow semantics.
+
+`libs/siwc` owns ChatGPT sign-in, application/account registrations, protected
+credentials, and renewable sessions. The root package exports the `siwc` module
+for native embedding. The [SIWC CLI](apps/siwc/README.md) uses the same owner for
+login, credential acquisition, and launching compatible Responses applications.
 
 ## Build
 
@@ -65,6 +75,7 @@ zig build build-lift -Doptimize=fast
 zig build build-cas -Doptimize=fast
 zig build build-ledger -Doptimize=fast
 zig build build-memory-note -Doptimize=fast
+zig build build-siwc -Doptimize=fast
 ```
 
 Run helpers:
@@ -75,7 +86,12 @@ zig build -Doptimize=fast
 ./zig-out/bin/bench_stats --help
 ./zig-out/bin/cas_smoke_check --help
 ./zig-out/bin/cas automation --help
+./zig-out/bin/siwc --help
 ```
+
+SIWC's offline authentication and command tests run with `zig build test-siwc`.
+Its PR and release qualification run both Debug and ReleaseSafe on Linux and
+macOS; qualification uses synthetic credentials and does not sign in to an account.
 
 ## Local Perf
 
@@ -128,6 +144,7 @@ Per-app VERSION files are the source of truth:
 - `apps/cas/VERSION`
 - `apps/ledger/VERSION`
 - `apps/memory-note/VERSION`
+- `apps/siwc/VERSION`
 
 PRs that touch release-relevant CLI surfaces must bump the corresponding
 `VERSION` file. The check is conservative: app-local changes count for that
@@ -140,8 +157,9 @@ surfaces such as
 `libs/definition_core/**` and `libs/definition_compat/**` count for `seq`,
 `cas`, and `ledger`;
 `libs/durable_store/**` and `libs/jsonl_core/**` count for `seq`, `cas`,
-`ledger`, and `memory-note`; and
-`libs/trace_core/**` counts for `seq` and `cas`.
+`ledger`, `memory-note`, and `siwc`;
+`libs/trace_core/**` counts for `seq` and `cas`; and
+`libs/siwc/**` counts for `siwc`.
 Do not close release-relevant CLI work with a local `./zig-out/bin` binary alone.
 Release closure means the changed CLI has a tagged GitHub release, the tap formula has been updated, Homebrew audit/test have passed, and the installed Homebrew binary reports the expected version.
 
@@ -152,6 +170,7 @@ Independent tags trigger independent workflows, and each tag must match its app 
 - `cas-v*` -> `.github/workflows/release-cas.yml`
 - `ledger-v*` -> `.github/workflows/release-ledger.yml`
 - `memory-note-v*` -> `.github/workflows/release-memory-note.yml`
+- `siwc-v*` -> `.github/workflows/release-siwc.yml`
 
 Pushes to `main` auto-create any missing release tags for changed `VERSION` files and dispatch the matching release workflow.
 Manual tag pushes still work, but they are no longer the only path.
@@ -163,6 +182,7 @@ Required tag forms:
 - `cas-v<version>` where `<version>` equals `apps/cas/VERSION`
 - `ledger-v<version>` where `<version>` equals `apps/ledger/VERSION`
 - `memory-note-v<version>` where `<version>` equals `apps/memory-note/VERSION`
+- `siwc-v<version>` where `<version>` equals `apps/siwc/VERSION`
 
 Artifacts are published as:
 

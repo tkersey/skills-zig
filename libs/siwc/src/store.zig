@@ -1,0 +1,889 @@
+const std = @import("std");
+const builtin = @import("builtin");
+const durable_store = @import("durable_store");
+
+pub const label_bytes_max = 64;
+pub const token_bytes_max = 32 * 1024;
+pub const record_bytes_max = 128 * 1024;
+pub const accounts_max = 128;
+pub const account_locks_max = accounts_max;
+pub const directory_entries_max = 1024;
+pub const identity_bytes_max = 1024;
+pub const scope_bytes_max = 4096;
+const host_id_bytes = 45;
+const owner_lookup_attempts_max = 4;
+
+pub const TokenSet = struct {
+    access_token: []const u8,
+    refresh_token: []const u8,
+    id_token: []const u8,
+    scope: []const u8,
+    expires_at: i64,
+    earliest_refresh_at: ?i64 = null,
+
+    pub fn validate(self: TokenSet) !void {
+        try validateText(self.access_token, token_bytes_max, false);
+        try validateText(self.refresh_token, token_bytes_max, false);
+        try validateText(self.id_token, token_bytes_max, false);
+        try validateText(self.scope, scope_bytes_max, true);
+        if (self.expires_at <= 0) return error.InvalidExpiry;
+        if (self.earliest_refresh_at) |earliest| {
+            if (earliest < 0 or earliest > self.expires_at) return error.InvalidExpiry;
+        }
+    }
+};
+
+pub const Record = struct {
+    version: u32 = 1,
+    app: []const u8,
+    label: []const u8,
+    client_id: ?[]const u8 = null,
+    subject: ?[]const u8 = null,
+    email: ?[]const u8 = null,
+    tokens: ?TokenSet = null,
+    refresh_pending: bool = false,
+
+    pub fn validate(self: Record) !void {
+        if (self.version != 1) return error.UnsupportedStoreVersion;
+        try validateLabel(self.app);
+        try validateLabel(self.label);
+        if (self.client_id) |id| {
+            try validateText(id, identity_bytes_max, false);
+            if (std.mem.eql(u8, id, "dynamic_agent_client")) return error.InvalidClientId;
+        }
+        if (self.subject) |subject| try validateText(subject, identity_bytes_max, false);
+        if (self.email) |email| try validateText(email, identity_bytes_max, true);
+        if (self.subject != null and self.client_id == null) return error.InvalidRegistration;
+        if (self.email != null and self.subject == null) return error.InvalidRegistration;
+        if (self.tokens) |tokens| {
+            if (self.client_id == null or self.subject == null) return error.InvalidRegistration;
+            try tokens.validate();
+        } else if (self.refresh_pending) return error.InvalidRefreshState;
+    }
+};
+
+pub const Store = struct {
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    app: []u8,
+    directory: durable_store.PrivateDirectory,
+    mode: Mode,
+
+    pub const Mode = enum { create, read_only };
+
+    pub fn open(
+        io: std.Io,
+        allocator: std.mem.Allocator,
+        root_path: []const u8,
+        app: []const u8,
+        mode: Mode,
+    ) !Store {
+        try validateRootPath(root_path);
+        try validateLabel(app);
+        var root = try openRoot(io, root_path, mode);
+        defer root.deinit();
+        try validateNativeOwner(root.directory.handle);
+        var directory = try openChild(&root, app, mode);
+        errdefer directory.deinit();
+        const iterable = try directory.directory.openDir(io, ".", .{
+            .iterate = true,
+            .follow_symlinks = false,
+        });
+        directory.deinit();
+        directory = .{ .io = io, .directory = iterable };
+        try validateNativeOwner(directory.directory.handle);
+        return .{
+            .io = io,
+            .allocator = allocator,
+            .app = try allocator.dupe(u8, app),
+            .directory = directory,
+            .mode = mode,
+        };
+    }
+
+    pub fn deinit(self: *Store) void {
+        self.directory.deinit();
+        self.allocator.free(self.app);
+        self.* = undefined;
+    }
+
+    pub fn load(self: *const Store, label: []const u8) !std.json.Parsed(Record) {
+        try validateLabel(label);
+        var leaf_buffer: [label_bytes_max + 16]u8 = undefined;
+        const leaf = try accountLeaf(&leaf_buffer, label);
+        const raw = try self.readPrivate(leaf, record_bytes_max);
+        defer self.allocator.free(raw);
+        var parsed = try std.json.parseFromSlice(Record, self.allocator, raw, .{
+            .allocate = .alloc_always,
+        });
+        errdefer parsed.deinit();
+        try parsed.value.validate();
+        if (!std.mem.eql(u8, parsed.value.app, self.app) or
+            !std.mem.eql(u8, parsed.value.label, label)) return error.RegistrationMismatch;
+        return parsed;
+    }
+
+    pub fn lock(self: *Store, label: []const u8) !Account {
+        if (self.mode != .create) return error.ReadOnlyStore;
+        try validateLabel(label);
+        const owned_label = try self.allocator.dupe(u8, label);
+        errdefer self.allocator.free(owned_label);
+        var leaf_buffer: [label_bytes_max + 16]u8 = undefined;
+        const leaf = try std.fmt.bufPrint(&leaf_buffer, ".account-{s}.lock", .{label});
+        return .{
+            .store = self,
+            .label = owned_label,
+            .file = try self.openAccountLock(leaf),
+        };
+    }
+
+    pub fn list(self: *const Store) ![][]u8 {
+        try self.admitDirectory();
+        var labels: std.ArrayList([]u8) = .empty;
+        errdefer {
+            for (labels.items) |label| self.allocator.free(label);
+            labels.deinit(self.allocator);
+        }
+        var iterator = self.directory.directory.iterate();
+        for (0..directory_entries_max + 1) |index| {
+            const entry = try iterator.next(self.io) orelse {
+                std.mem.sort([]u8, labels.items, {}, labelLessThan);
+                return labels.toOwnedSlice(self.allocator);
+            };
+            if (index == directory_entries_max) return error.TooManyDirectoryEntries;
+            if (!std.mem.startsWith(u8, entry.name, "account-") or
+                !std.mem.endsWith(u8, entry.name, ".json")) continue;
+            if (entry.kind != .file) return error.NotFile;
+            const label = entry.name[8 .. entry.name.len - 5];
+            try validateLabel(label);
+            if (labels.items.len == accounts_max) return error.TooManyAccounts;
+            const owned_label = try self.allocator.dupe(u8, label);
+            errdefer self.allocator.free(owned_label);
+            try labels.append(self.allocator, owned_label);
+        }
+        return error.TooManyDirectoryEntries;
+    }
+
+    pub fn freeList(self: *const Store, labels: [][]u8) void {
+        for (labels) |label| self.allocator.free(label);
+        self.allocator.free(labels);
+    }
+
+    pub fn getOrCreateHostId(self: *Store) ![]u8 {
+        if (self.mode != .create) return error.ReadOnlyStore;
+        const file = try self.openLock(".host.lock");
+        defer file.close(self.io);
+        if (try self.readHostId()) |host_id| return host_id;
+        var bytes: [16]u8 = undefined;
+        try self.io.randomSecure(&bytes);
+        bytes[6] = (bytes[6] & 0x0f) | 0x40;
+        bytes[8] = (bytes[8] & 0x3f) | 0x80;
+        const hex = std.fmt.bytesToHex(bytes, .lower);
+        const host_id = try std.fmt.allocPrint(self.allocator, "urn:uuid:{s}-{s}-{s}-{s}-{s}", .{
+            hex[0..8], hex[8..12], hex[12..16], hex[16..20], hex[20..32],
+        });
+        errdefer self.allocator.free(host_id);
+        try self.publish("host-id", host_id, true);
+        return host_id;
+    }
+
+    fn readHostId(self: *const Store) !?[]u8 {
+        const raw = self.readPrivate("host-id", host_id_bytes) catch |err|
+            switch (err) {
+                error.FileNotFound => return null,
+                else => return err,
+            };
+        errdefer self.allocator.free(raw);
+        try validateHostId(raw);
+        return raw;
+    }
+
+    fn readPrivate(self: *const Store, leaf: []const u8, limit: usize) ![]u8 {
+        try self.admitDirectory();
+        const stat = try self.directory.directory.statFile(self.io, leaf, .{
+            .follow_symlinks = false,
+        });
+        try validatePrivateFile(stat);
+        const file = try self.directory.directory.openFile(self.io, leaf, .{
+            .allow_directory = false,
+            .follow_symlinks = false,
+        });
+        defer file.close(self.io);
+        try validateNativeOwner(file.handle);
+        const opened_stat = try file.stat(self.io);
+        try validatePrivateFile(opened_stat);
+        if (opened_stat.size > limit) return error.FileTooBig;
+        return self.readBounded(file, limit);
+    }
+
+    fn readBounded(self: *const Store, file: std.Io.File, limit: usize) ![]u8 {
+        var reader = file.reader(self.io, &.{});
+        return reader.interface.allocRemaining(self.allocator, .limited(limit)) catch |err|
+            switch (err) {
+                error.StreamTooLong => error.FileTooBig,
+                error.ReadFailed => reader.err orelse err,
+                else => err,
+            };
+    }
+
+    fn openLock(self: *const Store, leaf: []const u8) !std.Io.File {
+        try self.admitDirectory();
+        const file = self.directory.directory.createFile(self.io, leaf, .{
+            .read = true,
+            .truncate = false,
+            .exclusive = true,
+            .lock = .exclusive,
+            .lock_nonblocking = true,
+            .permissions = .fromMode(0o600),
+        }) catch |err| switch (err) {
+            error.PathAlreadyExists => try self.openExistingLock(leaf),
+            error.WouldBlock => return error.AccountBusy,
+            else => return err,
+        };
+        errdefer file.close(self.io);
+        try validateNativeOwner(file.handle);
+        const stat = try file.stat(self.io);
+        try validatePrivateFile(stat);
+        if (stat.size != 0) return error.InvalidLock;
+        return file;
+    }
+
+    fn openAccountLock(self: *const Store, leaf: []const u8) !std.Io.File {
+        const inventory = try self.openLock(".inventory.lock");
+        defer inventory.close(self.io);
+        const stat = self.directory.directory.statFile(self.io, leaf, .{
+            .follow_symlinks = false,
+        }) catch |err| switch (err) {
+            error.FileNotFound => {
+                try self.admitAccountLockSlot();
+                return self.openLock(leaf);
+            },
+            else => return err,
+        };
+        try validatePrivateFile(stat);
+        return self.openLock(leaf);
+    }
+
+    fn admitAccountLockSlot(self: *const Store) !void {
+        var iterator = self.directory.directory.iterate();
+        var locks: usize = 0;
+        for (0..directory_entries_max + 1) |index| {
+            const entry = try iterator.next(self.io) orelse return;
+            if (index == directory_entries_max) return error.TooManyDirectoryEntries;
+            if (!std.mem.startsWith(u8, entry.name, ".account-") or
+                !std.mem.endsWith(u8, entry.name, ".lock")) continue;
+            if (entry.kind != .file) return error.NotFile;
+            try validateLabel(entry.name[9 .. entry.name.len - 5]);
+            locks += 1;
+            if (locks >= account_locks_max) return error.TooManyAccountLocks;
+        }
+        return error.TooManyDirectoryEntries;
+    }
+
+    fn openExistingLock(self: *const Store, leaf: []const u8) !std.Io.File {
+        const stat = try self.directory.directory.statFile(self.io, leaf, .{
+            .follow_symlinks = false,
+        });
+        try validatePrivateFile(stat);
+        return self.directory.directory.openFile(self.io, leaf, .{
+            .mode = .read_write,
+            .allow_directory = false,
+            .follow_symlinks = false,
+            .lock = .exclusive,
+            .lock_nonblocking = true,
+        }) catch |err| switch (err) {
+            error.WouldBlock => error.AccountBusy,
+            else => err,
+        };
+    }
+
+    fn publish(self: *const Store, leaf: []const u8, raw: []const u8, new: bool) !void {
+        try self.admitDirectory();
+        const directory = self.directory.directory;
+        const options: durable_store.PublicationOptions = .{
+            .permissions = .fromMode(0o600),
+            .durability = .file_and_directories_synced,
+        };
+        const outcome = if (new)
+            durable_store.publishCreateNew(self.io, directory, directory, leaf, &.{raw}, options)
+        else
+            durable_store.publishReplacement(self.io, directory, directory, leaf, &.{raw}, options);
+        switch (outcome) {
+            .complete => {},
+            .not_published, .publication_unknown => |failure| return failure.cause,
+            .published_unsynced => return error.DurabilityUnconfirmed,
+        }
+    }
+
+    fn admitDirectory(self: *const Store) !void {
+        try validateNativeOwner(self.directory.directory.handle);
+        const stat = try self.directory.directory.stat(self.io);
+        if (stat.kind != .directory) return error.NotDir;
+        if (stat.permissions.toMode() & 0o077 != 0) return error.InsecurePrivateDirectory;
+    }
+};
+
+pub const Account = struct {
+    store: *Store,
+    label: []u8,
+    file: std.Io.File,
+
+    pub fn deinit(self: *Account) void {
+        self.file.close(self.store.io);
+        self.store.allocator.free(self.label);
+        self.* = undefined;
+    }
+
+    pub fn load(self: *const Account) !std.json.Parsed(Record) {
+        return self.store.load(self.label);
+    }
+
+    pub fn reserveNew(self: *const Account) !void {
+        const inventory = try self.store.openLock(".inventory.lock");
+        defer inventory.close(self.store.io);
+        const labels = try self.store.list();
+        defer self.store.freeList(labels);
+        if (labels.len >= accounts_max) return error.TooManyAccounts;
+        const record: Record = .{ .app = self.store.app, .label = self.label };
+        self.write(record, true) catch |err| switch (err) {
+            error.PathAlreadyExists => return error.AccountAlreadyExists,
+            else => return err,
+        };
+    }
+
+    pub fn save(self: *const Account, record: Record) !void {
+        try record.validate();
+        var previous = try self.load();
+        defer previous.deinit();
+        try preserveIdentity(previous.value.client_id, record.client_id);
+        try preserveIdentity(previous.value.subject, record.subject);
+        try self.write(record, false);
+    }
+
+    fn write(self: *const Account, record: Record, new: bool) !void {
+        try record.validate();
+        if (!std.mem.eql(u8, record.app, self.store.app) or
+            !std.mem.eql(u8, record.label, self.label)) return error.RegistrationMismatch;
+        const raw = try std.json.Stringify.valueAlloc(self.store.allocator, record, .{});
+        defer self.store.allocator.free(raw);
+        if (raw.len > record_bytes_max) return error.RecordTooLarge;
+        var leaf_buffer: [label_bytes_max + 16]u8 = undefined;
+        const leaf = try accountLeaf(&leaf_buffer, self.label);
+        try self.store.publish(leaf, raw, new);
+    }
+};
+
+pub fn validateLabel(value: []const u8) !void {
+    if (value.len == 0 or value.len > label_bytes_max) return error.InvalidLabel;
+    if (!isLowerAlphanumeric(value[0])) return error.InvalidLabel;
+    for (value) |byte| {
+        if (!isLowerAlphanumeric(byte) and byte != '-' and byte != '_')
+            return error.InvalidLabel;
+    }
+}
+
+fn isLowerAlphanumeric(byte: u8) bool {
+    return (byte >= 'a' and byte <= 'z') or (byte >= '0' and byte <= '9');
+}
+
+fn validateText(value: []const u8, limit: usize, spaces: bool) !void {
+    if (value.len == 0 or value.len > limit) return error.InvalidRecordField;
+    if (!std.unicode.utf8ValidateSlice(value)) return error.InvalidRecordField;
+    for (value) |byte| {
+        if (byte < 0x20 or byte == 0x7f or (!spaces and byte == ' '))
+            return error.InvalidRecordField;
+    }
+}
+
+fn preserveIdentity(previous: ?[]const u8, next: ?[]const u8) !void {
+    if (previous) |expected| {
+        const actual = next orelse return error.RegistrationMismatch;
+        if (!std.mem.eql(u8, expected, actual)) return error.RegistrationMismatch;
+    }
+}
+
+fn accountLeaf(buffer: []u8, label: []const u8) ![]u8 {
+    return std.fmt.bufPrint(buffer, "account-{s}.json", .{label});
+}
+
+fn labelLessThan(_: void, a: []u8, b: []u8) bool {
+    return std.mem.lessThan(u8, a, b);
+}
+
+fn validateRootPath(path: []const u8) !void {
+    if (!std.fs.path.isAbsolute(path) or path.len <= 1 or path.len > 4096 or
+        std.mem.indexOfScalar(u8, path, 0) != null) return error.InvalidPath;
+    var parts = std.mem.tokenizeScalar(u8, path, std.fs.path.sep);
+    while (parts.next()) |part| {
+        if (std.mem.eql(u8, part, ".") or std.mem.eql(u8, part, ".."))
+            return error.InvalidPath;
+    }
+}
+
+fn openRoot(io: std.Io, path: []const u8, mode: Store.Mode) !durable_store.PrivateDirectory {
+    const fs = durable_store.Fs.init(io, .cwd());
+    return durable_store.PrivateDirectory.open(fs, path, .read_only) catch |err| switch (err) {
+        error.FileNotFound => if (mode == .create)
+            durable_store.PrivateDirectory.open(fs, path, .create)
+        else
+            err,
+        else => err,
+    };
+}
+
+fn openChild(
+    root: *durable_store.PrivateDirectory,
+    app: []const u8,
+    mode: Store.Mode,
+) !durable_store.PrivateDirectory {
+    return root.openChild(app, .read_only) catch |err| switch (err) {
+        error.FileNotFound => if (mode == .create) root.openChild(app, .create) else err,
+        else => err,
+    };
+}
+
+fn validatePrivateFile(stat: std.Io.File.Stat) !void {
+    if (stat.kind == .sym_link) return error.SymLinkLoop;
+    if (stat.kind != .file) return error.NotFile;
+    if (stat.nlink != 1) return error.HardlinkTarget;
+    if (stat.permissions.toMode() & 0o077 != 0) return error.InsecurePrivateFile;
+}
+
+fn validateNativeOwner(handle: std.posix.fd_t) !void {
+    const owner = switch (builtin.os.tag) {
+        .linux => try linuxOwner(handle),
+        .macos => try macosOwner(handle),
+        else => return error.UnsupportedPlatform,
+    };
+    try validateOwner(owner, std.c.geteuid());
+}
+
+fn validateOwner(owner: std.c.uid_t, expected: std.c.uid_t) !void {
+    if (owner != expected) return error.PrivateOwnerMismatch;
+}
+
+fn linuxOwner(handle: std.posix.fd_t) !std.c.uid_t {
+    const linux = std.os.linux;
+    for (0..owner_lookup_attempts_max) |_| {
+        var stat = std.mem.zeroes(linux.Statx);
+        const result = linux.statx(handle, "", linux.AT.EMPTY_PATH, .{ .UID = true }, &stat);
+        switch (linux.errno(result)) {
+            .SUCCESS => {
+                if (!stat.mask.UID) return error.OwnerLookupFailed;
+                return stat.uid;
+            },
+            .INTR => continue,
+            else => return error.OwnerLookupFailed,
+        }
+    }
+    return error.OwnerLookupFailed;
+}
+
+fn macosOwner(handle: std.posix.fd_t) !std.c.uid_t {
+    for (0..owner_lookup_attempts_max) |_| {
+        var stat: std.c.Stat = undefined;
+        switch (std.c.errno(std.c.fstat(handle, &stat))) {
+            .SUCCESS => return stat.uid,
+            .INTR => continue,
+            else => return error.OwnerLookupFailed,
+        }
+    }
+    return error.OwnerLookupFailed;
+}
+
+fn validateHostId(value: []const u8) !void {
+    if (value.len != host_id_bytes or !std.mem.startsWith(u8, value, "urn:uuid:"))
+        return error.InvalidHostId;
+    for (value[9..], 0..) |byte, index| {
+        if (index == 8 or index == 13 or index == 18 or index == 23) {
+            if (byte != '-') return error.InvalidHostId;
+        } else if (!std.ascii.isHex(byte) or std.ascii.isUpper(byte)) {
+            return error.InvalidHostId;
+        }
+    }
+    if (value[23] != '4' or std.mem.indexOfScalar(u8, "89ab", value[28]) == null)
+        return error.InvalidHostId;
+}
+
+const TestStore = struct {
+    tmp: std.testing.TmpDir,
+    path: []u8,
+    store: Store,
+
+    fn init(app: []const u8) !TestStore {
+        const allocator = std.testing.allocator;
+        var tmp = std.testing.tmpDir(.{ .iterate = true });
+        errdefer tmp.cleanup();
+        const parent = try tmp.dir.realPathFileAlloc(std.testing.io, ".", allocator);
+        defer allocator.free(parent);
+        const path = try std.fs.path.join(allocator, &.{ parent, "auth" });
+        errdefer allocator.free(path);
+        return .{
+            .tmp = tmp,
+            .path = path,
+            .store = try Store.open(std.testing.io, allocator, path, app, .create),
+        };
+    }
+
+    fn deinit(self: *TestStore) void {
+        self.store.deinit();
+        self.tmp.cleanup();
+        std.testing.allocator.free(self.path);
+    }
+};
+
+fn connectedRecord(app: []const u8, label: []const u8) Record {
+    return .{
+        .app = app,
+        .label = label,
+        .client_id = "oaiapp_test",
+        .subject = "subject-test",
+        .email = "test@example.invalid",
+        .tokens = .{
+            .access_token = "test-access",
+            .refresh_token = "test-refresh",
+            .id_token = "test-id",
+            .scope = "openid offline_access chatgpt.tokens.use.direct",
+            .expires_at = 3600,
+        },
+    };
+}
+
+test "account records preserve pending connected refreshing and signed-out phases" {
+    var fixture = try TestStore.init("example");
+    defer fixture.deinit();
+    var account = try fixture.store.lock("personal");
+    defer account.deinit();
+    try account.reserveNew();
+    try std.testing.expectError(error.AccountAlreadyExists, account.reserveNew());
+    var pending = try account.load();
+    defer pending.deinit();
+    try std.testing.expectEqual(@as(?TokenSet, null), pending.value.tokens);
+    var registered = pending.value;
+    registered.client_id = "oaiapp_test";
+    try account.save(registered);
+    var connected = connectedRecord("example", "personal");
+    try account.save(connected);
+    connected.refresh_pending = true;
+    try account.save(connected);
+    var refreshing = try account.load();
+    defer refreshing.deinit();
+    try std.testing.expect(refreshing.value.refresh_pending);
+    try std.testing.expectEqualStrings("test-refresh", refreshing.value.tokens.?.refresh_token);
+    var signed_out = connected;
+    signed_out.tokens = null;
+    signed_out.refresh_pending = false;
+    try account.save(signed_out);
+    var retained = try account.load();
+    defer retained.deinit();
+    try std.testing.expectEqualStrings("oaiapp_test", retained.value.client_id.?);
+    try std.testing.expectEqualStrings("subject-test", retained.value.subject.?);
+    try std.testing.expectEqual(@as(?TokenSet, null), retained.value.tokens);
+}
+
+test "record mutation cannot substitute or erase a bound identity" {
+    var fixture = try TestStore.init("example");
+    defer fixture.deinit();
+    var account = try fixture.store.lock("personal");
+    defer account.deinit();
+    try account.reserveNew();
+    const connected = connectedRecord("example", "personal");
+    try account.save(connected);
+    var changed = connected;
+    changed.client_id = "oaiapp_other";
+    try std.testing.expectError(error.RegistrationMismatch, account.save(changed));
+    changed = connected;
+    changed.subject = "other-subject";
+    try std.testing.expectError(error.RegistrationMismatch, account.save(changed));
+    changed = connected;
+    changed.label = "other";
+    try std.testing.expectError(error.RegistrationMismatch, account.save(changed));
+    changed = .{ .app = "example", .label = "personal" };
+    try std.testing.expectError(error.RegistrationMismatch, account.save(changed));
+    var loaded = try account.load();
+    defer loaded.deinit();
+    try std.testing.expectEqualStrings("subject-test", loaded.value.subject.?);
+    try std.testing.expectEqualStrings("test-access", loaded.value.tokens.?.access_token);
+}
+
+test "kernel session lock survives account replacement and releases on close" {
+    var fixture = try TestStore.init("example");
+    defer fixture.deinit();
+    var first = try fixture.store.lock("personal");
+    try first.reserveNew();
+    var other = try Store.open(
+        std.testing.io,
+        std.testing.allocator,
+        fixture.path,
+        "example",
+        .create,
+    );
+    defer other.deinit();
+    try std.testing.expectError(error.AccountBusy, other.lock("personal"));
+    try first.save(connectedRecord("example", "personal"));
+    try std.testing.expectError(error.AccountBusy, other.lock("personal"));
+    first.deinit();
+    var second = try other.lock("personal");
+    defer second.deinit();
+    var loaded = try second.load();
+    defer loaded.deinit();
+    try std.testing.expectEqualStrings("subject-test", loaded.value.subject.?);
+}
+
+test "account lock namespaces cannot collide with host or inventory locks" {
+    var fixture = try TestStore.init("example");
+    defer fixture.deinit();
+    for ([_][]const u8{ "host", "inventory" }) |label| {
+        var account = try fixture.store.lock(label);
+        defer account.deinit();
+        try account.reserveNew();
+        const host = try fixture.store.getOrCreateHostId();
+        defer std.testing.allocator.free(host);
+        try validateHostId(host);
+        var record = try account.load();
+        defer record.deinit();
+        try std.testing.expectEqualStrings(label, record.value.label);
+    }
+}
+
+test "account lock admission bounds interrupted reservations and preserves existing slots" {
+    var fixture = try TestStore.init("example");
+    defer fixture.deinit();
+    for (0..account_locks_max) |index| {
+        var buffer: [32]u8 = undefined;
+        const label = try std.fmt.bufPrint(&buffer, "slot-{d}", .{index});
+        var account = try fixture.store.lock(label);
+        account.deinit();
+    }
+    try std.testing.expectError(error.TooManyAccountLocks, fixture.store.lock("overflow"));
+    try std.testing.expectError(
+        error.FileNotFound,
+        fixture.store.directory.directory.statFile(std.testing.io, ".account-overflow.lock", .{}),
+    );
+    var recovering = try fixture.store.lock("slot-0");
+    defer recovering.deinit();
+    try recovering.reserveNew();
+    var record = try recovering.load();
+    defer record.deinit();
+    try std.testing.expectEqualStrings("slot-0", record.value.label);
+    const labels = try fixture.store.list();
+    defer fixture.store.freeList(labels);
+    try std.testing.expectEqual(@as(usize, 1), labels.len);
+    const host = try fixture.store.getOrCreateHostId();
+    defer std.testing.allocator.free(host);
+    try validateHostId(host);
+}
+
+test "app profiles and host identifiers remain separate and stable" {
+    var fixture = try TestStore.init("example");
+    defer fixture.deinit();
+    const first = try fixture.store.getOrCreateHostId();
+    defer std.testing.allocator.free(first);
+    const repeated = try fixture.store.getOrCreateHostId();
+    defer std.testing.allocator.free(repeated);
+    try std.testing.expectEqualStrings(first, repeated);
+    try validateHostId(first);
+    var other = try Store.open(
+        std.testing.io,
+        std.testing.allocator,
+        fixture.path,
+        "second",
+        .create,
+    );
+    defer other.deinit();
+    const second = try other.getOrCreateHostId();
+    defer std.testing.allocator.free(second);
+    try std.testing.expect(!std.mem.eql(u8, first, second));
+    var account = try fixture.store.lock("personal");
+    defer account.deinit();
+    try account.reserveNew();
+    try std.testing.expectError(error.FileNotFound, other.load("personal"));
+}
+
+test "read-only inspection lists accounts and cannot create authentication state" {
+    var fixture = try TestStore.init("example");
+    defer fixture.deinit();
+    var second = try fixture.store.lock("zebra");
+    defer second.deinit();
+    try second.reserveNew();
+    var first = try fixture.store.lock("alpha");
+    defer first.deinit();
+    try first.reserveNew();
+    var read_only = try Store.open(
+        std.testing.io,
+        std.testing.allocator,
+        fixture.path,
+        "example",
+        .read_only,
+    );
+    defer read_only.deinit();
+    const labels = try read_only.list();
+    defer read_only.freeList(labels);
+    try std.testing.expectEqual(@as(usize, 2), labels.len);
+    try std.testing.expectEqualStrings("alpha", labels[0]);
+    try std.testing.expectEqualStrings("zebra", labels[1]);
+    try std.testing.expectError(error.ReadOnlyStore, read_only.lock("new"));
+    try std.testing.expectError(error.ReadOnlyStore, read_only.getOrCreateHostId());
+}
+
+test "private records reject shared permissions hardlinks and symlinks" {
+    const io = std.testing.io;
+    var fixture = try TestStore.init("example");
+    defer fixture.deinit();
+    var account = try fixture.store.lock("personal");
+    defer account.deinit();
+    try account.reserveNew();
+    const directory = fixture.store.directory.directory;
+    const leaf = "account-personal.json";
+    try directory.setFilePermissions(io, leaf, .fromMode(0o644), .{});
+    try std.testing.expectError(error.InsecurePrivateFile, account.load());
+    try directory.setFilePermissions(io, leaf, .fromMode(0o600), .{});
+    try directory.hardLink(leaf, directory, "alias", io, .{});
+    try std.testing.expectError(error.HardlinkTarget, account.load());
+    try directory.deleteFile(io, "alias");
+    try directory.rename(leaf, directory, "original", io);
+    try directory.symLink(io, "original", leaf, .{});
+    try std.testing.expectError(error.SymLinkLoop, account.load());
+    try std.testing.expectError(
+        error.SymLinkLoop,
+        account.save(.{ .app = "example", .label = "personal" }),
+    );
+}
+
+test "credential ownership must match the effective user even with private permission bits" {
+    const owner = std.c.geteuid();
+    try validateOwner(owner, owner);
+    try std.testing.expectError(error.PrivateOwnerMismatch, validateOwner(owner +% 1, owner));
+    var fixture = try TestStore.init("example");
+    defer fixture.deinit();
+    try validateNativeOwner(fixture.store.directory.directory.handle);
+    var account = try fixture.store.lock("personal");
+    defer account.deinit();
+    try validateNativeOwner(account.file.handle);
+    try account.reserveNew();
+    var record = try account.load();
+    defer record.deinit();
+    try std.testing.expectEqualStrings("personal", record.value.label);
+}
+
+test "same-handle reads retain their byte bound when a file grows after admission" {
+    var fixture = try TestStore.init("example");
+    defer fixture.deinit();
+    const file = try fixture.store.directory.directory.createFile(std.testing.io, "growing", .{
+        .read = true,
+        .permissions = .fromMode(0o600),
+    });
+    defer file.close(std.testing.io);
+    try file.writePositionalAll(std.testing.io, "1234", 0);
+    const admitted = try file.stat(std.testing.io);
+    try std.testing.expectEqual(@as(u64, 4), admitted.size);
+    try file.writePositionalAll(std.testing.io, "5678", 4);
+    try std.testing.expectError(error.FileTooBig, fixture.store.readBounded(file, 4));
+}
+
+test "FIFO preflight refuses credential and host files before blocking open" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    var fixture = try TestStore.init("example");
+    defer fixture.deinit();
+    const linux = std.os.linux;
+    for ([_][:0]const u8{ "account-personal.json", "host-id" }) |leaf| {
+        const result = linux.mknodat(
+            fixture.store.directory.directory.handle,
+            leaf,
+            linux.S.IFIFO | 0o600,
+            0,
+        );
+        try std.testing.expectEqual(linux.E.SUCCESS, linux.errno(result));
+    }
+    try std.testing.expectError(error.NotFile, fixture.store.load("personal"));
+    try std.testing.expectError(error.NotFile, fixture.store.getOrCreateHostId());
+}
+
+test "private directory admission rejects unsafe roots and path aliases" {
+    const io = std.testing.io;
+    const allocator = std.testing.allocator;
+    var fixture = try TestStore.init("example");
+    defer fixture.deinit();
+    try fixture.tmp.dir.setFilePermissions(io, "auth", .fromMode(0o755), .{});
+    try std.testing.expectError(
+        error.InsecurePrivateDirectory,
+        Store.open(io, allocator, fixture.path, "example", .create),
+    );
+    const permissions = try fixture.tmp.dir.statFile(io, "auth", .{});
+    try std.testing.expectEqual(
+        @as(std.posix.mode_t, 0o755),
+        permissions.permissions.toMode() & 0o777,
+    );
+    try fixture.tmp.dir.setFilePermissions(io, "auth", .fromMode(0o700), .{});
+    try fixture.tmp.dir.rename("auth", fixture.tmp.dir, "original", io);
+    try fixture.tmp.dir.symLink(io, "original", "auth", .{ .is_directory = true });
+    try std.testing.expectError(
+        error.NotDir,
+        Store.open(io, allocator, fixture.path, "x", .create),
+    );
+    for ([_][]const u8{ "", "/", "relative", "/tmp/../private", "/tmp/./private" }) |path| {
+        try std.testing.expectError(
+            error.InvalidPath,
+            Store.open(io, allocator, path, "x", .create),
+        );
+    }
+}
+
+test "record validation rejects invalid phases fields and byte boundaries" {
+    var record = connectedRecord("example", "personal");
+    try record.validate();
+    record.version = 2;
+    try std.testing.expectError(error.UnsupportedStoreVersion, record.validate());
+    record = connectedRecord("example", "personal");
+    record.client_id = "dynamic_agent_client";
+    try std.testing.expectError(error.InvalidClientId, record.validate());
+    record = connectedRecord("example", "personal");
+    record.subject = null;
+    try std.testing.expectError(error.InvalidRegistration, record.validate());
+    record = .{ .app = "example", .label = "personal", .refresh_pending = true };
+    try std.testing.expectError(error.InvalidRefreshState, record.validate());
+    record = connectedRecord("example", "personal");
+    record.tokens.?.access_token = "bad\r\nheader";
+    try std.testing.expectError(error.InvalidRecordField, record.validate());
+    record = connectedRecord("example", "personal");
+    record.tokens.?.expires_at = 0;
+    try std.testing.expectError(error.InvalidExpiry, record.validate());
+    record = connectedRecord("example", "personal");
+    record.tokens.?.earliest_refresh_at = 3601;
+    try std.testing.expectError(error.InvalidExpiry, record.validate());
+    var maximum: [label_bytes_max]u8 = undefined;
+    @memset(&maximum, 'a');
+    try validateLabel(&maximum);
+    var oversized: [label_bytes_max + 1]u8 = undefined;
+    @memset(&oversized, 'a');
+    try std.testing.expectError(error.InvalidLabel, validateLabel(&oversized));
+    for ([_][]const u8{ "", ".", "..", "a/b", "Upper", "a b", "-leading" }) |label| {
+        try std.testing.expectError(error.InvalidLabel, validateLabel(label));
+    }
+}
+
+test "untrusted JSON rejects types missing data duplicates and mismatched registration" {
+    var fixture = try TestStore.init("example");
+    defer fixture.deinit();
+    const invalid = [_][]const u8{
+        "{}",
+        "{\"app\":false,\"label\":\"personal\"}",
+        "{\"app\":\"example\",\"label\":null}",
+        "{\"app\":\"example\",\"app\":\"other\",\"label\":\"personal\"}",
+        "{\"app\":\"other\",\"label\":\"personal\"}",
+        "{\"app\":\"example\",\"label\":\"other\"}",
+        "{\"app\":\"example\",\"label\":\"personal\",\"refresh_pending\":\"yes\"}",
+    };
+    for (invalid) |raw| {
+        try fixture.store.publish("account-personal.json", raw, false);
+        if (fixture.store.load("personal")) |parsed| {
+            parsed.deinit();
+            return error.InvalidRecordAccepted;
+        } else |_| {}
+    }
+    const oversized = try std.testing.allocator.alloc(u8, record_bytes_max + 1);
+    defer std.testing.allocator.free(oversized);
+    @memset(oversized, ' ');
+    try fixture.store.publish("account-personal.json", oversized, false);
+    try std.testing.expectError(error.FileTooBig, fixture.store.load("personal"));
+}
