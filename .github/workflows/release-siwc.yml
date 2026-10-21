@@ -1,0 +1,114 @@
+name: Release SIWC
+
+on:
+  push:
+    tags:
+      - "siwc-v*"
+  workflow_dispatch:
+    inputs:
+      tag_name:
+        description: Release tag to publish
+        required: true
+        type: string
+
+env:
+  RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag_name || github.ref_name }}
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+
+permissions:
+  actions: read
+  contents: write
+
+concurrency:
+  group: release-siwc-${{ github.event_name == 'workflow_dispatch' && inputs.tag_name || github.ref_name }}
+  cancel-in-progress: false
+
+jobs:
+  qualify:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux-x86_64
+            target: x86_64-linux-musl
+            os: ubuntu-latest
+          - platform: darwin-arm64
+            target: aarch64-macos.15.0
+            os: macos-15
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: refs/tags/${{ env.RELEASE_TAG }}
+      - name: Validate SIWC tag
+        shell: bash
+        run: |
+          set -euo pipefail
+          expected="siwc-v$(tr -d '[:space:]' < apps/siwc/VERSION)"
+          test "$RELEASE_TAG" = "$expected"
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.17.0
+      - name: Test SIWC in Debug
+        run: zig build test-siwc -Dtarget=${{ matrix.target }} -Dcpu=baseline -Doptimize=debug
+      - name: Test SIWC in ReleaseSafe
+        run: zig build test-siwc -Dtarget=${{ matrix.target }} -Dcpu=baseline -Doptimize=safe
+      - name: Build SIWC release executable
+        run: zig build build-siwc -Dtarget=${{ matrix.target }} -Dcpu=baseline -Doptimize=fast
+      - name: Package and verify SIWC archive
+        shell: bash
+        run: |
+          set -euo pipefail
+          expected="$(tr -d '[:space:]' < apps/siwc/VERSION)"
+          test "$(zig-out/bin/siwc --version)" = "$expected"
+          zig-out/bin/siwc --help
+          staging="$(mktemp -d "${RUNNER_TEMP}/siwc-release.XXXXXX")"
+          trap 'rm -rf "$staging"' EXIT
+          cp zig-out/bin/siwc "$staging/siwc"
+          archive="${RELEASE_TAG}-${{ matrix.platform }}.tar.gz"
+          tar -czf "$archive" -C "$staging" siwc
+          test "$(tar -tzf "$archive")" = siwc
+          echo "RELEASE_ARCHIVE=$archive" >> "$GITHUB_ENV"
+      - uses: actions/upload-artifact@v6
+        with:
+          name: ${{ env.RELEASE_ARCHIVE }}
+          path: ${{ env.RELEASE_ARCHIVE }}
+          if-no-files-found: error
+          overwrite: false
+
+  publish:
+    needs: qualify
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Download qualified archives
+        shell: bash
+        run: |
+          set -euo pipefail
+          gh run download "${{ github.run_id }}" \
+            --repo "$GITHUB_REPOSITORY" \
+            --dir release-assets \
+            --pattern "${RELEASE_TAG}-*.tar.gz"
+      - name: Verify exact SIWC artifact set and publish
+        shell: bash
+        run: |
+          set -euo pipefail
+          assets=()
+          for platform in linux-x86_64 darwin-arm64; do
+            name="${RELEASE_TAG}-${platform}.tar.gz"
+            asset="release-assets/$name/$name"
+            test -f "$asset"
+            test "$(tar -tzf "$asset")" = siwc
+            assets+=("$asset")
+          done
+          count="$(find release-assets -type f | wc -l | tr -d '[:space:]')"
+          test "$count" -eq 2
+          if gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release upload "$RELEASE_TAG" "${assets[@]}" --repo "$GITHUB_REPOSITORY" --clobber
+          else
+            gh release create "$RELEASE_TAG" "${assets[@]}" \
+              --repo "$GITHUB_REPOSITORY" --verify-tag --title "$RELEASE_TAG"
+          fi
