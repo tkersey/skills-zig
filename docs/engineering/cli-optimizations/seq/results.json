@@ -1,0 +1,1318 @@
+{
+  "baseline_revision": "8e470a24b533dba479f39f7ae3cc7f07b5fc5aeb",
+  "zig": "0.17.0",
+  "optimize": "fast",
+  "rounds": 11,
+  "ordering": "alternating baseline/candidate; rotating case order; one warmup each",
+  "environment": {
+    "os": "27.2",
+    "architecture": "arm64",
+    "cpu": "Apple M2 Pro",
+    "shared_with_unrelated_workloads": true
+  },
+  "binaries": {
+    "baseline": {
+      "sha256": "5165f1f54d5c72a2823457794b721535377148ecde13841d631ad37e35e7da4b"
+    },
+    "candidate": {
+      "sha256": "b239e01e9c99de4d3f3f4b050807ea6ce910a69ac9faca4ea6bf12b72a1aa2a2"
+    }
+  },
+  "summary": [
+    {
+      "case": "turns-64-projected",
+      "fixture_bytes": 553170,
+      "fixture_sha256": "1032d5766ca082ce043f8be1e75b959132eee403e46ab10d31817e9a39808ce3",
+      "spec": {
+        "dataset": "turns",
+        "select": [
+          "turn_id",
+          "status"
+        ],
+        "limit": 2048
+      },
+      "wall_ns": {
+        "baseline": {
+          "median": 6273000,
+          "min": 5758000,
+          "max": 6825000
+        },
+        "candidate": {
+          "median": 5961000,
+          "min": 5655000,
+          "max": 7054000
+        },
+        "improvement_percent": 4.973696795791487
+      },
+      "maximum_resident_set_bytes": {
+        "baseline": {
+          "median": 3391488,
+          "min": 3375104,
+          "max": 3407872
+        },
+        "candidate": {
+          "median": 2686976,
+          "min": 2670592,
+          "max": 2703360
+        },
+        "improvement_percent": 20.77294685990338
+      }
+    },
+    {
+      "case": "turns-512-projected",
+      "fixture_bytes": 8620738,
+      "fixture_sha256": "bcfa076312edb09e58e29d2a6565ebf6572e0e81be49643203deafc2ad517f52",
+      "spec": {
+        "dataset": "turns",
+        "select": [
+          "turn_id",
+          "status"
+        ],
+        "limit": 2048
+      },
+      "wall_ns": {
+        "baseline": {
+          "median": 17747000,
+          "min": 17454000,
+          "max": 17983000
+        },
+        "candidate": {
+          "median": 16567000,
+          "min": 16078000,
+          "max": 17071000
+        },
+        "improvement_percent": 6.649011100467685
+      },
+      "maximum_resident_set_bytes": {
+        "baseline": {
+          "median": 14450688,
+          "min": 14401536,
+          "max": 14450688
+        },
+        "candidate": {
+          "median": 3063808,
+          "min": 3047424,
+          "max": 3112960
+        },
+        "improvement_percent": 78.79818594104309
+      }
+    },
+    {
+      "case": "messages-512-projected",
+      "fixture_bytes": 8620738,
+      "fixture_sha256": "bcfa076312edb09e58e29d2a6565ebf6572e0e81be49643203deafc2ad517f52",
+      "spec": {
+        "dataset": "messages",
+        "select": [
+          "source_event_id",
+          "turn_index",
+          "role"
+        ],
+        "limit": 2048
+      },
+      "wall_ns": {
+        "baseline": {
+          "median": 37881000,
+          "min": 37027000,
+          "max": 38608000
+        },
+        "candidate": {
+          "median": 29705000,
+          "min": 29051000,
+          "max": 30967000
+        },
+        "improvement_percent": 21.583379530635412
+      },
+      "maximum_resident_set_bytes": {
+        "baseline": {
+          "median": 42614784,
+          "min": 42467328,
+          "max": 43171840
+        },
+        "candidate": {
+          "median": 16039936,
+          "min": 15974400,
+          "max": 16121856
+        },
+        "improvement_percent": 62.36063052672049
+      }
+    },
+    {
+      "case": "events-512-projected",
+      "fixture_bytes": 8620738,
+      "fixture_sha256": "bcfa076312edb09e58e29d2a6565ebf6572e0e81be49643203deafc2ad517f52",
+      "spec": {
+        "dataset": "source_events",
+        "select": [
+          "source_event_id",
+          "event_type",
+          "turn_index"
+        ],
+        "limit": 4096
+      },
+      "wall_ns": {
+        "baseline": {
+          "median": 38099000,
+          "min": 37247000,
+          "max": 38814000
+        },
+        "candidate": {
+          "median": 30194000,
+          "min": 29984000,
+          "max": 30641000
+        },
+        "improvement_percent": 20.748576078112286
+      },
+      "maximum_resident_set_bytes": {
+        "baseline": {
+          "median": 42827776,
+          "min": 42631168,
+          "max": 42975232
+        },
+        "candidate": {
+          "median": 16220160,
+          "min": 15974400,
+          "max": 16400384
+        },
+        "improvement_percent": 62.12700841622035
+      }
+    },
+    {
+      "case": "turns-64-full",
+      "fixture_bytes": 553170,
+      "fixture_sha256": "1032d5766ca082ce043f8be1e75b959132eee403e46ab10d31817e9a39808ce3",
+      "spec": {
+        "dataset": "turns",
+        "limit": 2048
+      },
+      "wall_ns": {
+        "baseline": {
+          "median": 7427000,
+          "min": 7117000,
+          "max": 7956000
+        },
+        "candidate": {
+          "median": 7535000,
+          "min": 6805000,
+          "max": 7898000
+        },
+        "improvement_percent": -1.454153763296082
+      },
+      "maximum_resident_set_bytes": {
+        "baseline": {
+          "median": 4128768,
+          "min": 4096000,
+          "max": 4145152
+        },
+        "candidate": {
+          "median": 4177920,
+          "min": 4145152,
+          "max": 4177920
+        },
+        "improvement_percent": -1.1904761904761905
+      }
+    }
+  ],
+  "samples": [
+    {
+      "round": 0,
+      "case": "turns-64-projected",
+      "observations": {
+        "baseline": {
+          "wall_ns": 6514000,
+          "maximum_resident_set_bytes": 3375104,
+          "stdout_bytes": 2680,
+          "stdout_sha256": "c243036247fc6e9be2c7657718b532d6b086f273bade1911bfdfeeaae4c70cd2",
+          "time_raw": "        0.00 real         0.00 user         0.00 sys\n             3375104  maximum resident set size\n                   0  average shared memory size\n                   0  average unshared data size\n                   0  average unshared stack size\n                 385  page reclaims\n                   0  page faults\n                   0  swaps\n                   0  block input operations\n                   0  block output operations\n                   0  messages sent\n                   0  messages received\n                   0  signals received\n                   0  voluntary context switches\n                   9  involuntary context switches\n            33090612  instructions retired\n             9335865  cycles elapsed\n             2359680  peak memory footprint\n"
+        },
+        "candidate": {
+          "wall_ns": 5655000,
+          "maximum_resident_set_bytes": 2686976,
+          "stdout_bytes": 2680,
+          "stdout_sha256": "c243036247fc6e9be2c7657718b532d6b086f273bade1911bfdfeeaae4c70cd2",
+          "time_raw": "        0.00 real         0.00 user         0.00 sys\n             2686976  maximum resident set size\n                   0  average shared memory size\n                   0  average unshared data size\n                   0  average unshared stack size\n                 343  page reclaims\n                   0  page faults\n                   0  swaps\n                   0  block input operations\n                   0  block output operations\n                   0  messages sent\n                   0  messages received\n                   0  signals received\n                   0  voluntary context switches\n                   7  involuntary context switches\n            32561195  instructions retired\n             8991513  cycles elapsed\n             1671552  peak memory footprint\n"
+        }
+      }
+    },
+    {
+      "round": 0,
+      "case": "turns-512-projected",
+      "observations": {
+        "baseline": {
+          "wall_ns": 17454000,
+          "maximum_resident_set_bytes": 14450688,
+          "stdout_bytes": 21908,
+          "stdout_sha256": "f6e5614160794026da2616d06ff85f55912d60a10aa7ac2dc600a32058dfb9d2",
+          "time_raw": "        0.01 real         0.01 user         0.00 sys\n            14450688  maximum resident set size\n                   0  average shared memory size\n                   0  average unshared data size\n                   0  average unshared stack size\n                1060  page reclaims\n                   0  page faults\n                   0  swaps\n                   0  block input operations\n                   0  block output operations\n                   0  messages sent\n                   0  messages received\n                   0  signals received\n                   0  voluntary context switches\n                   5  involuntary context switches\n           209046937  instructions retired\n            46725887  cycles elapsed\n            13451672  peak memory footprint\n"
+        },
+        "candidate": {
+          "wall_ns": 17071000,
+          "maximum_resident_set_bytes": 3080192,
+          "stdout_bytes": 21908,
+          "stdout_sha256": "f6e5614160794026da2616d06ff85f55912d60a10aa7ac2dc600a32058dfb9d2",
+          "time_raw": "        0.01 real         0.01 user         0.00 sys\n             3080192  maximum resident set size\n                   0  average shared memory size\n                   0  average unshared data size\n                   0  average unshared stack size\n                 367  page reclaims\n                   0  page faults\n                   0  swaps\n                   0  block input operations\n                   0  block output operations\n                   0  messages sent\n                   0  messages received\n                   0  signals received\n                   0  voluntary context switches\n                   7  involuntary context switches\n           201537125  instructions retired\n            43376701  cycles elapsed\n             2081176  peak memory footprint\n"
+        }
+      }
+    },
+    {
+      "round": 0,
+      "case": "messages-512-projected",
+      "observations": {
+        "baseline": {
+          "wall_ns": 38114000,
+          "maximum_resident_set_bytes": 42532864,
+          "stdout_bytes": 130346,
+          "stdout_sha256": "35e1ded052a0be47b15a8109d8626566c6356f8e62d38f3a1ef8f1eaf5282420",
+          "time_raw": "        0.03 real         0.02 user         0.00 sys\n            42532864  maximum resident set size\n                   0  average shared memory size\n                   0  average unshared data size\n                   0  average unshared stack size\n                2776  page reclaims\n                   0  page faults\n                   0  swaps\n                   0  block input operations\n                   0  block output operations\n                   0  messages sent\n                   0  messages received\n                   0  signals received\n                   0  voluntary context switches\n                   6  involuntary context switches\n           454348577  instructions retired\n           113455566  cycles elapsed\n            41550256  peak memory footprint\n"
+        },
+        "candidate": {
+          "wall_ns": 30558000,
+          "maximum_resident_set_bytes": 16039936,
+          "stdout_bytes": 130346,
+          "stdout_sha256": "35e1ded052a0be47b15a8109d8626566c6356f8e62d38f3a1ef8f1eaf5282420",
+          "time_raw": "        0.02 real         0.02 user         0.00 sys\n            16039936  maximum resident set size\n                   0  average shared memory size\n                   0  average unshared data size\n                   0  average unshared stack size\n                1157  page reclaims\n                   0  page faults\n                   0  swaps\n                   0  block input operations\n                   0  block output operations\n                   0  messages sent\n                   0  messages received\n                   0  signals received\n                   0  voluntary context switches\n                   9  involuntary context switches\n           344656550  instructions retired\n            87221554  cycles elapsed\n            15040920  peak memory footprint\n"
+        }
+      }
+    },
+    {
+      "round": 0,
+      "case": "events-512-projected",
+      "observations": {
+        "baseline": {
+          "wall_ns": 38043000,
+          "maximum_resident_set_bytes": 42762240,
+          "stdout_bytes": 285396,
+          "stdout_sha256": "4020442a861ae69b8772d11c8c6a69d8d9c45327f5ed3bde2d4e79a8a5e69047",
+          "time_raw": "        0.03 real         0.02 user         0.00 sys\n            42762240  maximum resident set size\n                   0  average shared memory size\n                   0  average unshared data size\n                   0  average unshared stack size\n                2789  page reclaims\n                   0  page faults\n                   0  swaps\n                   0  block input operations\n                   0  block output operations\n                   0  messages sent\n                   0  messages received\n                   0  signals received\n                   0  voluntary context switches\n                   9  involuntary context switches\n           460868937  instructions retired\n           114094579  cycles elapsed\n            41779632  peak memory footprint\n"
+        },
+        "candidate": {
+          "wall_ns": 30489000,
+          "maximum_resident_set_bytes": 16400384,
+          "stdout_bytes": 285396,
+          "stdout_sha256": "4020442a861ae69b8772d11c8c6a69d8d9c45327f5ed3bde2d4e79a8a5e69047",
+          "time_raw": "        0.02 real         0.02 user         0.00 sys\n            16400384  maximum resident set size\n                   0  average shared memory size\n                   0  average unshared data size\n                   0  average unshared stack size\n                1180  page reclaims\n                   0  page faults\n                   0  swaps\n                   0  block input operations\n                   0  block output operations\n                   0  messages sent\n                   0  messages received\n                   0  signals received\n                   0  voluntary context switches\n                   8  involuntary context switches\n           351495480  instructions retired\n            87251026  cycles elapsed\n            15401368  peak memory footprint\n"
+        }
+      }
+    },
+    {
+      "round": 0,
+      "case": "turns-64-full",
+      "observations": {
+        "baseline": {
+          "wall_ns": 7620000,
+          "maximum_resident_set_bytes": 4096000,
+          "stdout_bytes": 567131,
+          "stdout_sha256": "dfbbf37c14da7321da63d6a3506616f0c1c412ac0cd3176ed549ca50ea5abc8f",
+          "time_raw": "        0.00 real         0.00 user         0.00 sys\n             4096000  maximum resident set size\n                   0  average shared memory size\n                   0  average unshared data size\n                   0  average unshared stack size\n                 428  page reclaims\n                   0  page faults\n                   0  swaps\n                   0  block input operations\n                   0  block output operations\n                   0  messages sent\n                   0  messages received\n                   0  signals received\n                   0  voluntary context switches\n                   8  involuntary context switches\n            48277474  instructions retired\n            12921312  cycles elapsed\n             3080576  peak memory footprint\n"
+        },
+        "candidate": {
+          "wall_ns": 7150000,
+          "maximum_resident_set_bytes": 4145152,
+          "stdout_bytes": 567131,
+          "stdout_sha256": "dfbbf37c14da7321da63d6a3506616f0c1c412ac0cd3176ed549ca50ea5abc8f",
+          "time_raw": "        0.00 real         0.00 user         0.00 sys\n             4145152  maximum resident set size\n                   0  average shared memory size\n                   0  average unshared data size\n                   0  average unshared stack size\n                 432  page reclaims\n                   0  page faults\n                   0  swaps\n                   0  block input operations\n                   0  block output operations\n                   0  messages sent\n                   0  messages received\n                   0  signals received\n                   0  voluntary context switches\n                   8  involuntary context switches\n            48458793  instructions retired\n            12691049  cycles elapsed\n             3129728  peak memory footprint\n"
+        }
+      }
+    },
+    {
+      "round": 1,
+      "case": "turns-512-projected",
+      "observations": {
+        "candidate": {
+          "wall_ns": 16335000,
+          "maximum_resident_set_bytes": 3063808,
+          "stdout_bytes": 21908,
+          "stdout_sha256": "f6e5614160794026da2616d06ff85f55912d60a10aa7ac2dc600a32058dfb9d2",
+          "time_raw": "        0.01 real         0.01 user         0.00 sys\n             3063808  maximum resident set size\n                   0  average shared memory size\n                   0  average unshared data size\n                   0  average unshared stack size\n                 365  page reclaims\n                   0  page faults\n                   0  swaps\n                   0  block input operations\n                   0  block output operations\n                   0  messages sent\n                   0  messages received\n                   0  signals received\n                   0  voluntary context switches\n                   5  involuntary context switches\n           201339459  instructions retired\n            43512863  cycles elapsed\n             2064792  peak memory footprint\n"
+        },
+        "baseline": {
+          "wall_ns": 17747000,
+          "maximum_resident_set_bytes": 14450688,
+          "stdout_bytes": 21908,
+          "stdout_sha256": "f6e5614160794026da2616d06ff85f55912d60a10aa7ac2dc600a32058dfb9d2",
+          "time_raw": "        0.01 real         0.01 user         0.00 sys\n            14450688  maximum resident set size\n                   0  average shared memory size\n                   0  average unshared data size\n                   0  average unshared stack size\n                1060  page reclaims\n                   0  page faults\n                   0  swaps\n                   0  block input operations\n                   0  block output operations\n                   0  messages sent\n                   0  messages received\n                   0  signals received\n                   0  voluntary context switches\n                   8  involuntary context switches\n           209109091  instructions retired\n            47573654  cycles elapsed\n            13451672  peak memory footprint\n"
+        }
+      }
+    },
+    {
+      "round": 1,
+      "case": "messages-512-projected",
+      "observations": {
+        "candidate": {
+          "wall_ns": 29051000,
+          "maximum_resident_set_bytes": 16056320,
+          "stdout_bytes": 130346,
+          "stdout_sha256": "35e1ded052a0be47b15a8109d8626566c6356f8e62d38f3a1ef8f1eaf5282420",
+          "time_raw": "        0.02 real         0.02 user         0.00 sys\n            16056320  maximum resident set size\n                   0  average shared memory size\n                   0  average unshared data size\n                   0  average unshared stack size\n                1158  page reclaims\n                   0  page faults\n                   0  swaps\n                   0  block input operations\n                   0  block output operations\n                   0  messages sent\n                   0  messages received\n                   0  signals received\n                   0  voluntary context switches\n                   8  involuntary context switches\n           344727403  instructions retired\n            84750228  cycles elapsed\n            15057304  peak memory footprint\n"
+        },
+        "baseline": {
+          "wall_ns": 38333000,
+          "maximum_resident_set_bytes": 42614784,
+          "stdout_bytes": 130346,
+          "stdout_sha256": "35e1ded052a0be47b15a8109d8626566c6356f8e62d38f3a1ef8f1eaf5282420",
+          "time_raw": "        0.03 real         0.03 user         0.00 sys\n            42614784  maximum resident set size\n                   0  average shared memory size\n                   0  average unshared data size\n                   0  average unshared stack size\n                2779  page reclaims\n                   0  page faults\n                   0  swaps\n                   0  block input operations\n                   0  block output operations\n                   0  messages sent\n                   0  messages received\n                   0  signals received\n                   0  voluntary context switches\n                  14  involuntary context switches\n           454646503  instructions retired\n           113419622  cycles elapsed\n            41632176  peak memory footprint\n"
+        }
+      }
+    },
+    {
+      "round": 1,
+      "case": "events-512-projected",
+      "observations": {
+        "candidate": {
+          "wall_ns": 30116000,
+          "maximum_resident_set_bytes": 16203776,
+          "stdout_bytes": 285396,
+          "stdout_sha256": "4020442a861ae69b8772d11c8c6a69d8d9c45327f5ed3bde2d4e79a8a5e69047",
+          "time_raw": "        0.02 real         0.02 user         0.00 sys\n            16203776  maximum resident set size\n                   0  average shared memory size\n                   0  average unshared data size\n                   0  average unshared stack size\n                1168  page reclaims\n                   0  page faults\n                   0  swaps\n                   0  block input operations\n                   0  block output operations\n                   0  messages sent\n                   0  messages received\n                   0  signals received\n                   0  voluntary context switches\n                   6  involuntary context switches\n           351288765  instructions retired\n            87299793  cycles elapsed\n            15204760  peak memory footprint\n"
+        },
+        "baseline": {
+          "wall_ns": 37914000,
+          "maximum_resident_set_bytes": 42631168,
+          "stdout_bytes": 285396,
+          "stdout_sha256": "4020442a861ae69b8772d11c8c6a69d8d9c45327f5ed3bde2d4e79a8a5e69047",
+          "time_raw": "        0.03 real         0.02 user         0.00 sys\n            42631168  maximum resident set size\n                   0  average shared memory size\n                   0  average unshared data size\n                   0  average unshared stack size\n                2781  page reclaims\n                   0  page faults\n                   0  swaps\n                   0  block input operations\n                   0  block output operations\n                   0  messages sent\n                   0  messages received\n                   0  signals received\n                   0  voluntary context switches\n                  10  involuntary context switches\n           460835752  instructions retired\n           114285770  cycles elapsed\n            41664968  peak memory footprint\n"
+        }
+      }
+    },
+    {
+      "round": 1,
+      "case": "turns-64-full",
+      "observations": {
+        "candidate": {
+          "wall_ns": 7556000,
+          "maximum_resident_set_bytes": 4161536,
+          "stdout_bytes": 567131,
+          "stdout_sha256": "dfbbf37c14da7321da63d6a3506616f0c1c412ac0cd3176ed549ca50ea5abc8f",
+          "time_raw": "        0.00 real         0.00 user         0.00 sys\n             4161536  maximum resident set size\n                   0  average shared memory size\n                   0  average unshared data size\n                   0  average unshared stack size\n                 433  page reclaims\n                   0  page faults\n                   0  swaps\n                   0  block input operations\n                   0  block output operations\n                   0  messages sent\n                   0  messages received\n                   0  signals received\n                   0  voluntary context switches\n                   5  involuntary context switches\n            48378391  instructions retired\n            13029169  cycles elapsed\n             3146112  peak memory footprint\n"
+        },
+        "baseline": {
+          "wall_ns": 7860000,
+          "maximum_resident_set_bytes": 4128768,
+          "stdout_bytes": 567131,
+          "stdout_sha256": "dfbbf37c14da7321da63d6a3506616f0c1c412ac0cd3176ed549ca50ea5abc8f",
+          "time_raw": "        0.00 real         0.00 user         0.00 sys\n             4128768  maximum resident set size\n                   0  average shared memory size\n                   0  average unshared data size\n                   0  average unshared stack size\n                 431  page reclaims\n                   0  page faults\n                   0  swaps\n                   0  block input operations\n                   0  block output operations\n                   0  messages sent\n                   0  messages received\n                   0  signals received\n                   0  voluntary context switches\n                   7  involuntary context switches\n            48311221  instructions retired\n            12767809  cycles elapsed\n             3113344  peak memory footprint\n"
+        }
+      }
+    },
+    {
+      "round": 1,
+      "case": "turns-64-projected",
+      "observations": {
+        "candidate": {
+          "wall_ns": 6237000,
+          "maximum_resident_set_bytes": 2686976,
+          "stdout_bytes": 2680,
+          "stdout_sha256": "c243036247fc6e9be2c7657718b532d6b086f273bade1911bfdfeeaae4c70cd2",
+          "time_raw": "        0.00 real         0.00 user         0.00 sys\n             2686976  maximum resident set size\n                   0  average shared memory size\n                   0  average unshared data size\n                   0  average unshared stack size\n                 343  page reclaims\n                   0  page faults\n                   0  swaps\n                   0  block input operations\n                   0  block output operations\n                   0  messages sent\n                   0  messages received\n                   0  signals received\n                   0  voluntary context switches\n                   6  involuntary context switches\n            32514911  instructions retired\n             9477757  cycles elapsed\n             1671552  peak memory footprint\n"
+        },
+        "baseline": {
+          "wall_ns": 6027000,
+          "maximum_resident_set_bytes": 3391488,
+          "stdout_bytes": 2680,
+          "stdout_sha256": "c243036247fc6e9be2c7657718b532d6b086f273bade1911bfdfeeaae4c70cd2",
+          "time_raw": "        0.00 real         0.00 user         0.00 sys\n             3391488  maximum resident set size\n                   0  average shared memory size\n                   0  average unshared data size\n                   0  average unshared stack size\n                 385  page reclaims\n                   0  page faults\n                   0  swaps\n                   0  block input operations\n                   0  block output operations\n                   0  messages sent\n                   0  messages received\n                   0  signals received\n                   0  voluntary context switches\n                   8  involuntary context switches\n            33076555  instructions retired\n             9246069  cycles elapsed\n             2376064  peak memory footprint\n"
+        }
+      }
+    },
+    {
+      "round": 2,
+      "case": "messages-512-projected",
+      "observations": {
+        "baseline": {
+          "wall_ns": 37027000,
+          "maximum_resident_set_bytes": 43139072,
+          "stdout_bytes": 130346,
+          "stdout_sha256": "35e1ded052a0be47b15a8109d8626566c6356f8e62d38f3a1ef8f1eaf5282420",
+          "time_raw": "        0.03 real         0.02 user         0.00 sys\n            43139072  maximum resident set size\n                   0  average shared memory size\n                   0  average unshared data size\n                   0  average unshared stack size\n                2812  page reclaims\n                   0  page faults\n                   0  swaps\n                   0  block input operations\n                   0  block output operations\n                   0  messages sent\n                   0  messages received\n                   0  signals received\n                   0  voluntary context switches\n                   9  involuntary context switches\n           454761863  instructions retired\n           113388111  cycles elapsed\n            42156464  peak memory footprint\n"
+        },
+        "candidate": {
+          "wall_ns": 30391000,
+          "maximum_resident_set_bytes": 16072704,
+          "stdout_bytes": 130346,
+          "stdout_sha256": "35e1ded052a0be47b15a8109d8626566c6356f8e62d38f3a1ef8f1eaf5282420",
+          "time_raw": "        0.02 real         0.02 user         0.00 sys\n            16072704  maximum resident set size\n                   0  average shared memory size\n                   0  average unshared data size\n                   0  average unshared stack size\n                1160  page reclaims\n                   0  page faults\n                   0  swaps\n                   0  block input operations\n                   0  block output operations\n                   0  messages sent\n                   0  messages received\n                   0  signals received\n                   0  voluntary context switches\n                   9  involuntary context switches\n           344834391  instructions retired\n            88042077  cycles elapsed\n            15073688  peak memory footprint\n"
+        }
+      }
+    },
+    {
+      "round": 2,
+      "case": "events-512-projected",
+      "observations": {
+        "baseline": {
+          "wall_ns": 38372000,
+          "maximum_resident_set_bytes": 42844160,
+          "stdout_bytes": 285396,
+          "stdout_sha256": "4020442a861ae69b8772d11c8c6a69d8d9c45327f5ed3bde2d4e79a8a5e69047",
+          "time_raw": "        0.03 real         0.02 user         0.00 sys\n            42844160  maximum resident set size\n                   0  average shared memory size\n                   0  average unshared data size\n                   0  average unshared stack size\n                2795  page reclaims\n                   0  page faults\n                   0  swaps\n                   0  block input operations\n                   0  block output operations\n                   0  messages sent\n                   0  messages received\n                   0  signals received\n                   0  voluntary context switches\n                   7  involuntary context switches\n           460884429  instructions retired\n           114435160  cycles elapsed\n            41861552  peak memory footprint\n"
+        },
+        "candidate": {
+          "wall_ns": 29984000,
+          "maximum_resident_set_bytes": 16187392,
+          "stdout_bytes": 285396,
+          "stdout_sha256": "4020442a861ae69b8772d11c8c6a69d8d9c45327f5ed3bde2d4e79a8a5e69047",
+          "time_raw": "        0.02 real         0.02 user         0.00 sys\n            16187392  maximum resident set size\n                   0  average shared memory size\n                   0  average unshared data size\n                   0  average unshared stack size\n                1167  page reclaims\n                   0  page faults\n                   0  swaps\n                   0  block input operations\n                   0  block output operations\n                   0  messages sent\n                   0  messages received\n                   0  signals received\n                   0  voluntary context switches\n                   8  involuntary context switches\n           351328425  instructions retired\n            87836745  cycles elapsed\n            15188376  peak memory footprint\n"
+        }
+      }
+    },
+    {
+      "round": 2,
+      "case": "turns-64-full",
+      "observations": {
+        "baseline": {
+          "wall_ns": 7498000,
+          "maximum_resident_set_bytes": 4112384,
+          "stdout_bytes": 567131,
+          "stdout_sha256": "dfbbf37c14da7321da63d6a3506616f0c1c412ac0cd3176ed549ca50ea5abc8f",
+          "time_raw": "        0.00 real         0.00 user         0.00 sys\n             4112384  maximum resident set size\n                   0  average shared memory size\n                   0  average unshared data size\n                   0  average unshared stack size\n                 429  page reclaims\n                   0  page faults\n                   0  swaps\n                   0  block input operations\n                   0  block output operations\n                   0  messages sent\n                   0  messages received\n                   0  signals received\n                   0  voluntary context switches\n                   7  involuntary context switches\n            48287868  instructions retired\n            12691435  cycles elapsed\n             3096960  peak memory footprint\n"
+        },
+        "candidate": {
+          "wall_ns": 7535000,
+          "maximum_resident_set_bytes": 4177920,
+          "stdout_bytes": 567131,
+          "stdout_sha256": "dfbbf37c14da7321da63d6a3506616f0c1c412ac0cd3176ed549ca50ea5abc8f",
+          "time_raw": "        0.00 real         0.00 user         0.00 sys\n             4177920  maximum resident set size\n                   0  average shared memory size\n                   0  average unshared data size\n                   0  average unshared stack size\n                 434  page reclaims\n                   0  page faults\n                   0  swaps\n                   0  block input operations\n                   0  block output operations\n                   0  messages sent\n                   0  messages received\n                   0  signals received\n                   0  voluntary context switches\n                   6  involuntary context switches\n            48386810  instructions retired\n            12710402  cycles elapsed\n             3162496  peak memory footprint\n"
+        }
+      }
+    },
+    {
+      "round": 2,
+      "case": "turns-64-projected",
+      "observations": {
+        "baseline": {
+          "wall_ns": 6273000,
+          "maximum_resident_set_bytes": 3407872,
+          "stdout_bytes": 2680,
+          "stdout_sha256": "c243036247fc6e9be2c7657718b532d6b086f273bade1911bfdfeeaae4c70cd2",
+          "time_raw": "        0.00 real         0.00 user         0.00 sys\n             3407872  maximum resident set size\n                   0  average shared memory size\n                   0  average unshared data size\n                   0  average unshared stack size\n                 387  page reclaims\n                   0  page faults\n                   0  swaps\n                   0  block input operations\n                   0  block output operations\n                   0  messages sent\n                   0  messages received\n                   0  signals received\n                   0  voluntary context switches\n                   6  involuntary context switches\n            33043977  instructions retired\n             9402301  cycles elapsed\n             2392448  peak memory footprint\n"
+        },
+        "candidate": {
+          "wall_ns": 5961000,
+          "maximum_resident_set_bytes": 2703360,
+          "stdout_bytes": 2680,
+          "stdout_sha256": "c243036247fc6e9be2c7657718b532d6b086f273bade1911bfdfeeaae4c70cd2",
+          "time_raw": "        0.00 real         0.00 user         0.00 sys\n             2703360  maximum resident set size\n                   0  average shared memory size\n                   0  average unshared data size\n                   0  average unshared stack size\n                 344  page reclaims\n                   0  page faults\n                   0  swaps\n                   0  block input operations\n                   0  block output operations\n                   0  messages sent\n                   0  messages received\n                   0  signals received\n                   0  voluntary context switches\n                   6  involuntary context switches\n            32558801  instructions retired\n             9087489  cycles elapsed\n             1687936  peak memory footprint\n"
+        }
+      }
+    },
+    {
+      "round": 2,
+      "case": "turns-512-projected",
+      "observations": {
+        "baseline": {
+          "wall_ns": 17715000,
+          "maximum_resident_set_bytes": 14450688,
+          "stdout_bytes": 21908,
+          "stdout_sha256": "f6e5614160794026da2616d06ff85f55912d60a10aa7ac2dc600a32058dfb9d2",
+          "time_raw": "        0.01 real         0.01 user         0.00 sys\n            14450688  maximum resident set size\n                   0  average shared memory size\n                   0  average unshared data size\n                   0  average unshared stack size\n                1060  page reclaims\n                   0  page faults\n                   0  swaps\n                   0  block input operations\n                   0  block output operations\n                   0  messages sent\n                   0  messages received\n                   0  signals received\n                   0  voluntary context switches\n                   5  involuntary context switches\n           208999116  instructions retired\n            47121255  cycles elapsed\n            13451672  peak memory footprint\n"
+        },
+        "candidate": {
+          "wall_ns": 16552000,
+          "maximum_resident_set_bytes": 3047424,
+          "stdout_bytes": 21908,
+          "stdout_sha256": "f6e5614160794026da2616d06ff85f55912d60a10aa7ac2dc600a32058dfb9d2",
+          "time_raw": "        0.01 real         0.01 user         0.00 sys\n             3047424  maximum resident set size\n                   0  average shared memory size\n                   0  average unshared data size\n                   0  average unshared stack size\n                 364  page reclaims\n                   0  page faults\n                   0  swaps\n                   0  block input operations\n                   0  block output operations\n                   0  messages sent\n                   0  messages received\n                   0  signals received\n                   0  voluntary context switches\n                   3  involuntary context switches\n           201391239  instructions retired\n            43797711  cycles elapsed\n             2048408  peak memory footprint\n"
+        }
+      }
+    },
+    {
+      "round": 3,
+      "case": "events-512-projected",
+      "observations": {
+        "candidate": {
+          "wall_ns": 30083000,
+          "maximum_resident_set_bytes": 16302080,
+          "stdout_bytes": 285396,
+          "stdout_sha256": "4020442a861ae69b8772d11c8c6a69d8d9c45327f5ed3bde2d4e79a8a5e69047",
+          "time_raw": "        0.02 real         0.02 user         0.00 sys\n            16302080  maximum resident set size\n                   0  average shared memory size\n                   0  average unshared data size\n                   0  average unshared stack size\n                1174  page reclaims\n                   0  page faults\n                   0  swaps\n                   0  block input operations\n                   0  block output operations\n                   0  messages sent\n                   0  messages received\n                   0  signals received\n                   0  voluntary context switches\n                  11  involuntary context switches\n           351515937  instructions retired\n            88422188  cycles elapsed\n            15303064  peak memory footprint\n"
+        },
+        "baseline": {
+          "wall_ns": 38362000,
+          "maximum_resident_set_bytes": 42844160,
+          "stdout_bytes": 285396,
+          "stdout_sha256": "4020442a861ae69b8772d11c8c6a69d8d9c45327f5ed3bde2d4e79a8a5e69047",
+          "time_raw": "        0.03 real         0.02 user         0.00 sys\n            42844160  maximum resident set size\n                   0  average shared memory size\n                   0  average unshared data size\n                   0  average unshared stack size\n                2793  page reclaims\n                   0  page faults\n                   0  swaps\n                   0  block input operations\n                   0  block output operations\n                   0  messages sent\n                   0  messages received\n                   0  signals received\n                   0  voluntary context switches\n                  12  involuntary context switches\n           460997870  instructions retired\n           113956656  cycles elapsed\n            41861552  peak memory footprint\n"
+        }
+      }
+    },
+    {
+      "round": 3,
+      "case": "turns-64-full",
+      "observations": {
+        "candidate": {
+          "wall_ns": 7898000,
+          "maximum_resident_set_bytes": 4177920,
+          "stdout_bytes": 567131,
+          "stdout_sha256": "dfbbf37c14da7321da63d6a3506616f0c1c412ac0cd3176ed549ca50ea5abc8f",
+          "time_raw": "        0.00 real         0.00 user         0.00 sys\n             4177920  maximum resident set size\n                   0  average shared memory size\n                   0  average unshared data size\n                   0  average unshared stack size\n                 434  page reclaims\n                   0  page faults\n                   0  swaps\n                   0  block input operations\n                   0  block output operations\n                   0  messages sent\n                   0  messages received\n                   0  signals received\n                   0  voluntary context switches\n                   6  involuntary context switches\n            48400933  instructions retired\n            12940674  cycles elapsed\n             3162496  peak memory footprint\n"
+        },
+        "baseline": {
+          "wall_ns": 7297000,
+          "maximum_resident_set_bytes": 4112384,
+          "stdout_bytes": 567131,
+          "stdout_sha256": "dfbbf37c14da7321da63d6a3506616f0c1c412ac0cd3176ed549ca50ea5abc8f",
+          "time_raw": "        0.00 real         0.00 user         0.00 sys\n             4112384  maximum resident set size\n                   0  average shared memory size\n                   0  average unshared data size\n                   0  average unshared stack size\n                 429  page reclaims\n                   0  page faults\n                   0  swaps\n                   0  block input operations\n                   0  block output operations\n                   0  messages sent\n                   0  messages received\n                   0  signals received\n                   0  voluntary context switches\n                   5  involuntary context switches\n            48264748  instructions retired\n            12391080  cycles elapsed\n             3096960  peak memory footprint\n"
+        }
+      }
+    },
+    {
+      "round": 3,
+      "case": "turns-64-projected",
+      "observations": {
+        "candidate": {
+          "wall_ns": 7054000,
+          "maximum_resident_set_bytes": 2703360,
+          "stdout_bytes": 2680,
+          "stdout_sha256": "c243036247fc6e9be2c7657718b532d6b086f273bade1911bfdfeeaae4c70cd2",
+          "time_raw": "        0.00 real         0.00 user         0.00 sys\n             2703360  maximum resident set size\n                   0  average shared memory size\n                   0  average unshared data size\n                   0  average unshared stack size\n                 344  page reclaims\n                   0  page faults\n                   0  swaps\n                   0  block input operations\n                   0  block output operations\n                   0  messages sent\n                   0  messages received\n                   0  signals received\n                   0  voluntary context switches\n                   9  involuntary context switches\n            32641453  instructions retired\n            10084874  cycles elapsed\n             1687936  peak memory footprint\n"
+        },
+        "baseline": {
+          "wall_ns": 6677000,
+          "maximum_resident_set_bytes": 3391488,
+          "stdout_bytes": 2680,
+          "stdout_sha256": "c243036247fc6e9be2c7657718b532d6b086f273bade1911bfdfeeaae4c70cd2",
+          "time_raw": "        0.00 real         0.00 user         0.00 sys\n             3391488  maximum resident set size\n                   0  average shared memory size\n                   0  average unshared data size\n                   0  average unshared stack size\n                 386  page reclaims\n                   0  page faults\n                   0  swaps\n                   0  block input operations\n                   0  block output operations\n                   0  messages sent\n                   0  messages received\n                   0  signals received\n                   0  voluntary context switches\n                   8  involuntary context switches\n            33096314  instructions retired\n             9447113  cycles elapsed\n             2376064  peak memory footprint\n"
+        }
+      }
+    },
+    {
+      "round": 3,
+      "case": "turns-512-projected",
+      "observations": {
+        "candidate": {
+          "wall_ns": 16384000,
+          "maximum_resident_set_bytes": 3047424,
+          "stdout_bytes": 21908,
+          "stdout_sha256": "f6e5614160794026da2616d06ff85f55912d60a10aa7ac2dc600a32058dfb9d2",
+          "time_raw": "        0.01 real         0.01 user         0.00 sys\n             3047424  maximum resident set size\n                   0  average shared memory size\n                   0  average unshared data size\n                   0  average unshared stack size\n                 365  page reclaims\n                   0  page faults\n                   0  swaps\n                   0  block input operations\n                   0  block output operations\n                   0  messages sent\n                   0  messages received\n                   0  signals received\n                   0  voluntary context switches\n                   5  involuntary context switches\n           201481246  instructions retired\n            43525250  cycles elapsed\n             2048408  peak memory footprint\n"
+        },
+        "baseline": {
+          "wall_ns": 17580000,
+          "maximum_resident_set_bytes": 14401536,
+          "stdout_bytes": 21908,
+          "stdout_sha256": "f6e5614160794026da2616d06ff85f55912d60a10aa7ac2dc600a32058dfb9d2",
+          "time_raw": "        0.01 real         0.01 user         0.00 sys\n            14401536  maximum resident set size\n                   0  average shared memory size\n                   0  average unshared data size\n                   0  average unshared stack size\n                1057  page reclaims\n                   0  page faults\n                   0  swaps\n                   0  block input operations\n                   0  block output operations\n                   0  messages sent\n                   0  messages received\n                   0  signals received\n                   0  voluntary context switches\n                   7  involuntary context switches\n           209048023  instructions retired\n            46924711  cycles elapsed\n            13402520  peak memory footprint\n"
+        }
+      }
+    },
+    {
+      "round": 3,
+      "case": "messages-512-projected",
+      "observations": {
+        "candidate": {
+          "wall_ns": 29722000,
+          "maximum_resident_set_bytes": 15974400,
+          "stdout_bytes": 130346,
+          "stdout_sha256": "35e1ded052a0be47b15a8109d8626566c6356f8e62d38f3a1ef8f1eaf5282420",
+          "time_raw": "        0.02 real         0.02 user         0.00 sys\n            15974400  maximum resident set size\n                   0  average shared memory size\n                   0  average unshared data size\n                   0  average unshared stack size\n                1153  page reclaims\n                   0  page faults\n                   0  swaps\n                   0  block input operations\n                   0  block output operations\n                   0  messages sent\n                   0  messages received\n                   0  signals received\n                   0  voluntary context switches\n                  10  involuntary context switches\n           344564029  instructions retired\n            87782009  cycles elapsed\n            14975384  peak memory footprint\n"
+        },
+        "baseline": {
+          "wall_ns": 38608000,
+          "maximum_resident_set_bytes": 42565632,
+          "stdout_bytes": 130346,
+          "stdout_sha256": "35e1ded052a0be47b15a8109d8626566c6356f8e62d38f3a1ef8f1eaf5282420",
+          "time_raw": "        0.03 real         0.02 user         0.00 sys\n            42565632  maximum resident set size\n                   0  average shared memory size\n                   0  average unshared data size\n                   0  average unshared stack size\n                2776  page reclaims\n                   0  page faults\n                   0  swaps\n                   0  block input operations\n                   0  block output operations\n                   0  messages sent\n                   0  messages received\n                   0  signals received\n                   0  voluntary context switches\n                  10  involuntary context switches\n           454269156  instructions retired\n           114156788  cycles elapsed\n            41599432  peak memory footprint\n"
+        }
+      }
+    },
+    {
+      "round": 4,
+      "case": "turns-64-full",
+      "observations": {
+        "baseline": {
+          "wall_ns": 7796000,
+          "maximum_resident_set_bytes": 4128768,
+          "stdout_bytes": 567131,
+          "stdout_sha256": "dfbbf37c14da7321da63d6a3506616f0c1c412ac0cd3176ed549ca50ea5abc8f",
+          "time_raw": "        0.00 real         0.00 user         0.00 sys\n             4128768  maximum resident set size\n                   0  average shared memory size\n                   0  average unshared data size\n                   0  average unshared stack size\n                 430  page reclaims\n                   0  page faults\n                   0  swaps\n                   0  block input operations\n                   0  block output operations\n                   0  messages sent\n                   0  messages received\n                   0  signals received\n                   0  voluntary context switches\n                   8  involuntary context switches\n            48325024  instructions retired\n            13357676  cycles elapsed\n             3113344  peak memory footprint\n"
+        },
+        "candidate": {
+          "wall_ns": 7249000,
+          "maximum_resident_set_bytes": 4177920,
+          "stdout_bytes": 567131,
+          "stdout_sha256": "dfbbf37c14da7321da63d6a3506616f0c1c412ac0cd3176ed549ca50ea5abc8f",
+          "time_raw": "        0.00 real         0.00 user         0.00 sys\n             4177920  maximum resident set size\n                   0  average shared memory size\n                   0  average unshared data size\n                   0  average unshared stack size\n                 434  page reclaims\n                   0  page faults\n                   0  swaps\n                   0  block input operations\n                   0  block output operations\n                   0  messages sent\n                   0  messages received\n                   0  signals received\n                   0  voluntary context switches\n                   7  involuntary context switches\n            48396687  instructions retired\n            12876246  cycles elapsed\n             3162496  peak memory footprint\n"
+        }
+      }
+    },
+    {
+      "round": 4,
+      "case": "turns-64-projected",
+      "observations": {
+        "baseline": {
+          "wall_ns": 5771000,
+          "maximum_resident_set_bytes": 3407872,
+          "stdout_bytes": 2680,
+          "stdout_sha256": "c243036247fc6e9be2c7657718b532d6b086f273bade1911bfdfeeaae4c70cd2",
+          "time_raw": "        0.00 real         0.00 user         0.00 sys\n             3407872  maximum resident set size\n                   0  average shared memory size\n                   0  average unshared data size\n                   0  average unshared stack size\n                 386  page reclaims\n                   0  page faults\n                   0  swaps\n                   0  block input operations\n                   0  block output operations\n                   0  messages sent\n                   0  messages received\n                   0  signals received\n                   0  voluntary context switches\n                   5  involuntary context switches\n            33076847  instructions retired\n             9275271  cycles elapsed\n             2392448  peak memory footprint\n"
+        },
+        "candidate": {
+          "wall_ns": 5894000,
+          "maximum_resident_set_bytes": 2670592,
+          "stdout_bytes": 2680,
+          "stdout_sha256": "c243036247fc6e9be2c7657718b532d6b086f273bade1911bfdfeeaae4c70cd2",
+          "time_raw": "        0.00 real         0.00 user         0.00 sys\n             2670592  maximum resident set size\n                   0  average shared memory size\n                   0  average unshared data size\n                   0  average unshared stack size\n                 342  page reclaims\n                   0  page faults\n                   0  swaps\n                   0  block input operations\n                   0  block output operations\n                   0  messages sent\n                   0  messages received\n                   0  signals received\n                   0  voluntary context switches\n                   6  involuntary context switches\n            32584055  instructions retired\n             8882831  cycles elapsed\n             1655168  peak memory footprint\n"
+        }
+      }
+    },
+    {
+      "round": 4,
+      "case": "turns-512-projected",
+      "observations": {
+        "baseline": {
+          "wall_ns": 17883000,
+          "maximum_resident_set_bytes": 14450688,
+          "stdout_bytes": 21908,
+          "stdout_sha256": "f6e5614160794026da2616d06ff85f55912d60a10aa7ac2dc600a32058dfb9d2",
+          "time_raw": "        0.01 real         0.01 user         0.00 sys\n            14450688  maximum resident set size\n                   0  average shared memory size\n                   0  average unshared data size\n                   0  average unshared stack size\n                1060  page reclaims\n                   0  page faults\n                   0  swaps\n                   0  block input operations\n                   0  block output operations\n                   0  messages sent\n                   0  messages received\n                   0  signals received\n                   0  voluntary context switches\n                   9  involuntary context switches\n           209091969  instructions retired\n            47681519  cycles elapsed\n            13451672  peak memory footprint\n"
+        },
+        "candidate": {
+          "wall_ns": 17039000,
+          "maximum_resident_set_bytes": 3047424,
+          "stdout_bytes": 21908,
+          "stdout_sha256": "f6e5614160794026da2616d06ff85f55912d60a10aa7ac2dc600a32058dfb9d2",
+          "time_raw": "        0.01 real         0.01 user         0.00 sys\n             3047424  maximum resident set size\n                   0  average shared memory size\n                   0  average unshared data size\n                   0  average unshared stack size\n                 364  page reclaims\n                   0  page faults\n                   0  swaps\n                   0  block input operations\n                   0  block output operations\n                   0  messages sent\n                   0  messages received\n                   0  signals received\n                   0  voluntary context switches\n                   7  involuntary context switches\n           201513841  instructions retired\n            44014565  cycles elapsed\n             2048408  peak memory footprint\n"
+        }
+      }
+    },
+    {
+      "round": 4,
+      "case": "messages-512-projected",
+      "observations": {
+        "baseline": {
+          "wall_ns": 37605000,
+          "maximum_resident_set_bytes": 42631168,
+          "stdout_bytes": 130346,
+          "stdout_sha256": "35e1ded052a0be47b15a8109d8626566c6356f8e62d38f3a1ef8f1eaf5282420",
+          "time_raw": "        0.03 real         0.02 user         0.00 sys\n            42631168  maximum resident set size\n                   0  average shared memory size\n                   0  average unshared data size\n                   0  average unshared stack size\n                2780  page reclaims\n                   0  page faults\n                   0  swaps\n                   0  block input operations\n                   0  block output operations\n                   0  messages sent\n                   0  messages received\n                   0  signals received\n                   0  voluntary context switches\n                  10  involuntary context switches\n           454479899  instructions retired\n           112726795  cycles elapsed\n            41664968  peak memory footprint\n"
+        },
+        "candidate": {
+          "wall_ns": 29638000,
+          "maximum_resident_set_bytes": 16089088,
+          "stdout_bytes": 130346,
+          "stdout_sha256": "35e1ded052a0be47b15a8109d8626566c6356f8e62d38f3a1ef8f1eaf5282420",
+          "time_raw": "        0.02 real         0.02 user         0.00 sys\n            16089088  maximum resident set size\n                   0  average shared memory size\n                   0  average unshared data size\n                   0  average unshared stack size\n                1161  page reclaims\n                   0  page faults\n                   0  swaps\n                   0  block input operations\n                   0  block output operations\n                   0  messages sent\n                   0  messages received\n                   0  signals received\n                   0  voluntary context switches\n                   7  involuntary context switches\n           344736522  instructions retired\n            85856695  cycles elapsed\n            15090072  peak memory footprint\n"
+        }
+      }
+    },
+    {
+      "round": 4,
+      "case": "events-512-projected",
+      "observations": {
+        "baseline": {
+          "wall_ns": 38099000,
+          "maximum_resident_set_bytes": 42844160,
+          "stdout_bytes": 285396,
+          "stdout_sha256": "4020442a861ae69b8772d11c8c6a69d8d9c45327f5ed3bde2d4e79a8a5e69047",
+          "time_raw": "        0.03 real         0.02 user         0.00 sys\n            42844160  maximum resident set size\n                   0  average shared memory size\n                   0  average unshared data size\n                   0  average unshared stack size\n                2794  page reclaims\n                   0  page faults\n                   0  swaps\n                   0  block input operations\n                   0  block output operations\n                   0  messages sent\n                   0  messages received\n                   0  signals received\n                   0  voluntary context switches\n                   6  involuntary context switches\n           460913554  instructions retired\n           113522856  cycles elapsed\n            41861552  peak memory footprint\n"
+        },
+        "candidate": {
+          "wall_ns": 30444000,
+          "maximum_resident_set_bytes": 16269312,
+          "stdout_bytes": 285396,
+          "stdout_sha256": "4020442a861ae69b8772d11c8c6a69d8d9c45327f5ed3bde2d4e79a8a5e69047",
+          "time_raw": "        0.02 real         0.02 user         0.00 sys\n            16269312  maximum resident set size\n                   0  average shared memory size\n                   0  average unshared data size\n                   0  average unshared stack size\n                1172  page reclaims\n                   0  page faults\n                   0  swaps\n                   0  block input operations\n                   0  block output operations\n                   0  messages sent\n                   0  messages received\n                   0  signals received\n                   0  voluntary context switches\n                   8  involuntary context switches\n           351659968  instructions retired\n            89119048  cycles elapsed\n            15270296  peak memory footprint\n"
+        }
+      }
+    },
+    {
+      "round": 5,
+      "case": "turns-64-projected",
+      "observations": {
+        "candidate": {
+          "wall_ns": 6785000,
+          "maximum_resident_set_bytes": 2703360,
+          "stdout_bytes": 2680,
+          "stdout_sha256": "c243036247fc6e9be2c7657718b532d6b086f273bade1911bfdfeeaae4c70cd2",
+          "time_raw": "        0.00 real         0.00 user         0.00 sys\n             2703360  maximum resident set size\n                   0  average shared memory size\n                   0  average unshared data size\n                   0  average unshared stack size\n                 344  page reclaims\n                   0  page faults\n                   0  swaps\n                   0  block input operations\n                   0  block output operations\n                   0  messages sent\n                   0  messages received\n                   0  signals received\n                   0  voluntary context switches\n                   8  involuntary context switches\n            32598653  instructions retired\n             9287806  cycles elapsed\n             1687936  peak memory footprint\n"
+        },
+        "baseline": {
+          "wall_ns": 5883000,
+          "maximum_resident_set_bytes": 3375104,
+          "stdout_bytes": 2680,
+          "stdout_sha256": "c243036247fc6e9be2c7657718b532d6b086f273bade1911bfdfeeaae4c70cd2",
+          "time_raw": "        0.00 real         0.00 user         0.00 sys\n             3375104  maximum resident set size\n                   0  average shared memory size\n                   0  average unshared data size\n                   0  average unshared stack size\n                 385  page reclaims\n                   0  page faults\n                   0  swaps\n                   0  block input operations\n                   0  block output operations\n                   0  messages sent\n                   0  messages received\n                   0  signals received\n                   0  voluntary context switches\n                   6  involuntary context switches\n            33054622  instructions retired\n             9217172  cycles elapsed\n             2359680  peak memory footprint\n"
+        }
+      }
+    },
+    {
+      "round": 5,
+      "case": "turns-512-projected",
+      "observations": {
+        "candidate": {
+          "wall_ns": 17010000,
+          "maximum_resident_set_bytes": 3112960,
+          "stdout_bytes": 21908,
+          "stdout_sha256": "f6e5614160794026da2616d06ff85f55912d60a10aa7ac2dc600a32058dfb9d2",
+          "time_raw": "        0.01 real         0.01 user         0.00 sys\n             3112960  maximum resident set size\n                   0  average shared memory size\n                   0  average unshared data size\n                   0  average unshared stack size\n                 368  page reclaims\n                   0  page faults\n                   0  swaps\n                   0  block input operations\n                   0  block output operations\n                   0  messages sent\n                   0  messages received\n                   0  signals received\n                   0  voluntary context switches\n                  12  involuntary context switches\n           201483788  instructions retired\n            44748241  cycles elapsed\n             2113944  peak memory footprint\n"
+        },
+        "baseline": {
+          "wall_ns": 17473000,
+          "maximum_resident_set_bytes": 14434304,
+          "stdout_bytes": 21908,
+          "stdout_sha256": "f6e5614160794026da2616d06ff85f55912d60a10aa7ac2dc600a32058dfb9d2",
+          "time_raw": "        0.01 real         0.01 user         0.00 sys\n            14434304  maximum resident set size\n                   0  average shared memory size\n                   0  average unshared data size\n                   0  average unshared stack size\n                1060  page reclaims\n                   0  page faults\n                   0  swaps\n                   0  block input operations\n                   0  block output operations\n                   0  messages sent\n                   0  messages received\n                   0  signals received\n                   0  voluntary context switches\n                   6  involuntary context switches\n           209086507  instructions retired\n            47401799  cycles elapsed\n            13435288  peak memory footprint\n"
+        }
+      }
+    },
+    {
+      "round": 5,
+      "case": "messages-512-projected",
+      "observations": {
+        "candidate": {
+          "wall_ns": 29705000,
+          "maximum_resident_set_bytes": 16121856,
+          "stdout_bytes": 130346,
+          "stdout_sha256": "35e1ded052a0be47b15a8109d8626566c6356f8e62d38f3a1ef8f1eaf5282420",
+          "time_raw": "        0.02 real         0.02 user         0.00 sys\n            16121856  maximum resident set size\n                   0  average shared memory size\n                   0  average unshared data size\n                   0  average unshared stack size\n                1162  page reclaims\n                   0  page faults\n                   0  swaps\n                   0  block input operations\n                   0  block output operations\n                   0  messages sent\n                   0  messages received\n                   0  signals received\n                   0  voluntary context switches\n                   8  involuntary context switches\n           344662772  instructions retired\n            86201862  cycles elapsed\n            15122840  peak memory footprint\n"
+        },
+        "baseline": {
+          "wall_ns": 38487000,
+          "maximum_resident_set_bytes": 42958848,
+          "stdout_bytes": 130346,
+          "stdout_sha256": "35e1ded052a0be47b15a8109d8626566c6356f8e62d38f3a1ef8f1eaf5282420",
+          "time_raw": "        0.03 real         0.03 user         0.00 sys\n            42958848  maximum resident set size\n                   0  average shared memory size\n                   0  average unshared data size\n                   0  average unshared stack size\n                2801  page reclaims\n                   0  page faults\n                   0  swaps\n                   0  block input operations\n                   0  block output operations\n                   0  messages sent\n                   0  messages received\n                   0  signals received\n                   0  voluntary context switches\n                  12  involuntary context switches\n           454609096  instructions retired\n           113464581  cycles elapsed\n            41976240  peak memory footprint\n"
+        }
+      }
+    },
+    {
+      "round": 5,
+      "case": "events-512-projected",
+      "observations": {
+        "candidate": {
+          "wall_ns": 30149000,
+          "maximum_resident_set_bytes": 16171008,
+          "stdout_bytes": 285396,
+          "stdout_sha256": "4020442a861ae69b8772d11c8c6a69d8d9c45327f5ed3bde2d4e79a8a5e69047",
+          "time_raw": "        0.02 real         0.02 user         0.00 sys\n            16171008  maximum resident set size\n                   0  average shared memory size\n                   0  average unshared data size\n                   0  average unshared stack size\n                1165  page reclaims\n                   0  page faults\n                   0  swaps\n                   0  block input operations\n                   0  block output operations\n                   0  messages sent\n                   0  messages received\n                   0  signals received\n                   0  voluntary context switches\n                   5  involuntary context switches\n           351225960  instructions retired\n            88369830  cycles elapsed\n            15171992  peak memory footprint\n"
+        },
+        "baseline": {
+          "wall_ns": 38267000,
+          "maximum_resident_set_bytes": 42876928,
+          "stdout_bytes": 285396,
+          "stdout_sha256": "4020442a861ae69b8772d11c8c6a69d8d9c45327f5ed3bde2d4e79a8a5e69047",
+          "time_raw": "        0.03 real         0.02 user         0.00 sys\n            42876928  maximum resident set size\n                   0  average shared memory size\n                   0  average unshared data size\n                   0  average unshared stack size\n                2796  page reclaims\n                   0  page faults\n                   0  swaps\n                   0  block input operations\n                   0  block output operations\n                   0  messages sent\n                   0  messages received\n                   0  signals received\n                   0  voluntary context switches\n                  10  involuntary context switches\n           461003663  instructions retired\n           114463479  cycles elapsed\n            41910728  peak memory footprint\n"
+        }
+      }
+    },
+    {
+      "round": 5,
+      "case": "turns-64-full",
+      "observations": {
+        "candidate": {
+          "wall_ns": 7882000,
+          "maximum_resident_set_bytes": 4177920,
+          "stdout_bytes": 567131,
+          "stdout_sha256": "dfbbf37c14da7321da63d6a3506616f0c1c412ac0cd3176ed549ca50ea5abc8f",
+          "time_raw": "        0.00 real         0.00 user         0.00 sys\n             4177920  maximum resident set size\n                   0  average shared memory size\n                   0  average unshared data size\n                   0  average unshared stack size\n                 434  page reclaims\n                   0  page faults\n                   0  swaps\n                   0  block input operations\n                   0  block output operations\n                   0  messages sent\n                   0  messages received\n                   0  signals received\n                   0  voluntary context switches\n                   7  involuntary context switches\n            48387937  instructions retired\n            12764616  cycles elapsed\n             3162496  peak memory footprint\n"
+        },
+        "baseline": {
+          "wall_ns": 7336000,
+          "maximum_resident_set_bytes": 4145152,
+          "stdout_bytes": 567131,
+          "stdout_sha256": "dfbbf37c14da7321da63d6a3506616f0c1c412ac0cd3176ed549ca50ea5abc8f",
+          "time_raw": "        0.00 real         0.00 user         0.00 sys\n             4145152  maximum resident set size\n                   0  average shared memory size\n                   0  average unshared data size\n                   0  average unshared stack size\n                 432  page reclaims\n                   0  page faults\n                   0  swaps\n                   0  block input operations\n                   0  block output operations\n                   0  messages sent\n                   0  messages received\n                   0  signals received\n                   0  voluntary context switches\n                   5  involuntary context switches\n            48332778  instructions retired\n            12640176  cycles elapsed\n             3129728  peak memory footprint\n"
+        }
+      }
+    },
+    {
+      "round": 6,
+      "case": "turns-512-projected",
+      "observations": {
+        "baseline": {
+          "wall_ns": 17575000,
+          "maximum_resident_set_bytes": 14434304,
+          "stdout_bytes": 21908,
+          "stdout_sha256": "f6e5614160794026da2616d06ff85f55912d60a10aa7ac2dc600a32058dfb9d2",
+          "time_raw": "        0.01 real         0.01 user         0.00 sys\n            14434304  maximum resident set size\n                   0  average shared memory size\n                   0  average unshared data size\n                   0  average unshared stack size\n                1060  page reclaims\n                   0  page faults\n                   0  swaps\n                   0  block input operations\n                   0  block output operations\n                   0  messages sent\n                   0  messages received\n                   0  signals received\n                   0  voluntary context switches\n                   8  involuntary context switches\n           209022340  instructions retired\n            46828020  cycles elapsed\n            13435288  peak memory footprint\n"
+        },
+        "candidate": {
+          "wall_ns": 16944000,
+          "maximum_resident_set_bytes": 3080192,
+          "stdout_bytes": 21908,
+          "stdout_sha256": "f6e5614160794026da2616d06ff85f55912d60a10aa7ac2dc600a32058dfb9d2",
+          "time_raw": "        0.01 real         0.01 user         0.00 sys\n             3080192  maximum resident set size\n                   0  average shared memory size\n                   0  average unshared data size\n                   0  average unshared stack size\n                 367  page reclaims\n                   0  page faults\n                   0  swaps\n                   0  block input operations\n                   0  block output operations\n                   0  messages sent\n                   0  messages received\n                   0  signals received\n                   0  voluntary context switches\n                  12  involuntary context switches\n           201558565  instructions retired\n            43816360  cycles elapsed\n             2081176  peak memory footprint\n"
+        }
+      }
+    },
+    {
+      "round": 6,
+      "case": "messages-512-projected",
+      "observations": {
+        "baseline": {
+          "wall_ns": 37438000,
+          "maximum_resident_set_bytes": 42467328,
+          "stdout_bytes": 130346,
+          "stdout_sha256": "35e1ded052a0be47b15a8109d8626566c6356f8e62d38f3a1ef8f1eaf5282420",
+          "time_raw": "        0.03 real         0.02 user         0.00 sys\n            42467328  maximum resident set size\n                   0  average shared memory size\n                   0  average unshared data size\n                   0  average unshared stack size\n                2771  page reclaims\n                   0  page faults\n                   0  swaps\n                   0  block input operations\n                   0  block output operations\n                   0  messages sent\n                   0  messages received\n                   0  signals received\n                   0  voluntary context switches\n                  17  involuntary context switches\n           454405130  instructions retired\n           113476012  cycles elapsed\n            41501128  peak memory footprint\n"
+        },
+        "candidate": {
+          "wall_ns": 30136000,
+          "maximum_resident_set_bytes": 15990784,
+          "stdout_bytes": 130346,
+          "stdout_sha256": "35e1ded052a0be47b15a8109d8626566c6356f8e62d38f3a1ef8f1eaf5282420",
+          "time_raw": "        0.02 real         0.02 user         0.00 sys\n            15990784  maximum resident set size\n                   0  average shared memory size\n                   0  average unshared data size\n                   0  average unshared stack size\n                1154  page reclaims\n                   0  page faults\n                   0  swaps\n                   0  block input operations\n                   0  block output operations\n                   0  messages sent\n                   0  messages received\n                   0  signals received\n                   0  voluntary context switches\n                   8  involuntary context switches\n           344640580  instructions retired\n            87683999  cycles elapsed\n            14991768  peak memory footprint\n"
+        }
+      }
+    },
+    {
+      "round": 6,
+      "case": "events-512-projected",
+      "observations": {
+        "baseline": {
+          "wall_ns": 37247000,
+          "maximum_resident_set_bytes": 42811392,
+          "stdout_bytes": 285396,
+          "stdout_sha256": "4020442a861ae69b8772d11c8c6a69d8d9c45327f5ed3bde2d4e79a8a5e69047",
+          "time_raw": "        0.03 real         0.02 user         0.00 sys\n            42811392  maximum resident set size\n                   0  average shared memory size\n                   0  average unshared data size\n                   0  average unshared stack size\n                2792  page reclaims\n                   0  page faults\n                   0  swaps\n                   0  block input operations\n                   0  block output operations\n                   0  messages sent\n                   0  messages received\n                   0  signals received\n                   0  voluntary context switches\n                   6  involuntary context switches\n           460920442  instructions retired\n           112434455  cycles elapsed\n            41828784  peak memory footprint\n"
+        },
+        "candidate": {
+          "wall_ns": 29985000,
+          "maximum_resident_set_bytes": 16285696,
+          "stdout_bytes": 285396,
+          "stdout_sha256": "4020442a861ae69b8772d11c8c6a69d8d9c45327f5ed3bde2d4e79a8a5e69047",
+          "time_raw": "        0.02 real         0.02 user         0.00 sys\n            16285696  maximum resident set size\n                   0  average shared memory size\n                   0  average unshared data size\n                   0  average unshared stack size\n                1172  page reclaims\n                   0  page faults\n                   0  swaps\n                   0  block input operations\n                   0  block output operations\n                   0  messages sent\n                   0  messages received\n                   0  signals received\n                   0  voluntary context switches\n                   8  involuntary context switches\n           351214311  instructions retired\n            87102446  cycles elapsed\n            15286680  peak memory footprint\n"
+        }
+      }
+    },
+    {
+      "round": 6,
+      "case": "turns-64-full",
+      "observations": {
+        "baseline": {
+          "wall_ns": 7956000,
+          "maximum_resident_set_bytes": 4128768,
+          "stdout_bytes": 567131,
+          "stdout_sha256": "dfbbf37c14da7321da63d6a3506616f0c1c412ac0cd3176ed549ca50ea5abc8f",
+          "time_raw": "        0.00 real         0.00 user         0.00 sys\n             4128768  maximum resident set size\n                   0  average shared memory size\n                   0  average unshared data size\n                   0  average unshared stack size\n                 430  page reclaims\n                   0  page faults\n                   0  swaps\n                   0  block input operations\n                   0  block output operations\n                   0  messages sent\n                   0  messages received\n                   0  signals received\n                   0  voluntary context switches\n                   6  involuntary context switches\n            48297093  instructions retired\n            13618116  cycles elapsed\n             3113344  peak memory footprint\n"
+        },
+        "candidate": {
+          "wall_ns": 7344000,
+          "maximum_resident_set_bytes": 4177920,
+          "stdout_bytes": 567131,
+          "stdout_sha256": "dfbbf37c14da7321da63d6a3506616f0c1c412ac0cd3176ed549ca50ea5abc8f",
+          "time_raw": "        0.00 real         0.00 user         0.00 sys\n             4177920  maximum resident set size\n                   0  average shared memory size\n                   0  average unshared data size\n                   0  average unshared stack size\n                 433  page reclaims\n                   0  page faults\n                   0  swaps\n                   0  block input operations\n                   0  block output operations\n                   0  messages sent\n                   0  messages received\n                   0  signals received\n                   0  voluntary context switches\n                   7  involuntary context switches\n            48397205  instructions retired\n            13023221  cycles elapsed\n             3162496  peak memory footprint\n"
+        }
+      }
+    },
+    {
+      "round": 6,
+      "case": "turns-64-projected",
+      "observations": {
+        "baseline": {
+          "wall_ns": 6290000,
+          "maximum_resident_set_bytes": 3391488,
+          "stdout_bytes": 2680,
+          "stdout_sha256": "c243036247fc6e9be2c7657718b532d6b086f273bade1911bfdfeeaae4c70cd2",
+          "time_raw": "        0.00 real         0.00 user         0.00 sys\n             3391488  maximum resident set size\n                   0  average shared memory size\n                   0  average unshared data size\n                   0  average unshared stack size\n                 386  page reclaims\n                   0  page faults\n                   0  swaps\n                   0  block input operations\n                   0  block output operations\n                   0  messages sent\n                   0  messages received\n                   0  signals received\n                   0  voluntary context switches\n                   7  involuntary context switches\n            33125686  instructions retired\n             9337594  cycles elapsed\n             2376064  peak memory footprint\n"
+        },
+        "candidate": {
+          "wall_ns": 5895000,
+          "maximum_resident_set_bytes": 2686976,
+          "stdout_bytes": 2680,
+          "stdout_sha256": "c243036247fc6e9be2c7657718b532d6b086f273bade1911bfdfeeaae4c70cd2",
+          "time_raw": "        0.00 real         0.00 user         0.00 sys\n             2686976  maximum resident set size\n                   0  average shared memory size\n                   0  average unshared data size\n                   0  average unshared stack size\n                 343  page reclaims\n                   0  page faults\n                   0  swaps\n                   0  block input operations\n                   0  block output operations\n                   0  messages sent\n                   0  messages received\n                   0  signals received\n                   0  voluntary context switches\n                   6  involuntary context switches\n            32556434  instructions retired\n             9197178  cycles elapsed\n             1671552  peak memory footprint\n"
+        }
+      }
+    },
+    {
+      "round": 7,
+      "case": "messages-512-projected",
+      "observations": {
+        "candidate": {
+          "wall_ns": 29104000,
+          "maximum_resident_set_bytes": 16105472,
+          "stdout_bytes": 130346,
+          "stdout_sha256": "35e1ded052a0be47b15a8109d8626566c6356f8e62d38f3a1ef8f1eaf5282420",
+          "time_raw": "        0.02 real         0.02 user         0.00 sys\n            16105472  maximum resident set size\n                   0  average shared memory size\n                   0  average unshared data size\n                   0  average unshared stack size\n                1162  page reclaims\n                   0  page faults\n                   0  swaps\n                   0  block input operations\n                   0  block output operations\n                   0  messages sent\n                   0  messages received\n                   0  signals received\n                   0  voluntary context switches\n                   8  involuntary context switches\n           344718472  instructions retired\n            86211750  cycles elapsed\n            15106456  peak memory footprint\n"
+        },
+        "baseline": {
+          "wall_ns": 37881000,
+          "maximum_resident_set_bytes": 42516480,
+          "stdout_bytes": 130346,
+          "stdout_sha256": "35e1ded052a0be47b15a8109d8626566c6356f8e62d38f3a1ef8f1eaf5282420",
+          "time_raw": "        0.03 real         0.02 user         0.00 sys\n            42516480  maximum resident set size\n                   0  average shared memory size\n                   0  average unshared data size\n                   0  average unshared stack size\n                2773  page reclaims\n                   0  page faults\n                   0  swaps\n                   0  block input operations\n                   0  block output operations\n                   0  messages sent\n                   0  messages received\n                   0  signals received\n                   0  voluntary context switches\n                  11  involuntary context switches\n           454512912  instructions retired\n           113645282  cycles elapsed\n            41550280  peak memory footprint\n"
+        }
+      }
+    },
+    {
+      "round": 7,
+      "case": "events-512-projected",
+      "observations": {
+        "candidate": {
+          "wall_ns": 30194000,
+          "maximum_resident_set_bytes": 16220160,
+          "stdout_bytes": 285396,
+          "stdout_sha256": "4020442a861ae69b8772d11c8c6a69d8d9c45327f5ed3bde2d4e79a8a5e69047",
+          "time_raw": "        0.02 real         0.02 user         0.00 sys\n            16220160  maximum resident set size\n                   0  average shared memory size\n                   0  average unshared data size\n                   0  average unshared stack size\n                1169  page reclaims\n                   0  page faults\n                   0  swaps\n                   0  block input operations\n                   0  block output operations\n                   0  messages sent\n                   0  messages received\n                   0  signals received\n                   0  voluntary context switches\n                   9  involuntary context switches\n           351269595  instructions retired\n            87361945  cycles elapsed\n            15221144  peak memory footprint\n"
+        },
+        "baseline": {
+          "wall_ns": 38197000,
+          "maximum_resident_set_bytes": 42827776,
+          "stdout_bytes": 285396,
+          "stdout_sha256": "4020442a861ae69b8772d11c8c6a69d8d9c45327f5ed3bde2d4e79a8a5e69047",
+          "time_raw": "        0.03 real         0.03 user         0.00 sys\n            42827776  maximum resident set size\n                   0  average shared memory size\n                   0  average unshared data size\n                   0  average unshared stack size\n                2793  page reclaims\n                   0  page faults\n                   0  swaps\n                   0  block input operations\n                   0  block output operations\n                   0  messages sent\n                   0  messages received\n                   0  signals received\n                   0  voluntary context switches\n                  12  involuntary context switches\n           460816804  instructions retired\n           112738477  cycles elapsed\n            41845168  peak memory footprint\n"
+        }
+      }
+    },
+    {
+      "round": 7,
+      "case": "turns-64-full",
+      "observations": {
+        "candidate": {
+          "wall_ns": 7773000,
+          "maximum_resident_set_bytes": 4177920,
+          "stdout_bytes": 567131,
+          "stdout_sha256": "dfbbf37c14da7321da63d6a3506616f0c1c412ac0cd3176ed549ca50ea5abc8f",
+          "time_raw": "        0.00 real         0.00 user         0.00 sys\n             4177920  maximum resident set size\n                   0  average shared memory size\n                   0  average unshared data size\n                   0  average unshared stack size\n                 434  page reclaims\n                   0  page faults\n                   0  swaps\n                   0  block input operations\n                   0  block output operations\n                   0  messages sent\n                   0  messages received\n                   0  signals received\n                   0  voluntary context switches\n                   7  involuntary context switches\n            48413367  instructions retired\n            12814366  cycles elapsed\n             3162496  peak memory footprint\n"
+        },
+        "baseline": {
+          "wall_ns": 7427000,
+          "maximum_resident_set_bytes": 4145152,
+          "stdout_bytes": 567131,
+          "stdout_sha256": "dfbbf37c14da7321da63d6a3506616f0c1c412ac0cd3176ed549ca50ea5abc8f",
+          "time_raw": "        0.00 real         0.00 user         0.00 sys\n             4145152  maximum resident set size\n                   0  average shared memory size\n                   0  average unshared data size\n                   0  average unshared stack size\n                 432  page reclaims\n                   0  page faults\n                   0  swaps\n                   0  block input operations\n                   0  block output operations\n                   0  messages sent\n                   0  messages received\n                   0  signals received\n                   0  voluntary context switches\n                   6  involuntary context switches\n            48315261  instructions retired\n            12564948  cycles elapsed\n             3129728  peak memory footprint\n"
+        }
+      }
+    },
+    {
+      "round": 7,
+      "case": "turns-64-projected",
+      "observations": {
+        "candidate": {
+          "wall_ns": 5904000,
+          "maximum_resident_set_bytes": 2686976,
+          "stdout_bytes": 2680,
+          "stdout_sha256": "c243036247fc6e9be2c7657718b532d6b086f273bade1911bfdfeeaae4c70cd2",
+          "time_raw": "        0.00 real         0.00 user         0.00 sys\n             2686976  maximum resident set size\n                   0  average shared memory size\n                   0  average unshared data size\n                   0  average unshared stack size\n                 342  page reclaims\n                   0  page faults\n                   0  swaps\n                   0  block input operations\n                   0  block output operations\n                   0  messages sent\n                   0  messages received\n                   0  signals received\n                   0  voluntary context switches\n                   4  involuntary context switches\n            32539305  instructions retired\n             9006213  cycles elapsed\n             1671552  peak memory footprint\n"
+        },
+        "baseline": {
+          "wall_ns": 6529000,
+          "maximum_resident_set_bytes": 3391488,
+          "stdout_bytes": 2680,
+          "stdout_sha256": "c243036247fc6e9be2c7657718b532d6b086f273bade1911bfdfeeaae4c70cd2",
+          "time_raw": "        0.00 real         0.00 user         0.00 sys\n             3391488  maximum resident set size\n                   0  average shared memory size\n                   0  average unshared data size\n                   0  average unshared stack size\n                 386  page reclaims\n                   0  page faults\n                   0  swaps\n                   0  block input operations\n                   0  block output operations\n                   0  messages sent\n                   0  messages received\n                   0  signals received\n                   0  voluntary context switches\n                   7  involuntary context switches\n            33093839  instructions retired\n             9480775  cycles elapsed\n             2376064  peak memory footprint\n"
+        }
+      }
+    },
+    {
+      "round": 7,
+      "case": "turns-512-projected",
+      "observations": {
+        "candidate": {
+          "wall_ns": 16078000,
+          "maximum_resident_set_bytes": 3080192,
+          "stdout_bytes": 21908,
+          "stdout_sha256": "f6e5614160794026da2616d06ff85f55912d60a10aa7ac2dc600a32058dfb9d2",
+          "time_raw": "        0.01 real         0.01 user         0.00 sys\n             3080192  maximum resident set size\n                   0  average shared memory size\n                   0  average unshared data size\n                   0  average unshared stack size\n                 367  page reclaims\n                   0  page faults\n                   0  swaps\n                   0  block input operations\n                   0  block output operations\n                   0  messages sent\n                   0  messages received\n                   0  signals received\n                   0  voluntary context switches\n                   6  involuntary context switches\n           201486440  instructions retired\n            43576691  cycles elapsed\n             2081176  peak memory footprint\n"
+        },
+        "baseline": {
+          "wall_ns": 17904000,
+          "maximum_resident_set_bytes": 14450688,
+          "stdout_bytes": 21908,
+          "stdout_sha256": "f6e5614160794026da2616d06ff85f55912d60a10aa7ac2dc600a32058dfb9d2",
+          "time_raw": "        0.01 real         0.01 user         0.00 sys\n            14450688  maximum resident set size\n                   0  average shared memory size\n                   0  average unshared data size\n                   0  average unshared stack size\n                1060  page reclaims\n                   0  page faults\n                   0  swaps\n                   0  block input operations\n                   0  block output operations\n                   0  messages sent\n                   0  messages received\n                   0  signals received\n                   0  voluntary context switches\n                   9  involuntary context switches\n           209023907  instructions retired\n            47015226  cycles elapsed\n            13451672  peak memory footprint\n"
+        }
+      }
+    },
+    {
+      "round": 8,
+      "case": "events-512-projected",
+      "observations": {
+        "baseline": {
+          "wall_ns": 38002000,
+          "maximum_resident_set_bytes": 42975232,
+          "stdout_bytes": 285396,
+          "stdout_sha256": "4020442a861ae69b8772d11c8c6a69d8d9c45327f5ed3bde2d4e79a8a5e69047",
+          "time_raw": "        0.03 real         0.02 user         0.00 sys\n            42975232  maximum resident set size\n                   0  average shared memory size\n                   0  average unshared data size\n                   0  average unshared stack size\n                2802  page reclaims\n                   0  page faults\n                   0  swaps\n                   0  block input operations\n                   0  block output operations\n                   0  messages sent\n                   0  messages received\n                   0  signals received\n                   0  voluntary context switches\n                  14  involuntary context switches\n           460980477  instructions retired\n           113772846  cycles elapsed\n            41992624  peak memory footprint\n"
+        },
+        "candidate": {
+          "wall_ns": 30340000,
+          "maximum_resident_set_bytes": 16252928,
+          "stdout_bytes": 285396,
+          "stdout_sha256": "4020442a861ae69b8772d11c8c6a69d8d9c45327f5ed3bde2d4e79a8a5e69047",
+          "time_raw": "        0.02 real         0.02 user         0.00 sys\n            16252928  maximum resident set size\n                   0  average shared memory size\n                   0  average unshared data size\n                   0  average unshared stack size\n                1171  page reclaims\n                   0  page faults\n                   0  swaps\n                   0  block input operations\n                   0  block output operations\n                   0  messages sent\n                   0  messages received\n                   0  signals received\n                   0  voluntary context switches\n                   6  involuntary context switches\n           351319587  instructions retired\n            88232564  cycles elapsed\n            15253912  peak memory footprint\n"
+        }
+      }
+    },
+    {
+      "round": 8,
+      "case": "turns-64-full",
+      "observations": {
+        "baseline": {
+          "wall_ns": 7241000,
+          "maximum_resident_set_bytes": 4145152,
+          "stdout_bytes": 567131,
+          "stdout_sha256": "dfbbf37c14da7321da63d6a3506616f0c1c412ac0cd3176ed549ca50ea5abc8f",
+          "time_raw": "        0.00 real         0.00 user         0.00 sys\n             4145152  maximum resident set size\n                   0  average shared memory size\n                   0  average unshared data size\n                   0  average unshared stack size\n                 431  page reclaims\n                   0  page faults\n                   0  swaps\n                   0  block input operations\n                   0  block output operations\n                   0  messages sent\n                   0  messages received\n                   0  signals received\n                   0  voluntary context switches\n                   6  involuntary context switches\n            48276916  instructions retired\n            12732489  cycles elapsed\n             3129728  peak memory footprint\n"
+        },
+        "candidate": {
+          "wall_ns": 7181000,
+          "maximum_resident_set_bytes": 4177920,
+          "stdout_bytes": 567131,
+          "stdout_sha256": "dfbbf37c14da7321da63d6a3506616f0c1c412ac0cd3176ed549ca50ea5abc8f",
+          "time_raw": "        0.00 real         0.00 user         0.00 sys\n             4177920  maximum resident set size\n                   0  average shared memory size\n                   0  average unshared data size\n                   0  average unshared stack size\n                 434  page reclaims\n                   0  page faults\n                   0  swaps\n                   0  block input operations\n                   0  block output operations\n                   0  messages sent\n                   0  messages received\n                   0  signals received\n                   0  voluntary context switches\n                   7  involuntary context switches\n            48426766  instructions retired\n            12582501  cycles elapsed\n             3162496  peak memory footprint\n"
+        }
+      }
+    },
+    {
+      "round": 8,
+      "case": "turns-64-projected",
+      "observations": {
+        "baseline": {
+          "wall_ns": 5758000,
+          "maximum_resident_set_bytes": 3391488,
+          "stdout_bytes": 2680,
+          "stdout_sha256": "c243036247fc6e9be2c7657718b532d6b086f273bade1911bfdfeeaae4c70cd2",
+          "time_raw": "        0.00 real         0.00 user         0.00 sys\n             3391488  maximum resident set size\n                   0  average shared memory size\n                   0  average unshared data size\n                   0  average unshared stack size\n                 385  page reclaims\n                   0  page faults\n                   0  swaps\n                   0  block input operations\n                   0  block output operations\n                   0  messages sent\n                   0  messages received\n                   0  signals received\n                   0  voluntary context switches\n                   6  involuntary context switches\n            33200004  instructions retired\n             9141043  cycles elapsed\n             2376064  peak memory footprint\n"
+        },
+        "candidate": {
+          "wall_ns": 5778000,
+          "maximum_resident_set_bytes": 2703360,
+          "stdout_bytes": 2680,
+          "stdout_sha256": "c243036247fc6e9be2c7657718b532d6b086f273bade1911bfdfeeaae4c70cd2",
+          "time_raw": "        0.00 real         0.00 user         0.00 sys\n             2703360  maximum resident set size\n                   0  average shared memory size\n                   0  average unshared data size\n                   0  average unshared stack size\n                 344  page reclaims\n                   0  page faults\n                   0  swaps\n                   0  block input operations\n                   0  block output operations\n                   0  messages sent\n                   0  messages received\n                   0  signals received\n                   0  voluntary context switches\n                   8  involuntary context switches\n            32572531  instructions retired\n             9006344  cycles elapsed\n             1687936  peak memory footprint\n"
+        }
+      }
+    },
+    {
+      "round": 8,
+      "case": "turns-512-projected",
+      "observations": {
+        "baseline": {
+          "wall_ns": 17821000,
+          "maximum_resident_set_bytes": 14401536,
+          "stdout_bytes": 21908,
+          "stdout_sha256": "f6e5614160794026da2616d06ff85f55912d60a10aa7ac2dc600a32058dfb9d2",
+          "time_raw": "        0.01 real         0.01 user         0.00 sys\n            14401536  maximum resident set size\n                   0  average shared memory size\n                   0  average unshared data size\n                   0  average unshared stack size\n                1059  page reclaims\n                   0  page faults\n                   0  swaps\n                   0  block input operations\n                   0  block output operations\n                   0  messages sent\n                   0  messages received\n                   0  signals received\n                   0  voluntary context switches\n                   4  involuntary context switches\n           209026134  instructions retired\n            47808470  cycles elapsed\n            13402520  peak memory footprint\n"
+        },
+        "candidate": {
+          "wall_ns": 16959000,
+          "maximum_resident_set_bytes": 3047424,
+          "stdout_bytes": 21908,
+          "stdout_sha256": "f6e5614160794026da2616d06ff85f55912d60a10aa7ac2dc600a32058dfb9d2",
+          "time_raw": "        0.01 real         0.01 user         0.00 sys\n             3047424  maximum resident set size\n                   0  average shared memory size\n                   0  average unshared data size\n                   0  average unshared stack size\n                 364  page reclaims\n                   0  page faults\n                   0  swaps\n                   0  block input operations\n                   0  block output operations\n                   0  messages sent\n                   0  messages received\n                   0  signals received\n                   0  voluntary context switches\n                   7  involuntary context switches\n           201375774  instructions retired\n            44053033  cycles elapsed\n             2048408  peak memory footprint\n"
+        }
+      }
+    },
+    {
+      "round": 8,
+      "case": "messages-512-projected",
+      "observations": {
+        "baseline": {
+          "wall_ns": 37963000,
+          "maximum_resident_set_bytes": 43171840,
+          "stdout_bytes": 130346,
+          "stdout_sha256": "35e1ded052a0be47b15a8109d8626566c6356f8e62d38f3a1ef8f1eaf5282420",
+          "time_raw": "        0.03 real         0.02 user         0.00 sys\n            43171840  maximum resident set size\n                   0  average shared memory size\n                   0  average unshared data size\n                   0  average unshared stack size\n                2813  page reclaims\n                   0  page faults\n                   0  swaps\n                   0  block input operations\n                   0  block output operations\n                   0  messages sent\n                   0  messages received\n                   0  signals received\n                   0  voluntary context switches\n                  10  involuntary context switches\n           454801007  instructions retired\n           114528753  cycles elapsed\n            42205640  peak memory footprint\n"
+        },
+        "candidate": {
+          "wall_ns": 30967000,
+          "maximum_resident_set_bytes": 16023552,
+          "stdout_bytes": 130346,
+          "stdout_sha256": "35e1ded052a0be47b15a8109d8626566c6356f8e62d38f3a1ef8f1eaf5282420",
+          "time_raw": "        0.02 real         0.02 user         0.00 sys\n            16023552  maximum resident set size\n                   0  average shared memory size\n                   0  average unshared data size\n                   0  average unshared stack size\n                1157  page reclaims\n                   0  page faults\n                   0  swaps\n                   0  block input operations\n                   0  block output operations\n                   0  messages sent\n                   0  messages received\n                   0  signals received\n                   0  voluntary context switches\n                  12  involuntary context switches\n           344735593  instructions retired\n            88796366  cycles elapsed\n            15024536  peak memory footprint\n"
+        }
+      }
+    },
+    {
+      "round": 9,
+      "case": "turns-64-full",
+      "observations": {
+        "candidate": {
+          "wall_ns": 7560000,
+          "maximum_resident_set_bytes": 4145152,
+          "stdout_bytes": 567131,
+          "stdout_sha256": "dfbbf37c14da7321da63d6a3506616f0c1c412ac0cd3176ed549ca50ea5abc8f",
+          "time_raw": "        0.00 real         0.00 user         0.00 sys\n             4145152  maximum resident set size\n                   0  average shared memory size\n                   0  average unshared data size\n                   0  average unshared stack size\n                 432  page reclaims\n                   0  page faults\n                   0  swaps\n                   0  block input operations\n                   0  block output operations\n                   0  messages sent\n                   0  messages received\n                   0  signals received\n                   0  voluntary context switches\n                   6  involuntary context switches\n            48385071  instructions retired\n            12853160  cycles elapsed\n             3129728  peak memory footprint\n"
+        },
+        "baseline": {
+          "wall_ns": 7117000,
+          "maximum_resident_set_bytes": 4128768,
+          "stdout_bytes": 567131,
+          "stdout_sha256": "dfbbf37c14da7321da63d6a3506616f0c1c412ac0cd3176ed549ca50ea5abc8f",
+          "time_raw": "        0.00 real         0.00 user         0.00 sys\n             4128768  maximum resident set size\n                   0  average shared memory size\n                   0  average unshared data size\n                   0  average unshared stack size\n                 431  page reclaims\n                   0  page faults\n                   0  swaps\n                   0  block input operations\n                   0  block output operations\n                   0  messages sent\n                   0  messages received\n                   0  signals received\n                   0  voluntary context switches\n                   7  involuntary context switches\n            48354012  instructions retired\n            12913276  cycles elapsed\n             3113344  peak memory footprint\n"
+        }
+      }
+    },
+    {
+      "round": 9,
+      "case": "turns-64-projected",
+      "observations": {
+        "candidate": {
+          "wall_ns": 5984000,
+          "maximum_resident_set_bytes": 2686976,
+          "stdout_bytes": 2680,
+          "stdout_sha256": "c243036247fc6e9be2c7657718b532d6b086f273bade1911bfdfeeaae4c70cd2",
+          "time_raw": "        0.00 real         0.00 user         0.00 sys\n             2686976  maximum resident set size\n                   0  average shared memory size\n                   0  average unshared data size\n                   0  average unshared stack size\n                 343  page reclaims\n                   0  page faults\n                   0  swaps\n                   0  block input operations\n                   0  block output operations\n                   0  messages sent\n                   0  messages received\n                   0  signals received\n                   0  voluntary context switches\n                   7  involuntary context switches\n            32566618  instructions retired\n             9005542  cycles elapsed\n             1671552  peak memory footprint\n"
+        },
+        "baseline": {
+          "wall_ns": 6148000,
+          "maximum_resident_set_bytes": 3375104,
+          "stdout_bytes": 2680,
+          "stdout_sha256": "c243036247fc6e9be2c7657718b532d6b086f273bade1911bfdfeeaae4c70cd2",
+          "time_raw": "        0.00 real         0.00 user         0.00 sys\n             3375104  maximum resident set size\n                   0  average shared memory size\n                   0  average unshared data size\n                   0  average unshared stack size\n                 385  page reclaims\n                   0  page faults\n                   0  swaps\n                   0  block input operations\n                   0  block output operations\n                   0  messages sent\n                   0  messages received\n                   0  signals received\n                   0  voluntary context switches\n                   9  involuntary context switches\n            33080513  instructions retired\n             9325567  cycles elapsed\n             2359680  peak memory footprint\n"
+        }
+      }
+    },
+    {
+      "round": 9,
+      "case": "turns-512-projected",
+      "observations": {
+        "candidate": {
+          "wall_ns": 16297000,
+          "maximum_resident_set_bytes": 3047424,
+          "stdout_bytes": 21908,
+          "stdout_sha256": "f6e5614160794026da2616d06ff85f55912d60a10aa7ac2dc600a32058dfb9d2",
+          "time_raw": "        0.01 real         0.01 user         0.00 sys\n             3047424  maximum resident set size\n                   0  average shared memory size\n                   0  average unshared data size\n                   0  average unshared stack size\n                 365  page reclaims\n                   0  page faults\n                   0  swaps\n                   0  block input operations\n                   0  block output operations\n                   0  messages sent\n                   0  messages received\n                   0  signals received\n                   0  voluntary context switches\n                   8  involuntary context switches\n           201533068  instructions retired\n            43998657  cycles elapsed\n             2048408  peak memory footprint\n"
+        },
+        "baseline": {
+          "wall_ns": 17983000,
+          "maximum_resident_set_bytes": 14417920,
+          "stdout_bytes": 21908,
+          "stdout_sha256": "f6e5614160794026da2616d06ff85f55912d60a10aa7ac2dc600a32058dfb9d2",
+          "time_raw": "        0.01 real         0.01 user         0.00 sys\n            14417920  maximum resident set size\n                   0  average shared memory size\n                   0  average unshared data size\n                   0  average unshared stack size\n                1058  page reclaims\n                   0  page faults\n                   0  swaps\n                   0  block input operations\n                   0  block output operations\n                   0  messages sent\n                   0  messages received\n                   0  signals received\n                   0  voluntary context switches\n                  15  involuntary context switches\n           209186322  instructions retired\n            48302379  cycles elapsed\n            13418904  peak memory footprint\n"
+        }
+      }
+    },
+    {
+      "round": 9,
+      "case": "messages-512-projected",
+      "observations": {
+        "candidate": {
+          "wall_ns": 29666000,
+          "maximum_resident_set_bytes": 15974400,
+          "stdout_bytes": 130346,
+          "stdout_sha256": "35e1ded052a0be47b15a8109d8626566c6356f8e62d38f3a1ef8f1eaf5282420",
+          "time_raw": "        0.02 real         0.02 user         0.00 sys\n            15974400  maximum resident set size\n                   0  average shared memory size\n                   0  average unshared data size\n                   0  average unshared stack size\n                1153  page reclaims\n                   0  page faults\n                   0  swaps\n                   0  block input operations\n                   0  block output operations\n                   0  messages sent\n                   0  messages received\n                   0  signals received\n                   0  voluntary context switches\n                   5  involuntary context switches\n           344588756  instructions retired\n            85826291  cycles elapsed\n            14975384  peak memory footprint\n"
+        },
+        "baseline": {
+          "wall_ns": 37779000,
+          "maximum_resident_set_bytes": 42631168,
+          "stdout_bytes": 130346,
+          "stdout_sha256": "35e1ded052a0be47b15a8109d8626566c6356f8e62d38f3a1ef8f1eaf5282420",
+          "time_raw": "        0.03 real         0.02 user         0.00 sys\n            42631168  maximum resident set size\n                   0  average shared memory size\n                   0  average unshared data size\n                   0  average unshared stack size\n                2780  page reclaims\n                   0  page faults\n                   0  swaps\n                   0  block input operations\n                   0  block output operations\n                   0  messages sent\n                   0  messages received\n                   0  signals received\n                   0  voluntary context switches\n                  14  involuntary context switches\n           454474542  instructions retired\n           112774897  cycles elapsed\n            41648560  peak memory footprint\n"
+        }
+      }
+    },
+    {
+      "round": 9,
+      "case": "events-512-projected",
+      "observations": {
+        "candidate": {
+          "wall_ns": 30641000,
+          "maximum_resident_set_bytes": 15974400,
+          "stdout_bytes": 285396,
+          "stdout_sha256": "4020442a861ae69b8772d11c8c6a69d8d9c45327f5ed3bde2d4e79a8a5e69047",
+          "time_raw": "        0.02 real         0.02 user         0.00 sys\n            15974400  maximum resident set size\n                   0  average shared memory size\n                   0  average unshared data size\n                   0  average unshared stack size\n                1154  page reclaims\n                   0  page faults\n                   0  swaps\n                   0  block input operations\n                   0  block output operations\n                   0  messages sent\n                   0  messages received\n                   0  signals received\n                   0  voluntary context switches\n                  11  involuntary context switches\n           351154344  instructions retired\n            88868191  cycles elapsed\n            14975384  peak memory footprint\n"
+        },
+        "baseline": {
+          "wall_ns": 37999000,
+          "maximum_resident_set_bytes": 42745856,
+          "stdout_bytes": 285396,
+          "stdout_sha256": "4020442a861ae69b8772d11c8c6a69d8d9c45327f5ed3bde2d4e79a8a5e69047",
+          "time_raw": "        0.03 real         0.02 user         0.00 sys\n            42745856  maximum resident set size\n                   0  average shared memory size\n                   0  average unshared data size\n                   0  average unshared stack size\n                2788  page reclaims\n                   0  page faults\n                   0  swaps\n                   0  block input operations\n                   0  block output operations\n                   0  messages sent\n                   0  messages received\n                   0  signals received\n                   0  voluntary context switches\n                   9  involuntary context switches\n           461026003  instructions retired\n           113306498  cycles elapsed\n            41779656  peak memory footprint\n"
+        }
+      }
+    },
+    {
+      "round": 10,
+      "case": "turns-64-projected",
+      "observations": {
+        "baseline": {
+          "wall_ns": 6825000,
+          "maximum_resident_set_bytes": 3407872,
+          "stdout_bytes": 2680,
+          "stdout_sha256": "c243036247fc6e9be2c7657718b532d6b086f273bade1911bfdfeeaae4c70cd2",
+          "time_raw": "        0.00 real         0.00 user         0.00 sys\n             3407872  maximum resident set size\n                   0  average shared memory size\n                   0  average unshared data size\n                   0  average unshared stack size\n                 386  page reclaims\n                   0  page faults\n                   0  swaps\n                   0  block input operations\n                   0  block output operations\n                   0  messages sent\n                   0  messages received\n                   0  signals received\n                   0  voluntary context switches\n                   8  involuntary context switches\n            33066468  instructions retired\n             9525071  cycles elapsed\n             2392448  peak memory footprint\n"
+        },
+        "candidate": {
+          "wall_ns": 6597000,
+          "maximum_resident_set_bytes": 2686976,
+          "stdout_bytes": 2680,
+          "stdout_sha256": "c243036247fc6e9be2c7657718b532d6b086f273bade1911bfdfeeaae4c70cd2",
+          "time_raw": "        0.00 real         0.00 user         0.00 sys\n             2686976  maximum resident set size\n                   0  average shared memory size\n                   0  average unshared data size\n                   0  average unshared stack size\n                 343  page reclaims\n                   0  page faults\n                   0  swaps\n                   0  block input operations\n                   0  block output operations\n                   0  messages sent\n                   0  messages received\n                   0  signals received\n                   0  voluntary context switches\n                   7  involuntary context switches\n            32601775  instructions retired\n             9237408  cycles elapsed\n             1671552  peak memory footprint\n"
+        }
+      }
+    },
+    {
+      "round": 10,
+      "case": "turns-512-projected",
+      "observations": {
+        "baseline": {
+          "wall_ns": 17957000,
+          "maximum_resident_set_bytes": 14450688,
+          "stdout_bytes": 21908,
+          "stdout_sha256": "f6e5614160794026da2616d06ff85f55912d60a10aa7ac2dc600a32058dfb9d2",
+          "time_raw": "        0.01 real         0.01 user         0.00 sys\n            14450688  maximum resident set size\n                   0  average shared memory size\n                   0  average unshared data size\n                   0  average unshared stack size\n                1061  page reclaims\n                   0  page faults\n                   0  swaps\n                   0  block input operations\n                   0  block output operations\n                   0  messages sent\n                   0  messages received\n                   0  signals received\n                   0  voluntary context switches\n                   7  involuntary context switches\n           209127064  instructions retired\n            47528942  cycles elapsed\n            13451672  peak memory footprint\n"
+        },
+        "candidate": {
+          "wall_ns": 16567000,
+          "maximum_resident_set_bytes": 3080192,
+          "stdout_bytes": 21908,
+          "stdout_sha256": "f6e5614160794026da2616d06ff85f55912d60a10aa7ac2dc600a32058dfb9d2",
+          "time_raw": "        0.01 real         0.01 user         0.00 sys\n             3080192  maximum resident set size\n                   0  average shared memory size\n                   0  average unshared data size\n                   0  average unshared stack size\n                 366  page reclaims\n                   0  page faults\n                   0  swaps\n                   0  block input operations\n                   0  block output operations\n                   0  messages sent\n                   0  messages received\n                   0  signals received\n                   0  voluntary context switches\n                   5  involuntary context switches\n           201433510  instructions retired\n            43800682  cycles elapsed\n             2081176  peak memory footprint\n"
+        }
+      }
+    },
+    {
+      "round": 10,
+      "case": "messages-512-projected",
+      "observations": {
+        "baseline": {
+          "wall_ns": 37059000,
+          "maximum_resident_set_bytes": 42614784,
+          "stdout_bytes": 130346,
+          "stdout_sha256": "35e1ded052a0be47b15a8109d8626566c6356f8e62d38f3a1ef8f1eaf5282420",
+          "time_raw": "        0.03 real         0.02 user         0.00 sys\n            42614784  maximum resident set size\n                   0  average shared memory size\n                   0  average unshared data size\n                   0  average unshared stack size\n                2780  page reclaims\n                   0  page faults\n                   0  swaps\n                   0  block input operations\n                   0  block output operations\n                   0  messages sent\n                   0  messages received\n                   0  signals received\n                   0  voluntary context switches\n                   7  involuntary context switches\n           454380765  instructions retired\n           112160094  cycles elapsed\n            41632176  peak memory footprint\n"
+        },
+        "candidate": {
+          "wall_ns": 29541000,
+          "maximum_resident_set_bytes": 16023552,
+          "stdout_bytes": 130346,
+          "stdout_sha256": "35e1ded052a0be47b15a8109d8626566c6356f8e62d38f3a1ef8f1eaf5282420",
+          "time_raw": "        0.02 real         0.02 user         0.00 sys\n            16023552  maximum resident set size\n                   0  average shared memory size\n                   0  average unshared data size\n                   0  average unshared stack size\n                1156  page reclaims\n                   0  page faults\n                   0  swaps\n                   0  block input operations\n                   0  block output operations\n                   0  messages sent\n                   0  messages received\n                   0  signals received\n                   0  voluntary context switches\n                  11  involuntary context switches\n           344641612  instructions retired\n            85913340  cycles elapsed\n            15024536  peak memory footprint\n"
+        }
+      }
+    },
+    {
+      "round": 10,
+      "case": "events-512-projected",
+      "observations": {
+        "baseline": {
+          "wall_ns": 38814000,
+          "maximum_resident_set_bytes": 42647552,
+          "stdout_bytes": 285396,
+          "stdout_sha256": "4020442a861ae69b8772d11c8c6a69d8d9c45327f5ed3bde2d4e79a8a5e69047",
+          "time_raw": "        0.03 real         0.02 user         0.00 sys\n            42647552  maximum resident set size\n                   0  average shared memory size\n                   0  average unshared data size\n                   0  average unshared stack size\n                2781  page reclaims\n                   0  page faults\n                   0  swaps\n                   0  block input operations\n                   0  block output operations\n                   0  messages sent\n                   0  messages received\n                   0  signals received\n                   0  voluntary context switches\n                  11  involuntary context switches\n           460848654  instructions retired\n           114905639  cycles elapsed\n            41664944  peak memory footprint\n"
+        },
+        "candidate": {
+          "wall_ns": 30422000,
+          "maximum_resident_set_bytes": 16171008,
+          "stdout_bytes": 285396,
+          "stdout_sha256": "4020442a861ae69b8772d11c8c6a69d8d9c45327f5ed3bde2d4e79a8a5e69047",
+          "time_raw": "        0.02 real         0.02 user         0.00 sys\n            16171008  maximum resident set size\n                   0  average shared memory size\n                   0  average unshared data size\n                   0  average unshared stack size\n                1166  page reclaims\n                   0  page faults\n                   0  swaps\n                   0  block input operations\n                   0  block output operations\n                   0  messages sent\n                   0  messages received\n                   0  signals received\n                   0  voluntary context switches\n                   7  involuntary context switches\n           351298682  instructions retired\n            88607333  cycles elapsed\n            15171992  peak memory footprint\n"
+        }
+      }
+    },
+    {
+      "round": 10,
+      "case": "turns-64-full",
+      "observations": {
+        "baseline": {
+          "wall_ns": 7386000,
+          "maximum_resident_set_bytes": 4128768,
+          "stdout_bytes": 567131,
+          "stdout_sha256": "dfbbf37c14da7321da63d6a3506616f0c1c412ac0cd3176ed549ca50ea5abc8f",
+          "time_raw": "        0.00 real         0.00 user         0.00 sys\n             4128768  maximum resident set size\n                   0  average shared memory size\n                   0  average unshared data size\n                   0  average unshared stack size\n                 431  page reclaims\n                   0  page faults\n                   0  swaps\n                   0  block input operations\n                   0  block output operations\n                   0  messages sent\n                   0  messages received\n                   0  signals received\n                   0  voluntary context switches\n                   6  involuntary context switches\n            48307242  instructions retired\n            12717879  cycles elapsed\n             3113344  peak memory footprint\n"
+        },
+        "candidate": {
+          "wall_ns": 6805000,
+          "maximum_resident_set_bytes": 4177920,
+          "stdout_bytes": 567131,
+          "stdout_sha256": "dfbbf37c14da7321da63d6a3506616f0c1c412ac0cd3176ed549ca50ea5abc8f",
+          "time_raw": "        0.00 real         0.00 user         0.00 sys\n             4177920  maximum resident set size\n                   0  average shared memory size\n                   0  average unshared data size\n                   0  average unshared stack size\n                 433  page reclaims\n                   0  page faults\n                   0  swaps\n                   0  block input operations\n                   0  block output operations\n                   0  messages sent\n                   0  messages received\n                   0  signals received\n                   0  voluntary context switches\n                   5  involuntary context switches\n            48369401  instructions retired\n            12616003  cycles elapsed\n             3162496  peak memory footprint\n"
+        }
+      }
+    }
+  ]
+}

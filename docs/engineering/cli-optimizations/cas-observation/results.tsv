@@ -1,0 +1,7 @@
+variant	polls	notifications_per_poll	allocations	allocated_bytes	consumed_bytes
+baseline	1000	0	1000	131000	60000
+candidate	1000	0	1	131	60000
+baseline	1000	8	10000	1083000	868000
+candidate	1000	8	8002	808275	868000
+baseline	1000	64	66000	7795000	6524000
+candidate	1000	64	64002	6465331	6524000

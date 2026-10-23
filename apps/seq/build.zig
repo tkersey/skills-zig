@@ -74,6 +74,7 @@ fn createCoreModules(
         .optimize = optimize,
         .imports = &.{
             .{ .name = "definition_compat", .module = definition_compat },
+            .{ .name = "durable_store", .module = durable_store },
         },
     });
     const trace_core = b.createModule(.{
@@ -85,11 +86,17 @@ fn createCoreModules(
         },
     });
     const seq_time = createTimeModule(b, target, optimize);
+    const core_selection = b.createModule(.{
+        .root_source_file = b.path("../../libs/core/src/selection.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
     const seq_core = b.createModule(.{
         .root_source_file = b.path("src/v1/root.zig"),
         .target = target,
         .optimize = optimize,
         .imports = &.{
+            .{ .name = "core_selection", .module = core_selection },
             .{ .name = "definition_core", .module = definition_core },
             .{ .name = "durable_store", .module = durable_store },
             .{ .name = "jsonl_core", .module = jsonl_core },
@@ -103,7 +110,7 @@ fn createCoreModules(
         .optimize = optimize,
     });
     for ([_]*std.Build.Module{
-        definition_core, seq_core, durable_store, jsonl_core, trace_core,
+        definition_core, seq_core, durable_store, jsonl_core, trace_core, core_selection,
     }) |module| module.addImport("test_support", test_support);
     return .{
         .durable_store = durable_store,

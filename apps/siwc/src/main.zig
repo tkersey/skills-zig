@@ -77,7 +77,8 @@ fn run(
         if (read_only) .read_only else .create,
     );
     defer store.deinit();
-    var http: siwc.transport.Http = .{};
+    var http = try siwc.transport.Http.init(allocator, init.io);
+    defer http.deinit();
     var manager: siwc.Manager = .{
         .allocator = allocator,
         .io = init.io,

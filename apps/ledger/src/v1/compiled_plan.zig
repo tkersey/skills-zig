@@ -2,6 +2,7 @@ const std = @import("std");
 const storage_root = @import("storage_root");
 const definition_core = @import("definition_core");
 const source_cache = definition_core.source_cache;
+const cache_store = definition_core.cache_store;
 const durable_store = @import("durable_store");
 const definition = @import("definition.zig");
 const materialization = @import("materialization.zig");
@@ -317,7 +318,7 @@ fn tryLoadCache(
     cache_dir: []const u8,
     closure_limits: definition_core.closure.Limits,
 ) !?PlanSet {
-    var cache_root = try durable_store.PrivateDirectory.open(scope.fs, cache_dir, .read_only);
+    var cache_root = try cache_store.Directory.open(scope.fs, cache_dir, .read_only);
     defer cache_root.deinit();
     const locator_key = locatorKey(
         admitted_root,
@@ -325,12 +326,13 @@ fn tryLoadCache(
         route,
         runtime_version,
     );
-    var locator = (try tryLoadLocator(
+    var locator = (try cache_root.readVerifiedLocator(
         allocator,
-        admitted_root,
-        &cache_root,
         locator_key,
+        admitted_root,
+        locator_limits,
         closure_limits,
+        decodeLocator,
     )) orelse return null;
     defer locator.deinit(allocator);
     return try loadCachedPlan(
@@ -344,61 +346,25 @@ fn tryLoadCache(
     );
 }
 
-fn tryLoadLocator(
-    allocator: std.mem.Allocator,
-    admitted_root: []const u8,
-    cache_root: *const durable_store.PrivateDirectory,
-    locator_key: [32]u8,
-    closure_limits: definition_core.closure.Limits,
-) !?VerifiedLocator {
-    var entries = try cache_root.openChild("locators", .read_only);
-    defer entries.deinit();
-    const leaf = cacheLeaf(locator_key);
-    const locator_entry = entries.readAlloc(
-        allocator,
-        &leaf,
-        locator_limits.max_entry_bytes,
-    ) catch |err| switch (err) {
-        error.FileNotFound => return null,
-        else => return err,
-    };
-    defer allocator.free(locator_entry);
-    const locator_payload = try definition_core.cache.decode(
-        locator_key,
-        locator_entry,
-        locator_limits,
-    );
-    return try source_cache.verifyLocator(
-        cache_root.io,
-        allocator,
-        admitted_root,
-        try decodeLocator(allocator, locator_payload),
-        closure_limits,
-    );
-}
-
 fn loadCachedPlan(
     allocator: std.mem.Allocator,
     entry_path: []const u8,
     route: Route,
     runtime_version: []const u8,
-    cache_root: *const durable_store.PrivateDirectory,
+    cache_root: *const cache_store.Directory,
     locator: *const VerifiedLocator,
     closure_limits: definition_core.closure.Limits,
 ) !PlanSet {
-    var entries = try cache_root.openChild("plans", .read_only);
-    defer entries.deinit();
-    const leaf = cacheLeaf(locator.value.plan_key);
-    const plan_entry = try entries.readAlloc(allocator, &leaf, cache_limits.max_entry_bytes);
-    defer allocator.free(plan_entry);
-    const plan_payload = try definition_core.cache.decode(
+    var entry = try cache_root.read(
+        allocator,
+        .plans,
         locator.value.plan_key,
-        plan_entry,
         cache_limits,
     );
+    defer entry.deinit();
     var result = try decodePlanSet(
         allocator,
-        plan_payload,
+        entry.payload,
         route,
         entry_path,
         closure_limits,
@@ -435,14 +401,14 @@ fn writeCache(
     runtime_version: []const u8,
     plan_set: *const PlanSet,
 ) !void {
-    var cache_root = try durable_store.PrivateDirectory.open(scope.fs, cache_dir, .create);
+    var cache_root = try cache_store.Directory.open(scope.fs, cache_dir, .create);
     defer cache_root.deinit();
     const plan_key = planKey(
         runtime_version,
         route,
         &plan_set.definition_plan,
     );
-    try writePlanCache(
+    const publication = try writePlanCache(
         allocator,
         &cache_root,
         route,
@@ -451,44 +417,37 @@ fn writeCache(
     );
     try writeLocatorCache(
         allocator,
-        &cache_root,
+        publication,
         admitted_root,
         route,
         runtime_version,
         plan_set,
-        plan_key,
     );
 }
 
 fn writePlanCache(
     allocator: std.mem.Allocator,
-    cache_root: *const durable_store.PrivateDirectory,
+    cache_root: *const cache_store.Directory,
     route: Route,
     plan_set: *const PlanSet,
     plan_key: [32]u8,
-) !void {
+) !cache_store.PlanPublication {
     var plan_encoder = definition_core.cache.Encoder.init(
         allocator,
         cache_limits.max_payload_bytes,
     );
     defer plan_encoder.deinit();
     try encodePlanSet(plan_set, route, &plan_encoder);
-    const plan_payload = plan_encoder.written();
-    const header = try definition_core.cache.encodeHeader(plan_key, plan_payload, cache_limits);
-    var entries = try cache_root.openChild("plans", .create);
-    defer entries.deinit();
-    const leaf = cacheLeaf(plan_key);
-    try entries.replace(&leaf, &.{ &header, plan_payload });
+    return cache_root.publishPlan(plan_key, plan_encoder.written(), cache_limits);
 }
 
 fn writeLocatorCache(
     allocator: std.mem.Allocator,
-    cache_root: *const durable_store.PrivateDirectory,
+    publication: cache_store.PlanPublication,
     admitted_root: []const u8,
     route: Route,
     runtime_version: []const u8,
     plan_set: *const PlanSet,
-    plan_key: [32]u8,
 ) !void {
     const locator_key = locatorKey(
         admitted_root,
@@ -501,17 +460,12 @@ fn writeLocatorCache(
         locator_limits.max_payload_bytes,
     );
     defer locator_encoder.deinit();
-    try encodeLocator(plan_set, plan_key, &locator_encoder);
-    const locator_payload = locator_encoder.written();
-    const header = try definition_core.cache.encodeHeader(
+    try encodeLocator(plan_set, publication.key, &locator_encoder);
+    try publication.publishLocator(
         locator_key,
-        locator_payload,
+        locator_encoder.written(),
         locator_limits,
     );
-    var entries = try cache_root.openChild("locators", .create);
-    defer entries.deinit();
-    const leaf = cacheLeaf(locator_key);
-    try entries.replace(&leaf, &.{ &header, locator_payload });
 }
 
 fn encodePlanSet(
@@ -933,14 +887,6 @@ fn locatorKey(
         @tagName(route.kind),
         route.name orelse "",
     });
-}
-
-fn cacheLeaf(cache_key: [32]u8) [68]u8 {
-    const hex = definition_core.cache.keyHex(cache_key);
-    var leaf: [68]u8 = undefined;
-    @memcpy(leaf[0..64], &hex);
-    @memcpy(leaf[64..], ".bin");
-    return leaf;
 }
 
 fn cachePathAlloc(

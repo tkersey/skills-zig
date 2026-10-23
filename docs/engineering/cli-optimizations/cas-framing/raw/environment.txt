@@ -1,0 +1,12 @@
+zig_version=0.17.0
+architecture=arm64
+kernel=Darwin 27.2.0
+ProductName:		macOS
+ProductVersion:		27.2
+BuildVersion:		26B118
+Apple M2 Pro
+optimization=ReleaseFast (all modules)
+jobs=1
+harness_sha256:
+5e94b69290c573f6e42b4055cc48ce387626be34b69c9d6d04192d11a01c09e1  benchmark.zig
+868df9e4c5d4d9eaf3a787e718ea7684c5adcfa16342daf3bb525cd84a5a4dc2  reproduce.sh

@@ -1,7 +1,7 @@
 const core_io = @import("core_io");
 const builtin = @import("builtin");
 const std = @import("std");
-const delegate = @import("core_delegate");
+const core_process = @import("core_process");
 const core_cli = @import("core_cli");
 const app_meta = @import("app_meta");
 
@@ -140,7 +140,7 @@ pub fn run(init: std.process.Init) !u8 {
     const environ = init.environ_map;
     const allocator = init.gpa;
     const argv = try init.minimal.args.toSlice(init.arena.allocator());
-    if (argv.len <= 1 or delegate.isHelpRequested(argv) or std.mem.eql(u8, argv[1], "help")) {
+    if (argv.len <= 1 or core_cli.isHelpArg(argv[1]) or std.mem.eql(u8, argv[1], "help")) {
         var stdout_writer = std.Io.File.stdout().writer(
             io,
             &.{},
@@ -150,7 +150,7 @@ pub fn run(init: std.process.Init) !u8 {
         return 0;
     }
 
-    if (delegate.isVersionRequested(argv)) {
+    if (core_cli.isVersionArg(argv[1]) or core_cli.isVersionSubcommand(argv[1])) {
         var stdout_writer = std.Io.File.stdout().writer(
             io,
             &.{},
@@ -305,11 +305,7 @@ fn runCommand(
     });
     errdefer child.kill(io);
     const term = try child.wait(io);
-    return switch (term) {
-        .exited => |code| code,
-        .signal => |signal| @intCast(@min(@as(u32, 128) + @backingInt(signal), @as(u32, 255))),
-        .stopped, .unknown => 1,
-    };
+    return core_process.termToExitCode(term);
 }
 
 fn runCommandPosixSpawn(
@@ -320,22 +316,6 @@ fn runCommandPosixSpawn(
 ) !u8 {
     if (args.len == 0) return error.FileNotFound;
 
-    var argv_buf = try allocator.allocSentinel(?[*:0]const u8, args.len, null);
-    defer allocator.free(argv_buf);
-
-    var arg_storage = try allocator.alloc([:0]u8, args.len);
-    var arg_count: usize = 0;
-    defer {
-        for (arg_storage[0..arg_count]) |arg| allocator.free(arg);
-        allocator.free(arg_storage);
-    }
-
-    for (args, 0..) |arg, i| {
-        arg_storage[i] = try allocator.dupeSentinel(u8, arg, 0);
-        arg_count += 1;
-        argv_buf[i] = arg_storage[i].ptr;
-    }
-
     var actions: std.c.posix_spawn_file_actions_t = undefined;
     if (std.c.posix_spawn_file_actions_init(&actions) != 0) return error.SpawnFileActionsFailed;
     defer {
@@ -345,54 +325,16 @@ fn runCommandPosixSpawn(
     if (std.c.posix_spawn_file_actions_addfchdir_np(&actions, directory.handle) != 0)
         return error.SpawnFileActionsFailed;
 
-    var pid: std.c.pid_t = undefined;
-    // Keep the temporary POSIX environment under one owner, including partial
-    // construction failure (Zig 0.17 frees a partial pointer-array extent).
-    var environment_arena = std.heap.ArenaAllocator.init(allocator);
-    defer environment_arena.deinit();
-    const environment = try environ.createPosixBlock(environment_arena.allocator(), .{});
-    const envp = environment.slice.ptr;
-    const spawn_rc = if (std.mem.indexOfScalar(u8, args[0], '/') == null)
-        std.c.posix_spawnp(&pid, argv_buf[0].?, &actions, null, argv_buf.ptr, envp)
-    else
-        std.c.posix_spawn(&pid, argv_buf[0].?, &actions, null, argv_buf.ptr, envp);
-    if (spawn_rc != 0) return posixSpawnError(spawn_rc);
-
-    var status: if (builtin.link_libc) c_int else u32 = undefined;
-    // The owned child determines termination; interruptions only retry the wait.
-    while (true) { // tiger: event-loop
-        switch (std.posix.errno(std.posix.system.waitpid(pid, &status, 0))) {
-            .SUCCESS => return statusToExitCode(@bitCast(status)),
-            .INTR => continue,
-            .CHILD => return error.NoChildProcess,
-            else => return error.WaitFailed,
-        }
-    }
-}
-
-fn posixSpawnError(rc: c_int) anyerror {
-    const err: std.c.E = @fromBackingInt(@intCast(@as(u16, @intCast(rc))));
-    return switch (err) {
-        .NOMEM, .@"2BIG" => error.SystemResources,
-        .MFILE => error.ProcessFdQuotaExceeded,
-        .NFILE => error.SystemFdQuotaExceeded,
-        .ACCES => error.AccessDenied,
-        .PERM => error.PermissionDenied,
-        .NOEXEC => error.InvalidExe,
-        .NOENT => error.FileNotFound,
-        .NOTDIR => error.NotDir,
-        .NAMETOOLONG => error.NameTooLong,
-        else => error.SpawnFailed,
-    };
-}
-
-fn statusToExitCode(status: u32) u8 {
-    if (std.posix.W.IFEXITED(status)) return std.posix.W.EXITSTATUS(status);
-    if (std.posix.W.IFSIGNALED(status)) {
-        const signal: u32 = @backingInt(std.posix.W.TERMSIG(status));
-        return @intCast(@min(@as(u32, 128) + signal, @as(u32, 255)));
-    }
-    return 1;
+    const pid = try core_process.spawnDarwin(
+        allocator,
+        environ,
+        args[0],
+        args,
+        &actions,
+        null,
+        if (std.mem.indexOfScalar(u8, args[0], '/') == null) .search_path else .direct,
+    );
+    return core_process.waitPosix(pid);
 }
 
 fn resolveTarget(subcommand: []const u8) ?[]const u8 {

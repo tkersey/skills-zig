@@ -1,5 +1,11 @@
 const std = @import("std");
 
+pub const LineCursor = @import("line_cursor.zig").LineCursor;
+
+test {
+    _ = @import("line_cursor.zig");
+}
+
 pub const chunk_size: usize = 64 * 1024;
 // Preserve the former whole-file reader's accepted single-record envelope
 // while removing its aggregate source-size ceiling.

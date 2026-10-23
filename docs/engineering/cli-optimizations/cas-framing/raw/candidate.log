@@ -1,0 +1,23 @@
+1/1 client.test.framing benchmark synthetic transport...FRAMING size=1024 round=0 ns=291 reads=1 positional=0 allocations=2 requested_bytes=7295
+FRAMING size=1024 round=1 ns=292 reads=1 positional=0 allocations=2 requested_bytes=7295
+FRAMING size=1024 round=2 ns=1708 reads=1 positional=0 allocations=2 requested_bytes=7295
+FRAMING size=1024 round=3 ns=125 reads=1 positional=0 allocations=2 requested_bytes=7295
+FRAMING size=1024 round=4 ns=8166 reads=1 positional=0 allocations=2 requested_bytes=7295
+FRAMING size=1024 round=5 ns=208 reads=1 positional=0 allocations=2 requested_bytes=7295
+FRAMING size=1024 round=6 ns=7584 reads=1 positional=0 allocations=2 requested_bytes=7295
+FRAMING size=65536 round=0 ns=28959 reads=16 positional=0 allocations=10 requested_bytes=367743
+FRAMING size=65536 round=1 ns=32083 reads=16 positional=0 allocations=10 requested_bytes=367743
+FRAMING size=65536 round=2 ns=27875 reads=16 positional=0 allocations=10 requested_bytes=367743
+FRAMING size=65536 round=3 ns=33792 reads=16 positional=0 allocations=10 requested_bytes=367743
+FRAMING size=65536 round=4 ns=36375 reads=16 positional=0 allocations=10 requested_bytes=367743
+FRAMING size=65536 round=5 ns=35958 reads=16 positional=0 allocations=10 requested_bytes=367743
+FRAMING size=65536 round=6 ns=23333 reads=16 positional=0 allocations=10 requested_bytes=367743
+FRAMING size=1048576 round=0 ns=406208 reads=256 positional=0 allocations=24 requested_bytes=8528767
+FRAMING size=1048576 round=1 ns=394041 reads=256 positional=0 allocations=24 requested_bytes=8528767
+FRAMING size=1048576 round=2 ns=406167 reads=256 positional=0 allocations=24 requested_bytes=8528767
+FRAMING size=1048576 round=3 ns=365709 reads=256 positional=0 allocations=24 requested_bytes=8528767
+FRAMING size=1048576 round=4 ns=381500 reads=256 positional=0 allocations=24 requested_bytes=8528767
+FRAMING size=1048576 round=5 ns=387250 reads=256 positional=0 allocations=24 requested_bytes=8528767
+FRAMING size=1048576 round=6 ns=480875 reads=256 positional=0 allocations=24 requested_bytes=8528767
+OK
+All 1 tests passed.

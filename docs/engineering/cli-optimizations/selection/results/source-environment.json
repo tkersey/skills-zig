@@ -1,0 +1,63 @@
+{
+  "baseline_sha": "8e470a24b533dba479f39f7ae3cc7f07b5fc5aeb",
+  "zig_version": "0.17.0",
+  "platform": "macOS-27.2-arm64-arm-64bit-Mach-O",
+  "machine": "Apple M2 Pro",
+  "optimize": "fast",
+  "source_sha256": {
+    "libs/core/src/selection.zig": "f2b665c288b54ce0edb92f9101930a534e8b9488baaf54b52d2cf80ef2a8bf0c",
+    "apps/seq/src/v1/execution.zig": "937bb3d0bd0d6f1d6e24218266f051cd67654c683978ebbb60492bde2717d3f0",
+    "apps/seq/src/v1/relation_graph.zig": "afdc39d007a1fc67eaf99edb812873975119428aa4f35c8f1be81f4ac89d6efe",
+    "apps/ledger/src/v1/projection.zig": "47b45e9ab11c810919f89761d88f50863d87af2629ef6ef911ba4a9bfe3c293f",
+    "apps/ledger/src/v1/compiled_plan.zig": "15e2165d658952fe0dd63cc6f42336d4c23c9276cc72419efb5d7df6e27533b1",
+    "libs/definition_core/src/cache_store.zig": "dd243278deab12a3d9104d28b884fd9f60bc71b0205fe099c13b94be9e0c9402"
+  },
+  "build.zig": "5f9b5b466d6d279d7f1d9404ac2beb0eeaa7c94c2fd985d2cd1edd7ed7edee29",
+  "graph.zig": "f0415992b5722e09a52e414768ef81f08f1f9d976a00e9dce0504e3f33b8e928",
+  "reproduce.py": "ba39377074161a2b53037801222e3554980da2754b19dc997470d5e5bf5c67a2",
+  "measurement_order": [
+    "baseline",
+    "candidate",
+    "candidate",
+    "baseline"
+  ],
+  "samples_per_side_per_case": 60,
+  "host_noise": "Task-owned builds and benchmarks were paused; unrelated workloads remained on this shared host.",
+  "candidate_revision": "Working tree changes accompanying this evidence; component source hashes identify measured files.",
+  "raw_sha256": {
+    "graph-0-baseline.tsv": "7977b09540b65c95cd8112f23ab40f1a8f98f261563d9687efa0fc37a9b06f34",
+    "graph-1-candidate.tsv": "7585e6ac615e0e72c0a53720dcc90d1229549ef29903705f902da36e46abccf2",
+    "graph-2-candidate.tsv": "421a6b41694ae4a277f52b29d3b710a58f5488dd409f4be8fb1636fd976e3d2b",
+    "graph-3-baseline.tsv": "52447dcba4acd8f9986056a8d33c52298fbbe9a44a94304ea49c3ffa6217d1f1",
+    "ledger-0-baseline-ledger-topk-16384-k1.json": "41a3ea3ef9aa4d64f67f27e24f34a1d1d3b2628bee39344970d2c04e3cd7fea6",
+    "ledger-0-baseline-ledger-topk-16384-k10.json": "775a0b78c29825d2ca4e1e83fdf410868e2ce700e92e960c1cda2b44d0b4f2da",
+    "ledger-0-baseline-ledger-topk-16384-k100.json": "e48e51ba5719e9697004cec5ea654285c191ef5035b41a1c71989bebe96a0820",
+    "ledger-0-baseline-ledger-topk-16384-k1000.json": "8e859bee5c7aa7ae46d19a6c110c8436f3c800a40981f594fd3c49fcf9110a23",
+    "ledger-0-baseline-ledger-topk-32-k10.json": "06205d76e12eff3db074a4168bcbc3a5ca6eb238564a54f37f084e0b3902a554",
+    "ledger-1-candidate-ledger-topk-16384-k1.json": "1b3e002fcf4c97ca37bfb48b92bc917be81738d55d85a7512a47a7c7b196fd90",
+    "ledger-1-candidate-ledger-topk-16384-k10.json": "fc94a51c7ee12db3caf5854bde01eb82f757d46bf613a2d3f5cd4f9467643473",
+    "ledger-1-candidate-ledger-topk-16384-k100.json": "fffb20b00d10ebfe061a1c0a38114dc9c1b3bac42ab6cc0b3861d04200d09463",
+    "ledger-1-candidate-ledger-topk-16384-k1000.json": "bdcb2e928c62d36fd9f1a839aae5628a0242290d18ef4dc8bc6d861f29c44115",
+    "ledger-1-candidate-ledger-topk-32-k10.json": "6d2d78749b02332aafc596b74bb5b4849c584c35edb5223c5a1fe2a506bed59d",
+    "ledger-2-candidate-ledger-topk-16384-k1.json": "0b386b1a3892aff4180950bb9f77533598ad1b4053b3cc4927fd3f2742612b73",
+    "ledger-2-candidate-ledger-topk-16384-k10.json": "2842cc6e137dc5d10e7ba3bbeae3470256f8a1b0884c3ed2d90a26f0ed37562f",
+    "ledger-2-candidate-ledger-topk-16384-k100.json": "dd1b27f9059b6372192653a518898d8b9c920086c5b506fdc72c733f852cd42d",
+    "ledger-2-candidate-ledger-topk-16384-k1000.json": "e7a3385b8ca7ee18d1862c305fc465e1f79404c52141c81ccf972d3c040245c2",
+    "ledger-2-candidate-ledger-topk-32-k10.json": "e94ccafb993af80230f3a9f9b1da9a90d745cdb159d6a359a7133b13e2c323c9",
+    "ledger-3-baseline-ledger-topk-16384-k1.json": "dad5325789a1b633ebe157e60448c28f687ed38ae7c2930d82e476f2db1d5982",
+    "ledger-3-baseline-ledger-topk-16384-k10.json": "8dbfeb1743245baadd1247f1f56e10d31d390ebb391b8a2bc18445452de00bf7",
+    "ledger-3-baseline-ledger-topk-16384-k100.json": "5f836e2515a8ed0f1969b86eccab660b043e59c6b62b2e48981d7a25e90d5231",
+    "ledger-3-baseline-ledger-topk-16384-k1000.json": "17e81704856747dfb483ab947e60491d7817d156c2f108ea2075f236f279f95c",
+    "ledger-3-baseline-ledger-topk-32-k10.json": "aefaf2a86b00ff3f23de7dac5031366603da31b1f34039c278f6b33550a129e1"
+  },
+  "measurement_phases": {
+    "ledger": "Initial paired run; unaffected by subsequent graph-only change.",
+    "graph": "Second paired run after adaptive sorted-prefix successor; final acceptance evidence."
+  },
+  "binary_sha256": {
+    "baseline-ledger-bench": "c356bd242ffa35527a2abc50cc3ec0fad9d9579567fd224b4a33a8e5ecd7a803",
+    "baseline-graph-bench": "71496cc6855da8367571c46dbbf55b3db872c6e1fa9bd9791cebfad1285e9632",
+    "candidate-ledger-bench": "548fdcb1815ff1a7d63d5904c5462700ad8dc67a737319931e4eabf3a82da95d",
+    "candidate-graph-bench": "07ec88773362d8451abdaee95e7e25301c4fe4756f34f1cfd6449f6fe3433b03"
+  }
+}

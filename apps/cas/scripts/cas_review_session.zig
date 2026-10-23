@@ -8,6 +8,7 @@ const ReviewTarget = review_target.ReviewTarget;
 const TargetRecord = review_target.TargetRecord;
 const ParsedArgs = review_cli.ParsedArgs;
 const review_options = @import("cas_review_options.zig");
+const turn_observation = @import("turn_observation.zig");
 const cas_websocket = @import("cas_websocket_transport.zig");
 const builtin = @import("builtin");
 const core_cli = @import("core_cli");
@@ -3827,8 +3828,7 @@ const ReviewStatusFetch = struct {
             .itemsView = "full",
         });
         defer self.allocator.free(params);
-        for (captured.items) |line| self.allocator.free(line);
-        captured.clearRetainingCapacity();
+        turn_observation.clearNotifications(self.allocator, captured);
         const response = requestPaginatedReviewTurns(
             self.operation,
             self.allocator,
@@ -3989,17 +3989,8 @@ fn populatePaginatedReviewTurn(
         else => return error.InvalidResponse,
     };
     status.turn_count = turns.items.len;
-    var selected: ?std.json.ObjectMap = null;
-    for (turns.items) |turn_value| {
-        const turn = switch (turn_value) {
-            .object => |value| value,
-            else => continue,
-        };
-        const observed = core_json.stringField(turn, "id") orelse continue;
-        if (!std.mem.eql(u8, observed, expected)) continue;
-        if (selected != null) return error.DuplicateReviewTurn;
-        selected = turn;
-    }
+    const selected = turn_observation.selectTurn(turns.items, expected, .reject) catch
+        return error.DuplicateReviewTurn;
     const turn = selected orelse return;
     const turn_status = core_json.stringField(turn, "status") orelse
         return error.InvalidResponse;
@@ -4270,15 +4261,8 @@ fn selectThreadReviewTurn(
     const items = turns.array.items;
     turn_count.* = items.len;
     if (expected_turn_id) |expected| {
-        var selected: ?std.json.ObjectMap = null;
-        for (items) |turn| {
-            if (turn != .object) continue;
-            const observed = core_json.stringField(turn.object, "id") orelse continue;
-            if (!std.mem.eql(u8, observed, expected)) continue;
-            if (selected != null) return error.DuplicateReviewTurn;
-            selected = turn.object;
-        }
-        return selected;
+        return turn_observation.selectTurn(items, expected, .reject) catch
+            return error.DuplicateReviewTurn;
     }
     if (items.len > 0 and items[items.len - 1] == .object) return items[items.len - 1].object;
     return null;

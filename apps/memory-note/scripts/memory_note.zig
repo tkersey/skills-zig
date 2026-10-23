@@ -7,13 +7,13 @@ const memory_layout = @import("memory_layout.zig");
 const memory_migrate = @import("memory_migrate.zig");
 const memory_storage = @import("memory_storage.zig");
 const memory_envelope = @import("memory_envelope.zig");
+const memory_inventory = @import("memory_inventory.zig");
 
 const Fs = durable_store.Fs;
 const Version = core_cli.normalizeVersion(app_meta.version);
 
 const MaxInputBytes = 1024 * 1024;
-const MaxNoteBytes = 1024 * 1024;
-const MaxFiles = 10_000;
+const MaxNoteBytes = memory_inventory.note_bytes_max;
 
 const HelpText =
     \\memory-note
@@ -328,30 +328,15 @@ fn cmdAppend(
 
     var parsed = try validatedAppendInput(allocator, extension, kind, input);
     defer parsed.deinit();
-    const root = parsed.value.object;
-
     const fingerprint = try fingerprintInputAlloc(allocator, extension, kind, input);
     defer allocator.free(fingerprint);
-    const fp16 = fingerprint[0..16];
     const now = try nowUtcAlloc(fs.io, allocator);
     defer allocator.free(now);
-    const id = try noteIdAlloc(allocator, now, fp16);
-    defer allocator.free(id);
-    const slug = try slugAlloc(allocator, root.get("slug"), root.get("summary"));
-    defer allocator.free(slug);
-    const filename = try filenameAlloc(allocator, now, kind, slug, fp16);
-    defer allocator.free(filename);
-    const note =
-        try renderEnvelopeAlloc(allocator, id, now, extension, kind, fingerprint, parsed.value);
-    defer allocator.free(note);
-    if (note.len > MaxNoteBytes) return error.OutputTooLarge;
+    try validateEnvelopeSize(now, extension, kind, fingerprint, parsed.value);
 
     const notes_dir = try notesDirAlloc(allocator, home, args, extension);
     defer allocator.free(notes_dir);
     try memory_layout.validateDirectory(fs.io, fs.directory(), notes_dir);
-    const dest_path = try std.fs.path.join(allocator, &.{ notes_dir, filename });
-    defer allocator.free(dest_path);
-
     const lock_path = try memoryNoteLockPathAlloc(allocator, home, extension);
     defer allocator.free(lock_path);
     var lock = if (args.dry_run)
@@ -366,6 +351,35 @@ fn cmdAppend(
         try writeDuplicateSkip(allocator, stdout, extension, kind, existing, fingerprint);
         return 0;
     }
+
+    return appendNew(fs, allocator, stdout, args, notes_dir, now, fingerprint, parsed.value);
+}
+
+fn appendNew(
+    fs: Fs,
+    allocator: std.mem.Allocator,
+    stdout: *std.Io.Writer,
+    args: Args,
+    notes_dir: []const u8,
+    now: []const u8,
+    fingerprint: []const u8,
+    input: std.json.Value,
+) !u8 {
+    const extension = args.extension.?;
+    const kind = args.kind.?;
+    const fp16 = fingerprint[0..16];
+    const id = try noteIdAlloc(allocator, now, fp16);
+    defer allocator.free(id);
+    const root = input.object;
+    const slug = try slugAlloc(allocator, root.get("slug"), root.get("summary"));
+    defer allocator.free(slug);
+    const filename = try filenameAlloc(allocator, now, kind, slug, fp16);
+    defer allocator.free(filename);
+    const dest_path = try std.fs.path.join(allocator, &.{ notes_dir, filename });
+    defer allocator.free(dest_path);
+    const note = try renderEnvelopeAlloc(allocator, id, now, extension, kind, fingerprint, input);
+    defer allocator.free(note);
+    std.debug.assert(note.len <= MaxNoteBytes);
 
     if (args.dry_run) {
         try writeDryRun(allocator, stdout, id, extension, kind, fingerprint, dest_path, note);
@@ -389,17 +403,8 @@ fn cmdList(
     const notes_dir = try notesDirAlloc(allocator, home, args, extension);
     defer allocator.free(notes_dir);
     try memory_layout.validateDirectory(fs.io, fs.directory(), notes_dir);
-    const names = durable_store.listSortedRegularFilesNoSymlink(
-        fs,
-        allocator,
-        notes_dir,
-        MaxFiles,
-        MaxNoteBytes,
-    ) catch |err| switch (err) {
-        error.FileNotFound => &[_][]u8{},
-        else => return err,
-    };
-    defer durable_store.freeStringList(allocator, names);
+    var inventory = try memory_inventory.Reader.open(fs, allocator, notes_dir, .empty);
+    defer inventory.deinit();
 
     var out: std.Io.Writer.Allocating = .init(allocator);
     defer out.deinit();
@@ -408,28 +413,24 @@ fn cmdList(
     try writeJsonString(w, extension);
     try w.writeAll(",\"notes\":[");
     var emitted: usize = 0;
-    var idx = names.len;
+    var idx = inventory.names.len;
     while (idx > 0 and emitted < args.limit) {
         idx -= 1;
-        const path = try std.fs.path.join(allocator, &.{ notes_dir, names[idx] });
-        defer allocator.free(path);
-        const raw = try durable_store.readRegularFileNoSymlink(fs, allocator, path, MaxNoteBytes);
-        defer allocator.free(raw);
-        var parsed = std.json.parseFromSlice(std.json.Value, allocator, raw, .{}) catch |err| {
+        const record = try inventory.readBorrowed(idx);
+        const parsed = inventory.parseBorrowed(record) catch |err| {
             if (err == error.OutOfMemory) return err;
             continue;
         };
-        defer parsed.deinit();
-        const note = parseNoteSummary(parsed.value) catch continue;
+        const note = parseNoteSummary(parsed) catch continue;
         if (args.kind) |wanted| {
             if (!std.mem.eql(u8, note.kind, wanted)) continue;
         }
         if (emitted > 0) try w.writeByte(',');
-        try writeNoteSummaryJson(w, note, path);
+        try writeNoteSummaryJson(w, note, record.path);
         emitted += 1;
     }
     try w.writeAll("],\"truncated\":");
-    try w.writeAll(if (names.len > emitted) "true" else "false");
+    try w.writeAll(if (inventory.names.len > emitted) "true" else "false");
     try w.writeAll("}\n");
     try writeOutputAlloc(allocator, stdout, &out);
     return 0;
@@ -448,31 +449,21 @@ fn cmdShow(
     const notes_dir = try notesDirAlloc(allocator, home, args, extension);
     defer allocator.free(notes_dir);
     try memory_layout.validateDirectory(fs.io, fs.directory(), notes_dir);
-    const names = try durable_store.listSortedRegularFilesNoSymlink(
-        fs,
-        allocator,
-        notes_dir,
-        MaxFiles,
-        MaxNoteBytes,
-    );
-    defer durable_store.freeStringList(allocator, names);
+    var inventory = try memory_inventory.Reader.open(fs, allocator, notes_dir, .fail);
+    defer inventory.deinit();
 
     var found: ?[]u8 = null;
     defer if (found) |owned| allocator.free(owned);
-    for (names) |name| {
-        const path = try std.fs.path.join(allocator, &.{ notes_dir, name });
-        defer allocator.free(path);
-        const raw = try durable_store.readRegularFileNoSymlink(fs, allocator, path, MaxNoteBytes);
-        defer allocator.free(raw);
-        var parsed = std.json.parseFromSlice(std.json.Value, allocator, raw, .{}) catch |err| {
+    for (0..inventory.names.len) |index| {
+        const record = try inventory.readBorrowed(index);
+        const parsed = inventory.parseBorrowed(record) catch |err| {
             if (err == error.OutOfMemory) return err;
             continue;
         };
-        defer parsed.deinit();
-        const note = parseNoteSummary(parsed.value) catch continue;
+        const note = parseNoteSummary(parsed) catch continue;
         if (std.mem.eql(u8, note.id, id)) {
             if (found != null) return error.DuplicateId;
-            found = try allocator.dupe(u8, raw);
+            found = try allocator.dupe(u8, record.raw);
         }
     }
     const payload = found orelse return error.NotFound;
@@ -527,21 +518,12 @@ fn cmdDoctor(
             try writeDoctorFailureJson(w, err, diagnostic);
             continue;
         }
-        const names = durable_store.listSortedRegularFilesNoSymlink(
-            fs,
-            allocator,
-            notes_dir,
-            MaxFiles,
-            MaxNoteBytes,
-        ) catch |err| switch (err) {
-            error.FileNotFound => &[_][]u8{},
-            else => return err,
-        };
-        defer durable_store.freeStringList(allocator, names);
-        const counts = try doctorNoteCounts(fs, allocator, notes_dir, names, extension);
+        var inventory = try memory_inventory.Reader.open(fs, allocator, notes_dir, .empty);
+        defer inventory.deinit();
+        const counts = try doctorNoteCounts(&inventory, extension);
         checked += counts.checked;
         issues += counts.issues;
-        try w.print(",\"status\":\"ok\",\"notes\":{d}}}", .{names.len});
+        try w.print(",\"status\":\"ok\",\"notes\":{d}}}", .{inventory.names.len});
     }
     try w.print("],\"checked\":{d},\"issues\":{d},\"storage_mutated\":false}}\n", .{
         checked, issues,
@@ -551,26 +533,19 @@ fn cmdDoctor(
 }
 
 fn doctorNoteCounts(
-    fs: Fs,
-    allocator: std.mem.Allocator,
-    notes_dir: []const u8,
-    names: []const []const u8,
+    inventory: *memory_inventory.Reader,
     extension: []const u8,
 ) !struct { checked: usize, issues: usize } {
     var checked: usize = 0;
     var issues: usize = 0;
-    for (names) |name| {
-        const path = try std.fs.path.join(allocator, &.{ notes_dir, name });
-        defer allocator.free(path);
-        const raw = try durable_store.readRegularFileNoSymlink(fs, allocator, path, MaxNoteBytes);
-        defer allocator.free(raw);
-        var parsed = std.json.parseFromSlice(std.json.Value, allocator, raw, .{}) catch |err| {
+    for (0..inventory.names.len) |index| {
+        const record = try inventory.readBorrowed(index);
+        const parsed = inventory.parseBorrowed(record) catch |err| {
             if (err == error.OutOfMemory) return err;
             issues += 1;
             continue;
         };
-        defer parsed.deinit();
-        const note = parseNoteSummary(parsed.value) catch {
+        const note = parseNoteSummary(parsed) catch {
             issues += 1;
             continue;
         };
@@ -1072,10 +1047,42 @@ fn renderEnvelopeAlloc(
     fingerprint: []const u8,
     input: std.json.Value,
 ) ![]u8 {
-    const root = input.object;
     var out: std.Io.Writer.Allocating = .init(allocator);
     defer out.deinit();
-    const w = &out.writer;
+    try writeEnvelope(&out.writer, id, captured_at, extension, kind, fingerprint, input);
+    return out.toOwnedSlice();
+}
+
+fn validateEnvelopeSize(
+    captured_at: []const u8,
+    extension: []const u8,
+    kind: []const u8,
+    fingerprint: []const u8,
+    input: std.json.Value,
+) !void {
+    var output: std.Io.Writer.Discarding = .init(&.{});
+    try writeEnvelope(
+        &output.writer,
+        "MSN-00000000T000000Z-0000000000000000",
+        captured_at,
+        extension,
+        kind,
+        fingerprint,
+        input,
+    );
+    if (output.fullCount() > MaxNoteBytes) return error.OutputTooLarge;
+}
+
+fn writeEnvelope(
+    w: *std.Io.Writer,
+    id: []const u8,
+    captured_at: []const u8,
+    extension: []const u8,
+    kind: []const u8,
+    fingerprint: []const u8,
+    input: std.json.Value,
+) !void {
+    const root = input.object;
     try w.writeAll("{\"schema\":\"memory-source-note/v1\",\"id\":");
     try writeJsonString(w, id);
     try w.writeAll(",\"captured_at\":");
@@ -1103,7 +1110,6 @@ fn renderEnvelopeAlloc(
     try writeJsonString(w, fingerprint);
     try copyField(w, root, "payload");
     try w.writeAll("}\n");
-    return out.toOwnedSlice();
 }
 
 fn copyField(w: *std.Io.Writer, root: std.json.ObjectMap, field: []const u8) !void {
@@ -1125,37 +1131,19 @@ fn findFingerprint(
     notes_dir: []const u8,
     fingerprint: []const u8,
 ) !?ExistingFingerprint {
-    const names = durable_store.listSortedRegularFilesNoSymlink(
-        fs,
-        allocator,
-        notes_dir,
-        MaxFiles,
-        MaxNoteBytes,
-    ) catch |err| switch (err) {
-        error.FileNotFound => return null,
-        else => return err,
-    };
-    defer durable_store.freeStringList(allocator, names);
-    for (names) |name| {
-        const path = try std.fs.path.join(allocator, &.{ notes_dir, name });
-        defer allocator.free(path);
-        const raw = try durable_store.readRegularFileNoSymlink(
-            fs,
-            allocator,
-            path,
-            MaxNoteBytes,
-        );
-        defer allocator.free(raw);
-        var parsed = std.json.parseFromSlice(std.json.Value, allocator, raw, .{}) catch |err| {
+    var inventory = try memory_inventory.Reader.open(fs, allocator, notes_dir, .empty);
+    defer inventory.deinit();
+    for (0..inventory.names.len) |index| {
+        const record = try inventory.readBorrowed(index);
+        const parsed = inventory.parseBorrowed(record) catch |err| {
             if (err == error.OutOfMemory) return err;
             continue;
         };
-        defer parsed.deinit();
-        const note = parseNoteSummary(parsed.value) catch continue;
+        const note = parseNoteSummary(parsed) catch continue;
         if (std.mem.eql(u8, note.fingerprint, fingerprint)) {
             const id = try allocator.dupe(u8, note.id);
             errdefer allocator.free(id);
-            return .{ .id = id, .path = try allocator.dupe(u8, path) };
+            return .{ .id = id, .path = try allocator.dupe(u8, record.path) };
         }
     }
     return null;
@@ -1412,11 +1400,17 @@ test "rejects sensitive keys recursively" {
     );
 }
 
+const EnvelopeInputFixture =
+    \\{"operation":"assert","authority":"explicit-user-correction","summary":"Proceed.","scope":{"kind":"global","repo":null,"paths":[]},"source_refs":[{"kind":"user","ref":"r","summary":"s"}],"payload":{"harness_rule":"r","trigger":"t","preferred_behavior":"p","failure_avoided":"f","verification_cue":"v","evidence_count":1}}
+;
+
 test "renders envelope with generated fields" {
-    const raw =
-        \\{"operation":"assert","authority":"explicit-user-correction","summary":"Proceed.","scope":{"kind":"global","repo":null,"paths":[]},"source_refs":[{"kind":"user","ref":"r","summary":"s"}],"payload":{"harness_rule":"r","trigger":"t","preferred_behavior":"p","failure_avoided":"f","verification_cue":"v","evidence_count":1}}
-    ;
-    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, raw, .{});
+    var parsed = try std.json.parseFromSlice(
+        std.json.Value,
+        std.testing.allocator,
+        EnvelopeInputFixture,
+        .{},
+    );
     defer parsed.deinit();
     try memory_envelope.validateCommon(parsed.value.object);
     try validatePayload("harness", "harness-rule", parsed.value.object);
@@ -1639,6 +1633,62 @@ test "show releases a retained matching note when a later duplicate is rejected"
 
 test {
     _ = memory_migrate;
+    _ = memory_inventory;
+}
+
+test "allocation-free envelope admission matches rendered byte boundaries" {
+    const allocator = std.testing.allocator;
+    var input = try std.json.parseFromSlice(
+        std.json.Value,
+        allocator,
+        EnvelopeInputFixture,
+        .{},
+    );
+    defer input.deinit();
+    const summary = input.value.object.getPtr("summary").?;
+    summary.* = .{ .string = "" };
+    const id = "MSN-20261011T000000Z-0123456789abcdef";
+    const now = "2026-10-11T00:00:00Z";
+    const fingerprint = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+    const empty = try renderEnvelopeAlloc(
+        allocator,
+        id,
+        now,
+        "harness",
+        "harness-rule",
+        fingerprint,
+        input.value,
+    );
+    defer allocator.free(empty);
+    for ([_]usize{ MaxNoteBytes - 1, MaxNoteBytes, MaxNoteBytes + 1 }) |size| {
+        const text = try allocator.alloc(u8, size - empty.len);
+        defer allocator.free(text);
+        @memset(text, 'x');
+        summary.* = .{ .string = text };
+        const note = try renderEnvelopeAlloc(
+            allocator,
+            id,
+            now,
+            "harness",
+            "harness-rule",
+            fingerprint,
+            input.value,
+        );
+        defer allocator.free(note);
+        try std.testing.expectEqual(size, note.len);
+        const admission = validateEnvelopeSize(
+            now,
+            "harness",
+            "harness-rule",
+            fingerprint,
+            input.value,
+        );
+        if (size <= MaxNoteBytes) {
+            try admission;
+        } else {
+            try std.testing.expectError(error.OutputTooLarge, admission);
+        }
+    }
 }
 
 test "input reads use independent supplied directories and propagate canceled I/O" {

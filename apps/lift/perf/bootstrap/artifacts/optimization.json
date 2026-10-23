@@ -1,0 +1,818 @@
+{
+  "schema": "lift-bootstrap-comparison/v1",
+  "captured_utc": "2026-10-23T12:24:44.378691+00:00",
+  "host": "macOS-27.2-arm64-arm-64bit-Mach-O",
+  "machine": "arm64",
+  "toolchain": "0.17.0",
+  "build_mode": "fast",
+  "measurement": "whole CLI process elapsed time including startup and input/output",
+  "rounds": 9,
+  "order": "alternating forward/reverse; first invocation excluded",
+  "binaries_sha256": {
+    "baseline": "2f11a4c9e34284ef7fbb504cba54e82b95cc0364f5678944cfcf08c6ab748d5f",
+    "candidate": "1be556edb2e30dae9f2c633611622a12766d97ee3eba7a9eacd09c3762df0df2"
+  },
+  "harness_sha256": "d980f1e0a00c775c5626783b9bfa8a3caf32cdbc34868352ac33b8523a2b2ffc",
+  "cases": [
+    {
+      "case": "uniform-16",
+      "baseline_count": 16,
+      "variant_count": 16,
+      "ci_samples": 1000,
+      "seed": 42,
+      "baseline_input_sha256": "537debb236381b8c7e6e424b849071a3f1d1069e5a0f7442e2e39100343e705e",
+      "variant_input_sha256": "6393d8de95013e2c5b6f67f504a7c81f0224f5b14dc2846cc17a136df9100571",
+      "exit_status": 0,
+      "stdout_sha256": "b55579c3d97bcf632cdfd294d3ca1589e12ffc800098750ba98482d37fa7771f",
+      "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "initial_invocation_ns": {
+        "baseline": 8322083,
+        "candidate": 132273875
+      },
+      "measurements": {
+        "baseline": {
+          "median_ns": 6062750,
+          "minimum_ns": 5534834,
+          "maximum_ns": 10056917,
+          "samples_ns": [
+            5948500,
+            6348959,
+            5844875,
+            6062750,
+            5534834,
+            5607791,
+            9421583,
+            10056917,
+            6314292
+          ]
+        },
+        "candidate": {
+          "median_ns": 6058750,
+          "minimum_ns": 5569083,
+          "maximum_ns": 6769500,
+          "samples_ns": [
+            6198584,
+            5682083,
+            5750958,
+            6037042,
+            6058750,
+            5569083,
+            6325792,
+            6769500,
+            6339292
+          ]
+        }
+      }
+    },
+    {
+      "case": "duplicates-16",
+      "baseline_count": 16,
+      "variant_count": 16,
+      "ci_samples": 1000,
+      "seed": 42,
+      "baseline_input_sha256": "0f80a7627fe2d0f6572e09b9ef7b2c6d4ba0a27c84e31fa8f0384d63bd0ed4c0",
+      "variant_input_sha256": "ef42395f620cfc1c37b6f56018cda5b933900e637f1b95d5acf3b261c910603c",
+      "exit_status": 0,
+      "stdout_sha256": "256af9280aa3f3385ee4d33247feed20586d01206b88c10492fa910fb0d307f6",
+      "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "initial_invocation_ns": {
+        "baseline": 6041834,
+        "candidate": 6526833
+      },
+      "measurements": {
+        "baseline": {
+          "median_ns": 6863292,
+          "minimum_ns": 5552542,
+          "maximum_ns": 8462042,
+          "samples_ns": [
+            6737000,
+            6846666,
+            7659292,
+            8462042,
+            7357583,
+            6863292,
+            5798958,
+            5552542,
+            7149709
+          ]
+        },
+        "candidate": {
+          "median_ns": 5698416,
+          "minimum_ns": 5333666,
+          "maximum_ns": 7760209,
+          "samples_ns": [
+            7760209,
+            5746292,
+            5966667,
+            5698416,
+            5585334,
+            6266000,
+            5374167,
+            5333666,
+            5583459
+          ]
+        }
+      }
+    },
+    {
+      "case": "descending-16",
+      "baseline_count": 16,
+      "variant_count": 16,
+      "ci_samples": 1000,
+      "seed": 42,
+      "baseline_input_sha256": "ebfb6546a92b674f36a361dc7130447a0ea92ec142aeb6ee059e534d8c4feb07",
+      "variant_input_sha256": "5bde79cc3cc70fb2989f42087fff69362af031d3d770982f8b79c9d92b4a9608",
+      "exit_status": 0,
+      "stdout_sha256": "02fb5a4c103215c5ad81d16709344b2b7ace897f7fad65e5a55cd0ed4279443f",
+      "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "initial_invocation_ns": {
+        "baseline": 5723167,
+        "candidate": 6784333
+      },
+      "measurements": {
+        "baseline": {
+          "median_ns": 5575375,
+          "minimum_ns": 5092417,
+          "maximum_ns": 6501167,
+          "samples_ns": [
+            5092417,
+            6501167,
+            5678500,
+            5621458,
+            5291542,
+            5958584,
+            5575375,
+            5501292,
+            5413750
+          ]
+        },
+        "candidate": {
+          "median_ns": 5537416,
+          "minimum_ns": 5294791,
+          "maximum_ns": 6787875,
+          "samples_ns": [
+            5294791,
+            5899416,
+            5707667,
+            5529625,
+            5537416,
+            5980167,
+            5421167,
+            6787875,
+            5371916
+          ]
+        }
+      }
+    },
+    {
+      "case": "uniform-128",
+      "baseline_count": 128,
+      "variant_count": 128,
+      "ci_samples": 1000,
+      "seed": 42,
+      "baseline_input_sha256": "bbb4b707de3c4fc21e9b9e6b11cd5e10e70385362113083a55e3bacf78cc6349",
+      "variant_input_sha256": "f26ff53e6b84772ee51dac48c4eb8f345b5f25e537913ca98f1bc787b160ef03",
+      "exit_status": 0,
+      "stdout_sha256": "61d785353bbdab2ff36e5c9db671168608a6b53391241d8bfb09a3f971c97983",
+      "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "initial_invocation_ns": {
+        "baseline": 27617458,
+        "candidate": 15721333
+      },
+      "measurements": {
+        "baseline": {
+          "median_ns": 29975875,
+          "minimum_ns": 27972083,
+          "maximum_ns": 32847208,
+          "samples_ns": [
+            30433417,
+            30045458,
+            31680958,
+            28735750,
+            29516291,
+            32847208,
+            29975875,
+            27972083,
+            28079875
+          ]
+        },
+        "candidate": {
+          "median_ns": 16223208,
+          "minimum_ns": 15215917,
+          "maximum_ns": 23744000,
+          "samples_ns": [
+            23744000,
+            16135208,
+            20608667,
+            16016958,
+            15517958,
+            16223208,
+            17379500,
+            16580500,
+            15215917
+          ]
+        }
+      }
+    },
+    {
+      "case": "duplicates-128",
+      "baseline_count": 128,
+      "variant_count": 128,
+      "ci_samples": 1000,
+      "seed": 42,
+      "baseline_input_sha256": "a71b6381f673865bb702cfd86633bf2f743037cdca89cd36c872344bbe0edae4",
+      "variant_input_sha256": "d3dca64417c0d972ba1c95046bd312d3722ccdb15425ed5acf76e33894b97a40",
+      "exit_status": 0,
+      "stdout_sha256": "ca774e41197906b4f69fb35b36d28681a72b4a9157e266ceba9d47328ec40731",
+      "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "initial_invocation_ns": {
+        "baseline": 27330542,
+        "candidate": 15328667
+      },
+      "measurements": {
+        "baseline": {
+          "median_ns": 27333917,
+          "minimum_ns": 24612416,
+          "maximum_ns": 30353833,
+          "samples_ns": [
+            27333917,
+            26930959,
+            27959375,
+            29234375,
+            30353833,
+            25112333,
+            29896083,
+            24612416,
+            24687667
+          ]
+        },
+        "candidate": {
+          "median_ns": 14258792,
+          "minimum_ns": 13689083,
+          "maximum_ns": 16528416,
+          "samples_ns": [
+            13728833,
+            15640250,
+            16528416,
+            14555208,
+            14435916,
+            14258792,
+            13784500,
+            13732500,
+            13689083
+          ]
+        }
+      }
+    },
+    {
+      "case": "descending-128",
+      "baseline_count": 128,
+      "variant_count": 128,
+      "ci_samples": 1000,
+      "seed": 42,
+      "baseline_input_sha256": "a2e5d28d3c6c31351881d4c873020d2aeb6baf05583162eb2d9f4a18fd76d7cb",
+      "variant_input_sha256": "35faae36b0281ebf0d012f6753fe38cf288cb95051106fd87190ac3d6c59b7e4",
+      "exit_status": 0,
+      "stdout_sha256": "58aa99af690b4d93c714ca23c2d8f0deb0310e24fdee737ff36e1db81e509050",
+      "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "initial_invocation_ns": {
+        "baseline": 34114958,
+        "candidate": 15117667
+      },
+      "measurements": {
+        "baseline": {
+          "median_ns": 28670167,
+          "minimum_ns": 27797125,
+          "maximum_ns": 32602167,
+          "samples_ns": [
+            29229166,
+            27842291,
+            29788375,
+            28670167,
+            32602167,
+            28533833,
+            27797125,
+            29659834,
+            28184625
+          ]
+        },
+        "candidate": {
+          "median_ns": 15449250,
+          "minimum_ns": 14656458,
+          "maximum_ns": 17708500,
+          "samples_ns": [
+            16386500,
+            15061958,
+            15449250,
+            17708500,
+            15507083,
+            15272583,
+            14656458,
+            15087417,
+            15467375
+          ]
+        }
+      }
+    },
+    {
+      "case": "uniform-1024",
+      "baseline_count": 1024,
+      "variant_count": 1024,
+      "ci_samples": 1000,
+      "seed": 42,
+      "baseline_input_sha256": "5e410dba75ef44032c3d444146ae0af684c3ca8cc68032cb0b8d76079b9f2111",
+      "variant_input_sha256": "bcb235d94447ba59d559831ace225029f4866051fbb1ec707479eafbcff36efe",
+      "exit_status": 0,
+      "stdout_sha256": "796f904807bda928d856bc3532beca41f6c44999cd893ce3a58380cb24055072",
+      "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "initial_invocation_ns": {
+        "baseline": 294005875,
+        "candidate": 86174625
+      },
+      "measurements": {
+        "baseline": {
+          "median_ns": 291958333,
+          "minimum_ns": 290591042,
+          "maximum_ns": 293968333,
+          "samples_ns": [
+            291299334,
+            293968333,
+            292805208,
+            291958333,
+            292195458,
+            290591042,
+            293845417,
+            290889917,
+            291736041
+          ]
+        },
+        "candidate": {
+          "median_ns": 86309625,
+          "minimum_ns": 85705125,
+          "maximum_ns": 88687416,
+          "samples_ns": [
+            85705125,
+            88687416,
+            87253375,
+            87118208,
+            86030834,
+            86431417,
+            86309625,
+            85947542,
+            86068000
+          ]
+        }
+      }
+    },
+    {
+      "case": "duplicates-1024",
+      "baseline_count": 1024,
+      "variant_count": 1024,
+      "ci_samples": 1000,
+      "seed": 42,
+      "baseline_input_sha256": "2b71d7699399ed181b54a59ac8303b4ebbee9e864d3c8fd2b2de525ea268c07d",
+      "variant_input_sha256": "c391bee709729b2a508dddf1496bb99b716455460d584ee5c3b8ca8f8efa7ad2",
+      "exit_status": 0,
+      "stdout_sha256": "5f268d932f206701734d80d921f3c48e73d3e5cb86756ef62f51556cdcbdd472",
+      "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "initial_invocation_ns": {
+        "baseline": 206012833,
+        "candidate": 77074709
+      },
+      "measurements": {
+        "baseline": {
+          "median_ns": 207471584,
+          "minimum_ns": 203044375,
+          "maximum_ns": 209124542,
+          "samples_ns": [
+            204784208,
+            208227250,
+            209124542,
+            209013875,
+            207471584,
+            207930458,
+            205251625,
+            205912000,
+            203044375
+          ]
+        },
+        "candidate": {
+          "median_ns": 77664458,
+          "minimum_ns": 77286584,
+          "maximum_ns": 80146750,
+          "samples_ns": [
+            77316125,
+            80146750,
+            78746500,
+            77554167,
+            77524375,
+            80143125,
+            77286584,
+            77976125,
+            77664458
+          ]
+        }
+      }
+    },
+    {
+      "case": "descending-1024",
+      "baseline_count": 1024,
+      "variant_count": 1024,
+      "ci_samples": 1000,
+      "seed": 42,
+      "baseline_input_sha256": "1df294277393c63b600a719c7c0951aa1afb29767833a485b30eb4f61eed5959",
+      "variant_input_sha256": "ecad1ba3c6dd02ebf35e438075e87dfbd343b28d78f6e25044b6a36488bfd47b",
+      "exit_status": 0,
+      "stdout_sha256": "fb9969dce24b08324bd93af69e4c56279e2d5a914501b98da2ee0c8b7d1291e1",
+      "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "initial_invocation_ns": {
+        "baseline": 294355583,
+        "candidate": 88072542
+      },
+      "measurements": {
+        "baseline": {
+          "median_ns": 292177208,
+          "minimum_ns": 290874166,
+          "maximum_ns": 295071417,
+          "samples_ns": [
+            295071417,
+            291995625,
+            292177208,
+            291986333,
+            293137209,
+            291773375,
+            292393500,
+            292390250,
+            290874166
+          ]
+        },
+        "candidate": {
+          "median_ns": 86178666,
+          "minimum_ns": 85635542,
+          "maximum_ns": 87872916,
+          "samples_ns": [
+            87872916,
+            85635542,
+            86178666,
+            86926583,
+            85821084,
+            86405042,
+            85951208,
+            85716666,
+            86240500
+          ]
+        }
+      }
+    },
+    {
+      "case": "uniform-4096",
+      "baseline_count": 4096,
+      "variant_count": 4096,
+      "ci_samples": 1000,
+      "seed": 42,
+      "baseline_input_sha256": "d560bf18262ee9d59ae73c8ea6dd4a53bd57212f6a7d69cf6780503ba030f35d",
+      "variant_input_sha256": "a689b8a3cfcc170cf4debbd5a44bbaabdc87d0d957d35de71f00f684dd736368",
+      "exit_status": 0,
+      "stdout_sha256": "e78b35d083ee166f86fa2adb80824dcdf5ecf37f58cfac067df63d5956a4bc14",
+      "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "initial_invocation_ns": {
+        "baseline": 1444003542,
+        "candidate": 328388833
+      },
+      "measurements": {
+        "baseline": {
+          "median_ns": 1437962458,
+          "minimum_ns": 1434297250,
+          "maximum_ns": 1447356625,
+          "samples_ns": [
+            1438088000,
+            1437962458,
+            1447356625,
+            1439951458,
+            1437092792,
+            1444096083,
+            1435620209,
+            1434297250,
+            1437712459
+          ]
+        },
+        "candidate": {
+          "median_ns": 326919958,
+          "minimum_ns": 325418375,
+          "maximum_ns": 330266833,
+          "samples_ns": [
+            327307209,
+            325539916,
+            326919958,
+            327898541,
+            326012209,
+            329328791,
+            325726875,
+            330266833,
+            325418375
+          ]
+        }
+      }
+    },
+    {
+      "case": "duplicates-4096",
+      "baseline_count": 4096,
+      "variant_count": 4096,
+      "ci_samples": 1000,
+      "seed": 42,
+      "baseline_input_sha256": "ba018fed14cab403bd2971a5eb5ea52cada44788df69f2b14bb9f6900630cb1c",
+      "variant_input_sha256": "39b0995fa0295fb9135f77c2866daf37d5f14d772ddf89c0f469e11d6f5d4ec3",
+      "exit_status": 0,
+      "stdout_sha256": "e0aed6004ccc4e83e0fe7a062d67ca934b7815cc5824fe726d7ee71b7cbc4cad",
+      "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "initial_invocation_ns": {
+        "baseline": 880299958,
+        "candidate": 292401625
+      },
+      "measurements": {
+        "baseline": {
+          "median_ns": 880874667,
+          "minimum_ns": 878856917,
+          "maximum_ns": 881884709,
+          "samples_ns": [
+            881884709,
+            881855458,
+            879999875,
+            881347542,
+            880874667,
+            881515084,
+            878856917,
+            879601583,
+            879080916
+          ]
+        },
+        "candidate": {
+          "median_ns": 292850875,
+          "minimum_ns": 291019334,
+          "maximum_ns": 293564708,
+          "samples_ns": [
+            292850875,
+            293564708,
+            292869291,
+            293221500,
+            292439792,
+            291598375,
+            291019334,
+            293364708,
+            292536125
+          ]
+        }
+      }
+    },
+    {
+      "case": "descending-4096",
+      "baseline_count": 4096,
+      "variant_count": 4096,
+      "ci_samples": 1000,
+      "seed": 42,
+      "baseline_input_sha256": "ea2b1ec53b74bda175a0de108cf3e4c60fc9a47f4fb1edf6f2ecc3ec6e4dd343",
+      "variant_input_sha256": "8abc696f497e19e7556b5a98fc5883f391fd2fa280615d8ac218f42bb32a7dc0",
+      "exit_status": 0,
+      "stdout_sha256": "da988cfeb7607cd502d33824b509061583ab4b7926f45ad1192ac51038dbf435",
+      "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "initial_invocation_ns": {
+        "baseline": 1428402708,
+        "candidate": 324813125
+      },
+      "measurements": {
+        "baseline": {
+          "median_ns": 1438311709,
+          "minimum_ns": 1421036959,
+          "maximum_ns": 1443437083,
+          "samples_ns": [
+            1431537458,
+            1429684125,
+            1430929334,
+            1421036959,
+            1438706375,
+            1443437083,
+            1438311709,
+            1440762709,
+            1442762125
+          ]
+        },
+        "candidate": {
+          "median_ns": 325421833,
+          "minimum_ns": 322102333,
+          "maximum_ns": 327689375,
+          "samples_ns": [
+            323385708,
+            325421833,
+            323478750,
+            322102333,
+            322630959,
+            326708542,
+            325438417,
+            326021875,
+            327689375
+          ]
+        }
+      }
+    },
+    {
+      "case": "signed-zero",
+      "baseline_count": 6,
+      "variant_count": 6,
+      "ci_samples": 73,
+      "seed": 0,
+      "baseline_input_sha256": "df17a2dff8d5d4ae98d474b6e65af958e1fef12c0b4131b0c4691e558c899b55",
+      "variant_input_sha256": "5aaabf9862d4d23c4951c8a5bb11a7ebd3725ecdf547b8de05f5c7a5c647fe38",
+      "exit_status": 0,
+      "stdout_sha256": "407a6fe7fcea01bb7cc0ebc911a3e4e58690859963b07752cacd91005a912fc1",
+      "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "initial_invocation_ns": {
+        "baseline": 4455208,
+        "candidate": 4010083
+      },
+      "measurements": {
+        "baseline": {
+          "median_ns": 3578084,
+          "minimum_ns": 3275791,
+          "maximum_ns": 3823792,
+          "samples_ns": [
+            3448625,
+            3823792,
+            3471000,
+            3683833,
+            3535416,
+            3275791,
+            3633084,
+            3578084,
+            3727084
+          ]
+        },
+        "candidate": {
+          "median_ns": 3853500,
+          "minimum_ns": 3314541,
+          "maximum_ns": 4231625,
+          "samples_ns": [
+            3615333,
+            3787083,
+            3314541,
+            4002125,
+            3443083,
+            4116250,
+            3853500,
+            3921500,
+            4231625
+          ]
+        }
+      }
+    },
+    {
+      "case": "extremes",
+      "baseline_count": 6,
+      "variant_count": 6,
+      "ci_samples": 73,
+      "seed": 0,
+      "baseline_input_sha256": "c33ab72b38317934ac54552cdcbb8311382d613a15b460fecce2a14220b2484c",
+      "variant_input_sha256": "3c95861ca233fe661368b7879c2ad1ce0de27ab86a716268651b25bcccbd6686",
+      "exit_status": 0,
+      "stdout_sha256": "8ac39eefe778aeb55710382c41c35d99dc0e6d912d6a62cb6a4c974e9cf13066",
+      "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "initial_invocation_ns": {
+        "baseline": 4066917,
+        "candidate": 3939875
+      },
+      "measurements": {
+        "baseline": {
+          "median_ns": 3611417,
+          "minimum_ns": 3256500,
+          "maximum_ns": 3825500,
+          "samples_ns": [
+            3757167,
+            3482500,
+            3776334,
+            3551959,
+            3611417,
+            3730833,
+            3825500,
+            3405958,
+            3256500
+          ]
+        },
+        "candidate": {
+          "median_ns": 3742625,
+          "minimum_ns": 3402750,
+          "maximum_ns": 4183917,
+          "samples_ns": [
+            4183917,
+            3459459,
+            4127917,
+            3784875,
+            3671084,
+            3742625,
+            3769167,
+            3616792,
+            3402750
+          ]
+        }
+      }
+    },
+    {
+      "case": "infinity",
+      "baseline_count": 4,
+      "variant_count": 4,
+      "ci_samples": 73,
+      "seed": 0,
+      "baseline_input_sha256": "c8624de51133caacc7578e9a74add12c1c8bdc1ae250078a59e9ec7b1f6bc7a2",
+      "variant_input_sha256": "983103cd00c59ecdb3865c2fd2c155a50a05746c5cc21afdb43e7fe0eb4831bc",
+      "exit_status": 0,
+      "stdout_sha256": "c4960eda3fc93748de148b2bbffe6af7da5930ab86a365ec0057a977c81dd19d",
+      "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "initial_invocation_ns": {
+        "baseline": 3175125,
+        "candidate": 3281041
+      },
+      "measurements": {
+        "baseline": {
+          "median_ns": 3493875,
+          "minimum_ns": 3175250,
+          "maximum_ns": 3703916,
+          "samples_ns": [
+            3703916,
+            3388084,
+            3493875,
+            3678292,
+            3392750,
+            3543959,
+            3495750,
+            3483458,
+            3175250
+          ]
+        },
+        "candidate": {
+          "median_ns": 3418166,
+          "minimum_ns": 3244167,
+          "maximum_ns": 3906500,
+          "samples_ns": [
+            3906500,
+            3418166,
+            3421208,
+            3566125,
+            3244167,
+            3339458,
+            3552125,
+            3271750,
+            3299542
+          ]
+        }
+      }
+    },
+    {
+      "case": "singleton",
+      "baseline_count": 1,
+      "variant_count": 1,
+      "ci_samples": 73,
+      "seed": 0,
+      "baseline_input_sha256": "084c799cd551dd1d8d5c5f9a5d593b2e931f5e36122ee5c793c1d08a19839cc0",
+      "variant_input_sha256": "084c799cd551dd1d8d5c5f9a5d593b2e931f5e36122ee5c793c1d08a19839cc0",
+      "exit_status": 0,
+      "stdout_sha256": "1304724425738e612c758a11158a35797bc4689e6bb752f0fb6e2f2f8b8b7fad",
+      "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "initial_invocation_ns": {
+        "baseline": 3022250,
+        "candidate": 3267917
+      },
+      "measurements": {
+        "baseline": {
+          "median_ns": 3301750,
+          "minimum_ns": 3021416,
+          "maximum_ns": 3927666,
+          "samples_ns": [
+            3433125,
+            3927666,
+            3301750,
+            3021416,
+            3282250,
+            3276500,
+            3442458,
+            3530500,
+            3121333
+          ]
+        },
+        "candidate": {
+          "median_ns": 3488583,
+          "minimum_ns": 3265916,
+          "maximum_ns": 4382917,
+          "samples_ns": [
+            3488583,
+            3272417,
+            3733041,
+            3268750,
+            4382917,
+            3752333,
+            3423833,
+            3532750,
+            3265916
+          ]
+        }
+      }
+    }
+  ]
+}

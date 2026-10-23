@@ -1,4 +1,5 @@
 const std = @import("std");
+const core_selection = @import("core_selection");
 const definition_core = @import("definition_core");
 const custody = @import("custody.zig");
 const definition = @import("definition.zig");
@@ -798,6 +799,7 @@ const SortedAccumulator = struct {
     prepared_relevance: ?PreparedRelevance,
     referenced_ids: std.StringHashMap(void),
     retained_limit: ?usize,
+    sort_key_scratch: []std.json.Value,
     records_seen: usize = 0,
     records_matched: usize = 0,
 
@@ -820,6 +822,9 @@ const SortedAccumulator = struct {
                 limit
         else
             limit;
+        const sort_key_scratch = try allocator.alloc(std.json.Value, projection.sort_keys.len);
+        errdefer allocator.free(sort_key_scratch);
+        @memset(sort_key_scratch, .null);
         return .{
             .allocator = allocator,
             .projection = projection,
@@ -834,12 +839,14 @@ const SortedAccumulator = struct {
                 null,
             .referenced_ids = std.StringHashMap(void).init(allocator),
             .retained_limit = retained_limit,
+            .sort_key_scratch = sort_key_scratch,
         };
     }
 
     fn deinit(self: *SortedAccumulator) void {
         for (self.rows.items) |*row| row.deinit(self.allocator);
         self.rows.deinit(self.allocator);
+        self.allocator.free(self.sort_key_scratch);
         if (self.prepared_relevance) |*prepared| {
             prepared.deinit(self.allocator);
         }
@@ -921,19 +928,20 @@ const SortedAccumulator = struct {
         record_index: usize,
     ) !bool {
         const relevance_score = (try self.score(value)) orelse return false;
+        defer @memset(self.sort_key_scratch, .null);
         const keys = try self.sortKeys(
             value,
             record_index,
             relevance_score,
         );
-        var keys_owned = true;
-        defer if (keys_owned) self.freeKeys(keys);
         if (!self.admits(keys, record_index)) {
             try self.validatePayload(value, raw);
             var metadata = try self.rowMetadata(value);
             metadata.deinit(self.allocator);
             return true;
         }
+        const owned_keys = try self.ownSortKeys(keys);
+        errdefer self.freeKeys(owned_keys);
         const rendered_payload = try self.renderPayload(
             value,
             raw,
@@ -944,12 +952,11 @@ const SortedAccumulator = struct {
         errdefer metadata.deinit(self.allocator);
         try self.retain(.{
             .payload = rendered_payload,
-            .keys = keys,
+            .keys = owned_keys,
             .record_index = record_index,
             .row_id = metadata.row_id,
             .theme = metadata.theme,
         });
-        keys_owned = false;
         metadata.row_id = null;
         metadata.theme = null;
         return true;
@@ -960,18 +967,30 @@ const SortedAccumulator = struct {
         self.allocator.free(keys);
     }
 
-    fn admits(self: *const SortedAccumulator, keys: []const Scalar, record_index: usize) bool {
+    fn admits(
+        self: *const SortedAccumulator,
+        keys: []const std.json.Value,
+        record_index: usize,
+    ) bool {
         const limit = self.retained_limit orelse return true;
         if (limit == 0) return false;
         if (self.rows.items.len < limit) return true;
         const worst = self.rows.items[0];
-        return lessSortedKeys(
-            self.projection.sort_keys,
-            keys,
-            record_index,
-            worst.keys,
-            worst.record_index,
-        );
+        for (self.projection.sort_keys, keys, worst.keys) |key, candidate, retained| {
+            const order = if (candidate == .string)
+                std.mem.order(u8, candidate.string, retained.string)
+            else
+                definition_core.exact_number.orderValues(
+                    candidate,
+                    scalarNumberValue(retained).?,
+                ).?;
+            if (order == .eq) continue;
+            return switch (key.order) {
+                .ascending => order == .lt,
+                .descending => order == .gt,
+            };
+        }
+        return record_index < worst.record_index;
     }
 
     fn retain(self: *SortedAccumulator, row: SortedRow) !void {
@@ -984,43 +1003,23 @@ const SortedAccumulator = struct {
         std.debug.assert(self.rows.items.len <= limit);
         if (self.rows.items.len < limit) {
             try self.rows.append(self.allocator, row);
-            self.siftUp(self.rows.items.len - 1);
+            core_selection.siftUp(
+                SortedRow,
+                self.rows.items,
+                @as([]const SortKey, self.projection.sort_keys),
+                lessSortedRow,
+            );
         } else {
             var removed = self.rows.items[0];
             self.rows.items[0] = row;
-            self.siftDown();
+            core_selection.siftDown(
+                SortedRow,
+                self.rows.items,
+                @as([]const SortKey, self.projection.sort_keys),
+                lessSortedRow,
+            );
             removed.deinit(self.allocator);
         }
-    }
-
-    fn siftUp(self: *SortedAccumulator, start: usize) void {
-        std.debug.assert(start < self.rows.items.len);
-        var child = start;
-        while (child > 0) {
-            const parent = (child - 1) / 2;
-            if (!self.lessAt(parent, child)) break;
-            std.mem.swap(SortedRow, &self.rows.items[parent], &self.rows.items[child]);
-            child = parent;
-        }
-    }
-
-    fn siftDown(self: *SortedAccumulator) void {
-        var parent: usize = 0;
-        const count = self.rows.items.len;
-        std.debug.assert(count > 0);
-        // Only internal nodes have children; this guard also bounds child arithmetic.
-        while (parent < count / 2) {
-            var child = parent * 2 + 1;
-            if (child + 1 < count and self.lessAt(child, child + 1)) child += 1;
-            if (!self.lessAt(parent, child)) break;
-            std.mem.swap(SortedRow, &self.rows.items[parent], &self.rows.items[child]);
-            parent = child;
-        }
-    }
-
-    fn lessAt(self: *const SortedAccumulator, left: usize, right: usize) bool {
-        const rows = self.rows.items;
-        return lessSortedRow(self.projection.sort_keys, rows[left], rows[right]);
     }
 
     fn prepareReference(
@@ -1078,26 +1077,17 @@ const SortedAccumulator = struct {
         value: std.json.Value,
         record_index: usize,
         relevance_score: f64,
-    ) ![]Scalar {
-        const keys = try self.allocator.alloc(
-            Scalar,
-            self.projection.sort_keys.len,
-        );
-        var initialized: usize = 0;
-        errdefer {
-            for (keys[0..initialized]) |*key| key.deinit(self.allocator);
-            self.allocator.free(keys);
-        }
+    ) ![]const std.json.Value {
+        const keys = self.sort_key_scratch;
         for (self.projection.sort_keys, 0..) |sort_key, index| {
-            keys[index] = try self.sortKey(
+            keys[index] = try sortKey(
                 sort_key,
                 value,
                 record_index,
                 relevance_score,
             );
-            initialized += 1;
             if (self.rows.items.len != 0 and
-                !scalarKindsCompatible(
+                !candidateKindCompatible(
                     self.rows.items[0].keys[index],
                     keys[index],
                 ))
@@ -1109,31 +1099,46 @@ const SortedAccumulator = struct {
     }
 
     fn sortKey(
-        self: *SortedAccumulator,
         sort_key: SortKey,
         value: std.json.Value,
         record_index: usize,
         relevance_score: f64,
-    ) !Scalar {
+    ) !std.json.Value {
         const key = switch (sort_key.source) {
-            .record_order => Scalar{ .integer = @intCast(record_index) },
-            .relevance_score => Scalar{ .float = relevance_score },
-            .pointer => |pointer| try scalarFromJsonAlloc(
-                self.allocator,
-                definition_core.json_pointer.lookup(
-                    value,
-                    pointer,
-                ) orelse return error.ProjectionSortFieldMissing,
-            ),
+            .record_order => std.json.Value{ .integer = @intCast(record_index) },
+            .relevance_score => std.json.Value{ .float = relevance_score },
+            .pointer => |pointer| definition_core.json_pointer.lookup(
+                value,
+                pointer,
+            ) orelse return error.ProjectionSortFieldMissing,
         };
-        switch (key) {
-            .string, .number, .integer, .float => return key,
-            else => {
-                var owned = key;
-                owned.deinit(self.allocator);
-                return error.ProjectionSortScalarRequired;
+        return switch (key) {
+            .string, .integer, .float => key,
+            .number_string => |text| number: {
+                const parsed = definition_core.exact_number.parse(text) orelse
+                    return error.ProjectionScalarRequired;
+                if (definition_core.exact_number.toI64(parsed)) |integer| {
+                    break :number .{ .integer = integer };
+                }
+                break :number key;
             },
+            .bool, .null => error.ProjectionSortScalarRequired,
+            else => error.ProjectionScalarRequired,
+        };
+    }
+
+    fn ownSortKeys(self: *SortedAccumulator, borrowed: []const std.json.Value) ![]Scalar {
+        const keys = try self.allocator.alloc(Scalar, borrowed.len);
+        var initialized: usize = 0;
+        errdefer {
+            for (keys[0..initialized]) |*key| key.deinit(self.allocator);
+            self.allocator.free(keys);
         }
+        for (borrowed, keys) |value, *key| {
+            key.* = try scalarFromJsonAlloc(self.allocator, value);
+            initialized += 1;
+        }
+        return keys;
     }
 
     fn renderPayload(
@@ -7956,11 +7961,14 @@ fn compareScalars(left: Scalar, right: Scalar) !std.math.Order {
     ) orelse error.ProjectionOrderingTypeMismatch;
 }
 
-fn scalarKindsCompatible(left: Scalar, right: Scalar) bool {
+fn candidateKindCompatible(left: Scalar, right: std.json.Value) bool {
     if (left == .string or right == .string) {
         return left == .string and right == .string;
     }
-    return scalarNumberValue(left) != null and scalarNumberValue(right) != null;
+    return scalarNumberValue(left) != null and switch (right) {
+        .integer, .float, .number_string => true,
+        else => false,
+    };
 }
 
 fn scalarNumberValue(value: Scalar) ?std.json.Value {
@@ -9486,6 +9494,39 @@ test "top-K validates losing projection and sort fields before discarding rows" 
         "{\"selected\":\"first\"}",
         accumulator.rows.items[0].payload,
     );
+}
+
+test "top-K losing string and exact-number keys borrow scratch without allocating" {
+    var keys = try TopkTestKeys.init(.ascending);
+    defer keys.deinit();
+    var projection = topkTestProjection(&keys.keys);
+    projection.value_path = keys.keys[1].source.pointer;
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    var accumulator = try SortedAccumulator.init(
+        failing.allocator(),
+        &projection,
+        &topk_empty_bindings,
+        1,
+    );
+    defer accumulator.deinit();
+    try topkObserveText(&accumulator, "{\"n\":1e99,\"tag\":\"winner\"}");
+    const allocation_count = failing.alloc_index;
+    failing.fail_index = allocation_count;
+    for (0..32) |_| {
+        try topkObserveText(&accumulator, "{\"n\":9e99,\"tag\":\"loser\"}");
+        for (accumulator.sort_key_scratch) |key| try std.testing.expect(key == .null);
+    }
+    try std.testing.expect(!failing.has_induced_failure);
+    try std.testing.expectEqual(allocation_count, failing.alloc_index);
+    try std.testing.expectEqual(@as(usize, 33), accumulator.records_seen);
+    try std.testing.expectEqualStrings("1e99", accumulator.rows.items[0].keys[0].number);
+    try std.testing.expectEqualStrings("winner", accumulator.rows.items[0].keys[1].string);
+    try std.testing.expectError(
+        error.ProjectionSortFieldMissing,
+        topkObserveText(&accumulator, "{\"n\":9e99}"),
+    );
+    for (accumulator.sort_key_scratch) |key| try std.testing.expect(key == .null);
+    try std.testing.expectEqual(@as(usize, 33), accumulator.records_seen);
 }
 
 fn topkQueryBindings(

@@ -155,7 +155,8 @@ const siwc = @import("siwc");
 
 var store = try siwc.Store.open(io, allocator, auth_dir, "example", .create);
 defer store.deinit();
-var http: siwc.transport.Http = .{};
+var http = try siwc.transport.Http.init(allocator, io);
+defer http.deinit();
 var manager: siwc.Manager = .{
     .allocator = allocator,
     .io = io,
@@ -166,6 +167,15 @@ var lease = try manager.credential("personal");
 defer lease.deinit();
 // Use lease.value.access_token and lease.value.expires_at in your HTTP client.
 ```
+
+`Http.init` owns a session with at most two idle connections and serializes requests
+within their cancellation deadlines. Keep its allocator and I/O capability alive
+until `deinit`, and finish requests before destroying the session. Passing another
+I/O capability to that session is rejected. `Http{}` retains the stateless transport
+behavior for existing consumers and does not require cleanup.
+Token and revocation POSTs always open a fresh connection and are never replayed.
+A read may retry once on a fresh connection when a reused idle connection has
+closed before returning response headers; that retry shares the original deadline.
 
 For a native login UI, create a `callback.Listener`, pass its `redirect_uri` to
 `Manager.beginLogin`, open `Login.authorization_url`, and call

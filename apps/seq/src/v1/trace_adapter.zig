@@ -289,12 +289,13 @@ fn parseSelectedRelations(
     };
 }
 
-fn relationParseOptions(
+pub fn relationParseOptions(
     relations: []const physical.Relation,
     options: Options,
 ) trace_core.TraceParseOptions {
     var result = trace_core.TraceParseOptions{
         .ongoing_threshold_secs = options.ongoing_threshold_secs,
+        .include_occurrences = false,
         .include_message_bodies = false,
     };
     for (relations) |relation| {
@@ -1482,7 +1483,7 @@ fn supported(relation: physical.Relation) bool {
     };
 }
 
-fn traceParseOptions(
+pub fn traceParseOptions(
     relation: physical.Relation,
     demanded_fields: []const u16,
     options: Options,
@@ -1491,6 +1492,9 @@ fn traceParseOptions(
         .ongoing_threshold_secs = options.ongoing_threshold_secs,
         .include_raw = relation == .source_events and
             containsField(demanded_fields, 8),
+        .include_occurrence_payloads = (relation == .source_events and
+            containsField(demanded_fields, 7)) or
+            relation == .structured_documents or relation == .structured_values,
         .include_occurrences = relation == .source_events or
             relation == .messages or
             relation == .token_events or
@@ -1510,6 +1514,25 @@ fn traceParseOptions(
 fn containsField(fields: []const u16, wanted: u16) bool {
     for (fields) |field| if (field == wanted) return true;
     return false;
+}
+
+test "demanded trace records retain text without unused serialized payloads" {
+    var trace = try trace_core.parseSessionTraceBytes(
+        std.testing.io,
+        std.testing.allocator,
+        "trace.jsonl",
+        trace_rollout,
+        0,
+        traceParseOptions(.messages, &.{4}, .{}),
+    );
+    defer trace.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 4), trace.occurrences.items.len);
+    for (trace.occurrences.items) |occurrence| {
+        try std.testing.expect(occurrence.payload_json == null);
+        try std.testing.expect(occurrence.raw_json == null);
+    }
+    try std.testing.expectEqualStrings("observed", trace.occurrences.items[2].text.?);
+    try std.testing.expectEqual(@as(?i64, 1), trace.occurrences.items[2].turn_index);
 }
 
 const CorpusHasher = struct {

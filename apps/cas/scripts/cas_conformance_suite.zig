@@ -5,6 +5,7 @@ const cas_proxy_client = @import("cas_proxy_client");
 const cas_hooks = cas_proxy_client.hooks;
 const core_cli = @import("core_cli");
 const core_json = @import("core_json");
+const core_process = @import("core_process");
 const std = @import("std");
 
 const Version = core_cli.normalizeVersion(app_meta.version);
@@ -444,11 +445,7 @@ fn runCommandCapture(
     });
 
     return .{
-        .exit_code = switch (result.term) {
-            .exited => |code| code,
-            .signal => |signal| @intCast(@min(@as(u32, 128) + @backingInt(signal), @as(u32, 255))),
-            .stopped, .unknown => 1,
-        },
+        .exit_code = core_process.termToExitCode(result.term),
         .stdout = result.stdout,
         .stderr = result.stderr,
     };
@@ -501,31 +498,6 @@ fn runCommandCapturePosixSpawn(
         .stdout = try readFileAbsoluteAlloc(io, allocator, stdout_path, MaxCommandOutputBytes),
         .stderr = try readFileAbsoluteAlloc(io, allocator, stderr_path, MaxCommandOutputBytes / 2),
     };
-}
-
-fn posixSpawnError(rc: c_int) anyerror {
-    const err: std.c.E = @fromBackingInt(@intCast(@as(u16, @intCast(rc))));
-    return switch (err) {
-        .NOMEM, .@"2BIG" => error.SystemResources,
-        .MFILE => error.ProcessFdQuotaExceeded,
-        .NFILE => error.SystemFdQuotaExceeded,
-        .ACCES => error.AccessDenied,
-        .PERM => error.PermissionDenied,
-        .NOEXEC => error.InvalidExe,
-        .NOENT => error.FileNotFound,
-        .NOTDIR => error.NotDir,
-        .NAMETOOLONG => error.NameTooLong,
-        else => error.SpawnFailed,
-    };
-}
-
-fn statusToExitCode(status: u32) u8 {
-    if (std.posix.W.IFEXITED(status)) return std.posix.W.EXITSTATUS(status);
-    if (std.posix.W.IFSIGNALED(status)) {
-        const signal: u32 = @backingInt(std.posix.W.TERMSIG(status));
-        return @intCast(@min(@as(u32, 128) + signal, @as(u32, 255)));
-    }
-    return 1;
 }
 
 fn readFileAbsoluteAlloc(
@@ -1129,6 +1101,44 @@ test "overload scenario route drives production proxy retry integration" {
     try std.testing.expectEqual(@as(usize, 2), result.delays_ms.len);
 }
 
+test "captured processes retain directory environment arguments and both output streams" {
+    if (builtin.os.tag != .macos and builtin.os.tag != .linux) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var root = std.testing.tmpDir(.{});
+    defer root.cleanup();
+    try root.dir.writeFile(io, .{ .sub_path = "authority.txt", .data = "owned" });
+    const path = try root.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(path);
+    var environ: std.process.Environ.Map = .init(allocator);
+    defer environ.deinit();
+    try environ.put("CAS_CAPTURE_TEST", "supplied");
+    const ctx: Context = .{
+        .io = io,
+        .dir = root.dir,
+        .environ = &environ,
+        .cwd = path,
+        .smoke_binary = "unused",
+        .hook_policy = .inherit,
+        .backoff_base_ms = 1,
+        .max_retries = 2,
+    };
+    for ([_]?[]const u8{ null, path }) |cwd| {
+        const capture = try runCommandCapture(ctx, allocator, cwd, &.{
+            "/bin/sh", "-c",
+            "test -f authority.txt || exit 23; " ++
+                "printf '%s:%s' \"$CAS_CAPTURE_TEST\" \"$1\"; " ++
+                "printf diagnostic >&2; exit 7",
+            "marker",  "argument with spaces",
+        });
+        defer allocator.free(capture.stdout);
+        defer allocator.free(capture.stderr);
+        try std.testing.expectEqual(@as(i32, 7), capture.exit_code);
+        try std.testing.expectEqualStrings("supplied:argument with spaces", capture.stdout);
+        try std.testing.expectEqualStrings("diagnostic", capture.stderr);
+    }
+}
+
 fn parseValueArg(out: *ParsedArgs, arg: []const u8, value: []const u8) !void {
     if (std.mem.eql(u8, arg, "--cwd")) {
         out.cwd = value;
@@ -1200,43 +1210,16 @@ fn spawnCapturedCommand(
     } else if (std.c.posix_spawn_file_actions_addfchdir_np(&actions, directory.handle) != 0) {
         return error.SpawnFileActionsFailed;
     }
-    var argv_buf = try allocator.allocSentinel(?[*:0]const u8, argv.len, null);
-    defer allocator.free(argv_buf);
-    var arg_storage = try allocator.alloc([:0]u8, argv.len);
-    var arg_count: usize = 0;
-    defer {
-        for (arg_storage[0..arg_count]) |arg| allocator.free(arg);
-        allocator.free(arg_storage);
-    }
-    for (argv, 0..) |arg, i| {
-        arg_storage[i] = try allocator.dupeSentinel(u8, arg, 0);
-        arg_count += 1;
-        argv_buf[i] = arg_storage[i].ptr;
-    }
-    var pid: std.c.pid_t = undefined;
-    // Keep the temporary POSIX environment under one owner, including partial
-    // construction failure (Zig 0.17 frees a partial pointer-array extent).
-    var environment_arena = std.heap.ArenaAllocator.init(allocator);
-    defer environment_arena.deinit();
-    const environment = try environ.createPosixBlock(environment_arena.allocator(), .{});
-    const envp = environment.slice.ptr;
-    const spawn_rc = std.c.posix_spawn(&pid, argv_buf[0].?, &actions, null, argv_buf.ptr, envp);
-    if (spawn_rc != 0) return posixSpawnError(spawn_rc);
-    return waitCapturedCommand(pid);
-}
-
-fn waitCapturedCommand(pid: std.c.pid_t) !u8 {
-    var status: if (builtin.link_libc) c_int else u32 = undefined;
-    // The owned child determines termination; interruptions only retry the wait.
-    while (true) { // tiger: event-loop
-        switch (std.posix.errno(std.posix.system.waitpid(pid, &status, 0))) {
-            .SUCCESS => break,
-            .INTR => continue,
-            .CHILD => return error.NoChildProcess,
-            else => return error.WaitFailed,
-        }
-    }
-    return statusToExitCode(@bitCast(status));
+    const pid = try core_process.spawnDarwin(
+        allocator,
+        environ,
+        argv[0],
+        argv,
+        &actions,
+        null,
+        .direct,
+    );
+    return core_process.waitPosix(pid);
 }
 
 fn validateRetryProofs(
