@@ -7,14 +7,16 @@ unrelated host workloads remained. Raw samples and reproduction commands are lin
 below. Positive percentages mean a reduction; negative percentages mean an increase.
 Component timings do not establish whole-command or service latency.
 
-[Source and binary hashes](source-manifest.json) bind the captured candidate.
+[Source and binary hashes](source-manifest.json) identify the delivered candidate;
+each benchmark's metadata retains its measured input hashes. A later Seq test-fixture
+correction leaves the rebuilt release executable byte-identical to the measured one.
 
 ## Changes
 
 - Seq retains only demanded trace fields, while parsing and validating every record.
 - Seq graph top-k shares heap repair with streaming Seq and Ledger. Small selections
   retain k indexes; selections above half the rows sort indexes once and copy the
-  selected prefix. Incomparable or nonfinite keys preserve the full-sort ordering.
+  selected prefix. Incomparable or nonfinite keys retain the prior full-sort path.
 - Ledger borrows sort keys while deciding admission and owns keys only for retained rows.
 - Lift selects bootstrap order statistics and reuses three scratch arrays across
   p50/p95/p99. Signed zero and nonfinite samples keep the prior sort path.
@@ -187,8 +189,8 @@ individual payloads are freed. Full snapshots, log ordering and polling cadence 
 [Method, reproduction and results](siwc/README.md) · [all raw samples](siwc/results).
 The synthetic token/discovery/keys sequence uses 3 → 1 connections (66.67% fewer)
 in every sample. Across 125 samples per side, median loopback transport time is
-472,583 → 246,459 ns (47.85% lower). Baseline p10–p90 is 356,433–720,866 ns;
-candidate p10–p90 is 190,108–519,650 ns. This includes client setup/destruction but
+426,792 → 238,375 ns (44.15% lower). Baseline p10–p90 is 338,142–755,616 ns;
+candidate p10–p90 is 177,850–448,808 ns. This includes client setup/destruction but
 excludes TLS and remote authentication. Shared-host variation is substantial.
 
 ## Memory-note inventory
@@ -238,6 +240,14 @@ transport and inquiry integration, SIWC Debug/ReleaseSafe and offline process te
 Seq/install-prefix admission, release classifier/archive tests, lint, formatting and
 TigerStyle. Native Linux and packaged macOS release qualification run in GitHub CI.
 Exact final command results are recorded in the pull request.
+
+Review found and corrected an unsupported NaN input in the Seq test oracle and
+a SIWC timeout on header-terminated HTTP responses. Seq's corrected core tests
+pass in Debug and ReleaseSafe; repository Debug and full ReleaseFast checks pass.
+SIWC now completes bodyless responses without waiting for connection closure and
+consumes informational heads before the final response. Its tests also verify
+subsequent connection reuse, cancellation, and no replay after an accepted head.
+The SIWC measurements above were refreshed after this correction.
 
 Releases: Seq 1.2.4, Lift 0.4.2, CAS 0.8.2, Ledger 1.5.5, memory-note 0.3.4,
 and SIWC 0.1.2. There is no cache-schema or account-format migration.

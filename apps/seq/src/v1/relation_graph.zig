@@ -3184,7 +3184,7 @@ test "graph bounded top-k matches full sorting for ties nulls directions and cap
     }
 }
 
-test "graph top-k preserves full-sort behavior for incomparable and nonfinite keys" {
+test "graph top-k preserves full-sort behavior for incomparable keys and infinities" {
     var keys = [_]plan.SortKey{
         .{ .field_index = 0, .direction = .ascending, .nulls = .last },
     };
@@ -3192,7 +3192,8 @@ test "graph top-k preserves full-sort behavior for incomparable and nonfinite ke
         .{ .integer = 3 }, .{ .string = "a" }, .{ .integer = 2 }, .{ .boolean = true },
     };
     var numeric = [_]execution.Value{
-        .{ .float = 3 }, .{ .float = std.math.nan(f64) }, .{ .float = 2 },
+        .{ .float = 3 },                  .{ .float = std.math.inf(f64) },
+        .{ .float = -std.math.inf(f64) }, .{ .float = 2 },
     };
     const cases = [_]Table{
         .{ .values = &mixed, .width = 1 },
@@ -3202,6 +3203,9 @@ test "graph top-k preserves full-sort behavior for incomparable and nonfinite ke
         try std.testing.expect(!hasTotalSortOrder(input, &keys));
         for (0..input.values.len + 1) |limit| try expectGraphTopK(input, &keys, limit);
     }
+    // NaN is outside std.math.order's domain, so only test its heap exclusion.
+    var nan = [_]execution.Value{.{ .float = std.math.nan(f64) }};
+    try std.testing.expect(!hasTotalSortOrder(.{ .values = &nan, .width = 1 }, &keys));
 }
 
 fn graphTopKAllocationProbe(allocator: std.mem.Allocator, limit: usize) !void {

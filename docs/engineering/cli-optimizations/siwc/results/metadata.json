@@ -2,7 +2,7 @@
   "baseline_commit": "8e470a24b533dba479f39f7ae3cc7f07b5fc5aeb",
   "source_sha256": {
     "baseline": "1d49e995f43141d4edc87365fa4ec3151f6da616f581d97c8f2623c912fc9710",
-    "candidate": "573faeb6ef9a84f3fae6c07f8c9107cf735bfff1dd694c4ec77c2368027dac98"
+    "candidate": "b542bc26847ffba2ca3e3aaefc5153dfba0f25fba60369ea0869d35411c9c63b"
   },
   "harness_sha256": "48b41efddca7bcc4cac31d6f55afa64f8486a50f74ab00de2d7b9aeb52663d55",
   "optimize": "ReleaseFast",

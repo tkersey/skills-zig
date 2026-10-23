@@ -38,9 +38,10 @@ processes per side provide 60 samples per case. These are component measurements
 on a shared host, not whole-CLI latency or a service tail-latency estimate.
 
 The committed regression tests separately cover shared heap invariants, graph
-equivalence to full sorting, incompatible and nonfinite key fallback, allocation
-failure cleanup, losing-row validation, and borrowed string/exact-number sort
-keys without per-loser allocation.
+equivalence to full sorting, incompatible-key and infinity fallback, NaN heap
+exclusion, allocation failure cleanup, losing-row validation, and borrowed
+string/exact-number sort keys without per-loser allocation. NaN has no defined
+ordering in the existing full-sort comparator and is not passed to that oracle.
 
 ## Recorded final result
 
@@ -49,6 +50,9 @@ with Zig 0.17.0. All 48 graph output digests and all five Ledger workload/output
 digests matched. Task-owned builds were paused; unrelated jobs remained active.
 Graph measurements were repeated after introducing the adaptive sorted-prefix
 path; Ledger captures were retained because its implementation was unchanged.
+The later correction of the NaN test fixture changes only test code; the measured
+production functions are unchanged, and the rebuilt Seq release executable has
+the same SHA-256 recorded in the [source manifest](../source-manifest.json).
 
 | Case | Baseline p50 | Candidate p50 | Allocation calls | Requested allocation bytes |
 | --- | ---: | ---: | ---: | ---: |

@@ -23,7 +23,7 @@
     "apps/seq/src/v1/compiled_plan.zig": "4ef1996d2c6c99be9430d8b7575438481a6fe737a231df7431264fe47abb40e5",
     "apps/seq/src/v1/execution.zig": "937bb3d0bd0d6f1d6e24218266f051cd67654c683978ebbb60492bde2717d3f0",
     "apps/seq/src/v1/native.zig": "de7f8e668bb9898ab9cddd5f4815bb01df81f71783e1c0bd392b895076d05966",
-    "apps/seq/src/v1/relation_graph.zig": "afdc39d007a1fc67eaf99edb812873975119428aa4f35c8f1be81f4ac89d6efe",
+    "apps/seq/src/v1/relation_graph.zig": "5d37ec838a596a9a6cff49cb5c1201b76cfb7d7f492d1015d1f5784b46af2bf2",
     "apps/seq/src/v1/trace_adapter.zig": "e3e14343e5f7d389566645c86f19e8613821cc3c46c2d7363684a55ae771418c",
     "apps/siwc/README.md": "1174d2b50f7cfc96cb4401138156db0b67497a70ead97ed138e132d95ba26360",
     "apps/siwc/VERSION": "297b50f08386d3521f8fdaf2f78eb8d9d0acdf452d2e61596905fba37208c792",
@@ -41,14 +41,14 @@
     "libs/definition_core/src/root.zig": "43588d72eafa601abc28f0051fb47b787b5a9f0d7b2be25cd5b139d48bad2387",
     "libs/jsonl_core/src/lib.zig": "e1243f239a66e044a651152f05b01159d729ce6275d2a8f231df55ae2f3b7118",
     "libs/jsonl_core/src/line_cursor.zig": "783328be57850ea583f546ddb82a5d95fd838723e8e6067dd5902c2e96b263c8",
-    "libs/siwc/src/transport.zig": "573faeb6ef9a84f3fae6c07f8c9107cf735bfff1dd694c4ec77c2368027dac98"
+    "libs/siwc/src/transport.zig": "b542bc26847ffba2ca3e3aaefc5153dfba0f25fba60369ea0869d35411c9c63b"
   },
   "binary_sha256": {
     "seq": "b239e01e9c99de4d3f3f4b050807ea6ce910a69ac9faca4ea6bf12b72a1aa2a2",
     "bench_stats": "1be556edb2e30dae9f2c633611622a12766d97ee3eba7a9eacd09c3762df0df2",
     "cas": "063abd5af7b5043db42601c82f927593623ac4ab485196a42ef62d16067d370b",
     "ledger": "2d34b54253ea0012d92e3f3a3576b689f29a882c8cc4f264600dd4cfba259272",
-    "memory-note": "49092a79ac51ed68e9de7fef8dd78f5dc10df3f89b61f71e00a1968781324898",
-    "siwc": "5a6e6af35fedbe0ba1e96d8f5327da16b15e85fa7251dafe3f8d2a5c4b6d14c7"
+    "memory-note": "bf5a4f74ad0a75f5a28c5ac16cc35251955a33c65760c237eb64d0a0742857a5",
+    "siwc": "33c65e26084f3f9b698ac2500be90be8882c542d267d8f3b1d11f8dbcb4ac26d"
   }
 }

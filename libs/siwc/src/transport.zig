@@ -228,15 +228,16 @@ const Job = struct {
         );
         var complete = false;
         defer finishRequest(&request, complete);
-        var response = receiveResponseHead(&request, payload) catch |err| {
-            self.retry_idle_read = idle.contains(request.connection) and
+        var received_head = false;
+        var response = receiveResponseHead(&request, payload, &received_head) catch |err| {
+            self.retry_idle_read = !received_head and idle.contains(request.connection) and
                 idleConnectionClosed(&request, err);
             return err;
         };
         const status: u16 = @backingInt(response.head.status);
         if (status >= 300 and status < 400) return error.RedirectNotAllowed;
         var transfer: [4096]u8 = undefined;
-        const body = try response.reader(&transfer).allocRemaining(
+        const body = try responseBodyReader(&response, &transfer).allocRemaining(
             self.allocator,
             .limited(response_bytes_max),
         );
@@ -248,11 +249,30 @@ const Job = struct {
 fn receiveResponseHead(
     request: *std.http.Client.Request,
     payload: ?[]const u8,
+    received_head: *bool,
 ) !std.http.Client.Response {
     if (payload) |value| {
         try sendRequestBody(request, value);
     } else try request.sendBodiless();
-    return request.receiveHead(&.{});
+    request.handle_continue = false;
+    var response = try request.receiveHead(&.{});
+    received_head.* = true;
+    while (response.head.status.class() == .informational and
+        response.head.status != .switching_protocols)
+    {
+        _ = responseBodyReader(&response, &.{});
+        try request.client.io.checkCancel();
+        response = try request.receiveHead(&.{});
+    }
+    if (response.head.status == .switching_protocols) request.connection.?.closing = true;
+    return response;
+}
+
+fn responseBodyReader(response: *std.http.Client.Response, transfer: []u8) *std.Io.Reader {
+    const status = response.head.status;
+    if (status.class() == .informational or status == .no_content or status == .not_modified)
+        return response.request.reader.bodyReader(transfer, .none, 0);
+    return response.reader(transfer);
 }
 
 const IdleConnections = struct {
@@ -535,6 +555,8 @@ const HttpTestReply = struct {
     incomplete: bool = false,
     close_after: bool = false,
     drop_response: bool = false,
+    wire: []const []const u8 = &.{},
+    stall_after: bool = false,
 };
 
 const HttpTestServer = struct {
@@ -593,8 +615,26 @@ const HttpTestServer = struct {
             if (request.head.method == .POST) self.token_posts += 1;
             if (reply.drop_response) return;
             if (reply.incomplete) return incomplete(&writer.interface, reply.status);
-            try request.respond(reply.body, .{ .status = reply.status });
+            if (reply.wire.len != 0) {
+                try respondRaw(&request, reply.wire);
+            } else try request.respond(reply.body, .{ .status = reply.status });
+            if (reply.stall_after) try std.testing.io.sleep(.fromSeconds(10), .awake);
             if (!request.head.keep_alive or reply.close_after) return;
+        }
+    }
+
+    fn respondRaw(request: *std.http.Server.Request, wire: []const []const u8) !void {
+        std.debug.assert(wire.len > 0 and wire.len <= 8);
+        const body = request.server.reader.bodyReader(
+            &.{},
+            request.head.transfer_encoding,
+            request.head.content_length orelse 0,
+        );
+        _ = try body.discardRemaining();
+        for (wire, 0..) |part, index| {
+            try request.server.out.writeAll(part);
+            try request.server.out.flush();
+            if (index + 1 < wire.len) try std.testing.io.sleep(.fromMilliseconds(1), .awake);
         }
     }
 
@@ -804,7 +844,12 @@ test "HTTP idle recovery excludes partial response headers on connection reset" 
         .connection = &sink.connection,
         .redirect_behavior = .unhandled,
     });
-    try std.testing.expectError(error.ReadFailed, receiveResponseHead(&request, null));
+    var received_head = false;
+    try std.testing.expectError(
+        error.ReadFailed,
+        receiveResponseHead(&request, null, &received_head),
+    );
+    try std.testing.expect(!received_head);
     try std.testing.expect(!idleConnectionClosed(&request, error.ReadFailed));
     sink.connection.stream_reader.interface.end = 0;
     try std.testing.expect(idleConnectionClosed(&request, error.ReadFailed));
@@ -900,5 +945,182 @@ test "HTTP sessions retain response limits and close rejected response connectio
             );
         }
         try worker.await(std.testing.io);
+    }
+}
+
+fn expectFramedSequence(
+    reuse: bool,
+    first: Request,
+    wire: []const []const u8,
+    status: u16,
+    body: []const u8,
+    connections: usize,
+) !void {
+    var fixture = try HttpTestServer.open(&.{ .{ .wire = wire }, .{} });
+    defer fixture.server.deinit(std.testing.io);
+    var worker = try std.testing.io.concurrent(HttpTestServer.run, .{&fixture});
+    defer _ = worker.cancel(std.testing.io) catch null;
+    var http = if (reuse) try Http.init(std.testing.allocator, std.testing.io) else Http{};
+    defer http.deinit();
+    var uri_buffer: [64]u8 = undefined;
+    const uri = try fixture.uri(&uri_buffer);
+    for ([_]Request{ first, .discovery }, 0..) |value, index| {
+        var response = try http.requestUri(
+            std.testing.allocator,
+            std.testing.io,
+            value,
+            uri,
+            200,
+        );
+        defer response.deinit();
+        try std.testing.expectEqual(@as(u16, if (index == 0) status else 200), response.status);
+        try std.testing.expectEqualStrings(
+            if (index == 0) body else "synthetic-secret",
+            response.body,
+        );
+        try expectPooledBuffersErased(&http);
+    }
+    try worker.await(std.testing.io);
+    try std.testing.expectEqual(connections, fixture.connections);
+    try std.testing.expectEqual(@as(usize, 2), fixture.requests);
+    try std.testing.expectEqual(
+        @as(usize, @intFromBool(first.body() != null)),
+        fixture.token_posts,
+    );
+}
+
+test "HTTP status-defined empty responses complete before socket closure and permit reuse" {
+    for ([_]bool{ false, true }) |reuse| {
+        for ([_]Request{ .discovery, .{ .token = "synthetic-secret" } }) |request| {
+            try expectFramedSequence(
+                reuse,
+                request,
+                &.{"HTTP/1.1 204 No Content\r\n\r\n"},
+                204,
+                "",
+                if (reuse) 1 else 2,
+            );
+        }
+    }
+    for ([_][]const u8{
+        "HTTP/1.1 204 No Content\r\nContent-Length: 99\r\n\r\n",
+        "HTTP/1.1 204 No Content\r\nTransfer-Encoding: chunked\r\n\r\n",
+    }) |wire| try expectFramedSequence(true, .discovery, &.{wire}, 204, "", 1);
+}
+
+test "HTTP informational messages lead to the final response without repeating POST" {
+    const first = "HTTP/1.1 100 Continue\r\n\r\n";
+    const second = "HTTP/1.1 103 Early Hints\r\n\r\n";
+    const third = "HTTP/1.1 199 Informational\r\n\r\n";
+    const final = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok";
+    for ([_]bool{ false, true }) |reuse| {
+        for ([_][]const []const u8{
+            &.{first ++ second ++ third ++ final},
+            &.{ first, second, third, final },
+        }) |wire| try expectFramedSequence(
+            reuse,
+            .{ .token = "synthetic-secret" },
+            wire,
+            200,
+            "ok",
+            if (reuse) 1 else 2,
+        );
+    }
+}
+
+test "HTTP protocol switches preserve their status and retire the connection" {
+    try expectFramedSequence(
+        true,
+        .discovery,
+        &.{"HTTP/1.1 101 Switching Protocols\r\n\r\nupgraded bytes"},
+        101,
+        "",
+        2,
+    );
+}
+
+test "HTTP normal response framing and error status diagnostics remain intact" {
+    try expectFramedSequence(true, .discovery, &.{
+        "HTTP/1.1 400 Bad Request\r\nTransfer-Encoding: chunked\r\n\r\n" ++
+            "6\r\ndenied\r\n0\r\n\r\n",
+    }, 400, "denied", 1);
+    try expectFramedSequence(true, .discovery, &.{
+        "HTTP/1.1 205 Reset Content\r\nContent-Length: 0\r\n\r\n",
+    }, 205, "", 1);
+}
+
+test "HTTP framing failures retain redirect rejection cancellation and connection cleanup" {
+    const Case = struct { wire: []const u8, expected: anyerror, stall: bool = true };
+    for ([_]Case{
+        .{ .wire = "HTTP/1.1 304 Not Modified\r\n\r\n", .expected = error.RedirectNotAllowed },
+        .{ .wire = "HTTP/1.1 103 Early Hints\r\n\r\n", .expected = error.RequestTimedOut },
+        .{
+            .wire = "HTTP/1.1 200 OK\r\nContent-Length: 10\r\n\r\nx",
+            .expected = error.RequestTimedOut,
+        },
+        .{
+            .wire = "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n3\r\nx",
+            .expected = error.ReadFailed,
+            .stall = false,
+        },
+    }) |case| {
+        var fixture = try HttpTestServer.open(&.{.{
+            .wire = &.{case.wire},
+            .stall_after = case.stall,
+        }});
+        defer fixture.server.deinit(std.testing.io);
+        var worker = try std.testing.io.concurrent(HttpTestServer.run, .{&fixture});
+        defer _ = worker.cancel(std.testing.io) catch null;
+        var http = try Http.init(std.testing.allocator, std.testing.io);
+        defer http.deinit();
+        var uri_buffer: [64]u8 = undefined;
+        try std.testing.expectError(case.expected, http.requestUri(
+            std.testing.allocator,
+            std.testing.io,
+            .{ .token = "synthetic-secret" },
+            try fixture.uri(&uri_buffer),
+            50,
+        ));
+        try std.testing.expectEqual(@as(usize, 0), http.session.?.client.connection_pool.free_len);
+        try http.session.?.mutex.lock(std.testing.io);
+        http.session.?.mutex.unlock(std.testing.io);
+        try std.testing.expectEqual(@as(usize, 1), fixture.token_posts);
+    }
+}
+
+test "HTTP idle recovery never retries after any informational response head" {
+    for ([_][]const u8{
+        "HTTP/1.1 100 Continue\r\n\r\n",
+        "HTTP/1.1 103 Early Hints\r\n\r\n",
+    }) |wire| {
+        var fixture = try HttpTestServer.open(&.{
+            .{}, .{ .wire = &.{wire}, .close_after = true },
+        });
+        defer fixture.server.deinit(std.testing.io);
+        var worker = try std.testing.io.concurrent(HttpTestServer.run, .{&fixture});
+        defer _ = worker.cancel(std.testing.io) catch null;
+        var http = try Http.init(std.testing.allocator, std.testing.io);
+        defer http.deinit();
+        var uri_buffer: [64]u8 = undefined;
+        const uri = try fixture.uri(&uri_buffer);
+        var first = try http.requestUri(
+            std.testing.allocator,
+            std.testing.io,
+            .discovery,
+            uri,
+            200,
+        );
+        first.deinit();
+        try std.testing.expectError(error.HttpConnectionClosing, http.requestUri(
+            std.testing.allocator,
+            std.testing.io,
+            .discovery,
+            uri,
+            200,
+        ));
+        try worker.await(std.testing.io);
+        try std.testing.expectEqual(@as(usize, 1), fixture.connections);
+        try std.testing.expectEqual(@as(usize, 2), fixture.requests);
+        try std.testing.expectEqual(@as(usize, 0), http.session.?.client.connection_pool.free_len);
     }
 }
