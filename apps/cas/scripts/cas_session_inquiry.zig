@@ -7,6 +7,7 @@ const durable_store = @import("durable_store");
 const trace_core = @import("trace_core");
 const app_meta = @import("app_meta");
 const inquiry_anchor = @import("cas_session_inquiry_anchor");
+const turn_observation = @import("turn_observation.zig");
 const cas_client = @import("cas_proxy_client.zig");
 const cas_websocket = @import("cas_websocket_transport.zig");
 const canonical_trace = trace_core;
@@ -5523,18 +5524,19 @@ fn waitForTurnObservation(
     const start_ms = @divFloor(std.Io.Clock.awake.now(io).nanoseconds, 1_000_000);
     var latest = TurnObservation{};
     errdefer latest.deinit(allocator);
+    const params = try stringifyAnyAlloc(
+        allocator,
+        .{ .threadId = thread_id, .includeTurns = true },
+    );
+    defer allocator.free(params);
+    var notifications: std.ArrayList([]u8) = .empty;
+    defer {
+        turn_observation.clearNotifications(allocator, &notifications);
+        notifications.deinit(allocator);
+    }
     var elapsed: u64 = 0;
     while (elapsed <= timeout_ms) {
-        const params = try stringifyAnyAlloc(
-            allocator,
-            .{ .threadId = thread_id, .includeTurns = true },
-        );
-        defer allocator.free(params);
-        var notifications: std.ArrayList([]u8) = .empty;
-        defer {
-            for (notifications.items) |line| allocator.free(line);
-            notifications.deinit(allocator);
-        }
+        defer turn_observation.clearNotifications(allocator, &notifications);
         const read_json = try client.requestJsonCaptureNotifications(
             "thread/read",
             params,
@@ -5602,26 +5604,18 @@ fn observationFromThreadRead(
         .array => |arr| arr.items,
         else => return error.SourceStale,
     };
-    for (turns) |turn_value| {
-        const turn = switch (turn_value) {
-            .object => |obj| obj,
-            else => continue,
-        };
-        const id = core_json.stringField(turn, "id") orelse continue;
-        if (!std.mem.eql(u8, id, turn_id)) continue;
-        var out = TurnObservation{};
-        errdefer out.deinit(allocator);
-        out.status = try allocator.dupe(
-            u8,
-            core_json.stringField(turn, "status") orelse "inProgress",
-        );
-        out.terminal = isTerminalTurnStatus(out.statusText());
-        if (turn.get("items")) |items_value| {
-            out.final_text = try finalTextFromItems(allocator, items_value);
-        }
-        return out;
+    const turn = (try turn_observation.selectTurn(turns, turn_id, .first)) orelse return .{};
+    var out = TurnObservation{};
+    errdefer out.deinit(allocator);
+    out.status = try allocator.dupe(
+        u8,
+        core_json.stringField(turn, "status") orelse "inProgress",
+    );
+    out.terminal = isTerminalTurnStatus(out.statusText());
+    if (turn.get("items")) |items_value| {
+        out.final_text = try finalTextFromItems(allocator, items_value);
     }
-    return .{};
+    return out;
 }
 
 fn finalTextFromItems(allocator: std.mem.Allocator, items_value: std.json.Value) !?[]u8 {

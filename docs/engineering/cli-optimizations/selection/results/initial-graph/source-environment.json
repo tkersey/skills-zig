@@ -1,0 +1,34 @@
+{
+  "baseline_sha": "8e470a24b533dba479f39f7ae3cc7f07b5fc5aeb",
+  "zig_version": "0.17.0",
+  "platform": "macOS-27.2-arm64-arm-64bit-Mach-O",
+  "machine": "Apple M2 Pro",
+  "optimize": "fast",
+  "source_sha256": {
+    "libs/core/src/selection.zig": "f2b665c288b54ce0edb92f9101930a534e8b9488baaf54b52d2cf80ef2a8bf0c",
+    "apps/seq/src/v1/execution.zig": "937bb3d0bd0d6f1d6e24218266f051cd67654c683978ebbb60492bde2717d3f0",
+    "apps/seq/src/v1/relation_graph.zig": "acfc5ec3de6356d503f285da591142cde1853ea6322ac32972d0cb0a545327e5",
+    "apps/ledger/src/v1/projection.zig": "47b45e9ab11c810919f89761d88f50863d87af2629ef6ef911ba4a9bfe3c293f",
+    "apps/ledger/src/v1/compiled_plan.zig": "15e2165d658952fe0dd63cc6f42336d4c23c9276cc72419efb5d7df6e27533b1",
+    "libs/definition_core/src/cache_store.zig": "dd243278deab12a3d9104d28b884fd9f60bc71b0205fe099c13b94be9e0c9402"
+  },
+  "build.zig": "5f9b5b466d6d279d7f1d9404ac2beb0eeaa7c94c2fd985d2cd1edd7ed7edee29",
+  "graph.zig": "f0415992b5722e09a52e414768ef81f08f1f9d976a00e9dce0504e3f33b8e928",
+  "reproduce.py": "d4a8b1c68787a0d52ab793e4939bd89aae0c1faa3834aebeafd4ad229e97c163",
+  "measurement_order": [
+    "baseline",
+    "candidate",
+    "candidate",
+    "baseline"
+  ],
+  "samples_per_side_per_case": 60,
+  "host_noise": "Task-owned builds and benchmarks were paused; unrelated workloads remained on this shared host.",
+  "candidate_revision": "Working tree changes accompanying this evidence; component source hashes identify measured files.",
+  "raw_sha256": {
+    "graph-0-baseline.tsv": "0ec12ac8f2c5f0a2f9d06b94460335a5b675cd0edad470b08de05aab79d2d20a",
+    "graph-1-candidate.tsv": "5dffff0690a52a5357a93454585c130326697c5b4c030137ed7535d5fb770f84",
+    "graph-2-candidate.tsv": "a369cedd7fd55c32c424e0af0ebf4e8aa68b425aea112a2ce3f8046cbd7c6423",
+    "graph-3-baseline.tsv": "8e89375f495cadd3650cdee6d06ccc260883901e269f0444e011bd339a1b589a"
+  },
+  "disposition": "Superseded heap-only graph experiment. Excluded from final acceptance; retained only to explain adaptive successor."
+}

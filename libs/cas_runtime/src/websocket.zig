@@ -1,4 +1,6 @@
 const core_io = @import("core_io");
+const jsonl_core = @import("jsonl_core");
+const core_process = @import("core_process");
 const std = @import("std");
 
 const builtin = @import("builtin");
@@ -15,6 +17,7 @@ pub const max_message_bytes: usize = 8 * 1024 * 1024;
 pub const max_fragments: usize = 1024;
 pub const max_startup_stderr_line_bytes: usize = 4 * 1024;
 pub const max_startup_stderr_bytes: usize = 64 * 1024;
+const startup_read_chunk_bytes: usize = 4 * 1024;
 pub const max_readyz_bytes: usize = 1024;
 pub const default_startup_timeout_ms = launch.default_startup_timeout_ms;
 
@@ -812,9 +815,9 @@ fn readManagedStartup(
     errdefer if (listening) |owned| allocator.free(owned);
     var readyz: ?[]u8 = null;
     errdefer if (readyz) |owned| allocator.free(owned);
+    var lines: StartupLineReader = .{};
     for (0..16) |_| {
-        var line_buf: [max_startup_stderr_line_bytes]u8 = undefined;
-        const line = try readFdLine(io, file, &line_buf, deadline);
+        const line = try lines.next(io, file, deadline);
         total += line.len + 1;
         if (total > max_startup_stderr_bytes) return error.ManagedStartupOutputTooLarge;
         if (std.mem.startsWith(u8, line, "  listening on: ")) {
@@ -845,14 +848,40 @@ fn readManagedStartup(
     return error.ManagedStartupIncomplete;
 }
 
-fn readFdLine(
-    io: std.Io,
-    file: std.Io.File,
-    buffer: []u8,
-    deadline: std.Io.Clock.Timestamp,
-) ![]const u8 {
-    var used: usize = 0;
-    while (true) { // tiger: event-loop -- bounded by deadline and buffer length.
+const StartupLineReader = struct {
+    buffer: [max_startup_stderr_line_bytes + startup_read_chunk_bytes]u8 = undefined,
+    used: usize = 0,
+    cursor: jsonl_core.LineCursor = .{},
+
+    fn next(
+        self: *StartupLineReader,
+        io: std.Io,
+        file: std.Io.File,
+        deadline: std.Io.Clock.Timestamp,
+    ) ![]const u8 {
+        if (deadline.durationFromNow(io).raw.toMilliseconds() <= 0) return error.Timeout;
+        while (true) { // tiger: event-loop -- bounded by deadline and buffer length.
+            if (self.cursor.peek(self.buffer[0..self.used], false)) |frame| {
+                if (frame.bytes.len > max_startup_stderr_line_bytes) {
+                    return error.ManagedStartupLineTooLong;
+                }
+                self.cursor.consume();
+                return std.mem.trimEnd(u8, frame.bytes, "\r");
+            }
+            self.used = self.cursor.compact(self.buffer[0..self.used]);
+            if (self.used > max_startup_stderr_line_bytes) {
+                return error.ManagedStartupLineTooLong;
+            }
+            try self.readChunk(io, file, deadline);
+        }
+    }
+
+    fn readChunk(
+        self: *StartupLineReader,
+        io: std.Io,
+        file: std.Io.File,
+        deadline: std.Io.Clock.Timestamp,
+    ) !void {
         const remaining_ms = deadline.durationFromNow(io).raw.toMilliseconds();
         if (remaining_ms <= 0) return error.Timeout;
         var fds = [_]std.posix.pollfd{.{
@@ -864,15 +893,12 @@ fn readFdLine(
             &fds,
             @intCast(@min(remaining_ms, std.math.maxInt(i32))),
         ) == 0) return error.Timeout;
-        var byte: [1]u8 = undefined;
-        const count = try std.posix.read(file.handle, &byte);
+        const end = @min(self.buffer.len, self.used + startup_read_chunk_bytes);
+        const count = try std.posix.read(file.handle, self.buffer[self.used..end]);
         if (count == 0) return error.EndOfStream;
-        if (byte[0] == '\n') return std.mem.trimEnd(u8, buffer[0..used], "\r");
-        if (used == buffer.len) return error.ManagedStartupLineTooLong;
-        buffer[used] = byte[0];
-        used += 1;
+        self.used += count;
     }
-}
+};
 
 fn portSuffix(url: []const u8) ?u16 {
     const colon = std.mem.lastIndexOfScalar(u8, url, ':') orelse return null;
@@ -1162,13 +1188,14 @@ fn spawnOwnerPipeProcessPosix(
     const null_output = try dir.openFile(io, "/dev/null", .{ .mode = .write_only });
     defer null_output.close(io);
     try configureSpawnActions(child_dir, null_output, pipe_fds, &actions);
-    const pid = try posixSpawnArgv(
+    const pid = try core_process.spawnDarwin(
         allocator,
         environ,
         watchdog_argv[0],
         watchdog_argv,
         &actions,
         &attributes,
+        .direct,
     );
 
     _ = std.c.close(pipe_fds[0]);
@@ -1213,47 +1240,6 @@ fn configureSpawnActions(
     {
         return error.SpawnFileActionsFailed;
     }
-}
-
-fn posixSpawnArgv(
-    allocator: std.mem.Allocator,
-    environ: *const std.process.Environ.Map,
-    executable: []const u8,
-    source_argv: []const []const u8,
-    actions: *std.c.posix_spawn_file_actions_t,
-    attributes: ?*std.c.posix_spawnattr_t,
-) !std.c.pid_t {
-    var argv = try allocator.allocSentinel(?[*:0]const u8, source_argv.len, null);
-    defer allocator.free(argv);
-    var storage = try allocator.alloc([:0]u8, source_argv.len);
-    var count: usize = 0;
-    defer {
-        for (storage[0..count]) |arg| allocator.free(arg);
-        allocator.free(storage);
-    }
-    for (source_argv, 0..) |arg, index| {
-        storage[index] = try allocator.dupeSentinel(u8, arg, 0);
-        count += 1;
-        argv[index] = storage[index].ptr;
-    }
-    var pid: std.c.pid_t = undefined;
-    // Keep the temporary POSIX environment under one owner, including partial
-    // construction failure (Zig 0.17 frees a partial pointer-array extent).
-    var environment_arena = std.heap.ArenaAllocator.init(allocator);
-    defer environment_arena.deinit();
-    const envp = try environ.createPosixBlock(environment_arena.allocator(), .{});
-    const executable_z = try allocator.dupeSentinel(u8, executable, 0);
-    defer allocator.free(executable_z);
-    const rc = std.c.posix_spawn(
-        &pid,
-        executable_z,
-        actions,
-        attributes,
-        argv.ptr,
-        @ptrCast(envp.slice.ptr),
-    );
-    if (rc != 0) return posixSpawnError(rc);
-    return pid;
 }
 
 extern "c" fn posix_spawnattr_setpgroup(
@@ -1312,7 +1298,15 @@ fn spawnManagedServerPosix(
         if (std.c.posix_spawn_file_actions_adddup2(&actions, null_file.handle, @intCast(fd)) != 0)
             return error.SpawnFileActionsFailed;
     }
-    const pid = try posixSpawnArgv(allocator, environ, executable, argv, &actions, null);
+    const pid = try core_process.spawnDarwin(
+        allocator,
+        environ,
+        executable,
+        argv,
+        &actions,
+        null,
+        .direct,
+    );
     return .{
         .id = pid,
         .thread_handle = {},
@@ -1320,22 +1314,6 @@ fn spawnManagedServerPosix(
         .stdout = null,
         .stderr = null,
         .request_resource_usage_statistics = false,
-    };
-}
-
-fn posixSpawnError(rc: c_int) anyerror {
-    const err: std.c.E = @fromBackingInt(@intCast(@as(u16, @intCast(rc))));
-    return switch (err) {
-        .NOMEM, .@"2BIG" => error.SystemResources,
-        .MFILE => error.ProcessFdQuotaExceeded,
-        .NFILE => error.SystemFdQuotaExceeded,
-        .ACCES => error.AccessDenied,
-        .PERM => error.PermissionDenied,
-        .NOEXEC => error.InvalidExe,
-        .NOENT => error.FileNotFound,
-        .NOTDIR => error.NotDir,
-        .NAMETOOLONG => error.NameTooLong,
-        else => error.SpawnFailed,
     };
 }
 
@@ -2834,4 +2812,56 @@ test "ordinary managed startup failure retires its process group descendants" {
     try std.testing.expect(waitForProcessExit(io, server_pid, 2_000));
     try std.testing.expect(waitForProcessExit(io, descendant_pid, 2_000));
     try std.testing.expect(waitForProcessGroupExit(io, server_pid, 2_000));
+}
+
+test "managed startup framing keeps coalesced lines and exact content limits" {
+    const io = std.testing.io;
+    const deadline = std.Io.Clock.Timestamp.fromNow(io, .{
+        .raw = .fromMilliseconds(1000),
+        .clock = .awake,
+    });
+    const file: std.Io.File = .{ .handle = 123, .flags = .{ .nonblocking = false } };
+    var lines: StartupLineReader = .{};
+    const input = "first\r\nsecond\n";
+    @memcpy(lines.buffer[0..input.len], input);
+    lines.used = input.len;
+    try std.testing.expectEqualStrings("first", try lines.next(io, file, deadline));
+    try std.testing.expectEqualStrings("second", try lines.next(io, file, deadline));
+    lines = .{};
+    @memset(lines.buffer[0..max_startup_stderr_line_bytes], 'x');
+    lines.buffer[max_startup_stderr_line_bytes] = '\n';
+    lines.used = max_startup_stderr_line_bytes + 1;
+    try std.testing.expectEqual(
+        max_startup_stderr_line_bytes,
+        (try lines.next(io, file, deadline)).len,
+    );
+    lines = .{};
+    @memset(lines.buffer[0 .. max_startup_stderr_line_bytes + 1], 'x');
+    lines.buffer[max_startup_stderr_line_bytes + 1] = '\n';
+    lines.used = max_startup_stderr_line_bytes + 2;
+    try std.testing.expectError(error.ManagedStartupLineTooLong, lines.next(io, file, deadline));
+    const expired = std.Io.Clock.Timestamp.fromNow(io, .{
+        .raw = .fromMilliseconds(-1),
+        .clock = .awake,
+    });
+    try std.testing.expectError(error.Timeout, lines.next(io, file, expired));
+}
+
+test "managed startup reads a short receipt without filling its chunk" {
+    if (builtin.target.os.tag == .windows or
+        builtin.target.os.tag == .wasi) return error.SkipZigTest;
+    const io = std.testing.io;
+    var descriptors: [2]std.posix.fd_t = undefined;
+    if (std.c.pipe(&descriptors) != 0) return error.SystemResources;
+    const input: std.Io.File = .{ .handle = descriptors[0], .flags = .{ .nonblocking = false } };
+    defer input.close(io);
+    const output: std.Io.File = .{ .handle = descriptors[1], .flags = .{ .nonblocking = false } };
+    defer output.close(io);
+    try output.writeStreamingAll(io, "ignored\n  listening on: ws://127.0.0.1:12345\r\n" ++
+        "  readyz: http://127.0.0.1:12345/readyz\ntrailing diagnostics\n");
+    const startup = try readManagedStartup(std.testing.allocator, io, input, 1000);
+    defer std.testing.allocator.free(startup.listen_url);
+    defer std.testing.allocator.free(startup.readyz_url);
+    try std.testing.expectEqualStrings("ws://127.0.0.1:12345", startup.listen_url);
+    try std.testing.expectEqualStrings("http://127.0.0.1:12345/readyz", startup.readyz_url);
 }

@@ -1,0 +1,27 @@
+1/1 baseline_bench.test.transport performance synthetic login sequence...{"round":0,"requests":3,"connections":3,"elapsed_ns":790958}
+{"round":1,"requests":3,"connections":3,"elapsed_ns":381125}
+{"round":2,"requests":3,"connections":3,"elapsed_ns":380708}
+{"round":3,"requests":3,"connections":3,"elapsed_ns":384291}
+{"round":4,"requests":3,"connections":3,"elapsed_ns":388792}
+{"round":5,"requests":3,"connections":3,"elapsed_ns":378500}
+{"round":6,"requests":3,"connections":3,"elapsed_ns":393959}
+{"round":7,"requests":3,"connections":3,"elapsed_ns":361500}
+{"round":8,"requests":3,"connections":3,"elapsed_ns":364834}
+{"round":9,"requests":3,"connections":3,"elapsed_ns":347750}
+{"round":10,"requests":3,"connections":3,"elapsed_ns":386375}
+{"round":11,"requests":3,"connections":3,"elapsed_ns":369833}
+{"round":12,"requests":3,"connections":3,"elapsed_ns":366208}
+{"round":13,"requests":3,"connections":3,"elapsed_ns":376292}
+{"round":14,"requests":3,"connections":3,"elapsed_ns":352250}
+{"round":15,"requests":3,"connections":3,"elapsed_ns":364917}
+{"round":16,"requests":3,"connections":3,"elapsed_ns":464292}
+{"round":17,"requests":3,"connections":3,"elapsed_ns":465291}
+{"round":18,"requests":3,"connections":3,"elapsed_ns":413959}
+{"round":19,"requests":3,"connections":3,"elapsed_ns":417667}
+{"round":20,"requests":3,"connections":3,"elapsed_ns":414833}
+{"round":21,"requests":3,"connections":3,"elapsed_ns":474875}
+{"round":22,"requests":3,"connections":3,"elapsed_ns":472583}
+{"round":23,"requests":3,"connections":3,"elapsed_ns":441000}
+{"round":24,"requests":3,"connections":3,"elapsed_ns":411167}
+OK
+All 1 tests passed.

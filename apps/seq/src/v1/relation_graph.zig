@@ -1,4 +1,5 @@
 const std = @import("std");
+const core_selection = @import("core_selection");
 const definition_core = @import("definition_core");
 const definition = @import("definition.zig");
 const execution = @import("execution.zig");
@@ -596,9 +597,45 @@ fn topKTable(
     input: Table,
     top_k: plan.TopK,
 ) !Table {
-    const sorted = try sortTable(allocator, input, .{ .keys = top_k.keys });
-    defer allocator.free(sorted.values);
-    return limitTable(allocator, definition_plan, bindings, sorted, top_k.limit);
+    const rows = try input.rowCount();
+    const count = @min(rows, try limitCount(definition_plan, bindings, top_k.limit));
+    if (count > rows / 2 or !hasTotalSortOrder(input, top_k.keys)) {
+        return sortTablePrefix(allocator, input, .{ .keys = top_k.keys }, count);
+    }
+    const indices = try allocator.alloc(usize, count);
+    defer allocator.free(indices);
+    const context = SortContext{ .table = input, .keys = top_k.keys };
+    for (indices, 0..) |*slot, index| {
+        slot.* = index;
+        core_selection.siftUp(usize, indices[0 .. index + 1], context, SortContext.lessThan);
+    }
+    if (count != 0) for (count..rows) |index| {
+        if (!SortContext.lessThan(context, index, indices[0])) continue;
+        indices[0] = index;
+        core_selection.siftDown(usize, indices, context, SortContext.lessThan);
+    };
+    std.sort.heap(usize, indices, context, SortContext.lessThan);
+    return copyIndexedRows(allocator, input, indices);
+}
+
+fn hasTotalSortOrder(input: Table, keys: []const plan.SortKey) bool {
+    const Family = enum { number, text, boolean };
+    for (keys) |key| {
+        var family: ?Family = null;
+        for (0..input.values.len / input.width) |index| {
+            const value = input.row(index)[key.field_index];
+            const current: Family = switch (value) {
+                .integer => .number,
+                .float => |number| if (std.math.isFinite(number)) .number else return false,
+                .string, .json => .text,
+                .boolean => .boolean,
+                .null => continue,
+            };
+            if (family) |expected| if (current != expected) return false;
+            family = current;
+        }
+    }
+    return true;
 }
 
 fn executeGenericStage(
@@ -904,7 +941,23 @@ fn limitTable(
     input: Table,
     limit: plan.Limit,
 ) !Table {
-    const wanted = switch (limit) {
+    const wanted = try limitCount(definition_plan, bindings, limit);
+    const count = @min(wanted, try input.rowCount());
+    return .{
+        .values = try allocator.dupe(
+            execution.Value,
+            input.values[0 .. count * input.width],
+        ),
+        .width = input.width,
+    };
+}
+
+fn limitCount(
+    definition_plan: *const definition.Plan,
+    bindings: *const definition_core.parameters.Bindings,
+    limit: plan.Limit,
+) !usize {
+    return switch (limit) {
         .fixed => |value| value,
         .parameter => |index| switch (bindings.find(
             definition_plan.parameter_declarations.items[index].name,
@@ -913,14 +966,6 @@ fn limitTable(
                 return error.InvalidObservationLimit,
             else => return error.ObservationLimitParameterMustBeInteger,
         },
-    };
-    const count = @min(wanted, try input.rowCount());
-    return .{
-        .values = try allocator.dupe(
-            execution.Value,
-            input.values[0 .. count * input.width],
-        ),
-        .width = input.width,
     };
 }
 
@@ -952,7 +997,17 @@ fn sortTable(
     input: Table,
     sort: plan.Sort,
 ) !Table {
+    return sortTablePrefix(allocator, input, sort, try input.rowCount());
+}
+
+fn sortTablePrefix(
+    allocator: std.mem.Allocator,
+    input: Table,
+    sort: plan.Sort,
+    selected_count: usize,
+) !Table {
     const count = try input.rowCount();
+    std.debug.assert(selected_count <= count);
     const indices = try allocator.alloc(usize, count);
     defer allocator.free(indices);
     for (indices, 0..) |*index, value| index.* = value;
@@ -962,7 +1017,15 @@ fn sortTable(
         SortContext{ .table = input, .keys = sort.keys },
         SortContext.lessThan,
     );
-    const values = try allocator.alloc(execution.Value, input.values.len);
+    return copyIndexedRows(allocator, input, indices[0..selected_count]);
+}
+
+fn copyIndexedRows(
+    allocator: std.mem.Allocator,
+    input: Table,
+    indices: []const usize,
+) !Table {
+    const values = try allocator.alloc(execution.Value, indices.len * input.width);
     for (indices, 0..) |source_index, target_index| {
         @memcpy(
             values[target_index * input.width ..][0..input.width],
@@ -3059,6 +3122,118 @@ fn valueText(value: execution.Value) ?[]const u8 {
         .string, .json => |text| text,
         else => null,
     };
+}
+
+fn expectGraphTopK(input: Table, keys: []plan.SortKey, limit: usize) !void {
+    const allocator = std.testing.allocator;
+    const sorted = try sortTable(allocator, input, .{ .keys = keys });
+    defer allocator.free(sorted.values);
+    const selected = try topKTable(
+        allocator,
+        &graph_test_definition,
+        &expression_test_bindings,
+        input,
+        .{ .keys = keys, .limit = .{ .fixed = limit } },
+    );
+    defer allocator.free(selected.values);
+    const count = @min(try input.rowCount(), limit) * input.width;
+    try std.testing.expectEqual(count, selected.values.len);
+    for (sorted.values[0..count], selected.values) |expected, actual| {
+        if (expected == .float) {
+            try std.testing.expect(actual == .float);
+            try std.testing.expectEqual(
+                @as(u64, @bitCast(expected.float)),
+                @as(u64, @bitCast(actual.float)),
+            );
+        } else try std.testing.expectEqualDeep(expected, actual);
+    }
+}
+
+test "graph bounded top-k matches full sorting for ties nulls directions and capacities" {
+    var values: [771]execution.Value = undefined;
+    const tags = [_][]const u8{ "a", "b", "c" };
+    for (0..257) |index| {
+        const number: i64 = @as(i64, @intCast((index * 13) % 23)) - 11;
+        values[index * 3] = switch (index % 3) {
+            0 => .{ .integer = number },
+            1 => .{ .float = @floatFromInt(number) },
+            else => .null,
+        };
+        values[index * 3 + 1] = .{ .string = tags[index % tags.len] };
+        values[index * 3 + 2] = .{ .integer = @intCast(index) };
+    }
+    var keys = [_]plan.SortKey{
+        .{ .field_index = 0, .direction = .ascending, .nulls = .last },
+        .{ .field_index = 1, .direction = .descending, .nulls = .first },
+    };
+    for ([_]plan.SortDirection{ .ascending, .descending }) |direction| {
+        keys[0].direction = direction;
+        for ([_]plan.NullOrder{ .first, .last }) |nulls| {
+            keys[0].nulls = nulls;
+            for ([_]usize{ 0, 1, 2, 32, 257 }) |count| {
+                const input = Table{ .values = values[0 .. count * 3], .width = 3 };
+                try std.testing.expect(hasTotalSortOrder(input, &keys));
+                for ([_]usize{ 0, 1, 2, 10, 256, 257, 258 }) |limit| {
+                    try expectGraphTopK(input, &keys, limit);
+                }
+                for ([_]usize{ count / 2, count / 2 + 1, count -| 1 }) |limit| {
+                    try expectGraphTopK(input, &keys, limit);
+                }
+            }
+        }
+    }
+}
+
+test "graph top-k preserves full-sort behavior for incomparable and nonfinite keys" {
+    var keys = [_]plan.SortKey{
+        .{ .field_index = 0, .direction = .ascending, .nulls = .last },
+    };
+    var mixed = [_]execution.Value{
+        .{ .integer = 3 }, .{ .string = "a" }, .{ .integer = 2 }, .{ .boolean = true },
+    };
+    var numeric = [_]execution.Value{
+        .{ .float = 3 }, .{ .float = std.math.nan(f64) }, .{ .float = 2 },
+    };
+    const cases = [_]Table{
+        .{ .values = &mixed, .width = 1 },
+        .{ .values = &numeric, .width = 1 },
+    };
+    for (cases) |input| {
+        try std.testing.expect(!hasTotalSortOrder(input, &keys));
+        for (0..input.values.len + 1) |limit| try expectGraphTopK(input, &keys, limit);
+    }
+}
+
+fn graphTopKAllocationProbe(allocator: std.mem.Allocator, limit: usize) !void {
+    var values = [_]execution.Value{
+        .{ .integer = 5 }, .{ .integer = 1 }, .{ .integer = 4 }, .{ .integer = 2 },
+    };
+    var keys = [_]plan.SortKey{
+        .{ .field_index = 0, .direction = .ascending, .nulls = .last },
+    };
+    const selected = try topKTable(
+        allocator,
+        &graph_test_definition,
+        &expression_test_bindings,
+        .{ .values = &values, .width = 1 },
+        .{ .keys = &keys, .limit = .{ .fixed = limit } },
+    );
+    defer allocator.free(selected.values);
+    try std.testing.expectEqual(limit, selected.values.len);
+    const expected = [_]i64{ 1, 2, 4, 5 };
+    for (selected.values, expected[0..limit]) |actual, wanted| {
+        try std.testing.expectEqual(wanted, actual.integer);
+    }
+}
+
+test "graph top-k releases its bounded index and output at every allocation failure" {
+    for ([_]usize{ 2, 3 }) |limit| {
+        try @import("test_support").checkAllAllocationFailures(
+            std.testing.allocator,
+            graphTopKAllocationProbe,
+            .{limit},
+        );
+    }
 }
 
 test "lineage ownership is strict and does not cross siblings" {

@@ -243,30 +243,31 @@ fn comparisonIntervals(
     if (ci_samples > 0) {
         const seed = cfg.seed orelse defaultSeed(io);
         var prng = std.Random.DefaultPrng.init(seed);
-        ci.p50 = try bootstrapCiDelta(
+        var scratch = try BootstrapScratch.init(
             allocator,
+            baseline_values.len,
+            variant_values.len,
+            ci_samples,
+        );
+        defer scratch.deinit(allocator);
+        ci.p50 = scratch.interval(
             baseline_values,
             variant_values,
             50.0,
-            ci_samples,
             cfg.ci_alpha,
             &prng,
         );
-        ci.p95 = try bootstrapCiDelta(
-            allocator,
+        ci.p95 = scratch.interval(
             baseline_values,
             variant_values,
             95.0,
-            ci_samples,
             cfg.ci_alpha,
             &prng,
         );
-        ci.p99 = try bootstrapCiDelta(
-            allocator,
+        ci.p99 = scratch.interval(
             baseline_values,
             variant_values,
             99.0,
-            ci_samples,
             cfg.ci_alpha,
             &prng,
         );
@@ -628,37 +629,148 @@ fn bootstrapCiDelta(
     alpha: f64,
     prng: *std.Random.DefaultPrng,
 ) !CiInterval {
-    if (samples == 0) return error.InvalidBootstrapSamples;
-    if (baseline.len == 0 or variant.len == 0) return error.EmptyInput;
+    var scratch = try BootstrapScratch.init(allocator, baseline.len, variant.len, samples);
+    defer scratch.deinit(allocator);
+    return scratch.interval(baseline, variant, stat_pct, alpha, prng);
+}
 
-    var deltas = try allocator.alloc(f64, samples);
-    defer allocator.free(deltas);
-    const baseline_sample = try allocator.alloc(f64, baseline.len);
-    defer allocator.free(baseline_sample);
-    const variant_sample = try allocator.alloc(f64, variant.len);
-    defer allocator.free(variant_sample);
+const BootstrapScratch = struct {
+    baseline_sample: []f64,
+    variant_sample: []f64,
+    deltas: []f64,
 
-    var random = prng.random();
-    for (0..samples) |sample_idx| {
-        for (baseline_sample) |*slot| {
-            slot.* = baseline[random.uintLessThan(usize, baseline.len)];
-        }
-        for (variant_sample) |*slot| {
-            slot.* = variant[random.uintLessThan(usize, variant.len)];
-        }
-
-        std.mem.sort(f64, baseline_sample, {}, comptime std.sort.asc(f64));
-        std.mem.sort(f64, variant_sample, {}, comptime std.sort.asc(f64));
-        const baseline_stat = percentile(baseline_sample, stat_pct);
-        const variant_stat = percentile(variant_sample, stat_pct);
-        deltas[sample_idx] = variant_stat - baseline_stat;
+    fn init(
+        allocator: std.mem.Allocator,
+        baseline_count: usize,
+        variant_count: usize,
+        samples: usize,
+    ) !BootstrapScratch {
+        if (samples == 0) return error.InvalidBootstrapSamples;
+        if (baseline_count == 0 or variant_count == 0) return error.EmptyInput;
+        const deltas = try allocator.alloc(f64, samples);
+        errdefer allocator.free(deltas);
+        const baseline_sample = try allocator.alloc(f64, baseline_count);
+        errdefer allocator.free(baseline_sample);
+        const variant_sample = try allocator.alloc(f64, variant_count);
+        return .{
+            .baseline_sample = baseline_sample,
+            .variant_sample = variant_sample,
+            .deltas = deltas,
+        };
     }
 
-    std.mem.sort(f64, deltas, {}, comptime std.sort.asc(f64));
-    return .{
-        .lo = percentile(deltas, (alpha / 2.0) * 100.0),
-        .hi = percentile(deltas, (1.0 - (alpha / 2.0)) * 100.0),
-    };
+    fn deinit(self: BootstrapScratch, allocator: std.mem.Allocator) void {
+        allocator.free(self.deltas);
+        allocator.free(self.baseline_sample);
+        allocator.free(self.variant_sample);
+    }
+
+    fn interval(
+        self: BootstrapScratch,
+        baseline: []const f64,
+        variant: []const f64,
+        stat_pct: f64,
+        alpha: f64,
+        prng: *std.Random.DefaultPrng,
+    ) CiInterval {
+        std.debug.assert(self.baseline_sample.len == baseline.len);
+        std.debug.assert(self.variant_sample.len == variant.len);
+        const select_baseline = supportsRankSelection(baseline);
+        const select_variant = supportsRankSelection(variant);
+        var random = prng.random();
+        for (self.deltas) |*delta| {
+            for (self.baseline_sample) |*slot| {
+                slot.* = baseline[random.uintLessThan(usize, baseline.len)];
+            }
+            for (self.variant_sample) |*slot| {
+                slot.* = variant[random.uintLessThan(usize, variant.len)];
+            }
+            const base_stat = samplePercentile(self.baseline_sample, stat_pct, select_baseline);
+            const variant_stat = samplePercentile(self.variant_sample, stat_pct, select_variant);
+            delta.* = variant_stat - base_stat;
+        }
+        std.mem.sort(f64, self.deltas, {}, comptime std.sort.asc(f64));
+        return .{
+            .lo = percentile(self.deltas, (alpha / 2.0) * 100.0),
+            .hi = percentile(self.deltas, (1.0 - (alpha / 2.0)) * 100.0),
+        };
+    }
+};
+
+fn supportsRankSelection(values: []const f64) bool {
+    for (values) |value| {
+        if (!std.math.isFinite(value) or std.math.isNegativeZero(value)) return false;
+    }
+    return true;
+}
+
+fn samplePercentile(values: []f64, p: f64, select_rank: bool) f64 {
+    std.debug.assert(values.len > 0);
+    std.debug.assert(p >= 0 and p <= 100);
+    if (!select_rank) {
+        std.mem.sort(f64, values, {}, comptime std.sort.asc(f64));
+        return percentile(values, p);
+    }
+    const rank = @as(f64, @floatFromInt(values.len - 1)) * (p / 100.0);
+    const lower = std.math.floor(rank);
+    const index: usize = @intFromFloat(lower);
+    const first = selectRank(values, index);
+    if (lower == std.math.ceil(rank)) return first;
+    var second = values[index + 1];
+    for (values[index + 2 ..]) |value| second = @min(second, value);
+    return first + (second - first) * (rank - lower);
+}
+
+fn selectRank(values: []f64, rank: usize) f64 {
+    std.debug.assert(rank < values.len);
+    var start: usize = 0;
+    var end = values.len;
+    var partitions_left: usize = 2 * std.math.log2_int(usize, values.len) + 1;
+    while (end - start > 24 and partitions_left > 0) : (partitions_left -= 1) {
+        const pivot = medianOfThree(
+            values[start],
+            values[start + (end - start) / 2],
+            values[end - 1],
+        );
+        const partition = partitionAround(values[start..end], pivot);
+        const lower_end = start + partition.lower_end;
+        const upper_start = start + partition.upper_start;
+        if (rank < lower_end) {
+            end = lower_end;
+        } else if (rank >= upper_start) {
+            start = upper_start;
+        } else {
+            return values[rank];
+        }
+    }
+    std.mem.sort(f64, values[start..end], {}, comptime std.sort.asc(f64));
+    return values[rank];
+}
+
+fn medianOfThree(a: f64, b: f64, c: f64) f64 {
+    return @max(@min(a, b), @min(@max(a, b), c));
+}
+
+const RankPartition = struct { lower_end: usize, upper_start: usize };
+
+fn partitionAround(values: []f64, pivot: f64) RankPartition {
+    var lower: usize = 0;
+    var cursor: usize = 0;
+    var upper = values.len;
+    while (cursor < upper) {
+        if (values[cursor] < pivot) {
+            std.mem.swap(f64, &values[lower], &values[cursor]);
+            lower += 1;
+            cursor += 1;
+        } else if (values[cursor] > pivot) {
+            upper -= 1;
+            std.mem.swap(f64, &values[cursor], &values[upper]);
+        } else {
+            cursor += 1;
+        }
+    }
+    std.debug.assert(lower < upper);
+    return .{ .lower_end = lower, .upper_start = upper };
 }
 
 fn computeMean(values: []const f64) f64 {
@@ -1004,6 +1116,195 @@ test "bootstrap CI returns ordered interval" {
         &prng,
     );
     try std.testing.expect(ci.lo <= ci.hi);
+}
+
+test "selected percentiles match stable sorting across ranks and distributions" {
+    var input: [257]f64 = undefined;
+    var selected: [257]f64 = undefined;
+    var sorted: [257]f64 = undefined;
+    for (0..6) |distribution| {
+        for (1..input.len + 1) |count| {
+            for (input[0..count], 0..) |*value, index| {
+                value.* = selectionFixtureValue(distribution, index, count);
+            }
+            @memcpy(sorted[0..count], input[0..count]);
+            std.mem.sort(f64, sorted[0..count], {}, comptime std.sort.asc(f64));
+            for ([_]f64{ 0, 1, 25, 50, 90, 95, 99, 100 }) |p| {
+                @memcpy(selected[0..count], input[0..count]);
+                const actual = samplePercentile(selected[0..count], p, true);
+                const expected = percentile(sorted[0..count], p);
+                try std.testing.expectEqual(
+                    @as(u64, @bitCast(expected)),
+                    @as(u64, @bitCast(actual)),
+                );
+            }
+        }
+    }
+}
+
+fn selectionFixtureValue(distribution: usize, index: usize, count: usize) f64 {
+    return switch (distribution) {
+        0 => @floatFromInt(index),
+        1 => @floatFromInt(count - index),
+        2 => @floatFromInt(index % 3),
+        3 => 7,
+        4 => @as(f64, @floatFromInt((index * 37) % 113)) - 56,
+        5 => if (index % 2 == 0) @as(f64, @floatFromInt(index)) else -1e100,
+        else => unreachable,
+    };
+}
+
+test "signed zeros and nonfinite samples retain stable-sort behavior" {
+    const cases = [_][5]f64{
+        .{ -0.0, 0.0, -0.0, 0.0, 1 },
+        .{ -std.math.inf(f64), -1, 0, 1, std.math.inf(f64) },
+        .{ 1, std.math.nan(f64), 2, 3, 4 },
+    };
+    for (cases) |input| {
+        try std.testing.expect(!supportsRankSelection(&input));
+        for ([_]f64{ 0, 25, 50, 95, 100 }) |p| {
+            var actual_values = input;
+            var expected_values = input;
+            std.mem.sort(f64, &expected_values, {}, comptime std.sort.asc(f64));
+            const actual = samplePercentile(&actual_values, p, false);
+            const expected = percentile(&expected_values, p);
+            try std.testing.expectEqual(@as(u64, @bitCast(expected)), @as(u64, @bitCast(actual)));
+        }
+    }
+}
+
+fn referenceBootstrap(
+    allocator: std.mem.Allocator,
+    baseline: []const f64,
+    variant: []const f64,
+    p: f64,
+    samples: usize,
+    prng: *std.Random.DefaultPrng,
+) !CiInterval {
+    const deltas = try allocator.alloc(f64, samples);
+    defer allocator.free(deltas);
+    const baseline_sample = try allocator.alloc(f64, baseline.len);
+    defer allocator.free(baseline_sample);
+    const variant_sample = try allocator.alloc(f64, variant.len);
+    defer allocator.free(variant_sample);
+    var random = prng.random();
+    for (deltas) |*delta| {
+        for (baseline_sample) |*value| value.* = baseline[random.uintLessThan(usize, baseline.len)];
+        for (variant_sample) |*value| value.* = variant[random.uintLessThan(usize, variant.len)];
+        std.mem.sort(f64, baseline_sample, {}, comptime std.sort.asc(f64));
+        std.mem.sort(f64, variant_sample, {}, comptime std.sort.asc(f64));
+        delta.* = percentile(variant_sample, p) - percentile(baseline_sample, p);
+    }
+    std.mem.sort(f64, deltas, {}, comptime std.sort.asc(f64));
+    return .{ .lo = percentile(deltas, 2.5), .hi = percentile(deltas, 97.5) };
+}
+
+test "bootstrap selection preserves the reference RNG stream and interval bits" {
+    var baseline: [97]f64 = undefined;
+    var variant: [129]f64 = undefined;
+    for (&baseline, 0..) |*value, index| value.* = selectionFixtureValue(4, index, baseline.len);
+    for (&variant, 0..) |*value, index| value.* = selectionFixtureValue(5, index, variant.len);
+    for ([_]u64{ 0, 42, std.math.maxInt(u64) }) |seed| {
+        var actual_prng = std.Random.DefaultPrng.init(seed);
+        var expected_prng = std.Random.DefaultPrng.init(seed);
+        for ([_]f64{ 50, 95, 99 }) |p| {
+            const actual = try bootstrapCiDelta(
+                std.testing.allocator,
+                &baseline,
+                &variant,
+                p,
+                101,
+                0.05,
+                &actual_prng,
+            );
+            const expected = try referenceBootstrap(
+                std.testing.allocator,
+                &baseline,
+                &variant,
+                p,
+                101,
+                &expected_prng,
+            );
+            try std.testing.expectEqual(
+                @as(u64, @bitCast(expected.lo)),
+                @as(u64, @bitCast(actual.lo)),
+            );
+            try std.testing.expectEqual(
+                @as(u64, @bitCast(expected.hi)),
+                @as(u64, @bitCast(actual.hi)),
+            );
+        }
+        try std.testing.expectEqual(expected_prng.random().int(u64), actual_prng.random().int(u64));
+    }
+}
+
+test "comparison shares three scratch allocations across all quantiles" {
+    const baseline = [_]f64{ 1, 2, 3, 4, 5 };
+    const variant = [_]f64{ 2, 3, 4, 5, 6 };
+    var reference_alloc = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    var reference_prng = std.Random.DefaultPrng.init(42);
+    for ([_]f64{ 50, 95, 99 }) |p| {
+        _ = try referenceBootstrap(
+            reference_alloc.allocator(),
+            &baseline,
+            &variant,
+            p,
+            31,
+            &reference_prng,
+        );
+    }
+    try std.testing.expectEqual(@as(usize, 9), reference_alloc.allocations);
+    var actual_alloc = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    _ = try comparisonIntervals(
+        std.testing.io,
+        actual_alloc.allocator(),
+        .{ .ci_samples = 31, .seed = 42 },
+        &baseline,
+        &variant,
+    );
+    try std.testing.expectEqual(@as(usize, 3), actual_alloc.allocations);
+    try std.testing.expectEqual(actual_alloc.allocations, actual_alloc.deallocations);
+}
+
+fn comparisonIntervalsWithAllocator(allocator: std.mem.Allocator) !void {
+    const baseline = [_]f64{ 1, 2, 3, 4, 5 };
+    const variant = [_]f64{ 2, 3, 4, 5, 6 };
+    const actual = try comparisonIntervals(
+        std.testing.io,
+        allocator,
+        .{ .ci_samples = 17, .seed = 42 },
+        &baseline,
+        &variant,
+    );
+    try std.testing.expect(actual.p50 != null and actual.p95 != null and actual.p99 != null);
+}
+
+test "comparison scratch failures release every acquired buffer" {
+    try @import("test_support").checkAllAllocationFailures(
+        std.testing.allocator,
+        comparisonIntervalsWithAllocator,
+        .{},
+    );
+}
+
+test "bootstrap scratch rejects empty work before allocation" {
+    var tracked = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    const allocator = tracked.allocator();
+    try std.testing.expectError(
+        error.InvalidBootstrapSamples,
+        BootstrapScratch.init(allocator, 1, 1, 0),
+    );
+    try std.testing.expectError(error.EmptyInput, BootstrapScratch.init(allocator, 0, 1, 1));
+    try std.testing.expectError(error.EmptyInput, BootstrapScratch.init(allocator, 1, 0, 1));
+    const skipped = try comparisonIntervals(
+        std.testing.io,
+        allocator,
+        .{ .ci_samples = 0 },
+        &.{},
+        &.{},
+    );
+    try std.testing.expectEqualDeep(CiDelta{}, skipped);
+    try std.testing.expectEqual(@as(usize, 0), tracked.allocations);
 }
 
 test "compare json output is valid json" {

@@ -124,12 +124,7 @@ fn addCoreTests(ctx: BuildContext, shared: SharedModules, routine: *std.Build.St
         "test-core-cli",
         "Run shared cli helper tests",
     ).step);
-    core.dependOn(&support.addTestStep(
-        b,
-        shared.delegate,
-        "test-core-delegate",
-        "Run shared delegate helper tests",
-    ).step);
+    addProcessAndSelectionTests(ctx, shared, core);
     core.dependOn(&support.addTestStep(
         b,
         shared.json,
@@ -155,6 +150,26 @@ fn addCoreTests(ctx: BuildContext, shared: SharedModules, routine: *std.Build.St
         "Run shared perf helper tests",
     ).step);
     routine.dependOn(core);
+}
+
+fn addProcessAndSelectionTests(
+    ctx: BuildContext,
+    shared: SharedModules,
+    core: *std.Build.Step,
+) void {
+    core.dependOn(&support.addTestStepWithOptions(
+        ctx.b,
+        shared.process,
+        "test-core-process",
+        "Run shared process ownership tests",
+        .{ .link_libc = true },
+    ).step);
+    core.dependOn(&support.addTestStep(
+        ctx.b,
+        shared.selection,
+        "test-core-selection",
+        "Run shared ordered selection tests",
+    ).step);
 }
 
 fn addSlowTests(ctx: BuildContext, shared: SharedModules, full: *std.Build.Step) void {

@@ -1,4 +1,5 @@
 const std = @import("std");
+const core_selection = @import("core_selection");
 const definition_core = @import("definition_core");
 const definition = @import("definition.zig");
 const plan = @import("plan.zig");
@@ -1015,7 +1016,12 @@ pub const Runner = struct {
             self.row_refs[index] = reference;
             self.auxiliary_refs[index] = reference;
             self.materialized_row_count += 1;
-            self.topKHeapSiftUp(index, keys);
+            core_selection.siftUp(
+                RowRef,
+                self.auxiliary_refs[0..self.materialized_row_count],
+                TopKSortContext{ .runner = self, .keys = keys },
+                TopKSortContext.lessThan,
+            );
             return;
         }
         const worst_index = self.auxiliary_refs[0].row_index;
@@ -1030,78 +1036,28 @@ pub const Runner = struct {
         try self.materializeTopKAt(worst_index, row);
         self.row_refs[worst_index].ordinal = ordinal;
         self.auxiliary_refs[0] = self.row_refs[worst_index];
-        self.topKHeapSiftDown(keys);
-    }
-
-    fn topKHeapSiftUp(
-        self: *Runner,
-        initial_index: usize,
-        keys: []const RuntimeSortKey,
-    ) void {
-        var index = initial_index;
-        while (index != 0) {
-            const parent = (index - 1) / 2;
-            if (!self.topKRefSortsBefore(
-                self.auxiliary_refs[parent],
-                self.auxiliary_refs[index],
-                keys,
-            )) return;
-            std.mem.swap(
-                RowRef,
-                &self.auxiliary_refs[parent],
-                &self.auxiliary_refs[index],
-            );
-            index = parent;
-        }
-    }
-
-    fn topKHeapSiftDown(
-        self: *Runner,
-        keys: []const RuntimeSortKey,
-    ) void {
-        var index: usize = 0;
-        var remaining = self.materialized_row_count;
-        while (remaining > 0) : (remaining -= 1) {
-            const left = index * 2 + 1;
-            if (left >= self.materialized_row_count) return;
-            const right = left + 1;
-            const worse_child = if (right < self.materialized_row_count and
-                self.topKRefSortsBefore(
-                    self.auxiliary_refs[left],
-                    self.auxiliary_refs[right],
-                    keys,
-                ))
-                right
-            else
-                left;
-            if (!self.topKRefSortsBefore(
-                self.auxiliary_refs[index],
-                self.auxiliary_refs[worse_child],
-                keys,
-            )) return;
-            std.mem.swap(
-                RowRef,
-                &self.auxiliary_refs[index],
-                &self.auxiliary_refs[worse_child],
-            );
-            index = worse_child;
-        }
-    }
-
-    fn topKRefSortsBefore(
-        self: *const Runner,
-        left: RowRef,
-        right: RowRef,
-        keys: []const RuntimeSortKey,
-    ) bool {
-        return rowSortsBefore(
-            self.materializedRow(left.row_index),
-            left.ordinal,
-            self.materializedRow(right.row_index),
-            right.ordinal,
-            keys,
+        core_selection.siftDown(
+            RowRef,
+            self.auxiliary_refs[0..self.materialized_row_count],
+            TopKSortContext{ .runner = self, .keys = keys },
+            TopKSortContext.lessThan,
         );
     }
+
+    const TopKSortContext = struct {
+        runner: *const Runner,
+        keys: []const RuntimeSortKey,
+
+        fn lessThan(context: TopKSortContext, left: RowRef, right: RowRef) bool {
+            return rowSortsBefore(
+                context.runner.materializedRow(left.row_index),
+                left.ordinal,
+                context.runner.materializedRow(right.row_index),
+                right.ordinal,
+                context.keys,
+            );
+        }
+    };
 
     fn materializeTopKAt(
         self: *Runner,

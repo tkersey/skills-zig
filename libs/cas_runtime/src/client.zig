@@ -1,11 +1,13 @@
 const core_io = @import("core_io");
 const core_json = @import("core_json");
+const jsonl_core = @import("jsonl_core");
 const legacy_hooks = @import("hook_policy.zig");
 pub const app_server_launch = @import("transport.zig");
 const builtin = @import("builtin");
 const protocol = @import("protocol.zig");
 const std = @import("std");
 pub const websocket_transport = @import("websocket.zig");
+const stdio_read_chunk_bytes: usize = 4 * 1024;
 
 pub const hooks = struct {
     pub const HookPolicy = legacy_hooks.HookPolicy;
@@ -184,6 +186,7 @@ pub const Client = struct {
     stdout_file: ?std.Io.File,
     websocket: ?websocket_transport.Connection,
     line_buf: std.ArrayList(u8) = .empty,
+    line_cursor: jsonl_core.LineCursor = .{},
     next_request_id: i64 = 1,
     last_error: ?[]u8 = null,
     last_unsupported_server_request: ?[]u8 = null,
@@ -1020,43 +1023,52 @@ pub const Client = struct {
                     else => err,
                 };
             },
-            .stdio => {},
+            .stdio => return self.readStdioLineAlloc(websocket_transport.max_message_bytes),
         }
+    }
 
+    fn readStdioLineAlloc(self: *Client, message_bytes_max: usize) !?[]u8 {
+        std.debug.assert(message_bytes_max > 0);
+        var eof = false;
         while (true) { // tiger: event-loop -- bounded by owner state or deadline.
-            if (std.mem.indexOfScalar(u8, self.line_buf.items, '\n')) |nl_idx| {
-                const line = try self.allocator.dupe(u8, self.line_buf.items[0..nl_idx]);
-                const keep_from = nl_idx + 1;
-                const keep_len = self.line_buf.items.len - keep_from;
-                if (keep_len > 0) {
-                    std.mem.copyForwards(
-                        u8,
-                        self.line_buf.items[0..keep_len],
-                        self.line_buf.items[keep_from..],
-                    );
+            if (self.request_deadline_ms) |deadline_ms| {
+                if (deadline_ms <= monotonicMillis(self.io)) return error.ConnectionTimedOut;
+            }
+            if (self.line_cursor.peek(self.line_buf.items, eof)) |frame| {
+                if (frame.bytes.len > message_bytes_max - @intFromBool(frame.terminated)) {
+                    self.close();
+                    return error.AppServerMessageTooLarge;
                 }
-                self.line_buf.items.len = keep_len;
+                const line = try self.allocator.dupe(u8, frame.bytes);
+                self.line_cursor.consume();
                 return line;
             }
-
-            var tmp: [1]u8 = undefined;
-            if (self.request_deadline_ms) |deadline_ms| {
-                try waitFileReadableUntil(self.io, self.stdout_file.?, deadline_ms);
-            }
-            var reader = self.stdout_file.?.reader(self.io, &.{});
-            const n = try reader.interface.readSliceShort(tmp[0..]);
-            if (n == 0) {
-                if (self.line_buf.items.len == 0) return null;
-                const tail = try self.allocator.dupe(u8, self.line_buf.items);
-                self.line_buf.items.len = 0;
-                return tail;
-            }
-            if (self.line_buf.items.len > websocket_transport.max_message_bytes - n) {
+            if (eof) return null;
+            self.line_buf.items.len = self.line_cursor.compact(self.line_buf.items);
+            if (self.line_buf.items.len > message_bytes_max) {
                 self.close();
                 return error.AppServerMessageTooLarge;
             }
-            try self.line_buf.appendSlice(self.allocator, tmp[0..n]);
+            eof = !try self.readStdioChunk(message_bytes_max);
         }
+    }
+
+    fn readStdioChunk(self: *Client, message_bytes_max: usize) !bool {
+        std.debug.assert(self.line_buf.items.len <= message_bytes_max);
+        const available = message_bytes_max - self.line_buf.items.len;
+        const read_bytes_max = @min(stdio_read_chunk_bytes, available +| 1);
+        try self.line_buf.ensureUnusedCapacity(self.allocator, read_bytes_max);
+        if (self.request_deadline_ms) |deadline_ms| {
+            try waitFileReadableUntil(self.io, self.stdout_file.?, deadline_ms);
+        }
+        var reader = self.stdout_file.?.readerStreaming(self.io, &.{});
+        var buffers = [_][]u8{self.line_buf.unusedCapacitySlice()[0..read_bytes_max]};
+        const count = reader.interface.readVec(&buffers) catch |err| switch (err) {
+            error.EndOfStream => return false,
+            else => return err,
+        };
+        self.line_buf.items.len += count;
+        return true;
     }
 };
 
@@ -5941,4 +5953,179 @@ fn writeAuthorityCodex(dir: std.Io.Dir, io: std.Io) !void {
         ,
     });
     try dir.setFilePermissions(io, "authority-codex", .fromMode(0o755), .{});
+}
+
+const StdioFramingSource = struct {
+    bytes: []const u8,
+    offset: usize = 0,
+    reads: usize = 0,
+    fragment_bytes_max: usize = std.math.maxInt(usize),
+    empty_reads: usize = 0,
+    fail_read: bool = false,
+
+    const vtable = blk: {
+        var value = std.Io.failing.vtable.*;
+        value.operate = operate;
+        break :blk value;
+    };
+
+    fn client(self: *StdioFramingSource) Client {
+        var result = serverRequestTestClient();
+        result.io = .{ .userdata = self, .vtable = &vtable };
+        result.stdout_file = .{ .handle = 123, .flags = .{ .nonblocking = false } };
+        return result;
+    }
+
+    fn operate(
+        userdata: ?*anyopaque,
+        operation: std.Io.Operation,
+    ) std.Io.Cancelable!std.Io.Operation.Result {
+        const self: *StdioFramingSource = @ptrCast(@alignCast(userdata.?));
+        if (operation != .file_read_streaming) return error.Canceled;
+        self.reads += 1;
+        if (self.fail_read) return .{ .file_read_streaming = error.InputOutput };
+        if (self.empty_reads != 0) {
+            self.empty_reads -= 1;
+            return .{ .file_read_streaming = 0 };
+        }
+        if (self.offset == self.bytes.len) return .{ .file_read_streaming = error.EndOfStream };
+        const destination = operation.file_read_streaming.data[0];
+        const count = @min(destination.len, self.bytes.len - self.offset, self.fragment_bytes_max);
+        @memcpy(destination[0..count], self.bytes[self.offset..][0..count]);
+        self.offset += count;
+        return .{ .file_read_streaming = count };
+    }
+};
+
+test "stdio framing drains coalesced records without waiting for another read" {
+    var source = StdioFramingSource{ .bytes = "first\n\nlast" };
+    var client = source.client();
+    defer client.deinit();
+    for ([_][]const u8{ "first", "" }) |expected| {
+        const actual = (try client.readLineAlloc()).?;
+        defer std.testing.allocator.free(actual);
+        try std.testing.expectEqualStrings(expected, actual);
+        try std.testing.expectEqual(@as(usize, 1), source.reads);
+    }
+    const tail = (try client.readLineAlloc()).?;
+    defer std.testing.allocator.free(tail);
+    try std.testing.expectEqualStrings("last", tail);
+    try std.testing.expectEqual(@as(usize, 2), source.reads);
+    try std.testing.expect((try client.readLineAlloc()) == null);
+}
+
+test "stdio framing handles fragmentation zero reads and read failure" {
+    var source = StdioFramingSource{
+        .bytes = "first\nsecond\n",
+        .fragment_bytes_max = 1,
+        .empty_reads = 2,
+    };
+    var client = source.client();
+    defer client.deinit();
+    for ([_][]const u8{ "first", "second" }) |expected| {
+        const actual = (try client.readLineAlloc()).?;
+        defer std.testing.allocator.free(actual);
+        try std.testing.expectEqualStrings(expected, actual);
+    }
+    try std.testing.expectEqual(source.bytes.len + 2, source.reads);
+    source.fail_read = true;
+    try std.testing.expectError(error.ReadFailed, client.readLineAlloc());
+}
+
+test "stdio framing preserves inclusive message limits and EOF tails" {
+    for ([_][]const u8{ "abc\n", "abcd" }) |input| {
+        var source = StdioFramingSource{ .bytes = input };
+        var client = source.client();
+        defer client.deinit();
+        const actual = (try client.readStdioLineAlloc(4)).?;
+        defer std.testing.allocator.free(actual);
+        try std.testing.expectEqualStrings(std.mem.trimEnd(u8, input, "\n"), actual);
+    }
+    for ([_][]const u8{ "abcd\n", "abcde" }) |input| {
+        var source = StdioFramingSource{ .bytes = input };
+        var client = source.client();
+        defer client.deinit();
+        try std.testing.expectError(error.AppServerMessageTooLarge, client.readStdioLineAlloc(4));
+    }
+    var source = StdioFramingSource{ .bytes = "a\nb\nc\n" };
+    var client = source.client();
+    defer client.deinit();
+    for ([_][]const u8{ "a", "b", "c" }) |expected| {
+        const actual = (try client.readStdioLineAlloc(2)).?;
+        defer std.testing.allocator.free(actual);
+        try std.testing.expectEqualStrings(expected, actual);
+    }
+}
+
+test "stdio framing retains a buffered frame when output allocation fails" {
+    var client = serverRequestTestClient();
+    defer client.deinit();
+    try client.line_buf.appendSlice(std.testing.allocator, "first\nsecond\n");
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    client.allocator = failing.allocator();
+    const attempted = client.readLineAlloc();
+    client.allocator = std.testing.allocator;
+    try std.testing.expectError(error.OutOfMemory, attempted);
+    for ([_][]const u8{ "first", "second" }) |expected| {
+        const actual = (try client.readLineAlloc()).?;
+        defer std.testing.allocator.free(actual);
+        try std.testing.expectEqualStrings(expected, actual);
+    }
+}
+
+test "stdio framing reserves input storage before consuming source bytes" {
+    var source = StdioFramingSource{ .bytes = "first\n" };
+    var client = source.client();
+    defer client.deinit();
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    client.allocator = failing.allocator();
+    const attempted = client.readLineAlloc();
+    client.allocator = std.testing.allocator;
+    try std.testing.expectError(error.OutOfMemory, attempted);
+    try std.testing.expectEqual(@as(usize, 0), source.offset);
+    try std.testing.expectEqual(@as(usize, 0), source.reads);
+    const actual = (try client.readLineAlloc()).?;
+    defer std.testing.allocator.free(actual);
+    try std.testing.expectEqualStrings("first", actual);
+}
+
+test "stdio framing rechecks deadlines between coalesced notifications and responses" {
+    const Clock = struct {
+        calls: usize = 0,
+
+        fn now(userdata: ?*anyopaque, _: std.Io.Clock) std.Io.Timestamp {
+            const self: *@This() = @ptrCast(@alignCast(userdata.?));
+            defer self.calls += 1;
+            return .fromNanoseconds(if (self.calls == 0) 0 else 100 * std.time.ns_per_ms);
+        }
+    };
+    var clock: Clock = .{};
+    var vtable = std.Io.failing.vtable.*;
+    vtable.now = Clock.now;
+    var client = serverRequestTestClient();
+    client.io = .{ .userdata = &clock, .vtable = &vtable };
+    client.request_deadline_ms = 100;
+    defer client.deinit();
+    const coalesced = "{\"method\":\"fixture/event\",\"params\":{}}\n" ++
+        "{\"id\":1,\"result\":{\"ok\":true}}\n";
+    try client.line_buf.appendSlice(std.testing.allocator, coalesced);
+    var notifications: std.ArrayList([]u8) = .empty;
+    defer {
+        for (notifications.items) |line| std.testing.allocator.free(line);
+        notifications.deinit(std.testing.allocator);
+    }
+    var captured_bytes: usize = 0;
+    var interleaved: usize = 0;
+    try std.testing.expectError(error.ConnectionTimedOut, client.awaitRequestAttempt(
+        1,
+        &notifications,
+        &captured_bytes,
+        &interleaved,
+    ));
+    try std.testing.expectEqual(@as(usize, 1), notifications.items.len);
+    try std.testing.expectEqual(@as(usize, 2), clock.calls);
+    client.request_deadline_ms = null;
+    const response = (try client.readLineAlloc()).?;
+    defer std.testing.allocator.free(response);
+    try std.testing.expectEqualStrings("{\"id\":1,\"result\":{\"ok\":true}}", response);
 }

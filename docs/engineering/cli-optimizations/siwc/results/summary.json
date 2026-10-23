@@ -1,0 +1,37 @@
+{
+  "baseline": {
+    "samples": 125,
+    "requests_each": 3,
+    "connections_each": [
+      3
+    ],
+    "median_ns": 472583,
+    "p10_ns": 356433.2,
+    "p90_ns": 720866.2,
+    "process_medians_ns": [
+      703209,
+      574375,
+      485250,
+      358750,
+      386375
+    ]
+  },
+  "candidate": {
+    "samples": 125,
+    "requests_each": 3,
+    "connections_each": [
+      1
+    ],
+    "median_ns": 246459,
+    "p10_ns": 190108.2,
+    "p90_ns": 519649.6,
+    "process_medians_ns": [
+      442958,
+      432167,
+      194667,
+      229959,
+      200291
+    ]
+  },
+  "median_reduction_percent": 47.84852607901681
+}

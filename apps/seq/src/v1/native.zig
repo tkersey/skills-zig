@@ -1028,7 +1028,11 @@ fn feedQueryPath(
             runner,
         );
     }
-    const trace_options = traceOptions(compilation.relation);
+    const trace_options = trace_adapter.traceParseOptions(
+        compilation.relation,
+        compilation.program.source_field_indices,
+        .{},
+    );
     var trace = if (compilation.relation == .sessions)
         try trace_core.parseSessionSummaryTrace(io, dir, allocator, path, trace_options)
     else
@@ -2268,16 +2272,7 @@ fn containsIgnoreCase(
 }
 
 fn traceOptions(relation: physical.Relation) trace_core.TraceParseOptions {
-    return .{
-        .include_raw = relation == .source_events,
-        .include_occurrences = relation == .source_events or
-            relation == .messages or relation == .tool_invocations or
-            relation == .tool_results or relation == .structured_documents or
-            relation == .structured_values or relation == .token_events,
-        .include_token_events = relation == .token_events,
-        .include_message_bodies = relation == .turns or
-            relation == .messages,
-    };
+    return trace_adapter.relationParseOptions(&.{relation}, .{});
 }
 
 fn environmentValue(
@@ -2844,6 +2839,96 @@ fn testSession(
     return "{\"timestamp\":\"" ++ timestamp ++
         "\",\"type\":\"session_meta\",\"payload\":{\"id\":\"" ++
         session_id ++ "\"}}\n";
+}
+
+const demanded_query_trace =
+    "{\"timestamp\":\"2026-07-26T10:00:00Z\",\"type\":\"session_meta\"," ++
+    "\"payload\":{\"id\":\"session-1\",\"cwd\":\"/different-repo\"}}\n" ++
+    "{\"timestamp\":\"2026-07-26T10:00:01Z\",\"type\":\"event_msg\"," ++
+    "\"payload\":{\"type\":\"task_started\",\"turn_id\":\"turn-1\"}}\n" ++
+    "{\"timestamp\":\"2026-07-26T10:00:02Z\",\"type\":\"event_msg\"," ++
+    "\"payload\":{\"type\":\"user_message\",\"message\":\"question\"}}\n" ++
+    "{\"timestamp\":\"2026-07-26T10:00:03Z\",\"type\":\"event_msg\"," ++
+    "\"payload\":{\"type\":\"agent_message\",\"message\":\"answer\"}}\n" ++
+    "{\"timestamp\":\"2026-07-26T10:00:04Z\",\"type\":\"event_msg\"," ++
+    "\"payload\":{\"type\":\"task_complete\",\"turn_id\":\"turn-1\"}}\n";
+
+test "native query demand preserves projected and hidden message fields" {
+    const cases = [_]struct { query: []const u8, expected: []const u8 }{
+        .{
+            .query = "{\"dataset\":\"turns\",\"select\":[\"turn_id\"]}",
+            .expected = "[{\"turn_id\":\"turn-1\"}]\n",
+        },
+        .{
+            .query = "{\"dataset\":\"turns\",\"select\":[\"user_message\",\"final_answer\"]}",
+            .expected = "[{\"user_message\":\"question\",\"final_answer\":\"answer\"}]\n",
+        },
+        .{
+            .query = "{\"dataset\":\"turns\",\"select\":[\"turn_id\"],\"where\":[" ++
+                "{\"field\":\"user_message\",\"op\":\"eq\",\"value\":\"question\"}]}",
+            .expected = "[{\"turn_id\":\"turn-1\"}]\n",
+        },
+        .{
+            .query = "{\"dataset\":\"messages\",\"select\":[\"text\"]}",
+            .expected = "[{\"text\":\"question\"},{\"text\":\"answer\"}]\n",
+        },
+        .{
+            .query = "{\"dataset\":\"source_events\",\"select\":[\"payload_json\"]," ++
+                "\"where\":[{\"field\":\"event_type\",\"value\":\"agent_message\"}]}",
+            .expected = "[{\"payload_json\":{\"type\":\"agent_message\"," ++
+                "\"message\":\"answer\"}}]\n",
+        },
+    };
+    for (cases) |case| {
+        const output = try runDemandedQueryFixture(demanded_query_trace, case.query, .{});
+        defer std.testing.allocator.free(output);
+        try std.testing.expectEqualStrings(case.expected, output);
+    }
+}
+
+test "native demanded queries validate rejected repository sources" {
+    const query = "{\"dataset\":\"turns\",\"select\":[\"turn_id\"]}";
+    const invalid_sources = [_][]const u8{
+        demanded_query_trace ++ "{invalid-json\n",
+        demanded_query_trace ++ "{\"type\":\"session_meta\",\"payload\":{\"id\":\"other\"}}\n",
+    };
+    for (invalid_sources) |source| {
+        try std.testing.expectError(
+            error.PhysicalSourceWarningsPresent,
+            runDemandedQueryFixture(source, query, .{ .repo = "/selected-repo" }),
+        );
+    }
+}
+
+fn runDemandedQueryFixture(
+    source: []const u8,
+    query: []const u8,
+    options: Options,
+) ![]u8 {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "trace.jsonl", .data = source });
+    const path = try tmp.dir.realPathFileAlloc(
+        std.testing.io,
+        "trace.jsonl",
+        std.testing.allocator,
+    );
+    defer std.testing.allocator.free(path);
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, query, .{});
+    defer parsed.deinit();
+    var output: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer output.deinit();
+    var selected = options;
+    selected.path = path;
+    try runQueryObject(
+        std.testing.allocator,
+        &output.writer,
+        std.testing.io,
+        std.Io.Dir.cwd(),
+        selected,
+        parsed.value.object,
+    );
+    return output.toOwnedSlice();
 }
 
 test "native queries reject unknown spec keys" {

@@ -4,9 +4,10 @@ const Fs = durable_store.Fs;
 const layout = @import("memory_layout.zig");
 const memory_storage = @import("memory_storage.zig");
 const memory_envelope = @import("memory_envelope.zig");
+const memory_inventory = @import("memory_inventory.zig");
 
-const note_bytes_max = 1024 * 1024;
-const note_count_max = 10_000;
+const note_bytes_max = memory_inventory.note_bytes_max;
+const note_count_max = memory_inventory.note_count_max;
 
 pub const Result = struct {
     source_notes: u32 = 0,
@@ -103,28 +104,15 @@ fn inventory(
     extension: []const u8,
 ) !Inventory {
     try layout.validateDirectory(fs.io, fs.directory(), directory);
-    const names = durable_store.listSortedRegularFilesNoSymlink(
-        fs,
-        allocator,
-        directory,
-        note_count_max,
-        note_bytes_max,
-    ) catch |err| switch (err) {
-        error.FileNotFound => return .{},
-        else => return err,
-    };
-    defer durable_store.freeStringList(allocator, names);
+    var reader = try memory_inventory.Reader.open(fs, allocator, directory, .empty);
+    defer reader.deinit();
     var result: Inventory = .{};
     errdefer result.deinit(allocator);
-    for (names) |name| {
-        const path = try std.fs.path.join(allocator, &.{ directory, name });
-        defer allocator.free(path);
-        const raw = try durable_store.readRegularFileNoSymlink(fs, allocator, path, note_bytes_max);
-        defer allocator.free(raw);
-        var parsed = try std.json.parseFromSlice(std.json.Value, allocator, raw, .{});
-        defer parsed.deinit();
-        const id = try memory_envelope.storedIdentity(parsed.value, extension);
-        try insertEntry(allocator, &result, name, id, raw);
+    for (reader.names, 0..) |name, index| {
+        const record = try reader.readBorrowed(index);
+        const parsed = try reader.parseBorrowed(record);
+        const id = try memory_envelope.storedIdentity(parsed, extension);
+        try insertEntry(allocator, &result, name, id, record.raw);
     }
     return result;
 }

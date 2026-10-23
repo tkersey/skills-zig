@@ -35,7 +35,8 @@ pub const SharedModules = struct {
     io: *std.Build.Module,
     path: *std.Build.Module,
     cli: *std.Build.Module,
-    delegate: *std.Build.Module,
+    process: *std.Build.Module,
+    selection: *std.Build.Module,
     perf: *std.Build.Module,
     perf_contract: *std.Build.Module,
     jsonl: *std.Build.Module,
@@ -53,9 +54,8 @@ pub const SharedModules = struct {
         const core_io = ctx.module("libs/core/src/io_helpers.zig", &.{});
         const core_path = ctx.module("libs/core/src/path_helpers.zig", &.{});
         const core_cli = ctx.module("libs/core/src/cli_helpers.zig", &.{});
-        const core_delegate = ctx.module("libs/core/src/delegate_helpers.zig", &.{
-            .{ .name = "core_cli", .module = core_cli },
-        });
+        const core_process = ctx.module("libs/core/src/process_helpers.zig", &.{});
+        const core_selection = ctx.module("libs/core/src/selection.zig", &.{});
         const core_perf = ctx.module("libs/core/src/perf_helpers.zig", &.{});
         const core_perf_contract = ctx.module("tools/perf_contract.zig", &.{});
         const jsonl_core = ctx.module("libs/jsonl_core/src/lib.zig", &.{});
@@ -66,6 +66,7 @@ pub const SharedModules = struct {
         const definition_compat = ctx.module("libs/definition_compat/src/root.zig", &.{});
         const definition_core = ctx.module("libs/definition_core/src/root.zig", &.{
             .{ .name = "definition_compat", .module = definition_compat },
+            .{ .name = "durable_store", .module = durable_store },
         });
         const trace_core = ctx.module("libs/trace_core/src/root.zig", &.{
             .{ .name = "jsonl_core", .module = jsonl_core },
@@ -89,7 +90,8 @@ pub const SharedModules = struct {
             .io = core_io,
             .path = core_path,
             .cli = core_cli,
-            .delegate = core_delegate,
+            .process = core_process,
+            .selection = core_selection,
             .perf = core_perf,
             .perf_contract = core_perf_contract,
             .jsonl = jsonl_core,

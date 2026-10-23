@@ -1,0 +1,23 @@
+1/1 client.test.framing benchmark synthetic transport...FRAMING size=1024 round=0 ns=38792 reads=1024 positional=1024 allocations=5 requested_bytes=3139
+FRAMING size=1024 round=1 ns=40459 reads=1024 positional=1024 allocations=5 requested_bytes=3139
+FRAMING size=1024 round=2 ns=39584 reads=1024 positional=1024 allocations=5 requested_bytes=3139
+FRAMING size=1024 round=3 ns=38834 reads=1024 positional=1024 allocations=5 requested_bytes=3139
+FRAMING size=1024 round=4 ns=39042 reads=1024 positional=1024 allocations=5 requested_bytes=3139
+FRAMING size=1024 round=5 ns=38875 reads=1024 positional=1024 allocations=5 requested_bytes=3139
+FRAMING size=1024 round=6 ns=42250 reads=1024 positional=1024 allocations=5 requested_bytes=3139
+FRAMING size=65536 round=0 ns=42657625 reads=65536 positional=65536 allocations=21 requested_bytes=483791
+FRAMING size=65536 round=1 ns=42536458 reads=65536 positional=65536 allocations=21 requested_bytes=492418
+FRAMING size=65536 round=2 ns=42765000 reads=65536 positional=65536 allocations=21 requested_bytes=492418
+FRAMING size=65536 round=3 ns=42701917 reads=65536 positional=65536 allocations=21 requested_bytes=492418
+FRAMING size=65536 round=4 ns=42452459 reads=65536 positional=65536 allocations=21 requested_bytes=492418
+FRAMING size=65536 round=5 ns=42379042 reads=65536 positional=65536 allocations=21 requested_bytes=492418
+FRAMING size=65536 round=6 ns=42737750 reads=65536 positional=65536 allocations=21 requested_bytes=492418
+FRAMING size=1048576 round=0 ns=10326015291 reads=1048576 positional=1048576 allocations=35 requested_bytes=8753992
+FRAMING size=1048576 round=1 ns=10348489167 reads=1048576 positional=1048576 allocations=35 requested_bytes=8753992
+FRAMING size=1048576 round=2 ns=10358362708 reads=1048576 positional=1048576 allocations=35 requested_bytes=8753992
+FRAMING size=1048576 round=3 ns=10345560125 reads=1048576 positional=1048576 allocations=35 requested_bytes=8753992
+FRAMING size=1048576 round=4 ns=11459946542 reads=1048576 positional=1048576 allocations=35 requested_bytes=8753992
+FRAMING size=1048576 round=5 ns=11143842125 reads=1048576 positional=1048576 allocations=35 requested_bytes=8753992
+FRAMING size=1048576 round=6 ns=10417100334 reads=1048576 positional=1048576 allocations=35 requested_bytes=8753992
+OK
+All 1 tests passed.

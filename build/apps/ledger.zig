@@ -100,6 +100,7 @@ fn createLedgerModules(ctx: BuildContext, shared: SharedModules) LedgerModules {
     });
     const core = ctx.module("apps/ledger/src/v1/root.zig", &.{
         .{ .name = "core_calendar", .module = shared.calendar },
+        .{ .name = "core_selection", .module = shared.selection },
         .{ .name = "definition_core", .module = shared.definitions },
         .{ .name = "durable_store", .module = shared.durable },
         .{ .name = "storage_root", .module = storage_root },
