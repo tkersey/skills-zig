@@ -1060,11 +1060,14 @@ test "parseAndCanonicalizeRrule canonicalizes prefix and key order" {
 }
 
 test "parseRrule rejects unsupported status tokens" {
+    var capture = @import("automation/testing.zig").StderrCapture.init(std.testing.allocator);
+    defer capture.deinit();
     const alloc = std.testing.allocator;
     try std.testing.expectError(
         error.UserInput,
-        parseAndCanonicalizeRrule(std.testing.io, alloc, "RRULE:FREQ=MONTHLY;BYHOUR=9;BYMINUTE=0"),
+        parseAndCanonicalizeRrule(capture.io(), alloc, "RRULE:FREQ=MONTHLY;BYHOUR=9;BYMINUTE=0"),
     );
+    try capture.expectEqual("error: unsupported FREQ: MONTHLY (allowed: HOURLY, DAILY, WEEKLY)\n");
 }
 
 test "nextWeekly computes next weekday correctly" {
@@ -1095,8 +1098,10 @@ test "generateUuidV4 emits expected shape" {
 }
 
 test "parseSchedulerLabelArgs rejects invalid labels" {
+    var capture = @import("automation/testing.zig").StderrCapture.init(std.testing.allocator);
+    defer capture.deinit();
     const operation: Operation = .{
-        .io = std.testing.io,
+        .io = capture.io(),
         .cwd = std.Io.Dir.cwd(),
         .cwd_path = ".",
         .environment = &.init(std.testing.allocator),
@@ -1105,15 +1110,19 @@ test "parseSchedulerLabelArgs rejects invalid labels" {
         error.UserInput,
         parseSchedulerLabelArgs(operation, &.{ "--label", "../bad" }),
     );
+    try capture.expectEqual("error: invalid label: ../bad (allowed: [A-Za-z0-9._-])\n");
     try std.testing.expectError(
         error.UserInput,
         parseSchedulerLabelArgs(operation, &.{ "--label", "bad label" }),
     );
+    try capture.expectEqual("error: invalid label: bad label (allowed: [A-Za-z0-9._-])\n");
 }
 
 test "parseRunDueArgs rejects invalid lock label" {
+    var capture = @import("automation/testing.zig").StderrCapture.init(std.testing.allocator);
+    defer capture.deinit();
     const operation: Operation = .{
-        .io = std.testing.io,
+        .io = capture.io(),
         .cwd = std.Io.Dir.cwd(),
         .cwd_path = ".",
         .environment = &.init(std.testing.allocator),
@@ -1122,10 +1131,12 @@ test "parseRunDueArgs rejects invalid lock label" {
         error.UserInput,
         parseRunDueArgs(operation, &.{ "--lock-label", "../bad" }),
     );
+    try capture.expectEqual("error: invalid label: ../bad (allowed: [A-Za-z0-9._-])\n");
     try std.testing.expectError(
         error.UserInput,
         parseRunDueArgs(operation, &.{ "--lock-label", "bad label" }),
     );
+    try capture.expectEqual("error: invalid label: bad label (allowed: [A-Za-z0-9._-])\n");
 }
 
 test "computeNextRunAt accepts legacy non-prefixed rrule" {
@@ -1705,8 +1716,19 @@ test "mutation writability inspection diagnoses missing owners without creating 
 fn seedMalformedAutomation(
     operation: Operation,
     allocator: std.mem.Allocator,
+    dir: std.Io.Dir,
     db_path: []const u8,
 ) !void {
+    try dir.writeFile(operation.io, .{ .sub_path = "codex-dev.db", .data = "" });
+    try dir.createDirPath(operation.io, "automations/malformed");
+    try dir.writeFile(operation.io, .{
+        .sub_path = "automations/malformed/automation.toml",
+        .data = "stale = true\n",
+    });
+    try dir.writeFile(operation.io, .{
+        .sub_path = "automations/malformed/memory.md",
+        .data = "",
+    });
     var db = try Db.open(operation, allocator, db_path);
     defer db.close();
     try createTestSchema(allocator, &db);
@@ -1722,8 +1744,10 @@ fn seedMalformedAutomation(
 }
 
 test "doctor emits complete JSON when an automation row has malformed cwds" {
+    var capture = @import("automation/testing.zig").StderrCapture.init(std.testing.allocator);
+    defer capture.deinit();
     var operation: Operation = .{
-        .io = std.testing.io,
+        .io = capture.io(),
         .cwd = std.Io.Dir.cwd(),
         .cwd_path = ".",
         .environment = &.init(std.testing.allocator),
@@ -1732,13 +1756,6 @@ test "doctor emits complete JSON when an automation row has malformed cwds" {
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    try tmp.dir.writeFile(io, .{ .sub_path = "codex-dev.db", .data = "" });
-    try tmp.dir.createDirPath(io, "automations/malformed");
-    try tmp.dir.writeFile(io, .{
-        .sub_path = "automations/malformed/automation.toml",
-        .data = "stale = true\n",
-    });
-    try tmp.dir.writeFile(io, .{ .sub_path = "automations/malformed/memory.md", .data = "" });
     const root = try tmp.dir.realPathFileAlloc(io, ".", alloc);
     defer alloc.free(root);
     const db_path = try std.fs.path.join(alloc, &.{ root, "codex-dev.db" });
@@ -1748,7 +1765,7 @@ test "doctor emits complete JSON when an automation row has malformed cwds" {
     const report_path = try std.fs.path.join(alloc, &.{ root, "doctor.json" });
     defer alloc.free(report_path);
 
-    try seedMalformedAutomation(operation, alloc, db_path);
+    try seedMalformedAutomation(operation, alloc, tmp.dir, db_path);
 
     operation.automation_root = automation_root;
 
@@ -1790,11 +1807,14 @@ test "doctor emits complete JSON when an automation row has malformed cwds" {
     }
     try std.testing.expect(saw_malformed);
     try std.testing.expect(saw_skipped);
+    try capture.expectEqual("error: HOME is not set\n");
 }
 
 test "doctor emits blocked JSON when the automation root is a regular file" {
+    var capture = @import("automation/testing.zig").StderrCapture.init(std.testing.allocator);
+    defer capture.deinit();
     var operation: Operation = .{
-        .io = std.testing.io,
+        .io = capture.io(),
         .cwd = std.Io.Dir.cwd(),
         .cwd_path = ".",
         .environment = &.init(std.testing.allocator),
@@ -1854,6 +1874,7 @@ test "doctor emits blocked JSON when the automation root is a regular file" {
         }
     }
     try std.testing.expect(saw_root_diagnostic);
+    try capture.expectEqual("error: HOME is not set\n");
 }
 
 test "transaction rollback preserves the pre-mutation row" {
@@ -2066,8 +2087,10 @@ test "runDueAutomation non-dry-run finalizes run row with provided io" {
 }
 
 test "runPerfCase covers residual automation command families" {
+    var capture = @import("automation/testing.zig").StderrCapture.init(std.testing.allocator);
+    defer capture.deinit();
     var operation: Operation = .{
-        .io = std.testing.io,
+        .io = capture.io(),
         .cwd = std.Io.Dir.cwd(),
         .cwd_path = ".",
         .environment = &.init(std.testing.allocator),
@@ -2101,6 +2124,7 @@ test "runPerfCase covers residual automation command families" {
     var db = try Db.open(operation, alloc, db_path);
     defer db.close();
     try std.testing.expectError(error.UserInput, getAutomationById(alloc, &db, "cron-001"));
+    try capture.expectEqual("error: no automation with id cron-001\n");
 }
 
 test "lock acquisition is fail-closed while lock exists" {
@@ -2168,17 +2192,22 @@ test "scheduler label parser retains JSON output selection" {
 }
 
 test "doctor CLI keeps scheduler identity environment-only" {
+    var capture = @import("automation/testing.zig").StderrCapture.init(std.testing.allocator);
+    defer capture.deinit();
     const json = try parseDoctorArgs(std.testing.io, &.{"--json"});
     try std.testing.expect(json.json);
     try std.testing.expectError(
         error.UserInput,
-        parseDoctorArgs(std.testing.io, &.{ "--label", "com.example.scheduler" }),
+        parseDoctorArgs(capture.io(), &.{ "--label", "com.example.scheduler" }),
     );
+    try capture.expectEqual("error: unknown doctor arg: --label\n");
 }
 
 test "run-due limits remain positive and fit the SQLite integer domain" {
+    var capture = @import("automation/testing.zig").StderrCapture.init(std.testing.allocator);
+    defer capture.deinit();
     const operation: Operation = .{
-        .io = std.testing.io,
+        .io = capture.io(),
         .cwd = std.Io.Dir.cwd(),
         .cwd_path = ".",
         .environment = &.init(std.testing.allocator),
@@ -2191,24 +2220,42 @@ test "run-due limits remain positive and fit the SQLite integer domain" {
     try std.testing.expectEqual(std.math.maxInt(i64), (try parseRunDueArgs(operation, &.{
         "--limit", "9223372036854775807", "--lock-label", "com.example.numeric-test",
     })).limit);
-    for ([_][]const u8{ "0", "-1", "9223372036854775808", "18446744073709551615" }) |raw| {
+    const cases = [_]struct { raw: []const u8, diagnostic: []const u8 }{
+        .{ .raw = "0", .diagnostic = "error: --limit must be >= 1\n" },
+        .{ .raw = "-1", .diagnostic = "error: --limit must be >= 1\n" },
+        .{
+            .raw = "9223372036854775808",
+            .diagnostic = "error: --limit must be a positive integer\n",
+        },
+        .{
+            .raw = "18446744073709551615",
+            .diagnostic = "error: --limit must be a positive integer\n",
+        },
+    };
+    for (cases) |case| {
         try std.testing.expectError(error.UserInput, parseRunDueArgs(operation, &.{
-            "--limit", raw, "--lock-label", "com.example.numeric-test",
+            "--limit", case.raw, "--lock-label", "com.example.numeric-test",
         }));
+        try capture.expectEqual(case.diagnostic);
     }
 }
 
 test "automation timestamp projection uses store-owned admission" {
+    var capture = @import("automation/testing.zig").StderrCapture.init(std.testing.allocator);
+    defer capture.deinit();
     try std.testing.expectEqual(@as(i64, -1000), try parseUnixTimestampMs(std.testing.io, "-1"));
     try std.testing.expectError(
         error.UserInput,
-        parseUnixTimestampMs(std.testing.io, "-9223372036854775808"),
+        parseUnixTimestampMs(capture.io(), "-9223372036854775808"),
     );
+    try capture.expectEqual("error: timestamp seconds are outside the millisecond range\n");
 }
 
 test "due selection binds the largest positive SQLite limit without narrowing" {
+    var capture = @import("automation/testing.zig").StderrCapture.init(std.testing.allocator);
+    defer capture.deinit();
     const operation: Operation = .{
-        .io = std.testing.io,
+        .io = capture.io(),
         .cwd = std.Io.Dir.cwd(),
         .cwd_path = ".",
         .environment = &.init(std.testing.allocator),
@@ -2233,6 +2280,7 @@ test "due selection binds the largest positive SQLite limit without narrowing" {
         0,
         null,
     ));
+    try capture.expectEqual("error: --limit must be >= 1\n");
     try std.testing.expectError(error.UserInput, selectDueAutomations(
         allocator,
         &db,
@@ -2240,6 +2288,7 @@ test "due selection binds the largest positive SQLite limit without narrowing" {
         -1,
         null,
     ));
+    try capture.expectEqual("error: --limit must be >= 1\n");
 }
 
 test "automation operations keep interleaved directories and environments independent" {
@@ -2382,7 +2431,9 @@ fn openDatabaseWithAllocator(allocator: std.mem.Allocator, operation: Operation)
 
 test "automation admission honors injected cancellation and retains borrowed handles" {
     const allocator = std.testing.allocator;
-    const io = std.testing.io;
+    var capture = @import("automation/testing.zig").StderrCapture.init(allocator);
+    defer capture.deinit();
+    const io = capture.io();
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try tmp.dir.realPathFileAlloc(io, ".", allocator);
@@ -2409,6 +2460,7 @@ test "automation admission honors injected cancellation and retains borrowed han
     var canceled = operation;
     canceled.io.vtable = &vtable;
     try std.testing.expectError(error.UserInput, Db.open(canceled, allocator, "store.db"));
+    try capture.expectEqual("error: db not found: store.db\n");
     try @import("test_support").checkAllAllocationFailures(
         allocator,
         openDatabaseWithAllocator,

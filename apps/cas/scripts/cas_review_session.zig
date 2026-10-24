@@ -1571,7 +1571,7 @@ const ReviewStart = struct {
     }
 
     fn terminalize(self: *ReviewStart, failure: FailureInfo) void {
-        terminalizeOwnedReviewAttempt(
+        const persistence_errors = terminalizeOwnedReviewAttempt(
             self.operation,
             self.allocator,
             &self.managed_server.?,
@@ -1586,6 +1586,12 @@ const ReviewStart = struct {
             },
             failure,
         );
+        if (persistence_errors.lock) |err| {
+            std.log.warn("terminal review lock persistence failed: {s}", .{@errorName(err)});
+        }
+        if (persistence_errors.record) |err| {
+            std.log.warn("terminal review record persistence failed: {s}", .{@errorName(err)});
+        }
     }
 
     fn terminalStartFailure(self: *ReviewStart, failure: FailureInfo, sent: bool) !noreturn {
@@ -5206,6 +5212,11 @@ const OwnedReviewTerminalContext = struct {
     event_log_path: ?[]const u8 = null,
 };
 
+const ReviewTerminalPersistenceErrors = struct {
+    lock: ?anyerror = null,
+    record: ?anyerror = null,
+};
+
 fn terminalizeOwnedReviewAttempt(
     operation: Operation,
     allocator: std.mem.Allocator,
@@ -5214,7 +5225,8 @@ fn terminalizeOwnedReviewAttempt(
     lock: ReviewTupleLock,
     context: OwnedReviewTerminalContext,
     failure: FailureInfo,
-) void {
+) ReviewTerminalPersistenceErrors {
+    var persistence_errors: ReviewTerminalPersistenceErrors = .{};
     managed_server.kill();
     const durable_failure = terminalReviewOwnerFailure(failure.code) orelse failure;
     const terminal_state = if (std.mem.eql(u8, failure.code, "account_resource_exhausted"))
@@ -5233,7 +5245,7 @@ fn terminalizeOwnedReviewAttempt(
         context.event_log_path,
     );
     writeReviewTupleLock(operation, allocator, lock_path, terminal_lock) catch |err| {
-        std.log.warn("terminal review lock persistence failed: {s}", .{@errorName(err)});
+        persistence_errors.lock = err;
     };
 
     if (context.record) |record| {
@@ -5243,10 +5255,11 @@ fn terminalizeOwnedReviewAttempt(
         record.terminal_failure_at_unix_s = unixSeconds(operation);
         if (context.record_path) |record_path| {
             writeSessionRecord(operation, allocator, record_path, record.*) catch |err| {
-                std.log.warn("terminal review record persistence failed: {s}", .{@errorName(err)});
+                persistence_errors.record = err;
             };
         }
     }
+    return persistence_errors;
 }
 
 fn startParentThreadAlloc(
@@ -20145,10 +20158,39 @@ fn testUnboundWaitLock(allocator: std.mem.Allocator, root: []const u8) !ReviewTu
     };
 }
 
+fn testTerminalOwnerRecord(event_log_path: []const u8) SessionRecord {
+    return .{
+        .cwd = "/tmp",
+        .parent_thread_id = "parent",
+        .review_thread_id = "review",
+        .review_turn_id = "turn",
+        .delivery = "detached",
+        .target = .{ .type = "uncommittedChanges" },
+        .event_log_path = event_log_path,
+        .created_at_unix_s = 1,
+        .last_observed_status = "inProgress",
+        .codex_version = "codex 0.1.0",
+        .compatibility_verdict = "compatible",
+    };
+}
+
 test "terminal owner receipt survives persistence failure" {
     var operation_fixture = try TestOperation.init();
     defer operation_fixture.deinit();
     const operation = operation_fixture.operation();
+    const allocator = std.testing.allocator;
+    const fs_io = operation.fs.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(fs_io, .{ .sub_path = "not-a-directory", .data = "" });
+    const blocked_parent = try tmp.dir.realPathFileAlloc(fs_io, "not-a-directory", allocator);
+    defer allocator.free(blocked_parent);
+    const lock_path = try std.fs.path.join(allocator, &.{ blocked_parent, "lock.json" });
+    defer allocator.free(lock_path);
+    const record_path = try std.fs.path.join(allocator, &.{ blocked_parent, "review.json" });
+    defer allocator.free(record_path);
+    const event_log_path = try std.fs.path.join(allocator, &.{ blocked_parent, "events.ndjson" });
+    defer allocator.free(event_log_path);
 
     var threaded = std.Io.Threaded.init(std.testing.allocator, .{});
     defer threaded.deinit();
@@ -20168,19 +20210,7 @@ test "terminal owner receipt survives persistence failure" {
     };
     defer managed_server.deinit(std.testing.allocator);
     const managed_pid = managed_server.processId();
-    var record = SessionRecord{
-        .cwd = "/tmp",
-        .parent_thread_id = "parent",
-        .review_thread_id = "review",
-        .review_turn_id = "turn",
-        .delivery = "detached",
-        .target = .{ .type = "uncommittedChanges" },
-        .event_log_path = "/definitely/missing/events.ndjson",
-        .created_at_unix_s = 1,
-        .last_observed_status = "inProgress",
-        .codex_version = "codex 0.1.0",
-        .compatibility_verdict = "compatible",
-    };
+    var record = testTerminalOwnerRecord(event_log_path);
     const tuple = testTupleIdentity("acct:a");
     const lock = makeReviewTupleLock(
         "sha256:persistence-failure",
@@ -20191,14 +20221,14 @@ test "terminal owner receipt survives persistence failure" {
         null,
     );
     const failure = terminalReviewTransportFailure("review_transport_lost").?;
-    terminalizeOwnedReviewAttempt(
+    const persistence_errors = terminalizeOwnedReviewAttempt(
         operation,
         std.testing.allocator,
         &managed_server,
-        "/definitely/missing/lock.json",
+        lock_path,
         lock,
         .{
-            .record_path = "/definitely/missing/review.json",
+            .record_path = record_path,
             .record = &record,
             .review_thread_id = record.review_thread_id,
             .review_turn_id = record.review_turn_id,
@@ -20206,6 +20236,8 @@ test "terminal owner receipt survives persistence failure" {
         },
         failure,
     );
+    try std.testing.expectEqual(@as(?anyerror, error.NotDir), persistence_errors.lock);
+    try std.testing.expectEqual(@as(?anyerror, error.NotDir), persistence_errors.record);
     try std.testing.expect(!cas_websocket.processAlive(managed_pid));
     try std.testing.expectEqualStrings("review_transport_lost", record.terminal_failure_code.?);
 }

@@ -425,10 +425,13 @@ fn checkedTimestampMillis(io: std.Io, seconds: i64) !i64 {
 test "minute alignment preserves negative floors and rejects an unrepresentable floor" {
     try std.testing.expectEqual(@as(i64, -60_000), try alignMsToMinute(std.testing.io, -1));
     try std.testing.expectEqual(@as(i64, 60_000), try alignMsToMinute(std.testing.io, 60_001));
+    var capture = @import("testing.zig").StderrCapture.init(std.testing.allocator);
+    defer capture.deinit();
     try std.testing.expectError(
         error.UserInput,
-        alignMsToMinute(std.testing.io, std.math.minInt(i64)),
+        alignMsToMinute(capture.io(), std.math.minInt(i64)),
     );
+    try capture.expectEqual("error: aligned minute is outside the timestamp range\n");
 }
 
 test "hourly recurrence preserves the largest representable interval" {
@@ -440,11 +443,14 @@ test "hourly recurrence preserves the largest representable interval" {
 }
 
 test "hourly recurrence reports when the next timestamp exceeds i64" {
+    var capture = @import("testing.zig").StderrCapture.init(std.testing.allocator);
+    defer capture.deinit();
     var rule = RRule.init(std.testing.allocator);
     defer rule.deinit(std.testing.allocator);
     rule.byminute = 59;
     const last = std.math.maxInt(i64);
-    try std.testing.expectError(error.UserInput, nextHourly(std.testing.io, rule, last, last));
+    try std.testing.expectError(error.UserInput, nextHourly(capture.io(), rule, last, last));
+    try capture.expectEqual("error: next run is outside the timestamp range\n");
 }
 
 fn parseWeeklyWithAllocator(allocator: std.mem.Allocator, io: std.Io) !void {
@@ -458,19 +464,25 @@ test "recurrence parser releases accumulated days on allocation or shape failure
         parseWeeklyWithAllocator,
         .{std.testing.io},
     );
+    var capture = @import("testing.zig").StderrCapture.init(std.testing.allocator);
+    defer capture.deinit();
     try std.testing.expectError(
         error.UserInput,
-        parseRrule(std.testing.io, std.testing.allocator, "FREQ=WEEKLY;BYDAY=MO,TU;BYHOUR=1"),
+        parseRrule(capture.io(), std.testing.allocator, "FREQ=WEEKLY;BYDAY=MO,TU;BYHOUR=1"),
     );
+    try capture.expectEqual("error: WEEKLY rrules must include BYDAY, BYHOUR, and BYMINUTE\n");
 }
 
 test "recurrence parser rejects intervals that do not fit the stored representation" {
+    var capture = @import("testing.zig").StderrCapture.init(std.testing.allocator);
+    defer capture.deinit();
     try std.testing.expectError(
         error.UserInput,
         parseRrule(
-            std.testing.io,
+            capture.io(),
             std.testing.allocator,
             "FREQ=HOURLY;BYMINUTE=0;INTERVAL=4294967296",
         ),
     );
+    try capture.expectEqual("error: INTERVAL must fit an unsigned 32-bit integer\n");
 }

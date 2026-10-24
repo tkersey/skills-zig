@@ -1467,8 +1467,10 @@ test "persisted scheduler plist requires well formed XML and exact label" {
 }
 
 test "install rejects extra persisted arguments before effects" {
+    var capture = @import("testing.zig").StderrCapture.init(std.testing.allocator);
+    defer capture.deinit();
     const operation: Operation = .{
-        .io = std.testing.io,
+        .io = capture.io(),
         .cwd = std.Io.Dir.cwd(),
         .cwd_path = ".",
         .environment = &.init(std.testing.allocator),
@@ -1517,6 +1519,9 @@ test "install rejects extra persisted arguments before effects" {
     try std.testing.expectError(error.FileNotFound, tmp.dir.access(io, "LaunchAgents", .{}));
     try std.testing.expectError(error.FileNotFound, tmp.dir.access(io, "Logs", .{}));
     try expectPlistPreservedAtPath(operation, plist_path, TestCasExtraArgumentPlist);
+    try capture.expectEqual(
+        "error: refusing to replace non-matching persisted scheduler without --replace\n",
+    );
 }
 
 test "launchctl query distinguishes exact absence from query failures" {
@@ -1558,8 +1563,10 @@ test "launchctl query distinguishes exact absence from query failures" {
 }
 
 test "scheduler status propagates launchctl query failure" {
+    var capture = @import("testing.zig").StderrCapture.init(std.testing.allocator);
+    defer capture.deinit();
     const operation: Operation = .{
-        .io = std.testing.io,
+        .io = capture.io(),
         .cwd = std.Io.Dir.cwd(),
         .cwd_path = ".",
         .environment = &.init(std.testing.allocator),
@@ -1588,11 +1595,14 @@ test "scheduler status propagates launchctl query failure" {
         ),
     );
     try script.expectComplete();
+    try capture.expectEqual("error: launchd scheduler state is unavailable: spawn-failed\n");
 }
 
 test "loaded CAS with extra arguments requires explicit replacement" {
+    var capture = @import("testing.zig").StderrCapture.init(std.testing.allocator);
+    defer capture.deinit();
     const operation: Operation = .{
-        .io = std.testing.io,
+        .io = capture.io(),
         .cwd = std.Io.Dir.cwd(),
         .cwd_path = ".",
         .environment = &.init(std.testing.allocator),
@@ -1639,6 +1649,9 @@ test "loaded CAS with extra arguments requires explicit replacement" {
     try script.expectComplete();
     try std.testing.expectError(error.FileNotFound, tmp.dir.access(io, "LaunchAgents", .{}));
     try std.testing.expectError(error.FileNotFound, tmp.dir.access(io, "Logs", .{}));
+    try capture.expectEqual(
+        "error: refusing to replace non-matching loaded scheduler without --replace\n",
+    );
 }
 
 test "replace adopts the exact same-label standalone Cron scheduler" {
@@ -1729,8 +1742,10 @@ fn expectCronReplacement(
 }
 
 test "failed or unverified bootout preserves the scheduler plist" {
+    var capture = @import("testing.zig").StderrCapture.init(std.testing.allocator);
+    defer capture.deinit();
     const operation: Operation = .{
-        .io = std.testing.io,
+        .io = capture.io(),
         .cwd = std.Io.Dir.cwd(),
         .cwd_path = ".",
         .environment = &.init(std.testing.allocator),
@@ -1776,6 +1791,9 @@ test "failed or unverified bootout preserves the scheduler plist" {
     );
     try unverified_bootout.expectComplete();
     try expectPlistPreserved(io, &tmp);
+    try capture.expectEqual(
+        "error: scheduler absence was not verified after bootout: command-failed\n",
+    );
 }
 
 test "uninstall removes the plist only after verified launchd absence" {
@@ -1925,8 +1943,10 @@ test "scheduler install succeeds after uninstall disabled the same label" {
 }
 
 test "uninstall verification failure preserves the scheduler plist" {
+    var capture = @import("testing.zig").StderrCapture.init(std.testing.allocator);
+    defer capture.deinit();
     const operation: Operation = .{
-        .io = std.testing.io,
+        .io = capture.io(),
         .cwd = std.Io.Dir.cwd(),
         .cwd_path = ".",
         .environment = &.init(std.testing.allocator),
@@ -1956,6 +1976,9 @@ test "uninstall verification failure preserves the scheduler plist" {
     );
     try script.expectComplete();
     try expectPlistPreserved(io, &tmp);
+    try capture.expectEqual(
+        "error: scheduler absence was not verified before plist removal: command-failed\n",
+    );
 }
 
 fn expectSchedulerPlistReadFailure(
@@ -1985,10 +2008,13 @@ test "scheduler plist inspection distinguishes absence from read failures" {
     const root = try tmp.dir.realPathFileAlloc(io, ".", allocator);
     defer allocator.free(root);
 
+    var capture = @import("testing.zig").StderrCapture.init(std.testing.allocator);
+    defer capture.deinit();
     try std.testing.expectError(
         error.UserInput,
-        schedulerPlistPath(std.testing.io, allocator, null, "com.example.scheduler"),
+        schedulerPlistPath(capture.io(), allocator, null, "com.example.scheduler"),
     );
+    try capture.expectEqual("error: HOME is not set\n");
 
     const missing_path = try std.fs.path.join(allocator, &.{ root, "missing.plist" });
     defer allocator.free(missing_path);
