@@ -2936,7 +2936,7 @@ test "stdio handshake failure reaps the spawned app-server" {
     const pid_bytes = try tmp.dir.readFileAlloc(io, "pid", allocator, .limited(64));
     defer allocator.free(pid_bytes);
     const process_id = try std.fmt.parseInt(u64, std.mem.trim(u8, pid_bytes, " \t\r\n"), 10);
-    try std.testing.expect(!websocket_transport.processAlive(process_id));
+    try std.testing.expect(!websocket_transport.processAlive(std.testing.io, process_id));
 }
 
 test "stdio request deadline bounds a silent live app-server and reaps it" {
@@ -2995,8 +2995,8 @@ test "stdio request deadline bounds a silent live app-server and reaps it" {
         pid_fields.next() orelse return error.InvalidPidFixture,
         10,
     );
-    try std.testing.expect(!websocket_transport.processAlive(shell_process_id));
-    try std.testing.expect(!websocket_transport.processAlive(sleep_process_id));
+    try std.testing.expect(!websocket_transport.processAlive(std.testing.io, shell_process_id));
+    try std.testing.expect(!websocket_transport.processAlive(std.testing.io, sleep_process_id));
 }
 
 test "stdio startup deadline includes the hook capability probe" {
@@ -3029,7 +3029,7 @@ test "stdio startup deadline includes the hook capability probe" {
     const pid_bytes = try tmp.dir.readFileAlloc(io, "pid", allocator, .limited(64));
     defer allocator.free(pid_bytes);
     const pid = try std.fmt.parseInt(u64, pid_bytes, 10);
-    try std.testing.expect(!websocket_transport.processAlive(pid));
+    try std.testing.expect(!websocket_transport.processAlive(std.testing.io, pid));
 }
 
 test "stdio hook admission and handshake restore the caller request deadline" {
@@ -3129,8 +3129,8 @@ test "stdio request deadline bounds a blocked write and reaps the app-server" {
         pid_fields.next() orelse return error.InvalidPidFixture,
         10,
     );
-    try std.testing.expect(!websocket_transport.processAlive(shell_process_id));
-    try std.testing.expect(!websocket_transport.processAlive(sleep_process_id));
+    try std.testing.expect(!websocket_transport.processAlive(std.testing.io, shell_process_id));
+    try std.testing.expect(!websocket_transport.processAlive(std.testing.io, sleep_process_id));
 }
 
 test "unknown server request replies then records exact method and terminates" {

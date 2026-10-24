@@ -1094,7 +1094,7 @@ fn cmdCleanup(op: Operation, allocator: std.mem.Allocator, options: Options) !vo
     ) catch null;
     defer if (maybe_record) |loaded| freeDetachedRecord(allocator, loaded);
     const was_alive = if (maybe_record) |loaded|
-        cas_websocket.processAlive(loaded.managed_server_pid)
+        cas_websocket.processAlive(op.fs.io, loaded.managed_server_pid)
     else
         false;
     var cleanup_result: CleanupForksResult = .{};
@@ -3515,7 +3515,7 @@ fn startDetachedCollector(
     options: Options,
     record: DetachedRecord,
 ) !cas_client.Client {
-    const managed_runtime_alive = cas_websocket.processAlive(record.managed_server_pid);
+    const managed_runtime_alive = cas_websocket.processAlive(op.fs.io, record.managed_server_pid);
     if (!managed_runtime_alive) return error.InquiryTransportLost;
     const hook_policy = cas_client.hooks.HookPolicy.parse(options.hooks) orelse .inherit;
 
@@ -3698,7 +3698,9 @@ fn interruptDetachedInquiry(
     inquiry_id: []const u8,
 ) !InterruptOutput {
     const record = try loadDetachedRecordAlloc(op, allocator, options.home, inquiry_id);
-    if (!cas_websocket.processAlive(record.managed_server_pid)) return error.InquiryTransportLost;
+    if (!cas_websocket.processAlive(op.fs.io, record.managed_server_pid)) {
+        return error.InquiryTransportLost;
+    }
     var client = try cas_client.Client.start(allocator, .{
         .io = op.fs.io,
         .dir = op.fs.directory(),
@@ -7517,7 +7519,7 @@ test "inquiry server survives launcher teardown and cleanup retires its descenda
     );
     defer allocator.free(descendant_raw);
     const descendant = try std.fmt.parseInt(u64, descendant_raw, 10);
-    try std.testing.expect(cas_websocket.processAlive(descendant));
+    try std.testing.expect(cas_websocket.processAlive(std.testing.io, descendant));
     try managed.detach();
     managed.deinit(allocator);
     deinitialized = true;

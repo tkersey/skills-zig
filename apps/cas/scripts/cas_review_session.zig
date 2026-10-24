@@ -7791,7 +7791,7 @@ fn reviewTupleLockDeadTransportProven(
     lock: ReviewTupleLock,
 ) bool {
     if (!reviewTupleLockReplaceableDeadFailure(lock)) return false;
-    if (cas_websocket.processAlive(lock.ownerPid)) return false;
+    if (cas_websocket.processAlive(operation.fs.io, lock.ownerPid)) return false;
     if (std.mem.eql(u8, lock.lockVersion, review_tuple_lock_version)) {
         return (reviewTuplePredecessorIncarnationExitedAlloc(
             operation,
@@ -7804,7 +7804,7 @@ fn reviewTupleLockDeadTransportProven(
         allocator,
         lock,
     ) orelse return false;
-    return !cas_websocket.processAlive(managed_server_pid);
+    return !cas_websocket.processAlive(operation.fs.io, managed_server_pid);
 }
 
 fn reviewTupleManagedServerPid(
@@ -19249,7 +19249,7 @@ fn checkPredecessorCompatibility(
         legacy_lock,
         cas_websocket.owner_watchdog_shutdown_grace_ms + 100,
     );
-    try std.testing.expect(cas_websocket.processAlive(process_id));
+    try std.testing.expect(cas_websocket.processAlive(operation.fs.io, process_id));
 }
 
 test "replacement admission requires exact predecessor shutdown receipt" {
@@ -19307,7 +19307,7 @@ test "replacement admission requires exact predecessor shutdown receipt" {
         "{\"schema\":\"CAS-WDR-v1\",\"token\":\"generation-token\"}\n",
     );
     try ensureReviewTuplePredecessorExitedWithin(operation, std.testing.allocator, lock, 1);
-    try std.testing.expect(cas_websocket.processAlive(process_id));
+    try std.testing.expect(cas_websocket.processAlive(std.testing.io, process_id));
 
     try checkPredecessorCompatibility(operation, lock, process_id);
 }
@@ -19810,7 +19810,7 @@ fn checkTerminalizedOwnerReplay(
             .hint = "dead-owner-specific display copy",
         },
     );
-    try std.testing.expect(cas_websocket.processAlive(currentProcessId()));
+    try std.testing.expect(cas_websocket.processAlive(operation.fs.io, currentProcessId()));
     var terminalized = try loadOwnedSessionRecordPath(
         operation,
         std.testing.allocator,
@@ -20068,7 +20068,7 @@ fn checkReviewHandoff(
         operation.environ,
     );
     const pid: u64 = @intCast(child.id.?);
-    defer if (cas_websocket.processAlive(pid)) child.kill(io);
+    defer if (cas_websocket.processAlive(operation.fs.io, pid)) child.kill(io);
     // This stage follows grace-status observation and never uses the RPC gate.
     var unused_gate: ReviewRuntimeGate = undefined;
     var start = ReviewStart{
@@ -20092,7 +20092,7 @@ fn checkReviewHandoff(
     try checkHandoffReport(&start, timed_out, fail_output);
     start.deinit();
     deinitialized = true;
-    try std.testing.expectEqual(binding == null, cas_websocket.processAlive(pid));
+    try std.testing.expectEqual(binding == null, cas_websocket.processAlive(operation.fs.io, pid));
 }
 
 fn checkHandoffReport(start: *ReviewStart, timed_out: bool, fail_output: bool) !void {
@@ -20238,7 +20238,7 @@ test "terminal owner receipt survives persistence failure" {
     );
     try std.testing.expectEqual(@as(?anyerror, error.NotDir), persistence_errors.lock);
     try std.testing.expectEqual(@as(?anyerror, error.NotDir), persistence_errors.record);
-    try std.testing.expect(!cas_websocket.processAlive(managed_pid));
+    try std.testing.expect(!cas_websocket.processAlive(std.testing.io, managed_pid));
     try std.testing.expectEqualStrings("review_transport_lost", record.terminal_failure_code.?);
 }
 
