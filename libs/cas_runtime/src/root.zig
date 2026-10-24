@@ -59,4 +59,5 @@ test {
     _ = @import("managed_server.zig");
     _ = @import("client.zig");
     _ = @import("websocket.zig");
+    _ = @import("process_state.zig");
 }

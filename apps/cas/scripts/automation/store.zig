@@ -2340,9 +2340,16 @@ test "timestamp admission preserves unit threshold and signed boundaries" {
     inline for (cases) |case| {
         try std.testing.expectEqual(case[1], try parseUnixTimestampMs(std.testing.io, case[0]));
     }
-    for ([_][]const u8{
-        "-9223372036854776", "-9223372036854775808", "9223372036854775808", "invalid",
-    }) |raw| {
-        try std.testing.expectError(error.UserInput, parseUnixTimestampMs(std.testing.io, raw));
+    var capture = @import("testing.zig").StderrCapture.init(std.testing.allocator);
+    defer capture.deinit();
+    const invalid_cases = .{
+        .{ "-9223372036854776", "error: timestamp seconds are outside the millisecond range\n" },
+        .{ "-9223372036854775808", "error: timestamp seconds are outside the millisecond range\n" },
+        .{ "9223372036854775808", "error: timestamp must be an integer unix value\n" },
+        .{ "invalid", "error: timestamp must be an integer unix value\n" },
+    };
+    inline for (invalid_cases) |case| {
+        try std.testing.expectError(error.UserInput, parseUnixTimestampMs(capture.io(), case[0]));
+        try capture.expectEqual(case[1]);
     }
 }

@@ -410,7 +410,14 @@ jobs:
           tar -czf "${archive}" -C "${package_dir}" .
           .github/scripts/verify_cas_archive.sh linux-x86_64 "${archive}"
       - name: Test generic CAS surfaces
+        if: runner.os != 'Linux'
         run: zig build test-cas
+      - name: Install full-suite guard dependency
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install --yes ripgrep
+      - name: Qualify full suite on native Linux
+        if: runner.os == 'Linux'
+        run: zig build test-full -Doptimize=debug -j2 --summary all
       - name: Upload exact Codex evidence
         uses: actions/upload-artifact@v4
         with:

@@ -1,6 +1,7 @@
 const core_io = @import("core_io");
 const jsonl_core = @import("jsonl_core");
 const core_process = @import("core_process");
+const process_state = @import("process_state.zig");
 const std = @import("std");
 
 const builtin = @import("builtin");
@@ -1317,7 +1318,7 @@ fn spawnManagedServerPosix(
     };
 }
 
-pub fn processAlive(process_id: u64) bool {
+pub fn processAlive(io: std.Io, process_id: u64) bool {
     return switch (builtin.target.os.tag) {
         .windows => true,
         .wasi => false,
@@ -1328,6 +1329,8 @@ pub fn processAlive(process_id: u64) bool {
                 error.ProcessNotFound => break :blk false,
                 else => break :blk true,
             };
+            if (builtin.target.os.tag == .linux and
+                process_state.processIsTerminal(io, process_id)) break :blk false;
             break :blk true;
         },
     };
@@ -1348,12 +1351,45 @@ pub fn processGroupAlive(process_group_id: u64) bool {
     };
 }
 
+test "Linux zombie cleanup retains process-group ownership evidence" {
+    if (builtin.target.os.tag != .linux) return error.SkipZigTest;
+    const io = std.testing.io;
+    var child = try std.process.spawn(io, .{
+        .argv = &.{ "/bin/sh", "-c", "exit 0" },
+        .stdin = .ignore,
+        .stdout = .ignore,
+        .stderr = .ignore,
+        .pgid = 0,
+    });
+    defer child.kill(io);
+    const pid = child.id.?;
+    var info: std.os.linux.siginfo_t = undefined;
+    const result = std.os.linux.waitid(
+        .PID,
+        pid,
+        &info,
+        std.os.linux.W.EXITED | std.os.linux.W.NOWAIT,
+        null,
+    );
+    try std.testing.expectEqual(std.posix.E.SUCCESS, std.posix.errno(result));
+    const process_id: u64 = @intCast(pid);
+    try std.testing.expect(processGroupAlive(process_id));
+    try std.testing.expect(!processAlive(io, process_id));
+    try std.testing.expect(waitForProcessExit(io, process_id, 100));
+    try std.testing.expect(waitForProcessGroupExit(io, process_id, 100));
+    try std.testing.expect(processGroupAlive(process_id));
+    try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, try child.wait(io));
+    try std.testing.expect(!processGroupAlive(process_id));
+}
+
 pub fn waitForProcessGroupExit(io: std.Io, process_group_id: u64, timeout_ms: u32) bool {
     const started_ms = @divFloor(
         std.Io.Clock.awake.now(io).nanoseconds,
         1_000_000,
     );
     while (processGroupAlive(process_group_id)) {
+        if (builtin.target.os.tag == .linux and
+            process_state.groupIsTerminal(io, process_group_id)) return true;
         const now_ms = @divFloor(
             std.Io.Clock.awake.now(io).nanoseconds,
             1_000_000,
@@ -1443,7 +1479,7 @@ pub fn waitForProcessExit(io: std.Io, process_id: u64, timeout_ms: u32) bool {
         std.Io.Clock.awake.now(io).nanoseconds,
         1_000_000,
     );
-    while (processAlive(process_id)) {
+    while (processAlive(io, process_id)) {
         const now_ms = @divFloor(
             std.Io.Clock.awake.now(io).nanoseconds,
             1_000_000,
@@ -2428,9 +2464,9 @@ test "owner-lived watchdog retires its exact server when owner control closes" {
     const process_ids = try awaitOwnerProcessIds(allocator, io, tmp.dir, pid_path);
     const server_pid = process_ids.server;
     const descendant_pid = process_ids.descendant;
-    try std.testing.expect(processAlive(watchdog_pid));
-    try std.testing.expect(processAlive(server_pid));
-    try std.testing.expect(processAlive(descendant_pid));
+    try std.testing.expect(processAlive(std.testing.io, watchdog_pid));
+    try std.testing.expect(processAlive(std.testing.io, server_pid));
+    try std.testing.expect(processAlive(std.testing.io, descendant_pid));
     const receipt_path = managed.shutdownReceiptPath().?;
     const receipt_token = managed.shutdownReceiptToken().?;
     const receipt_dir = try std.fs.path.join(allocator, &.{ root, "receipts" });
@@ -2495,8 +2531,8 @@ test "detached watchdog retains cleanup with a live or exited server leader" {
         try managed.detach();
         try std.testing.expect(managed.owner_control == null);
         try std.Io.sleep(io, .fromMilliseconds(100), .awake);
-        try std.testing.expect(processAlive(managed.processId()));
-        try std.testing.expect(processAlive(ids.descendant));
+        try std.testing.expect(processAlive(std.testing.io, managed.processId()));
+        try std.testing.expect(processAlive(std.testing.io, ids.descendant));
         // The persisted cleanup consumer retains its original positive-PID signal.
         terminateProcess(managed.processId());
         _ = try child.wait(io);
@@ -2674,7 +2710,7 @@ test "ordinary managed teardown retires its process group descendants" {
 
     const process_ids = try awaitOwnerProcessIds(allocator, io, tmp.dir, pid_path);
     try std.testing.expectEqual(child_pid, process_ids.server);
-    try std.testing.expect(processAlive(process_ids.descendant));
+    try std.testing.expect(processAlive(std.testing.io, process_ids.descendant));
 
     managed.deinit(allocator);
     deinitialized = true;
@@ -2742,7 +2778,7 @@ test "ordinary detach joins the blocked stderr task and preserves the process" {
     try std.testing.expect(managed.stderr_drainer == null);
     managed.deinit(allocator);
     deinitialized = true;
-    try std.testing.expect(processAlive(pid));
+    try std.testing.expect(processAlive(std.testing.io, pid));
 }
 
 test "ordinary managed startup failure retires its process group descendants" {

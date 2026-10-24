@@ -399,8 +399,10 @@ test "memory creation never follows a dangling symlink" {
 }
 
 test "memory summary rejects symlink and non-file memory targets" {
+    var capture = @import("testing.zig").StderrCapture.init(std.testing.allocator);
+    defer capture.deinit();
     var operation: Operation = .{
-        .io = std.testing.io,
+        .io = capture.io(),
         .cwd = std.Io.Dir.cwd(),
         .cwd_path = ".",
         .environment = &.init(std.testing.allocator),
@@ -417,6 +419,14 @@ test "memory summary rejects symlink and non-file memory targets" {
     defer allocator.free(root);
     const automation_root = try std.fs.path.join(allocator, &.{ root, "automations" });
     defer allocator.free(automation_root);
+    const memory_path = try std.fs.path.join(allocator, &.{ automation_root, "row", "memory.md" });
+    defer allocator.free(memory_path);
+    const expected = try std.fmt.allocPrint(
+        allocator,
+        "error: refusing non-regular memory file ({s})\n",
+        .{memory_path},
+    );
+    defer allocator.free(expected);
 
     operation.automation_root = automation_root;
 
@@ -424,6 +434,7 @@ test "memory summary rejects symlink and non-file memory targets" {
         error.UserInput,
         writeMemorySummary(operation, allocator, "row", "must not escape", 0),
     );
+    try capture.expectEqual(expected);
     const outside = try tmp.dir.readFileAlloc(io, "outside.md", allocator, .limited(64));
     defer allocator.free(outside);
     try std.testing.expectEqualStrings("outside\n", outside);
@@ -440,6 +451,7 @@ test "memory summary rejects symlink and non-file memory targets" {
         error.UserInput,
         writeMemorySummary(operation, allocator, "row", "must stay a file", 0),
     );
+    try capture.expectEqual(expected);
 }
 
 fn parseCwdsWithAllocator(allocator: std.mem.Allocator, io: std.Io) !void {
@@ -458,8 +470,11 @@ test "cwd JSON releases partially built output under allocation failure" {
 }
 
 test "cwd JSON rejects a malformed later element without leaking prior strings" {
+    var capture = @import("testing.zig").StderrCapture.init(std.testing.allocator);
+    defer capture.deinit();
     try std.testing.expectError(
         error.UserInput,
-        parseCwdsJson(std.testing.io, std.testing.allocator, "[\"one\",\"two\",3]"),
+        parseCwdsJson(capture.io(), std.testing.allocator, "[\"one\",\"two\",3]"),
     );
+    try capture.expectEqual("error: cwds_json must be a JSON array of strings\n");
 }

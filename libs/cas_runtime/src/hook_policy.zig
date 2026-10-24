@@ -440,7 +440,7 @@ fn exerciseHangingHelp(close_output: bool) !void {
     var count: usize = 0;
     while (fields.next()) |field| {
         const pid = try std.fmt.parseInt(u64, field, 10);
-        try std.testing.expect(!@import("websocket.zig").processAlive(pid));
+        try std.testing.expect(!@import("websocket.zig").processAlive(io, pid));
         count += 1;
     }
     try std.testing.expectEqual(@as(usize, 2), count);
