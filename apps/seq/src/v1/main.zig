@@ -5,7 +5,7 @@ const seq = @import("seq_v1_core");
 const durable_store = @import("durable_store");
 
 const Version = std.mem.trim(u8, app_meta.version, " \t\r\n");
-const source_adapter_version = "seq-source-adapter-set/v1";
+const source_adapter_version = "seq-source-adapter-set/v2";
 const max_output_cells: usize = 4_000_000;
 const max_discovery_bytes: usize = 256 * 1024 * 1024;
 
@@ -709,12 +709,8 @@ fn runObserve(
     var args = try parseObserveArgs(io, allocator, argv);
     defer args.deinit(allocator);
     args.selectors.environment = environment;
-    const normalized_repo = if (args.selectors.repo) |repo|
-        try seq.native.absolutePathAlloc(allocator, environment, repo, io, dir)
-    else
-        null;
-    defer if (normalized_repo) |repo| allocator.free(repo);
-    if (normalized_repo) |repo| args.selectors.repo = repo;
+    var normalized_paths = try ObservationPaths.init(allocator, io, dir, &args.selectors);
+    defer normalized_paths.deinit(allocator);
     if (args.format != .json) return error.UnsupportedObservationRenderer;
     const projection_names = [_][]const u8{args.projection};
     var context = try loadDefinition(
@@ -769,6 +765,41 @@ fn runObserve(
         &program,
     );
 }
+
+const ObservationPaths = struct {
+    const fields = .{ "path", "root", "repo" };
+    values: [fields.len]?[]u8 = @splat(null),
+
+    fn init(
+        allocator: std.mem.Allocator,
+        io: std.Io,
+        dir: std.Io.Dir,
+        selectors: *seq.native.Options,
+    ) !ObservationPaths {
+        var paths = ObservationPaths{};
+        errdefer paths.deinit(allocator);
+        inline for (fields, 0..) |field, index| {
+            if (@field(selectors, field)) |raw| {
+                paths.values[index] = try seq.native.absolutePathAlloc(
+                    allocator,
+                    selectors.environment,
+                    raw,
+                    io,
+                    dir,
+                );
+            }
+        }
+        inline for (fields, 0..) |field, index| {
+            @field(selectors, field) = paths.values[index];
+        }
+        return paths;
+    }
+
+    fn deinit(self: *ObservationPaths, allocator: std.mem.Allocator) void {
+        for (self.values) |value| if (value) |path| allocator.free(path);
+        self.* = undefined;
+    }
+};
 
 fn emitObservation(
     io: std.Io,
@@ -935,7 +966,7 @@ const GraphObservationContext = struct {
                 .source_row_count = result.source_rows,
                 .materialized_row_count = result.materialized_rows,
             },
-            .corpus_adapter = metrics.adapter orelse "codex-rollout-jsonl/v1",
+            .corpus_adapter = metrics.adapter orelse source_adapter_version,
             .corpus_digest = digest,
             .corpus_files = metrics.files,
             .corpus_sessions = metrics.sessions,
@@ -1053,6 +1084,38 @@ fn graphDiscoverySelectors(args: *const ObserveArgs) seq.native.Options {
     return selectors;
 }
 
+fn resolveGraphPaths(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    dir: std.Io.Dir,
+    args: *const ObserveArgs,
+) !std.ArrayList([]u8) {
+    var paths = try seq.native.resolveTargetPaths(
+        allocator,
+        io,
+        dir,
+        graphDiscoverySelectors(args),
+        false,
+    );
+    errdefer seq.native.freePaths(allocator, &paths);
+    const selected_path = args.selectors.path orelse return paths;
+    std.debug.assert(std.fs.path.isAbsolute(selected_path));
+    for (paths.items) |path| {
+        if (std.mem.eql(u8, path, selected_path)) return paths;
+    }
+    // An explicit file outside the default corpus defines its own source scope.
+    // An explicit root still supplies the caller-selected lineage candidates.
+    if (args.selectors.root == null) {
+        seq.native.freePaths(allocator, &paths);
+        paths = .empty;
+    }
+    // Native discovery keeps its traversal bounds; this adds at most one file.
+    const owned_path = try allocator.dupe(u8, selected_path);
+    errdefer allocator.free(owned_path);
+    try paths.append(allocator, owned_path);
+    return paths;
+}
+
 fn readMaterializedGraphPaths(
     graph: *const GraphObservationContext,
     rows: *MaterializedGraphScans,
@@ -1080,9 +1143,9 @@ fn readMaterializedGraphPaths(
         if (selected.file_opened) metrics.opened += 1;
         try recordDiscoveryBytes(metrics, selected.discovery_bytes_read);
         const parsed = if (selected.parsed) |*value| value else continue;
-        try metrics.admitAdapter("codex-rollout-jsonl/v1");
+        try metrics.admitAdapter(seq.trace_adapter.adapterId(&parsed.trace));
         try recordCorpusBytes(metrics, parsed.metrics.bytes_read);
-        try admitCodexSession(metrics, parsed);
+        try admitTraceSession(metrics, parsed);
         digest_set.add(path, &parsed.corpus_digest);
         for (rows.rows) |*scan| {
             _ = try seq.trace_adapter.appendRelationRowsAlloc(
@@ -1149,13 +1212,7 @@ fn executeGraphObservation(
     };
     var rows = try MaterializedGraphScans.init(&graph, scan_stages);
     defer rows.deinit(&graph);
-    var paths = try seq.native.resolveTargetPaths(
-        allocator,
-        io,
-        dir,
-        graphDiscoverySelectors(args),
-        false,
-    );
+    var paths = try resolveGraphPaths(allocator, io, dir, args);
     defer seq.native.freePaths(allocator, &paths);
     try rows.reserve(&graph, paths.items.len);
     var metrics = PhysicalMetrics{};
@@ -1374,9 +1431,9 @@ const StreamingGraphState = struct {
         if (selected.file_opened) self.metrics.opened += 1;
         try recordDiscoveryBytes(&self.metrics, selected.discovery_bytes_read);
         const parsed = if (selected.parsed) |*value| value else return;
-        try self.metrics.admitAdapter("codex-rollout-jsonl/v1");
+        try self.metrics.admitAdapter(seq.trace_adapter.adapterId(&parsed.trace));
         try recordCorpusBytes(&self.metrics, parsed.metrics.bytes_read);
-        try admitCodexSession(&self.metrics, parsed);
+        try admitTraceSession(&self.metrics, parsed);
         self.digest_set.add(task.path, &parsed.corpus_digest);
         try self.appendPartition(parsed, reducer);
     }
@@ -1502,13 +1559,7 @@ fn executeStreamingGraphObservation(
         .plans = context,
         .bindings = bindings,
     };
-    var paths = try seq.native.resolveTargetPaths(
-        allocator,
-        io,
-        dir,
-        graphDiscoverySelectors(args),
-        false,
-    );
+    var paths = try resolveGraphPaths(allocator, io, dir, args);
     defer seq.native.freePaths(allocator, &paths);
     var discovered = try DiscoveredSessions.init(
         io,
@@ -1839,7 +1890,7 @@ fn executePhysicalObservation(
     return .{
         .result = try runner.finish(),
         .runner = runner,
-        .corpus_adapter = metrics.adapter orelse "codex-rollout-jsonl/v1",
+        .corpus_adapter = metrics.adapter orelse source_adapter_version,
         .corpus_digest = digest_set.digest(),
         .corpus_files = metrics.files,
         .corpus_sessions = metrics.sessions,
@@ -1896,7 +1947,7 @@ fn feedPhysicalFile(
             metrics,
         );
     }
-    return feedCodexFile(
+    return feedTraceFile(
         io,
         dir,
         allocator,
@@ -1987,7 +2038,7 @@ fn openCodeSessionPasses(
     return true;
 }
 
-fn feedCodexFile(
+fn feedTraceFile(
     io: std.Io,
     dir: std.Io.Dir,
     allocator: std.mem.Allocator,
@@ -2025,7 +2076,7 @@ fn feedCodexFile(
     try recordDiscoveryBytes(metrics, selected.discovery_bytes_read);
     var parsed = selected.parsed orelse return .continue_scanning;
     defer parsed.deinit(allocator);
-    try metrics.admitAdapter("codex-rollout-jsonl/v1");
+    try metrics.admitAdapter(seq.trace_adapter.adapterId(&parsed.trace));
     try recordCorpusBytes(metrics, parsed.metrics.bytes_read);
     if (relation == .sessions) {
         if (!seq.native.sessionPasses(
@@ -2038,9 +2089,9 @@ fn feedCodexFile(
     )) {
         return .continue_scanning;
     }
-    try admitCodexSession(metrics, &parsed);
+    try admitTraceSession(metrics, &parsed);
     digest_set.add(path, &parsed.corpus_digest);
-    return feedCodexRows(
+    return feedTraceRows(
         allocator,
         args,
         program,
@@ -2075,7 +2126,7 @@ fn recordCorpusBytes(metrics: *PhysicalMetrics, bytes: usize) !void {
     ) catch return error.ObservationMetricOverflow;
 }
 
-fn admitCodexSession(
+fn admitTraceSession(
     metrics: *PhysicalMetrics,
     parsed: *const seq.trace_adapter.ParsedTrace,
 ) !void {
@@ -2088,7 +2139,7 @@ fn admitCodexSession(
     metrics.sessions += 1;
 }
 
-fn feedCodexRows(
+fn feedTraceRows(
     allocator: std.mem.Allocator,
     args: *const ObserveArgs,
     program: *const seq.execution.Program,
@@ -2705,6 +2756,7 @@ fn emitCapabilities(io: std.Io, argv: []const []const u8) !u8 {
         "{{\"schema\":\"seq-capabilities/v1\",\"version\":\"{s}\"," ++
             "\"observation_abis\":[\"{s}\"],\"source_adapters\":" ++
             "[\"codex-rollout-jsonl/v1\"," ++
+            "\"pi-session-jsonl/v1\"," ++
             "\"opencode-prompt-history-jsonl/v1\"," ++
             "\"immutable-relation-json/v1\"],\"operators\":[",
         .{ Version, seq.definition.abi },
@@ -2912,6 +2964,112 @@ test "observe parser accepts explicit definition selectors and parameters" {
         args.selectors.path.?,
     );
     try std.testing.expectEqual(@as(usize, 1), args.parameter_specs.len);
+}
+
+fn testObservation(selectors: seq.native.Options) ObserveArgs {
+    return .{
+        .definition_path = "definition.json",
+        .projection = "rows",
+        .selectors = selectors,
+        .input_specs = &.{},
+        .parameter_specs = &.{},
+        .format = .json,
+    };
+}
+
+test "graph discovery normalizes selectors and unions an explicit file with lineage candidates" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "sessions");
+    try tmp.dir.writeFile(io, .{ .sub_path = "sessions/ancestor.jsonl", .data = "{}\n" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "outside.jsonl", .data = "{}\n" });
+    const root = try tmp.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(root);
+    var environment = std.process.Environ.Map.init(allocator);
+    defer environment.deinit();
+    try environment.put("HOME", root);
+    var args = testObservation(.{
+        .path = "./outside.jsonl",
+        .root = "~/sessions",
+        .repo = ".",
+        .environment = &environment,
+    });
+    var normalized = try ObservationPaths.init(allocator, io, tmp.dir, &args.selectors);
+    defer normalized.deinit(allocator);
+    const selected = try std.fs.path.join(allocator, &.{ root, "outside.jsonl" });
+    defer allocator.free(selected);
+    const session_root = try std.fs.path.join(allocator, &.{ root, "sessions" });
+    defer allocator.free(session_root);
+    try std.testing.expectEqualStrings(selected, args.selectors.path.?);
+    try std.testing.expectEqualStrings(session_root, args.selectors.root.?);
+    try std.testing.expectEqualStrings(root, args.selectors.repo.?);
+    var paths = try resolveGraphPaths(allocator, io, tmp.dir, &args);
+    defer seq.native.freePaths(allocator, &paths);
+    try std.testing.expectEqual(@as(usize, 2), paths.items.len);
+    try std.testing.expectEqualStrings("ancestor.jsonl", std.fs.path.basename(paths.items[0]));
+    try std.testing.expectEqualStrings(selected, paths.items[1]);
+    var selected_inside = args;
+    selected_inside.selectors.path = paths.items[0];
+    var deduplicated = try resolveGraphPaths(allocator, io, tmp.dir, &selected_inside);
+    defer seq.native.freePaths(allocator, &deduplicated);
+    try std.testing.expectEqual(@as(usize, 1), deduplicated.items.len);
+    try std.testing.expectEqualStrings(paths.items[0], deduplicated.items[0]);
+}
+
+test "graph discovery keeps an explicit file when the default corpus is absent" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "pi.jsonl", .data = "{}\n" });
+    const root = try tmp.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(root);
+    var environment = std.process.Environ.Map.init(allocator);
+    defer environment.deinit();
+    try environment.put("HOME", root);
+    var args = testObservation(.{ .path = "pi.jsonl", .environment = &environment });
+    var normalized = try ObservationPaths.init(allocator, io, tmp.dir, &args.selectors);
+    defer normalized.deinit(allocator);
+    var paths = try resolveGraphPaths(allocator, io, tmp.dir, &args);
+    defer seq.native.freePaths(allocator, &paths);
+    try std.testing.expectEqual(@as(usize, 1), paths.items.len);
+    try std.testing.expectEqualStrings(args.selectors.path.?, paths.items[0]);
+}
+
+test "an outside explicit file excludes default corpus while an inside file retains lineage" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, ".codex/sessions");
+    try tmp.dir.writeFile(io, .{ .sub_path = ".codex/sessions/one.jsonl", .data = "{}\n" });
+    try tmp.dir.writeFile(io, .{ .sub_path = ".codex/sessions/two.jsonl", .data = "{}\n" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "pi.jsonl", .data = "{}\n" });
+    const root = try tmp.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(root);
+    var environment = std.process.Environ.Map.init(allocator);
+    defer environment.deinit();
+    try environment.put("HOME", root);
+    var outside = testObservation(.{ .path = "pi.jsonl", .environment = &environment });
+    var outside_paths = try ObservationPaths.init(allocator, io, tmp.dir, &outside.selectors);
+    defer outside_paths.deinit(allocator);
+    var selected = try resolveGraphPaths(allocator, io, tmp.dir, &outside);
+    defer seq.native.freePaths(allocator, &selected);
+    try std.testing.expectEqual(@as(usize, 1), selected.items.len);
+    try std.testing.expectEqualStrings(outside.selectors.path.?, selected.items[0]);
+    var inside = testObservation(.{
+        .path = ".codex/sessions/one.jsonl",
+        .environment = &environment,
+    });
+    var inside_paths = try ObservationPaths.init(allocator, io, tmp.dir, &inside.selectors);
+    defer inside_paths.deinit(allocator);
+    var lineage = try resolveGraphPaths(allocator, io, tmp.dir, &inside);
+    defer seq.native.freePaths(allocator, &lineage);
+    try std.testing.expectEqual(@as(usize, 2), lineage.items.len);
+    try std.testing.expectEqualStrings(inside.selectors.path.?, lineage.items[0]);
+    try std.testing.expectEqualStrings("two.jsonl", std.fs.path.basename(lineage.items[1]));
 }
 
 test "selected parser warnings contaminate the observation envelope" {

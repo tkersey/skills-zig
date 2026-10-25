@@ -9,6 +9,7 @@ ranked_definition=apps/seq/src/v1/fixtures/ranked-observation.json
 ranked_facts=apps/seq/src/v1/fixtures/ranked-facts.json
 rollout=apps/seq/src/v1/fixtures/rollout.jsonl
 opencode_history=apps/seq/src/v1/fixtures/opencode/prompt-history.jsonl
+pi_session=apps/seq/src/v1/fixtures/pi/session.jsonl
 temp_base=$(cd "${TMPDIR:-/tmp}" && pwd -P)
 cache_dir=$(mktemp -d "$temp_base/seq-v1-smoke.XXXXXX")
 trap 'test -n "${cache_dir:-}" && rm -rf -- "$cache_dir"' EXIT
@@ -110,6 +111,88 @@ then
 fi
 grep -Fq '"code":"OpenCodeStructuredValuesUnavailable"' \
   <<<"$opencode_structured_error"
+
+pi_sessions=$("$binary" sessions --root apps/seq/src/v1/fixtures/pi --format json)
+jq -e 'length == 1 and (.[0] | .session_id == "pi-fixture" and
+  .originator == "pi" and .cwd == "/pi-fixture-repo" and .turn_count == 2 and
+  .thread_name == "Pi branch fixture" and .total_tokens == 80 and
+  .input_tokens == 65 and .cached_input_tokens == 2 and .output_tokens == 15 and
+  .parent_session_id == null)' <<<"$pi_sessions" >/dev/null
+
+pi_turns=$("$binary" turns --path "$pi_session" --format json)
+jq -e 'length == 2 and
+  (any(.[]; .turn_index == 1 and .final_answer == "Alternative Pi FAILURE answer")) and
+  (any(.[]; .turn_index == 2 and .final_answer == "Second Pi answer"))' \
+  <<<"$pi_turns" >/dev/null
+if grep -Fq 'PRIVATE_PI_REASONING' <<<"$pi_turns"; then
+  exit 1
+fi
+
+pi_observation=$("$binary" observe \
+  --definition "$message_definition" --projection rows \
+  --path "$pi_session" --param needle=failure --format json)
+grep -Fq '"adapter":"pi-session-jsonl/v1"' <<<"$pi_observation"
+grep -Fq '"text":"inspect Pi FAILURE evidence"' <<<"$pi_observation"
+grep -Fq '"text":"Alternative Pi FAILURE answer"' <<<"$pi_observation"
+grep -Fq '"source_event_id":"sha256:' <<<"$pi_observation"
+
+pi_graph_definition=apps/seq/src/v1/fixtures/pi/graph-observation.json
+mkdir -p "$cache_dir/codex/sessions"
+cp "$rollout" "$cache_dir/codex/sessions/rollout.jsonl"
+pi_graph=$(CODEX_HOME="$cache_dir/codex" "$binary" observe \
+  --definition "$pi_graph_definition" --projection rows --path "$pi_session" --format json)
+jq -e '.corpus.adapter == "pi-session-jsonl/v1" and .corpus.files == 1 and
+  .data.rows[0].session_id == "pi-fixture"' <<<"$pi_graph" >/dev/null
+pi_graph_root=$("$binary" observe --definition "$pi_graph_definition" --projection rows \
+  --root apps/seq/src/v1/fixtures/pi --format json)
+jq -e '.corpus.files == 1 and (.data.rows | length == 1) and
+  .data.rows[0].session_id == "pi-fixture"' <<<"$pi_graph_root" >/dev/null
+
+pi_messages=$("$binary" query --path "$pi_session" \
+  --spec '{"dataset":"messages","select":["text"],"limit":100,"format":"json"}')
+grep -Fq 'Original Pi answer' <<<"$pi_messages"
+grep -Fq 'Alternative Pi FAILURE answer' <<<"$pi_messages"
+if grep -Fq 'PRIVATE_PI_REASONING' <<<"$pi_messages"; then
+  exit 1
+fi
+
+pi_payloads=$("$binary" query --path "$pi_session" \
+  --spec '{"dataset":"source_events","select":["source_event_id","payload_json","format"],"limit":100,"format":"json"}')
+jq -e 'any(.[]; .payload_json.id == "a4" and .payload_json.parentId == "u1" and
+  .format == "pi_session_jsonl")' <<<"$pi_payloads" >/dev/null
+if grep -Eq 'PRIVATE_PI_REASONING|PRIVATE_PI_TOOL_SIGNATURE' <<<"$pi_payloads"; then
+  exit 1
+fi
+pi_raw=$("$binary" query --path "$pi_session" \
+  --spec '{"dataset":"source_events","select":["source_event_id","raw_json"],"limit":100,"format":"json"}')
+grep -Fq 'PRIVATE_PI_REASONING' <<<"$pi_raw"
+grep -Fq 'PRIVATE_PI_TOOL_SIGNATURE' <<<"$pi_raw"
+test "$(jq -c 'map(.source_event_id)' <<<"$pi_payloads")" = \
+  "$(jq -c 'map(.source_event_id)' <<<"$pi_raw")"
+
+pi_tools=$("$binary" tool-lifecycle --path "$pi_session" --format json)
+jq -e 'length == 1 and (.[0] | .tool_name == "bash" and .turn_index == 1 and
+  .lifecycle_status == "completed" and .output_text == "{\"status\":\"ok\"}")' \
+  <<<"$pi_tools" >/dev/null
+pi_structured=$("$binary" query --path "$pi_session" \
+  --spec '{"dataset":"structured_values","select":["json_pointer","scalar_value"],"limit":10,"format":"json"}')
+jq -e 'any(.[]; .json_pointer == "/status" and .scalar_value == "ok")' \
+  <<<"$pi_structured" >/dev/null
+test "$("$binary" session-graph --path "$pi_session" --format json)" = '[]'
+
+pi_tail=$(CODEX_THREAD_ID= PI_SESSION_ID= PI_SESSION_FILE="$PWD/$pi_session" \
+  "$binary" tail --current --once --format json)
+grep -Fq '"format":"pi_session_jsonl"' <<<"$pi_tail"
+pi_find=$("$binary" find-session --root apps/seq/src/v1/fixtures/pi \
+  --session-id pi-fixture --format json)
+grep -Fq '"session_id":"pi-fixture"' <<<"$pi_find"
+
+if pi_usage_error=$("$binary" query --path "$pi_session" \
+  --spec '{"dataset":"token_events","select":["total_tokens"],"format":"json"}' 2>&1)
+then
+  exit 1
+fi
+grep -Fq '"code":"PiCumulativeTokenEventsUnavailable"' <<<"$pi_usage_error"
 
 external_output=$("$binary" observe \
   --definition "$external_definition" \
@@ -255,6 +338,7 @@ grep -Fq '"id":"distinct","version":1' <<<"$capabilities"
 grep -Fq '"id":"ordered-fold","version":1' <<<"$capabilities"
 grep -Fq '"id":"reachability","version":1' <<<"$capabilities"
 grep -Fq '"opencode-prompt-history-jsonl/v1"' <<<"$capabilities"
+grep -Fq '"pi-session-jsonl/v1"' <<<"$capabilities"
 grep -Fq '"seq-command-error/v1"' <<<"$capabilities"
 grep -Fq '"seq-definition-check-result/v1"' <<<"$capabilities"
 grep -Fq '"seq-definition-description/v1"' <<<"$capabilities"

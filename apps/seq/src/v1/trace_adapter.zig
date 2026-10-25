@@ -105,6 +105,13 @@ pub const ParsedTrace = struct {
     }
 };
 
+pub fn adapterId(trace: *const trace_core.CanonicalSessionTrace) []const u8 {
+    return switch (trace.session.source_format) {
+        .pi_session_jsonl => "pi-session-jsonl/v1",
+        else => "codex-rollout-jsonl/v1",
+    };
+}
+
 pub fn parseFile(
     io: std.Io,
     dir: std.Io.Dir,
