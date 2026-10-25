@@ -5,6 +5,7 @@ pub const TraceFormat = enum {
     new_044_plus,
     mid_payload_meta,
     old_2025_08_root_meta,
+    pi_session_jsonl,
     unknown,
 };
 
@@ -78,6 +79,7 @@ pub const RawTraceEvent = struct {
 pub const SessionRecord = struct {
     session_id: ?[]u8 = null,
     path: []u8,
+    source_format: TraceFormat = .unknown,
     date_group: ?[]u8 = null,
     start_time: ?[]u8 = null,
     end_time: ?[]u8 = null,
@@ -385,6 +387,13 @@ pub fn messageTextPartsFromPayloadAlloc(
         .object => |map| map,
         else => return error.InvalidMessagePayload,
     };
+    // Pi keeps the persisted entry envelope as its occurrence payload so that
+    // entry IDs and parent IDs remain available to exact source consumers.
+    if (std.mem.eql(u8, stringField(payload, "type") orelse "", "message")) {
+        if (objectField(payload, "message")) |message| {
+            return messageTextPartsAlloc(allocator, message);
+        }
+    }
     return messageTextPartsAlloc(allocator, payload);
 }
 
@@ -482,7 +491,9 @@ pub fn parseRawTraceEvent(
     }
     event.event_type = try dupOpt(allocator, classification.event_type);
     event.timestamp = try dupOpt(allocator, bestTimestamp(root));
-    if (root.get("payload")) |payload| {
+    if (classification.format == .pi_session_jsonl) {
+        event.payload_json = try piPayloadJsonAlloc(allocator, root);
+    } else if (root.get("payload")) |payload| {
         event.payload_json = try stringifyJsonValue(allocator, payload);
     }
     event.raw_json = try allocator.dupe(u8, trimmed);
@@ -496,6 +507,14 @@ const RawEventClassification = struct {
 };
 
 fn classifyRawEvent(root: std.json.ObjectMap) RawEventClassification {
+    if (isPiStandaloneEntry(root)) {
+        const message = objectField(root, "message");
+        return .{
+            .entry_type = stringField(root, "type").?,
+            .event_type = if (message) |value| stringField(value, "role") else null,
+            .format = .pi_session_jsonl,
+        };
+    }
     var entry_type: []const u8 = "unknown";
     var event_type: ?[]const u8 = null;
     var format: TraceFormat = .unknown;
@@ -721,6 +740,9 @@ pub fn parseSessionTraceReaderWithVisitorMetrics(
     };
     defer parser.seen_messages.deinit();
     defer parser.tool_lookup.deinit(allocator);
+    var pi_parser = PiParser.init(allocator, &trace, options, false);
+    defer pi_parser.deinit();
+    var source_is_pi: ?bool = null;
     var scratch = ParseScratch.init(allocator);
     defer scratch.deinit();
     var lines = try jsonl_stream.Stream.init(allocator, reader, .{});
@@ -737,11 +759,748 @@ pub fn parseSessionTraceReaderWithVisitorMetrics(
                 continue;
             },
         } orelse continue;
-        try parser.apply(ParsedRecord.init(root, record.number, line));
+        if (source_is_pi == null) source_is_pi = isPiSessionHeader(root);
+        const parsed_record = ParsedRecord.init(root, record.number, line);
+        if (source_is_pi.?) {
+            try pi_parser.apply(parsed_record);
+        } else {
+            try parser.apply(parsed_record);
+        }
     }
-    try finalizeTrace(io, allocator, &trace, source_mtime_ns, options);
+    if (source_is_pi orelse false) {
+        try pi_parser.finish(io, source_mtime_ns);
+    } else {
+        try finalizeTrace(io, allocator, &trace, source_mtime_ns, options);
+    }
     metrics.* = .{ .bytes_read = lines.bytes_read, .lines_seen = lines.line_number };
     return trace;
+}
+
+fn isPiSessionHeader(root: std.json.ObjectMap) bool {
+    return std.mem.eql(u8, stringField(root, "type") orelse "", "session") and
+        stringField(root, "id") != null;
+}
+
+fn isPiStandaloneEntry(root: std.json.ObjectMap) bool {
+    if (isPiSessionHeader(root)) return true;
+    const entry_type = stringField(root, "type") orelse return false;
+    if (std.mem.eql(u8, entry_type, "message")) {
+        const message = objectField(root, "message") orelse return false;
+        return stringField(message, "role") != null;
+    }
+    return oneOfString(entry_type, &.{
+        "model_change", "thinking_level_change", "session_info",
+        "compaction",   "branch_summary",        "custom_message",
+        "context_edit",
+    });
+}
+
+const PiTurnState = struct {
+    status: TurnStatus = .ongoing,
+    reason: []const u8 = "pi_user_message",
+};
+
+const PiEntryContext = struct {
+    turn_index: ?usize = null,
+    settings_index: ?usize = null,
+};
+
+const PiSettings = struct {
+    model: ?[]const u8 = null,
+    provider: ?[]const u8 = null,
+    reasoning_effort: ?[]const u8 = null,
+};
+
+/// Pi is an append-only tree. Keep all physical entries, attributing each to
+/// its nearest user ancestor instead of whichever branch was read most recently.
+/// Summary parsing retains only this lineage index and compact turn status.
+const PiParser = struct {
+    allocator: std.mem.Allocator,
+    trace: *CanonicalSessionTrace,
+    options: TraceParseOptions,
+    summary: bool,
+    header_seen: bool = false,
+    version: i64 = 1,
+    entry_contexts: std.StringHashMapUnmanaged(PiEntryContext) = .empty,
+    turn_states: std.ArrayList(PiTurnState) = .empty,
+    previous_context: PiEntryContext = .{},
+    settings: std.ArrayList(PiSettings) = .empty,
+    metadata_arena: std.heap.ArenaAllocator,
+    tool_lookup: ToolLookup,
+
+    fn init(
+        allocator: std.mem.Allocator,
+        trace: *CanonicalSessionTrace,
+        options: TraceParseOptions,
+        summary: bool,
+    ) PiParser {
+        return .{
+            .allocator = allocator,
+            .trace = trace,
+            .options = options,
+            .summary = summary,
+            .metadata_arena = std.heap.ArenaAllocator.init(allocator),
+            .tool_lookup = .{ .enabled = options.max_tools == null },
+        };
+    }
+
+    fn deinit(self: *PiParser) void {
+        var keys = self.entry_contexts.keyIterator();
+        while (keys.next()) |key| self.allocator.free(key.*);
+        self.entry_contexts.deinit(self.allocator);
+        self.turn_states.deinit(self.allocator);
+        self.tool_lookup.deinit(self.allocator);
+        self.settings.deinit(self.allocator);
+        self.metadata_arena.deinit();
+    }
+
+    fn apply(self: *PiParser, record: ParsedRecord) !void {
+        if (!self.header_seen) {
+            try self.applyHeader(record);
+            try self.appendOccurrence(record, null);
+            return;
+        }
+        try applySessionTimestamp(self.allocator, &self.trace.session, record.timestamp);
+        var context = self.parentContext(record.root);
+        const entry_type = record.root_type orelse "unknown";
+        if (std.mem.eql(u8, entry_type, "message")) {
+            if (objectField(record.root, "message")) |message| {
+                if (std.mem.eql(u8, stringField(message, "role") orelse "", "assistant")) {
+                    try self.updateSettings(&context, .{
+                        .model = stringField(message, "model"),
+                        .provider = stringField(message, "provider"),
+                    });
+                }
+                context.turn_index = try self.applyMessage(record, message, context);
+            }
+        } else {
+            try self.applyMetadata(record, &context);
+        }
+        try self.rememberEntry(record, context);
+        try self.appendOccurrence(record, context.turn_index);
+    }
+
+    fn applyHeader(self: *PiParser, record: ParsedRecord) !void {
+        std.debug.assert(isPiSessionHeader(record.root));
+        if (self.options.include_token_events) return error.PiCumulativeTokenEventsUnavailable;
+        self.header_seen = true;
+        self.version = intField(record.root, "version") orelse 1;
+        const session = &self.trace.session;
+        session.source_format = .pi_session_jsonl;
+        const id = stringField(record.root, "id").?;
+        try replaceOpt(self.allocator, &session.session_id, id);
+        try replaceOpt(self.allocator, &session.root_session_id, id);
+        try replaceOpt(self.allocator, &session.originator, "pi");
+        if (stringField(record.root, "cwd")) |cwd| {
+            try replaceOpt(self.allocator, &session.cwd, cwd);
+        }
+        try applySessionTimestamp(self.allocator, session, record.timestamp);
+        // parentSession is a file path, not a worker/session identifier.
+        if (self.version > 3) {
+            try self.warn(record, "future Pi version interpreted using known tree fields");
+        }
+    }
+
+    fn parentContext(self: *const PiParser, root: std.json.ObjectMap) PiEntryContext {
+        if (self.version < 2) return self.previous_context;
+        const parent_id = stringField(root, "parentId") orelse return .{};
+        return self.entry_contexts.get(parent_id) orelse .{};
+    }
+
+    fn settingsAt(self: *const PiParser, context: PiEntryContext) PiSettings {
+        return if (context.settings_index) |index| self.settings.items[index] else .{};
+    }
+
+    fn updateSettings(self: *PiParser, context: *PiEntryContext, updates: PiSettings) !void {
+        var settings = self.settingsAt(context.*);
+        var changed = false;
+        inline for (.{ "model", "provider", "reasoning_effort" }) |field| {
+            if (@field(updates, field)) |value| {
+                const previous = @field(settings, field);
+                if (previous == null or !std.mem.eql(u8, previous.?, value)) {
+                    @field(settings, field) = try self.metadata_arena.allocator().dupe(u8, value);
+                    changed = true;
+                }
+            }
+        }
+        if (!changed) return;
+        try self.settings.append(self.allocator, settings);
+        context.settings_index = self.settings.items.len - 1;
+    }
+
+    fn rememberEntry(self: *PiParser, record: ParsedRecord, context: PiEntryContext) !void {
+        self.previous_context = context;
+        const id = stringField(record.root, "id") orelse return;
+        if (self.entry_contexts.getPtr(id)) |existing| {
+            existing.* = context;
+            try self.warn(record, "duplicate Pi entry ID; latest occurrence owns descendants");
+            return;
+        }
+        const owned_id = try self.allocator.dupe(u8, id);
+        errdefer self.allocator.free(owned_id);
+        try self.entry_contexts.put(self.allocator, owned_id, context);
+    }
+
+    fn newTurn(self: *PiParser, record: ParsedRecord, context: PiEntryContext) !usize {
+        const index = self.turn_states.items.len;
+        try self.turn_states.append(self.allocator, .{});
+        if (self.summary) return index;
+        var current: ?usize = null;
+        const full_index = try startTurn(
+            self.allocator,
+            self.trace,
+            self.trace.session.path,
+            &current,
+            stringField(record.root, "id"),
+            record.timestamp,
+        );
+        std.debug.assert(full_index == index);
+        const turn = &self.trace.turns.items[index];
+        const settings = self.settingsAt(context);
+        turn.cwd = try dupOpt(self.allocator, self.trace.session.cwd);
+        turn.model = try dupOpt(self.allocator, settings.model);
+        turn.reasoning_effort = try dupOpt(self.allocator, settings.reasoning_effort);
+        return index;
+    }
+
+    fn applyMessage(
+        self: *PiParser,
+        record: ParsedRecord,
+        message: std.json.ObjectMap,
+        context: PiEntryContext,
+    ) !?usize {
+        const parent_turn = context.turn_index;
+        const role = stringField(message, "role") orelse return parent_turn;
+        if (std.mem.eql(u8, role, "user")) {
+            if (parent_turn) |index| {
+                if (self.turn_states.items[index].status == .ongoing) {
+                    try self.setStatus(index, .aborted, "pi_superseded_turn", record.timestamp);
+                }
+            }
+            const index = try self.newTurn(record, context);
+            if (!self.summary and self.options.include_message_bodies) {
+                try applyResponseMessage(
+                    self.allocator,
+                    &self.trace.turns.items[index],
+                    message,
+                    role,
+                    record.line_number,
+                );
+            }
+            return index;
+        }
+        if (!oneOfString(role, &.{ "assistant", "toolResult", "bashExecution" })) {
+            return parent_turn;
+        }
+        const index = parent_turn orelse try self.newTurn(record, context);
+        if (std.mem.eql(u8, role, "assistant")) {
+            if (!self.summary) {
+                const settings = self.settingsAt(context);
+                const turn = &self.trace.turns.items[index];
+                try replaceNullable(self.allocator, &turn.model, settings.model);
+                try replaceNullable(
+                    self.allocator,
+                    &turn.reasoning_effort,
+                    settings.reasoning_effort,
+                );
+            }
+            try self.applyAssistant(record, message, index);
+        } else if (std.mem.eql(u8, role, "toolResult")) {
+            if (!self.summary) try self.applyToolResult(record, message, index);
+        } else {
+            if (!self.summary) try self.applyBashExecution(record, message, index);
+            if (parent_turn == null) {
+                try self.setStatus(index, .complete, "pi_shell_execution", record.timestamp);
+            }
+        }
+        return index;
+    }
+
+    fn applyMetadata(self: *PiParser, record: ParsedRecord, context: *PiEntryContext) !void {
+        const entry_type = record.root_type orelse return;
+        const session = &self.trace.session;
+        if (std.mem.eql(u8, entry_type, "model_change")) {
+            try self.updateSettings(context, .{
+                .model = stringField(record.root, "modelId"),
+                .provider = stringField(record.root, "provider"),
+            });
+        } else if (std.mem.eql(u8, entry_type, "thinking_level_change")) {
+            try self.updateSettings(context, .{
+                .reasoning_effort = stringField(record.root, "thinkingLevel"),
+            });
+        } else if (std.mem.eql(u8, entry_type, "session_info")) {
+            const name = stringField(record.root, "name");
+            const nonempty_name = if (name) |value|
+                if (std.mem.trim(u8, value, " \t\r\n").len > 0) value else null
+            else
+                null;
+            try replaceNullable(self.allocator, &session.thread_name, nonempty_name);
+        } else if (std.mem.eql(u8, entry_type, "compaction")) {
+            if (!self.summary) {
+                if (context.turn_index) |index| self.trace.turns.items[index].has_compaction = true;
+            }
+        }
+    }
+
+    fn applyAssistant(
+        self: *PiParser,
+        record: ParsedRecord,
+        message: std.json.ObjectMap,
+        turn_index: usize,
+    ) !void {
+        if (stringField(message, "model")) |model| {
+            try replaceOpt(self.allocator, &self.trace.session.model, model);
+            if (!self.summary) {
+                try replaceOpt(self.allocator, &self.trace.turns.items[turn_index].model, model);
+            }
+        }
+        if (stringField(message, "provider")) |provider| {
+            try replaceOpt(self.allocator, &self.trace.session.model_provider, provider);
+        }
+        try self.applyUsage(record, message, turn_index);
+        const state = piAssistantStatus(stringField(message, "stopReason") orelse "");
+        try self.setStatus(turn_index, state.status, state.reason, record.timestamp);
+        if (self.summary) return;
+        const turn = &self.trace.turns.items[turn_index];
+        if (stringField(message, "errorMessage")) |error_message| {
+            try replaceOpt(self.allocator, &turn.@"error", error_message);
+            if (state.status == .aborted) {
+                try replaceOpt(self.allocator, &turn.aborted_reason, error_message);
+            }
+        }
+        if (self.options.include_message_bodies) {
+            const text = try messageTextAlloc(self.allocator, message);
+            defer self.allocator.free(text);
+            if (text.len > 0) {
+                try attachAssistantMessage(self.allocator, turn, text, record.line_number);
+            }
+        }
+        try self.declareTools(record, message, turn_index);
+    }
+
+    fn setStatus(
+        self: *PiParser,
+        turn_index: usize,
+        status: TurnStatus,
+        reason: []const u8,
+        timestamp: ?[]const u8,
+    ) !void {
+        self.turn_states.items[turn_index] = .{ .status = status, .reason = reason };
+        if (self.summary) return;
+        const turn = &self.trace.turns.items[turn_index];
+        turn.status = status;
+        try replaceOpt(self.allocator, &turn.status_reason, reason);
+        if (status == .ongoing) {
+            freeOpt(self.allocator, turn.completed_at);
+            turn.completed_at = null;
+        } else if (timestamp) |value| {
+            try replaceOpt(self.allocator, &turn.completed_at, value);
+        }
+    }
+
+    fn applyUsage(
+        self: *PiParser,
+        record: ParsedRecord,
+        message: std.json.ObjectMap,
+        turn_index: usize,
+    ) !void {
+        const raw_usage = objectField(message, "usage") orelse {
+            if (message.get("usage") != null) {
+                try self.warn(record, "invalid Pi usage object; totals cover observed fields only");
+            }
+            return;
+        };
+        const usage = PiUsage.read(raw_usage);
+        var valid = usage.valid;
+        valid = addPiUsage(&self.trace.session, usage) and valid;
+        if (!self.summary) {
+            valid = addPiUsage(&self.trace.turns.items[turn_index], usage) and valid;
+        }
+        if (!valid) {
+            try self.warn(
+                record,
+                "incomplete or invalid Pi usage; totals cover observed fields only",
+            );
+        }
+    }
+
+    fn declareTools(
+        self: *PiParser,
+        record: ParsedRecord,
+        message: std.json.ObjectMap,
+        turn_index: usize,
+    ) !void {
+        const content = message.get("content") orelse return;
+        const parts = valueArray(content) orelse return;
+        for (parts.items) |part| {
+            const call = valueObject(part) orelse continue;
+            if (!std.mem.eql(u8, stringField(call, "type") orelse "", "toolCall")) continue;
+            try self.declareTool(record, call, turn_index);
+        }
+    }
+
+    fn declareTool(
+        self: *PiParser,
+        record: ParsedRecord,
+        call: std.json.ObjectMap,
+        turn_index: usize,
+    ) !void {
+        const id = stringField(call, "id") orelse return;
+        if (self.tool_lookup.find(self.trace, id) != null) return;
+        if (self.trace.omitted_tool_call_ids.contains(id)) return;
+        const name = stringField(call, "name") orelse "unknown";
+        var tool = try initToolRecord(self.allocator, self.trace, turn_index, id);
+        var owned = true;
+        errdefer if (owned) tool.deinit(self.allocator);
+        tool.started_at = try dupOpt(self.allocator, record.timestamp);
+        tool.tool_name = try self.allocator.dupe(u8, name);
+        tool.kind = piToolKind(name);
+        tool.namespace = if (stringField(call, "namespace")) |namespace|
+            try self.allocator.dupe(u8, namespace)
+        else
+            try namespaceFromName(self.allocator, name);
+        if (call.get("arguments")) |arguments| {
+            tool.arguments_json = try stringifyJsonValue(self.allocator, arguments);
+            try parseExecArgsIntoRecord(self.allocator, &tool, tool.arguments_json.?);
+        }
+        if (tool.cwd == null) tool.cwd = try dupOpt(self.allocator, self.trace.session.cwd);
+        tool.lifecycle_status = .declared;
+        tool.declared_line = @intCast(record.line_number);
+        try self.trace.tools.append(self.allocator, tool);
+        owned = false;
+        try self.tool_lookup.remember(self.allocator, self.trace);
+        self.trace.turns.items[turn_index].tool_count += 1;
+        try retainNewestTools(self.allocator, self.trace, self.options.max_tools);
+    }
+
+    fn applyToolResult(
+        self: *PiParser,
+        record: ParsedRecord,
+        message: std.json.ObjectMap,
+        turn_index: usize,
+    ) !void {
+        const id = stringField(message, "toolCallId") orelse return;
+        const index = self.tool_lookup.find(self.trace, id) orelse blk: {
+            if (self.trace.omitted_tool_call_ids.contains(id)) return;
+            try inferToolRecord(
+                self.allocator,
+                self.trace,
+                &self.tool_lookup,
+                turn_index,
+                id,
+                record.timestamp,
+                self.options.max_tools,
+            );
+            break :blk self.tool_lookup.find(self.trace, id) orelse return;
+        };
+        const tool = &self.trace.tools.items[index];
+        if (stringField(message, "toolName")) |name| {
+            try replaceOpt(self.allocator, &tool.tool_name, name);
+            tool.kind = piToolKind(name);
+        }
+        const output = try messageTextAlloc(self.allocator, message);
+        defer self.allocator.free(output);
+        try replaceOpt(self.allocator, &tool.output_text, output);
+        if (record.timestamp) |timestamp| {
+            try replaceOpt(self.allocator, &tool.completed_at, timestamp);
+        }
+        tool.finalized_line = @intCast(record.line_number);
+        tool.duration_ms = intField(message, "durationMs");
+        if (objectField(message, "details")) |details| {
+            tool.exit_code = intField(details, "exitCode");
+            if (tool.duration_ms == null) tool.duration_ms = intField(details, "durationMs");
+        }
+        tool.lifecycle_status = if (boolField(message, "isError") orelse false)
+            .failed
+        else
+            completedToolStatus(tool.exit_code, null);
+    }
+
+    fn applyBashExecution(
+        self: *PiParser,
+        record: ParsedRecord,
+        message: std.json.ObjectMap,
+        turn_index: usize,
+    ) !void {
+        const id = try self.allocator.print("pi-bash-{d}", .{record.line_number});
+        defer self.allocator.free(id);
+        var tool = try initToolRecord(self.allocator, self.trace, turn_index, id);
+        var owned = true;
+        errdefer if (owned) tool.deinit(self.allocator);
+        tool.kind = .exec_command;
+        tool.tool_name = try self.allocator.dupe(u8, "bash");
+        tool.started_at = try dupOpt(self.allocator, record.timestamp);
+        tool.completed_at = try dupOpt(self.allocator, record.timestamp);
+        tool.command_text = try dupOpt(self.allocator, stringField(message, "command"));
+        tool.output_text = try dupOpt(self.allocator, stringField(message, "output"));
+        tool.cwd = try dupOpt(self.allocator, self.trace.session.cwd);
+        tool.exit_code = intField(message, "exitCode");
+        tool.lifecycle_status = if (boolField(message, "cancelled") orelse false)
+            .failed
+        else
+            completedToolStatus(tool.exit_code, null);
+        tool.declared_line = @intCast(record.line_number);
+        tool.finalized_line = @intCast(record.line_number);
+        try self.trace.tools.append(self.allocator, tool);
+        owned = false;
+        try self.tool_lookup.remember(self.allocator, self.trace);
+        self.trace.turns.items[turn_index].tool_count += 1;
+        try retainNewestTools(self.allocator, self.trace, self.options.max_tools);
+    }
+
+    fn appendOccurrence(self: *PiParser, record: ParsedRecord, turn_index: ?usize) !void {
+        if (self.summary or !self.options.include_occurrences) return;
+        const entry_type = record.root_type orelse "unknown";
+        const message = if (std.mem.eql(u8, entry_type, "message"))
+            objectField(record.root, "message")
+        else
+            null;
+        const role = if (message) |value| stringField(value, "role") else null;
+        var occurrence = try TraceOccurrence.init(
+            self.allocator,
+            self.trace.session.path,
+            record.line_number,
+            self.trace.occurrences.items.len,
+            if (turn_index) |index| @intCast(index + 1) else null,
+            entry_type,
+            role,
+            role,
+            null,
+            false,
+        );
+        errdefer occurrence.deinit(self.allocator);
+        occurrence.format = .pi_session_jsonl;
+        occurrence.private = piMessageOnlyThinking(record.root);
+        occurrence.timestamp = try dupOpt(self.allocator, record.timestamp);
+        if (message) |value| {
+            occurrence.text = try messageTextAlloc(self.allocator, value);
+        } else if (std.mem.eql(u8, entry_type, "custom_message")) {
+            occurrence.text = try messageTextAlloc(self.allocator, record.root);
+        } else if (oneOfString(entry_type, &.{ "compaction", "branch_summary" })) {
+            occurrence.text = try dupOpt(self.allocator, stringField(record.root, "summary"));
+        }
+        occurrence.message_visible = if (role) |value|
+            oneOfString(value, &.{ "user", "assistant" }) and
+                (if (occurrence.text) |text| text.len > 0 else false)
+        else
+            false;
+        if (self.options.include_occurrence_payloads) {
+            occurrence.payload_json = try piPayloadJsonAlloc(self.allocator, record.root);
+        }
+        if (self.options.include_raw) {
+            occurrence.raw_json = try self.allocator.dupe(u8, record.line);
+        }
+        try self.trace.occurrences.append(self.allocator, occurrence);
+    }
+
+    fn finish(self: *PiParser, io: std.Io, source_mtime_ns: i128) !void {
+        const age_secs = @divTrunc(nowRealtimeNs(io) - source_mtime_ns, std.time.ns_per_s);
+        const fresh = age_secs <= self.options.ongoing_threshold_secs;
+        for (self.turn_states.items, 0..) |state, index| {
+            if (state.status != .ongoing) continue;
+            const active_turn = self.previous_context.turn_index;
+            const active = active_turn != null and active_turn.? == index;
+            const reason = if (!active)
+                "pi_inactive_branch"
+            else if (fresh)
+                "fresh_ongoing_turn"
+            else
+                "stale_ongoing_file";
+            const status: TurnStatus = if (active and fresh) .ongoing else .aborted;
+            try self.setStatus(index, status, reason, null);
+            if (active and fresh) self.trace.session.is_ongoing = true;
+        }
+        const reason = if (self.turn_states.items.len == 0)
+            "no_turns"
+        else
+            self.turn_states.items[
+                self.previous_context.turn_index orelse self.turn_states.items.len - 1
+            ].reason;
+        try replaceOpt(self.allocator, &self.trace.session.status_reason, reason);
+        const settings = self.settingsAt(self.previous_context);
+        try replaceNullable(self.allocator, &self.trace.session.model, settings.model);
+        try replaceNullable(self.allocator, &self.trace.session.model_provider, settings.provider);
+        self.trace.session.turn_count = @intCast(self.turn_states.items.len);
+        for (self.trace.tools.items) |*tool| {
+            if (tool.lifecycle_status == .declared) tool.lifecycle_status = .unresolved;
+        }
+    }
+
+    fn warn(self: *PiParser, record: ParsedRecord, description: []const u8) !void {
+        const warning = try self.allocator.print(
+            "{s}:{d}: {s}",
+            .{ self.trace.session.path, record.line_number, description },
+        );
+        errdefer self.allocator.free(warning);
+        try self.trace.warnings.append(self.allocator, warning);
+    }
+};
+
+fn piMessageOnlyThinking(root: std.json.ObjectMap) bool {
+    const message = objectField(root, "message") orelse return false;
+    if (!std.mem.eql(u8, stringField(message, "role") orelse "", "assistant")) return false;
+    const content = message.get("content") orelse return false;
+    const parts = valueArray(content) orelse return false;
+    if (parts.items.len == 0) return false;
+    for (parts.items) |part| {
+        const block = valueObject(part) orelse return false;
+        if (!std.mem.eql(u8, stringField(block, "type") orelse "", "thinking")) return false;
+    }
+    return true;
+}
+
+/// Payload is a public projection; only explicit raw_json retains thinking.
+/// Shallow containers borrow parsed values until serialization, preserving the
+/// persisted entry identity without copying or rewriting its private blocks.
+fn piPayloadJsonAlloc(allocator: std.mem.Allocator, root: std.json.ObjectMap) !?[]u8 {
+    if (piMessageOnlyThinking(root)) return null;
+    const message = objectField(root, "message") orelse
+        return try stringifyJsonValue(allocator, .{ .object = root });
+    if (!std.mem.eql(u8, stringField(message, "role") orelse "", "assistant")) {
+        return try stringifyJsonValue(allocator, .{ .object = root });
+    }
+    const content = message.get("content") orelse
+        return try stringifyJsonValue(allocator, .{ .object = root });
+    const parts = valueArray(content) orelse
+        return try stringifyJsonValue(allocator, .{ .object = root });
+    var public_parts = std.json.Array.init(allocator);
+    defer public_parts.deinit();
+    var public_blocks: std.ArrayList(std.json.ObjectMap) = .empty;
+    defer {
+        for (public_blocks.items) |*block| block.deinit(allocator);
+        public_blocks.deinit(allocator);
+    }
+    for (parts.items) |part| {
+        if (valueObject(part)) |block| {
+            if (std.mem.eql(u8, stringField(block, "type") orelse "", "thinking")) continue;
+            if (block.get("thoughtSignature") != null) {
+                var public_block = try piObjectCopy(allocator, block);
+                var owned = true;
+                errdefer if (owned) public_block.deinit(allocator);
+                _ = public_block.orderedRemove("thoughtSignature");
+                try public_blocks.append(allocator, public_block);
+                owned = false;
+                try public_parts.append(.{ .object = public_block });
+                continue;
+            }
+        }
+        try public_parts.append(part);
+    }
+    var public_message = try piObjectCopy(allocator, message);
+    defer public_message.deinit(allocator);
+    try public_message.put(allocator, "content", .{ .array = public_parts });
+    var public_root = try piObjectCopy(allocator, root);
+    defer public_root.deinit(allocator);
+    try public_root.put(allocator, "message", .{ .object = public_message });
+    return try stringifyJsonValue(allocator, .{ .object = public_root });
+}
+
+fn piObjectCopy(allocator: std.mem.Allocator, source: std.json.ObjectMap) !std.json.ObjectMap {
+    var copy: std.json.ObjectMap = .empty;
+    errdefer copy.deinit(allocator);
+    var fields = source.iterator();
+    while (fields.next()) |field| try copy.put(allocator, field.key_ptr.*, field.value_ptr.*);
+    return copy;
+}
+
+fn piAssistantStatus(stop_reason: []const u8) PiTurnState {
+    if (std.mem.eql(u8, stop_reason, "stop")) {
+        return .{ .status = .complete, .reason = "pi_stop" };
+    }
+    if (std.mem.eql(u8, stop_reason, "length")) {
+        return .{ .status = .complete, .reason = "pi_length" };
+    }
+    if (std.mem.eql(u8, stop_reason, "error")) {
+        return .{ .status = .@"error", .reason = "pi_error" };
+    }
+    if (std.mem.eql(u8, stop_reason, "aborted")) {
+        return .{ .status = .aborted, .reason = "pi_aborted" };
+    }
+    return .{ .status = .ongoing, .reason = "pi_request_incomplete" };
+}
+
+fn piToolKind(name: []const u8) ToolKind {
+    if (oneOfString(name, &.{ "bash", "powershell" })) return .exec_command;
+    return kindFromName(name);
+}
+
+const PiUsage = struct {
+    input_tokens: ?i64 = null,
+    cached_input_tokens: ?i64 = null,
+    output_tokens: ?i64 = null,
+    reasoning_output_tokens: ?i64 = null,
+    total_tokens: ?i64 = null,
+    valid: bool = true,
+
+    fn read(raw: std.json.ObjectMap) PiUsage {
+        var usage = PiUsage{
+            .input_tokens = piCounter(raw, "input"),
+            .cached_input_tokens = piCounter(raw, "cacheRead"),
+            .output_tokens = piCounter(raw, "output"),
+            .reasoning_output_tokens = piCounter(raw, "reasoning"),
+            .total_tokens = piCounter(raw, "totalTokens"),
+        };
+        const cache_write = piCounter(raw, "cacheWrite");
+        usage.valid = usage.input_tokens != null and usage.cached_input_tokens != null and
+            cache_write != null and usage.output_tokens != null and usage.total_tokens != null;
+        if (raw.get("reasoning") != null and usage.reasoning_output_tokens == null) {
+            usage.valid = false;
+        }
+        // Pi's input count excludes both cache categories. Canonical input
+        // includes them; cacheRead is the reported cached subset of that input.
+        const input_complete = usage.input_tokens != null and
+            usage.cached_input_tokens != null and cache_write != null;
+        if (input_complete) {
+            const read_added = addPiCounter(&usage.input_tokens, usage.cached_input_tokens);
+            const write_added = addPiCounter(&usage.input_tokens, cache_write);
+            if (!read_added or !write_added) usage.input_tokens = null;
+        } else {
+            usage.input_tokens = null;
+        }
+        if (usage.output_tokens != null) {
+            if (usage.reasoning_output_tokens) |reasoning| {
+                if (reasoning > usage.output_tokens.?) usage.valid = false;
+            }
+        }
+        if (usage.input_tokens == null) usage.valid = false;
+        return usage;
+    }
+};
+
+fn piCounter(raw: std.json.ObjectMap, key: []const u8) ?i64 {
+    const raw_value = raw.get(key) orelse return null;
+    if (raw_value == .float and @trunc(raw_value.float) != raw_value.float) return null;
+    const value = intField(raw, key) orelse return null;
+    return if (value >= 0) value else null;
+}
+
+fn addPiCounter(target: *?i64, value: ?i64) bool {
+    if (value) |amount| target.* = std.math.add(i64, target.* orelse 0, amount) catch return false;
+    return true;
+}
+
+fn addPiUsage(target: anytype, usage: PiUsage) bool {
+    var valid = true;
+    inline for (.{
+        "input_tokens",            "cached_input_tokens", "output_tokens",
+        "reasoning_output_tokens", "total_tokens",
+    }) |field| {
+        valid = addPiCounter(&@field(target, field), @field(usage, field)) and valid;
+    }
+    return valid;
+}
+
+fn replaceNullable(
+    allocator: std.mem.Allocator,
+    target: *?[]u8,
+    value: ?[]const u8,
+) !void {
+    if (value) |text| {
+        try replaceOpt(allocator, target, text);
+    } else {
+        freeOpt(allocator, target.*);
+        target.* = null;
+    }
 }
 
 const TraceParser = struct {
@@ -1202,6 +1961,9 @@ pub fn parseSessionSummaryTraceReaderWithVisitorMetrics(
         .seen_turn_ids = std.StringHashMap(void).init(allocator),
     };
     defer parser.deinit();
+    var pi_parser = PiParser.init(allocator, &trace, options, true);
+    defer pi_parser.deinit();
+    var source_is_pi: ?bool = null;
     var scratch = ParseScratch.init(allocator);
     defer scratch.deinit();
     var lines = try jsonl_stream.Stream.init(allocator, reader, .{});
@@ -1211,10 +1973,12 @@ pub fn parseSessionSummaryTraceReaderWithVisitorMetrics(
         try visit(context, record.bytes, record.number);
         const line = std.mem.trim(u8, record.bytes, " \t\r\n");
         if (line.len == 0) continue;
-        if (fastTimestampSlice(line)) |timestamp| {
-            try applySessionTimestamp(allocator, &trace.session, timestamp);
+        if (source_is_pi != null and !source_is_pi.?) {
+            if (fastTimestampSlice(line)) |timestamp| {
+                try applySessionTimestamp(allocator, &trace.session, timestamp);
+            }
+            if (!sessionSummaryLineCouldMatter(line)) continue;
         }
-        if (!sessionSummaryLineCouldMatter(line)) continue;
         const root = scratch.parse(line) catch |err| switch (err) {
             error.OutOfMemory => return err,
             else => {
@@ -1222,9 +1986,19 @@ pub fn parseSessionSummaryTraceReaderWithVisitorMetrics(
                 continue;
             },
         } orelse continue;
-        try parser.apply(ParsedRecord.init(root, record.number, line));
+        if (source_is_pi == null) source_is_pi = isPiSessionHeader(root);
+        const parsed_record = ParsedRecord.init(root, record.number, line);
+        if (source_is_pi.?) {
+            try pi_parser.apply(parsed_record);
+        } else {
+            try parser.apply(parsed_record);
+        }
     }
-    try parser.finish(io, source_mtime_ns, options);
+    if (source_is_pi orelse false) {
+        try pi_parser.finish(io, source_mtime_ns);
+    } else {
+        try parser.finish(io, source_mtime_ns, options);
+    }
     metrics.* = .{ .bytes_read = lines.bytes_read, .lines_seen = lines.line_number };
     return trace;
 }
@@ -3034,6 +3808,439 @@ fn stringifyJsonValue(allocator: std.mem.Allocator, value: std.json.Value) ![]u8
 
 fn freeOpt(allocator: std.mem.Allocator, value: ?[]u8) void {
     if (value) |v| allocator.free(v);
+}
+
+const pi_test_trace =
+    \\{"type":"session","version":3,"id":"pi-test","timestamp":"2026-10-01T10:00:00Z","cwd":"/pi-work","parentSession":"/archive/old.jsonl"}
+    \\{"type":"model_change","id":"m1","parentId":null,"timestamp":"2026-10-01T10:00:01Z","provider":"moonshot","modelId":"kimi"}
+    \\{"type":"thinking_level_change","id":"h1","parentId":"m1","thinkingLevel":"high"}
+    \\{"type":"message","id":"u1","parentId":"h1","timestamp":"2026-10-01T10:00:02Z","message":{"role":"user","content":"first question"}}
+    \\{"type":"message","id":"a1","parentId":"u1","timestamp":"2026-10-01T10:00:03Z","message":{"role":"assistant","content":[{"type":"thinking","thinking":"PRIVATE_THOUGHT","thinkingSignature":"PRIVATE_SIGNATURE"},{"type":"text","text":"Inspecting"},{"type":"toolCall","id":"call-1","name":"bash","arguments":{"command":"printf hi"},"thoughtSignature":"PRIVATE_PI_TOOL_SIGNATURE"}],"usage":{"input":10,"cacheRead":3,"cacheWrite":4,"output":2,"reasoning":1,"totalTokens":19},"stopReason":"toolUse"}}
+    \\{"type":"message","id":"r1","parentId":"a1","timestamp":"2026-10-01T10:00:04Z","message":{"role":"toolResult","toolCallId":"call-1","toolName":"bash","content":[{"type":"text","text":"failure"}],"isError":true,"details":{"exitCode":1},"durationMs":12}}
+    \\{"type":"message","id":"a2","parentId":"r1","timestamp":"2026-10-01T10:00:05Z","message":{"role":"assistant","content":[{"type":"text","text":"original answer"}],"usage":{"input":20,"cacheRead":0,"cacheWrite":0,"output":4,"totalTokens":24},"stopReason":"stop"}}
+    \\{"type":"message","id":"u2","parentId":"a2","timestamp":"2026-10-01T10:00:06Z","message":{"role":"user","content":"second question"}}
+    \\{"type":"message","id":"a3","parentId":"u2","timestamp":"2026-10-01T10:00:07Z","message":{"role":"assistant","content":[{"type":"text","text":"second answer"}],"stopReason":"length"}}
+    \\{"type":"message","id":"a4","parentId":"u1","timestamp":"2026-10-01T10:00:08Z","message":{"role":"assistant","content":[{"type":"text","text":"alternative answer"}],"usage":{"input":30,"cacheRead":0,"cacheWrite":0,"output":6,"totalTokens":36},"stopReason":"stop"}}
+    \\{"type":"compaction","id":"c1","parentId":"a4","summary":"condensed","firstKeptEntryId":"u1","tokensBefore":42}
+    \\{"type":"custom_message","id":"x1","parentId":"c1","content":[{"type":"text","text":"extension note"}],"customType":"test","display":true}
+    \\{"type":"future_entry","id":"f1","parentId":"x1","futureData":{"kept":true}}
+    \\{"type":"session_info","id":"i1","parentId":"f1","timestamp":"2026-10-01T10:00:09Z","name":"Pi test"}
+;
+
+fn piTestSummary(
+    allocator: std.mem.Allocator,
+    source: []const u8,
+    options: TraceParseOptions,
+) !CanonicalSessionTrace {
+    var reader = std.Io.Reader.fixed(source);
+    return parseSessionSummaryTraceReader(
+        std.testing.io,
+        allocator,
+        "pi.jsonl",
+        &reader,
+        0,
+        options,
+    );
+}
+
+test "Pi trees retain all branches and map assistant replies and tools to their ancestors" {
+    const allocator = std.testing.allocator;
+    var trace = try parseSessionTraceBytes(
+        std.testing.io,
+        allocator,
+        "pi.jsonl",
+        pi_test_trace,
+        0,
+        .{ .include_raw = true },
+    );
+    defer trace.deinit(allocator);
+    try std.testing.expectEqual(TraceFormat.pi_session_jsonl, trace.session.source_format);
+    try std.testing.expectEqualStrings("pi-test", trace.session.session_id.?);
+    try std.testing.expectEqualStrings("/pi-work", trace.session.cwd.?);
+    try std.testing.expectEqualStrings("pi", trace.session.originator.?);
+    try std.testing.expectEqualStrings("Pi test", trace.session.thread_name.?);
+    try std.testing.expectEqualStrings("kimi", trace.session.model.?);
+    try std.testing.expectEqual(@as(?i64, 79), trace.session.total_tokens);
+    try std.testing.expectEqual(@as(?i64, 67), trace.session.input_tokens);
+    try std.testing.expectEqual(@as(?i64, 3), trace.session.cached_input_tokens);
+    try std.testing.expectEqual(@as(?i64, 12), trace.session.output_tokens);
+    try std.testing.expectEqual(@as(?i64, 1), trace.session.reasoning_output_tokens);
+    try std.testing.expectEqual(@as(usize, 2), trace.turns.items.len);
+    try std.testing.expectEqualStrings("alternative answer", trace.turns.items[0].final_answer.?);
+    try std.testing.expectEqualStrings("second answer", trace.turns.items[1].final_answer.?);
+    try std.testing.expectEqualStrings("high", trace.turns.items[0].reasoning_effort.?);
+    try std.testing.expectEqual(@as(?usize, 10), trace.turns.items[0].final_answer_line);
+    try std.testing.expectEqual(@as(?i64, 79), trace.turns.items[0].total_tokens);
+    try std.testing.expectEqual(@as(?i64, null), trace.turns.items[1].total_tokens);
+    try std.testing.expect(trace.turns.items[0].has_compaction);
+    try std.testing.expectEqual(@as(usize, 1), trace.tools.items.len);
+    const tool = trace.tools.items[0];
+    try std.testing.expectEqual(ToolKind.exec_command, tool.kind);
+    try std.testing.expectEqual(ToolLifecycleStatus.failed, tool.lifecycle_status);
+    try std.testing.expectEqualStrings("printf hi", tool.command_text.?);
+    try std.testing.expectEqualStrings("failure", tool.output_text.?);
+    try std.testing.expectEqual(@as(?i64, 1), tool.turn_index);
+    try std.testing.expectEqual(@as(?i64, 5), tool.declared_line);
+    try std.testing.expectEqual(@as(?i64, 6), tool.finalized_line);
+    try std.testing.expectEqual(@as(?i64, 12), tool.duration_ms);
+    try std.testing.expectEqual(@as(usize, 14), trace.occurrences.items.len);
+    try std.testing.expectEqual(@as(?i64, 1), trace.occurrences.items[9].turn_index);
+    try std.testing.expectEqualStrings("original answer", trace.occurrences.items[6].text.?);
+    try std.testing.expectEqualStrings("future_entry", trace.occurrences.items[12].entry_type);
+    try std.testing.expectEqual(@as(usize, 0), trace.graph_edges.items.len);
+    try std.testing.expect(trace.session.parent_session_id == null);
+    try std.testing.expectEqual(@as(usize, 0), trace.warnings.items.len);
+}
+
+test "Pi thinking is private while public payloads keep envelope identity and exact raw is opt in" {
+    const allocator = std.testing.allocator;
+    var trace = try parseSessionTraceBytes(
+        std.testing.io,
+        allocator,
+        "pi.jsonl",
+        pi_test_trace,
+        0,
+        .{ .include_raw = true },
+    );
+    defer trace.deinit(allocator);
+    const occurrence = trace.occurrences.items[4];
+    try std.testing.expectEqualStrings("Inspecting", occurrence.text.?);
+    try std.testing.expect(occurrence.message_visible and !occurrence.private);
+    try std.testing.expect(std.mem.indexOf(u8, occurrence.payload_json.?, "PRIVATE_") == null);
+    try std.testing.expect(std.mem.indexOf(u8, occurrence.raw_json.?, "PRIVATE_THOUGHT") != null);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        occurrence.raw_json.?,
+        "PRIVATE_PI_TOOL_SIGNATURE",
+    ) != null);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        occurrence.payload_json.?,
+        "\"parentId\":\"u1\"",
+    ) != null);
+    const parts = try messageTextPartsFromPayloadAlloc(allocator, occurrence.payload_json.?);
+    defer freeMessageTextParts(allocator, parts);
+    try std.testing.expectEqual(@as(usize, 1), parts.len);
+    try std.testing.expectEqualStrings("Inspecting", parts[0].text);
+    var raw_event = (try parseRawTraceEvent(allocator, "pi.jsonl", 5, occurrence.raw_json.?)).?;
+    defer raw_event.deinit(allocator);
+    try std.testing.expectEqual(TraceFormat.pi_session_jsonl, raw_event.format);
+    try std.testing.expect(std.mem.indexOf(u8, raw_event.payload_json.?, "PRIVATE_") == null);
+    const private_source =
+        \\{"type":"session","version":3,"id":"private"}
+        \\{"type":"message","id":"a1","parentId":null,"message":{"role":"assistant","content":[{"type":"thinking","thinking":"PRIVATE_THOUGHT"}],"stopReason":"aborted"}}
+    ;
+    var private_trace = try parseSessionTraceBytes(
+        std.testing.io,
+        allocator,
+        "private.jsonl",
+        private_source,
+        0,
+        .{},
+    );
+    defer private_trace.deinit(allocator);
+    const private_occurrence = private_trace.occurrences.items[1];
+    try std.testing.expect(private_occurrence.private and !private_occurrence.message_visible);
+    try std.testing.expect(private_occurrence.payload_json == null);
+    try std.testing.expect(private_occurrence.raw_json == null);
+    try std.testing.expect(private_trace.turns.items[0].final_answer == null);
+}
+
+test "Pi summary and selective full parsing preserve metadata without retaining omitted bodies" {
+    const allocator = std.testing.allocator;
+    var full = try parseSessionTraceBytes(
+        std.testing.io,
+        allocator,
+        "pi.jsonl",
+        pi_test_trace,
+        0,
+        .{
+            .include_occurrences = false,
+            .include_message_bodies = false,
+            .max_tools = 0,
+        },
+    );
+    defer full.deinit(allocator);
+    var summary = try piTestSummary(allocator, pi_test_trace, .{ .include_raw = true });
+    defer summary.deinit(allocator);
+    try std.testing.expectEqualDeep(full.session, summary.session);
+    try std.testing.expectEqual(@as(usize, 0), summary.turns.items.len);
+    try std.testing.expectEqual(@as(usize, 0), summary.tools.items.len);
+    try std.testing.expectEqual(@as(usize, 0), summary.occurrences.items.len);
+    try std.testing.expectEqual(@as(usize, 0), full.occurrences.items.len);
+    try std.testing.expectEqual(@as(usize, 0), full.tools.items.len);
+    try std.testing.expectEqual(@as(i64, 1), full.turns.items[0].tool_count);
+    try std.testing.expect(full.turns.items[0].user_message == null);
+    try std.testing.expect(full.turns.items[0].final_answer == null);
+    try std.testing.expectEqual(@as(usize, 0), full.token_events.items.len);
+    var projected = try parseSessionTraceBytes(
+        std.testing.io,
+        allocator,
+        "pi.jsonl",
+        pi_test_trace,
+        0,
+        .{ .include_occurrence_payloads = false, .include_raw = true },
+    );
+    defer projected.deinit(allocator);
+    try std.testing.expect(projected.occurrences.items[4].payload_json == null);
+    try std.testing.expect(projected.occurrences.items[4].raw_json != null);
+    try std.testing.expectEqualStrings("Inspecting", projected.occurrences.items[4].text.?);
+}
+
+test "Pi explicitly rejects requested Codex cumulative token event tuples in both parse routes" {
+    try std.testing.expectError(
+        error.PiCumulativeTokenEventsUnavailable,
+        parseSessionTraceBytes(
+            std.testing.io,
+            std.testing.allocator,
+            "pi.jsonl",
+            pi_test_trace,
+            0,
+            .{ .include_token_events = true },
+        ),
+    );
+    try std.testing.expectError(
+        error.PiCumulativeTokenEventsUnavailable,
+        piTestSummary(std.testing.allocator, pi_test_trace, .{ .include_token_events = true }),
+    );
+}
+
+test "Pi version two branch settings follow parent ancestry and session names can be cleared" {
+    const source =
+        \\{"type":"session","version":2,"id":"branch-settings"}
+        \\{"type":"model_change","id":"m1","parentId":null,"modelId":"first","provider":"one"}
+        \\{"type":"thinking_level_change","id":"h1","parentId":"m1","thinkingLevel":"high"}
+        \\{"type":"message","id":"u1","parentId":"h1","message":{"role":"user","content":"first"}}
+        \\{"type":"message","id":"a1","parentId":"u1","message":{"role":"assistant","content":[],"stopReason":"stop"}}
+        \\{"type":"model_change","id":"m2","parentId":"a1","modelId":"second","provider":"two"}
+        \\{"type":"thinking_level_change","id":"l1","parentId":"m2","thinkingLevel":"low"}
+        \\{"type":"message","id":"u2","parentId":"l1","message":{"role":"user","content":"second"}}
+        \\{"type":"message","id":"u3","parentId":"a1","message":{"role":"user","content":"old branch"}}
+        \\{"type":"session_info","id":"n1","parentId":"u3","name":"Old name"}
+        \\{"type":"session_info","id":"n2","parentId":"n1","name":"  "}
+    ;
+    const allocator = std.testing.allocator;
+    var full = try parseSessionTraceBytes(std.testing.io, allocator, "pi.jsonl", source, 0, .{});
+    defer full.deinit(allocator);
+    var summary = try piTestSummary(allocator, source, .{});
+    defer summary.deinit(allocator);
+    try std.testing.expectEqualDeep(full.session, summary.session);
+    try std.testing.expectEqualStrings("second", full.turns.items[1].model.?);
+    try std.testing.expectEqualStrings("low", full.turns.items[1].reasoning_effort.?);
+    try std.testing.expectEqualStrings("first", full.turns.items[2].model.?);
+    try std.testing.expectEqualStrings("high", full.turns.items[2].reasoning_effort.?);
+    try std.testing.expectEqualStrings("first", full.session.model.?);
+    try std.testing.expectEqualStrings("one", full.session.model_provider.?);
+    try std.testing.expect(full.session.thread_name == null);
+    try std.testing.expectEqualStrings("pi_inactive_branch", full.turns.items[1].status_reason.?);
+    const missing_name_source = source ++
+        "\n{\"type\":\"session_info\",\"id\":\"n3\",\"parentId\":\"n2\",\"name\":\"Named\"}\n" ++
+        "{\"type\":\"session_info\",\"id\":\"n4\",\"parentId\":\"n3\"}";
+    var cleared = try piTestSummary(allocator, missing_name_source, .{});
+    defer cleared.deinit(allocator);
+    try std.testing.expect(cleared.session.thread_name == null);
+}
+
+test "Pi legacy linear sessions tolerate malformed tails and retain unknown entries" {
+    const source =
+        \\{"type":"session","id":"legacy","timestamp":"2025-01-01T00:00:00Z"}
+        \\{"type":"message","message":{"role":"user","content":"first"}}
+        \\{"type":"message","message":{"role":"assistant","content":[{"type":"text","text":"interrupted"}],"stopReason":"aborted","errorMessage":"cancelled"}}
+        \\{"type":"message","message":{"role":"user","content":"second"}}
+        \\{"type":"message","message":{"role":"assistant","content":[],"stopReason":"error","errorMessage":"failed"}}
+        \\{"type":"message","message":{"role":"hookMessage","content":"legacy custom"}}
+        \\{"type":"future_entry","opaque":"kept"}
+        \\{"type":"message"
+    ;
+    const allocator = std.testing.allocator;
+    var full = try parseSessionTraceBytes(std.testing.io, allocator, "pi.jsonl", source, 0, .{});
+    defer full.deinit(allocator);
+    var summary = try piTestSummary(allocator, source, .{});
+    defer summary.deinit(allocator);
+    try std.testing.expectEqualDeep(full.session, summary.session);
+    try std.testing.expectEqual(@as(usize, 2), full.turns.items.len);
+    try std.testing.expectEqual(TurnStatus.aborted, full.turns.items[0].status);
+    try std.testing.expectEqual(TurnStatus.@"error", full.turns.items[1].status);
+    try std.testing.expectEqualStrings("cancelled", full.turns.items[0].aborted_reason.?);
+    try std.testing.expectEqualStrings("failed", full.turns.items[1].@"error".?);
+    try std.testing.expectEqual(@as(usize, 1), full.warnings.items.len);
+    try std.testing.expectEqual(@as(usize, 7), full.occurrences.items.len);
+    try std.testing.expectEqual(@as(?i64, 2), full.occurrences.items[6].turn_index);
+    try std.testing.expectEqual(@as(?i64, null), full.session.total_tokens);
+}
+
+test "Pi requires a validated first header and never synthesizes absent usage counters" {
+    const invalid_header =
+        \\{"type":"session","id":123}
+        \\{"type":"session","version":3,"id":"later"}
+    ;
+    const allocator = std.testing.allocator;
+    var other = try parseSessionTraceBytes(
+        std.testing.io,
+        allocator,
+        "pi.jsonl",
+        invalid_header,
+        0,
+        .{},
+    );
+    defer other.deinit(allocator);
+    try std.testing.expectEqual(TraceFormat.unknown, other.session.source_format);
+    const source =
+        \\{"type":"session","version":3,"id":"partial-usage"}
+        \\{"type":"message","id":"u1","parentId":null,"message":{"role":"user","content":"question"}}
+        \\{"type":"message","id":"a1","parentId":"u1","message":{"role":"assistant","content":[],"usage":{"input":2,"output":3,"cacheRead":0,"cacheWrite":0},"stopReason":"stop"}}
+        \\{"type":"message","id":"a2","parentId":"u1","message":{"role":"assistant","content":[],"usage":{"input":-1,"output":"bad","cacheRead":0,"cacheWrite":0,"totalTokens":5},"stopReason":"stop"}}
+    ;
+    var partial = try parseSessionTraceBytes(std.testing.io, allocator, "pi.jsonl", source, 0, .{});
+    defer partial.deinit(allocator);
+    try std.testing.expectEqual(@as(?i64, null), partial.turns.items[0].reasoning_output_tokens);
+    try std.testing.expectEqual(@as(?i64, 5), partial.session.total_tokens);
+    try std.testing.expectEqual(@as(?i64, 2), partial.session.input_tokens);
+    try std.testing.expectEqual(@as(?i64, 3), partial.session.output_tokens);
+    try std.testing.expectEqual(@as(usize, 2), partial.warnings.items.len);
+    var parsed_usage = try std.json.parseFromSlice(
+        std.json.Value,
+        allocator,
+        "{\"input\":1}",
+        .{},
+    );
+    defer parsed_usage.deinit();
+    const absent_total = PiUsage.read(valueObject(parsed_usage.value).?);
+    try std.testing.expect(absent_total.total_tokens == null);
+    try std.testing.expect(absent_total.input_tokens == null);
+}
+
+test "Pi usage preserves provider totals while rejecting fractional and overflowing input" {
+    const cases = [_]struct { json: []const u8, valid: bool, input: ?i64, total: ?i64 }{
+        .{
+            .json =
+            \\{"input":1,"cacheRead":2,"cacheWrite":3,"output":4,"totalTokens":99}
+            ,
+            .valid = true,
+            .input = 6,
+            .total = 99,
+        },
+        .{
+            .json =
+            \\{"input":1.5,"cacheRead":0,"cacheWrite":0,"output":4,"totalTokens":5}
+            ,
+            .valid = false,
+            .input = null,
+            .total = 5,
+        },
+        .{
+            .json =
+            \\{"input":9223372036854775807,"cacheRead":1,"cacheWrite":0,"output":0,"totalTokens":9223372036854775807}
+            ,
+            .valid = false,
+            .input = null,
+            .total = std.math.maxInt(i64),
+        },
+        .{
+            .json =
+            \\{"input":1,"cacheRead":0,"cacheWrite":0,"output":4,"reasoning":5,"totalTokens":5}
+            ,
+            .valid = false,
+            .input = 1,
+            .total = 5,
+        },
+    };
+    for (cases) |case| {
+        var parsed = try std.json.parseFromSlice(
+            std.json.Value,
+            std.testing.allocator,
+            case.json,
+            .{},
+        );
+        defer parsed.deinit();
+        const usage = PiUsage.read(valueObject(parsed.value).?);
+        try std.testing.expectEqual(case.valid, usage.valid);
+        try std.testing.expectEqual(case.input, usage.input_tokens);
+        try std.testing.expectEqual(case.total, usage.total_tokens);
+    }
+}
+
+const PiVisitorProbe = struct {
+    source: []const u8,
+    offset: usize = 0,
+    lines: usize = 0,
+
+    fn visit(self: *PiVisitorProbe, bytes: []const u8, line_number: usize) !void {
+        const next = std.mem.indexOfScalarPos(u8, self.source, self.offset, '\n');
+        const end = next orelse self.source.len;
+        try std.testing.expectEqualStrings(self.source[self.offset..end], bytes);
+        self.lines += 1;
+        try std.testing.expectEqual(self.lines, line_number);
+        self.offset = if (next != null) end + 1 else end;
+    }
+};
+
+test "Pi full and summary visitors preserve physical bytes and streaming metrics" {
+    const source = " \r\n" ++ pi_test_trace;
+    const allocator = std.testing.allocator;
+    var full_reader = std.Io.Reader.fixed(source);
+    var summary_reader = std.Io.Reader.fixed(source);
+    var full_probe = PiVisitorProbe{ .source = source };
+    var summary_probe = PiVisitorProbe{ .source = source };
+    var full_metrics = StreamMetrics{};
+    var summary_metrics = StreamMetrics{};
+    var full = try parseSessionTraceReaderWithVisitorMetrics(
+        std.testing.io,
+        allocator,
+        "pi.jsonl",
+        &full_reader,
+        0,
+        .{},
+        &full_probe,
+        PiVisitorProbe.visit,
+        &full_metrics,
+    );
+    defer full.deinit(allocator);
+    var summary = try parseSessionSummaryTraceReaderWithVisitorMetrics(
+        std.testing.io,
+        allocator,
+        "pi.jsonl",
+        &summary_reader,
+        0,
+        .{},
+        &summary_probe,
+        PiVisitorProbe.visit,
+        &summary_metrics,
+    );
+    defer summary.deinit(allocator);
+    try std.testing.expectEqualDeep(full_metrics, summary_metrics);
+    try std.testing.expectEqual(@as(usize, source.len), full_metrics.bytes_read);
+    try std.testing.expectEqual(@as(usize, 15), full_metrics.lines_seen);
+    try std.testing.expectEqual(@as(usize, source.len), full_probe.offset);
+    try std.testing.expectEqual(@as(usize, source.len), summary_probe.offset);
+    try std.testing.expectEqual(@as(usize, 2), full.occurrences.items[0].line_number);
+    try std.testing.expectEqual(@as(usize, 0), full.occurrences.items[0].ordinal);
+    const expected_id = computeSourceEventId("pi.jsonl", 6, 4);
+    try std.testing.expectEqualStrings(&expected_id, full.occurrences.items[4].sourceEventId());
+}
+
+test "Pi full and summary ownership survives every allocation failure" {
+    try @import("test_support").checkAllAllocationFailures(
+        std.testing.allocator,
+        checkPiTraceAllocation,
+        .{},
+    );
+}
+
+fn checkPiTraceAllocation(allocator: std.mem.Allocator) !void {
+    var full = try parseSessionTraceBytes(
+        std.testing.io,
+        allocator,
+        "pi.jsonl",
+        pi_test_trace,
+        0,
+        .{ .include_raw = true },
+    );
+    defer full.deinit(allocator);
+    var summary = try piTestSummary(allocator, pi_test_trace, .{});
+    defer summary.deinit(allocator);
+    try std.testing.expectEqualDeep(full.session, summary.session);
+    try std.testing.expectEqual(@as(usize, 2), full.turns.items.len);
 }
 
 test "parseRawTraceEvent detects newer event_msg" {

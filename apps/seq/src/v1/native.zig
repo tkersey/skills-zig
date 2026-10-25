@@ -1772,6 +1772,35 @@ fn runIndex(
     );
 }
 
+const CurrentSession = struct {
+    path: ?[]const u8 = null,
+    id: ?[]const u8 = null,
+    pi: bool = false,
+
+    fn fromEnvironment(environment: ?*const std.process.Environ.Map) !CurrentSession {
+        const codex_id = environmentValue(environment, "CODEX_THREAD_ID");
+        const pi_path = environmentValue(environment, "PI_SESSION_FILE");
+        const pi_id = environmentValue(environment, "PI_SESSION_ID");
+        const pi = pi_path != null or pi_id != null;
+        if (codex_id != null and pi) return error.AmbiguousCurrentSessionSource;
+        if (codex_id == null and !pi) return error.CurrentSessionUnavailable;
+        return .{ .path = pi_path, .id = codex_id orelse pi_id, .pi = pi };
+    }
+
+    fn rootAlloc(
+        self: CurrentSession,
+        allocator: std.mem.Allocator,
+        options: Options,
+        io: std.Io,
+        dir: std.Io.Dir,
+    ) ![]u8 {
+        if (self.pi and options.root == null) {
+            return resolvePiRootAlloc(allocator, options.environment, io, dir);
+        }
+        return resolveRootAlloc(allocator, options.environment, options.root, io, dir);
+    }
+};
+
 pub fn resolveTargetPaths(
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -1779,7 +1808,11 @@ pub fn resolveTargetPaths(
     options: Options,
     require_single: bool,
 ) !std.ArrayList([]u8) {
-    if (options.path) |path| {
+    const current = if (options.current)
+        try CurrentSession.fromEnvironment(options.environment)
+    else
+        CurrentSession{};
+    if (options.path orelse current.path) |path| {
         var paths: std.ArrayList([]u8) = .empty;
         errdefer freePaths(allocator, &paths);
         try paths.append(
@@ -1788,15 +1821,9 @@ pub fn resolveTargetPaths(
         );
         return paths;
     }
-    const root = try resolveRootAlloc(
-        allocator,
-        options.environment,
-        options.root,
-        io,
-        dir,
-    );
+    const root = try current.rootAlloc(allocator, options, io, dir);
     defer allocator.free(root);
-    const live_native_root = try isLiveNativeSessionRoot(
+    const live_native_root = !current.pi and try isLiveNativeSessionRoot(
         allocator,
         options,
         root,
@@ -1811,11 +1838,7 @@ pub fn resolveTargetPaths(
         options,
     );
     errdefer freePaths(allocator, &paths);
-    const exact_session_id = options.session_id orelse if (options.current)
-        environmentValue(options.environment, "CODEX_THREAD_ID") orelse
-            return error.CurrentSessionUnavailable
-    else
-        null;
+    const exact_session_id = options.session_id orelse current.id;
     if (exact_session_id == null) {
         retainCanonicalRolloutWindow(
             allocator,
@@ -2139,6 +2162,25 @@ fn resolveRootAlloc(
     return std.fs.path.join(allocator, &.{ home, ".codex", "sessions" });
 }
 
+fn resolvePiRootAlloc(
+    allocator: std.mem.Allocator,
+    environment: ?*const std.process.Environ.Map,
+    io: std.Io,
+    dir: std.Io.Dir,
+) ![]u8 {
+    if (environmentValue(environment, "PI_CODING_AGENT_SESSION_DIR")) |root| {
+        return absolutePathAlloc(allocator, environment, root, io, dir);
+    }
+    if (environmentValue(environment, "PI_CODING_AGENT_DIR")) |agent_dir| {
+        const base = try absolutePathAlloc(allocator, environment, agent_dir, io, dir);
+        defer allocator.free(base);
+        return std.fs.path.join(allocator, &.{ base, "sessions" });
+    }
+    const home = environmentValue(environment, "HOME") orelse
+        return error.EnvironmentVariableNotFound;
+    return std.fs.path.join(allocator, &.{ home, ".pi", "agent", "sessions" });
+}
+
 fn isLiveNativeSessionRoot(
     allocator: std.mem.Allocator,
     options: Options,
@@ -2369,6 +2411,88 @@ test "current session resolves CODEX_THREAD_ID exactly" {
         "current.jsonl",
         std.fs.path.basename(paths.items[0]),
     );
+}
+
+test "Pi current session file is selected without scanning a default root" {
+    var environment = std.process.Environ.Map.init(std.testing.allocator);
+    defer environment.deinit();
+    try environment.put("PI_SESSION_FILE", "/pi/custom-session.jsonl");
+    try environment.put("PI_SESSION_ID", "pi-custom");
+    var paths = try resolveTargetPaths(
+        std.testing.allocator,
+        std.testing.io,
+        std.Io.Dir.cwd(),
+        .{ .current = true, .environment = &environment },
+        true,
+    );
+    defer freePaths(std.testing.allocator, &paths);
+    try std.testing.expectEqual(@as(usize, 1), paths.items.len);
+    try std.testing.expectEqualStrings("/pi/custom-session.jsonl", paths.items[0]);
+}
+
+test "Pi current ID resolves the configured session directory from headers" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "custom-name.jsonl",
+        .data =
+        \\{"type":"session","version":3,"id":"pi-custom","timestamp":"2026-10-01T10:00:00Z","cwd":"/repo"}
+        ,
+    });
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
+    defer std.testing.allocator.free(root);
+    var environment = std.process.Environ.Map.init(std.testing.allocator);
+    defer environment.deinit();
+    try environment.put("PI_SESSION_ID", "pi-custom");
+    try environment.put("PI_CODING_AGENT_SESSION_DIR", root);
+    var paths = try resolveTargetPaths(
+        std.testing.allocator,
+        std.testing.io,
+        std.Io.Dir.cwd(),
+        .{ .current = true, .environment = &environment },
+        true,
+    );
+    defer freePaths(std.testing.allocator, &paths);
+    try std.testing.expectEqual(@as(usize, 1), paths.items.len);
+    try std.testing.expectEqualStrings("custom-name.jsonl", std.fs.path.basename(paths.items[0]));
+}
+
+test "current selector rejects conflicting Codex and Pi hints" {
+    var environment = std.process.Environ.Map.init(std.testing.allocator);
+    defer environment.deinit();
+    try environment.put("CODEX_THREAD_ID", "codex-session");
+    try environment.put("PI_SESSION_FILE", "/pi/session.jsonl");
+    try std.testing.expectError(error.AmbiguousCurrentSessionSource, resolveTargetPaths(
+        std.testing.allocator,
+        std.testing.io,
+        std.Io.Dir.cwd(),
+        .{ .current = true, .environment = &environment },
+        true,
+    ));
+}
+
+test "Pi root overrides do not change the ordinary Codex default" {
+    var environment = std.process.Environ.Map.init(std.testing.allocator);
+    defer environment.deinit();
+    try environment.put("HOME", "/user");
+    try environment.put("PI_CODING_AGENT_DIR", "~/pi-custom");
+    const pi_root = try resolvePiRootAlloc(
+        std.testing.allocator,
+        &environment,
+        std.testing.io,
+        std.Io.Dir.cwd(),
+    );
+    defer std.testing.allocator.free(pi_root);
+    try std.testing.expectEqualStrings("/user/pi-custom/sessions", pi_root);
+    const codex_root = try resolveRootAlloc(
+        std.testing.allocator,
+        &environment,
+        null,
+        std.testing.io,
+        std.Io.Dir.cwd(),
+    );
+    defer std.testing.allocator.free(codex_root);
+    try std.testing.expectEqualStrings("/user/.codex/sessions", codex_root);
 }
 
 test "exact session selector inspects noncanonical files under imported roots" {

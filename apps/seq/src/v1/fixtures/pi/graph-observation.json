@@ -1,0 +1,54 @@
+{
+  "schema": "seq-observation-definition/v1",
+  "id": "example/session-graph-selection",
+  "requires": {
+    "abi": "seq-observation-abi/v1",
+    "operators": ["scan", "derive", "reachability", "filter", "project"]
+  },
+  "parameters": {},
+  "selectors": ["path", "root"],
+  "relations": [
+    {"name": "sessions", "fields": ["session_id", "path", "parent_session_id"]}
+  ],
+  "inputs": [],
+  "pipeline": [
+    {"op": "scan", "relation": "sessions", "as": "session_rows"},
+    {
+      "op": "derive", "input": "session_rows", "as": "seeds",
+      "fields": [{
+        "name": "selected", "type": "boolean", "nullable": false,
+        "expr": {"op": "or", "args": [
+          {"op": "is-null", "args": [{"selector": "path"}]},
+          {"op": "eq", "args": [{"field": "path"}, {"selector": "path"}]}
+        ]}
+      }]
+    },
+    {
+      "op": "reachability", "input": "seeds", "as": "scope",
+      "keys": {
+        "node": "session_id", "parent": "parent_session_id",
+        "seed": "selected", "direction": "descendants"
+      },
+      "fields": [
+        {"name": "session_id", "type": "string", "nullable": false, "field": "session_id"},
+        {"name": "path", "type": "string", "nullable": false, "field": "path"},
+        {"name": "reachable", "type": "boolean", "nullable": false, "meta": "reachable"}
+      ]
+    },
+    {
+      "op": "filter", "input": "scope", "as": "selected",
+      "where": [{"field": "reachable", "op": "exact", "value": true}]
+    },
+    {"op": "project", "input": "selected", "as": "rows", "fields": ["session_id", "path"]}
+  ],
+  "projections": {
+    "rows": {
+      "relation": "rows", "schema": "example-session-graph-selection/v1",
+      "fields": ["session_id", "path"], "renderers": ["json"]
+    }
+  },
+  "bounds": {
+    "max_rows": 100, "max_output_bytes": 65536, "max_fold_states": 8,
+    "max_input_bytes": 1048576, "max_graph_depth": 8, "max_graph_nodes": 100
+  }
+}
