@@ -42,6 +42,14 @@ pub fn controlComponent(scope: *const Scope) []const u8 {
     return if (scope.fs.isPinned()) "." else ".ledger";
 }
 
+pub fn controlPathAlloc(
+    scope: *const Scope,
+    allocator: std.mem.Allocator,
+    repo_root: []const u8,
+) ![]u8 {
+    return std.fs.path.join(allocator, &.{ repo_root, controlComponent(scope) });
+}
+
 pub fn isActive(scope: *const Scope) bool {
     return scope.fs.isPinned();
 }
@@ -158,12 +166,156 @@ fn checkedRoot(
     supplied_root: []const u8,
     expected_id: []const u8,
 ) !std.Io.Dir {
-    if (!std.fs.path.isAbsolute(supplied_root)) return error.StorageRootNotAbsolute;
     if (expected_id.len == 0 or expected_id.len > 256) return error.InvalidStoreIdentity;
+    var admitted = try SourceRoot.open(allocator, io, supplied_root, expected_id);
+    defer admitted.deinit();
+    const control = admitted.control orelse return error.StorageRootMissing;
+    admitted.control = null;
+    return control;
+}
+
+pub const SourceRoot = struct {
+    allocator: std.mem.Allocator,
+    locator: []u8,
+    directory: std.Io.Dir,
+    control: ?std.Io.Dir,
+    io: std.Io,
+    store_id: ?[]u8,
+
+    pub fn open(
+        allocator: std.mem.Allocator,
+        io: std.Io,
+        supplied_root: []const u8,
+        expected_id: ?[]const u8,
+    ) !SourceRoot {
+        if (expected_id) |id| {
+            if (id.len == 0 or id.len > 256) return error.InvalidStoreIdentity;
+        }
+        const directory = try openRootDirectory(io, supplied_root);
+        errdefer directory.close(io);
+        if (expected_id) |id| try checkMarker(allocator, io, directory, id);
+        const control = directory.openDir(io, ".ledger", .{
+            .follow_symlinks = false,
+        }) catch |err| switch (err) {
+            error.FileNotFound => absent: {
+                if (expected_id != null) return error.StorageRootMissing;
+                break :absent null;
+            },
+            error.NotDir => return error.StorageRootNotDirectory,
+            error.SymLinkLoop => return error.SymlinkComponent,
+            else => return err,
+        };
+        errdefer if (control) |opened| opened.close(io);
+        const locator = try allocator.dupe(u8, supplied_root);
+        errdefer allocator.free(locator);
+        return .{
+            .allocator = allocator,
+            .locator = locator,
+            .directory = directory,
+            .control = control,
+            .io = io,
+            .store_id = if (expected_id) |id| try allocator.dupe(u8, id) else null,
+        };
+    }
+
+    pub fn deinit(self: *SourceRoot) void {
+        if (self.control) |control| control.close(self.io);
+        self.directory.close(self.io);
+        self.allocator.free(self.locator);
+        if (self.store_id) |id| self.allocator.free(id);
+        self.* = undefined;
+    }
+
+    pub fn scope(self: *const SourceRoot) ?Scope {
+        return .init(.anchored(self.io, self.control orelse return null));
+    }
+
+    pub fn prepareControlForApply(self: *SourceRoot, storage_mutated: *bool) !void {
+        if (self.control != null) return self.revalidateControl();
+        try self.revalidateRoot(self.locator);
+        try durable_store.ensureDirectoryPathNoSymlinksObserved(
+            .anchored(self.io, self.directory),
+            ".ledger",
+            storage_mutated,
+        );
+        self.control = try self.directory.openDir(self.io, ".ledger", .{
+            .follow_symlinks = false,
+        });
+        try self.revalidateControl();
+    }
+
+    pub fn openControlFile(self: *const SourceRoot, path: []const u8) !std.Io.File {
+        const control = self.control orelse return error.StorageRootMissing;
+        if (path.len == 0 or std.fs.path.isAbsolute(path) or path[path.len - 1] == '/') {
+            return error.InvalidSourcePath;
+        }
+        var parent = try control.openDir(self.io, ".", .{ .follow_symlinks = false });
+        defer parent.close(self.io);
+        var components = std.mem.splitScalar(u8, path, '/');
+        while (components.next()) |part| {
+            if (part.len == 0 or std.mem.eql(u8, part, ".") or
+                std.mem.eql(u8, part, "..") or std.mem.indexOfScalar(u8, part, 0) != null)
+            {
+                return error.InvalidSourcePath;
+            }
+            if (components.peek() == null) return openRegularLeaf(self.io, parent, part);
+            const next = try parent.openDir(self.io, part, .{ .follow_symlinks = false });
+            parent.close(self.io);
+            parent = next;
+        }
+        return error.InvalidSourcePath;
+    }
+
+    pub fn revalidate(self: *const SourceRoot, locator: []const u8) !void {
+        if (!std.mem.eql(u8, locator, self.locator)) try self.revalidateRoot(locator);
+        try self.revalidateControl();
+    }
+
+    fn revalidateRoot(self: *const SourceRoot, locator: []const u8) !void {
+        const current = try openRootDirectory(self.io, locator);
+        defer current.close(self.io);
+        try sameDirectory(self.io, self.directory, current);
+        if (self.store_id) |id| try checkMarker(self.allocator, self.io, current, id);
+    }
+
+    pub fn revalidateControl(self: *const SourceRoot) !void {
+        try self.revalidateRoot(self.locator);
+        try self.revalidateOpenedControl();
+    }
+
+    fn revalidateOpenedControl(self: *const SourceRoot) !void {
+        const current = self.directory.openDir(self.io, ".ledger", .{
+            .follow_symlinks = false,
+        }) catch |err| switch (err) {
+            error.FileNotFound => {
+                if (self.control == null) return;
+                return error.PreparationSourceChanged;
+            },
+            error.NotDir, error.SymLinkLoop => return error.PreparationSourceChanged,
+            else => return err,
+        };
+        defer current.close(self.io);
+        const expected = self.control orelse return error.PreparationSourceChanged;
+        try sameDirectory(self.io, expected, current);
+    }
+};
+
+fn openRegularLeaf(io: std.Io, parent: std.Io.Dir, leaf: []const u8) !std.Io.File {
+    return durable_store.openRegularFileNoSymlink(.anchored(io, parent), leaf);
+}
+
+fn sameDirectory(io: std.Io, expected: std.Io.Dir, current: std.Io.Dir) !void {
+    const before = try durable_store.openDirectoryIdentity(io, expected);
+    const after = try durable_store.openDirectoryIdentity(io, current);
+    if (!std.meta.eql(before, after)) return error.PreparationSourceChanged;
+}
+
+fn openRootDirectory(io: std.Io, supplied_root: []const u8) !std.Io.Dir {
+    if (!std.fs.path.isAbsolute(supplied_root)) return error.StorageRootNotAbsolute;
     var root_dir = try std.Io.Dir.openDirAbsolute(io, "/", .{
         .follow_symlinks = false,
     });
-    defer root_dir.close(io);
+    errdefer root_dir.close(io);
     var components = std.fs.path.componentIterator(supplied_root);
     while (components.next()) |component| {
         if (std.mem.eql(u8, component.name, ".") or
@@ -182,20 +334,7 @@ fn checkedRoot(
         root_dir.close(io);
         root_dir = next;
     }
-    const control = root_dir.openDir(io, ".ledger", .{
-        .follow_symlinks = false,
-    }) catch |err| {
-        try checkMarker(allocator, io, root_dir, expected_id);
-        return switch (err) {
-            error.FileNotFound => error.StorageRootMissing,
-            error.NotDir => error.StorageRootNotDirectory,
-            error.SymLinkLoop => error.SymlinkComponent,
-            else => err,
-        };
-    };
-    errdefer control.close(io);
-    try checkMarker(allocator, io, root_dir, expected_id);
-    return control;
+    return root_dir;
 }
 
 fn checkMarker(
@@ -413,4 +552,145 @@ test "managed admission propagates supplied I/O cancellation" {
     try std.testing.expectError(error.Canceled, prepare(std.testing.allocator, io, &.{
         "ledger", "doctor", "--store-root", "/", "--store-id", "cancelled",
     }));
+}
+
+test "source admission retains selected root and rejects replacement" {
+    const io = std.testing.io;
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "source/.ledger");
+    try tmp.dir.writeFile(io, .{ .sub_path = "source/.ledger/value", .data = "original" });
+    const locator = try tmp.dir.realPathFileAlloc(io, "source", allocator);
+    defer allocator.free(locator);
+    var source = try SourceRoot.open(allocator, io, locator, null);
+    defer source.deinit();
+    try source.revalidate(locator);
+    try tmp.dir.rename("source", tmp.dir, "moved", io);
+    try tmp.dir.createDirPath(io, "source/.ledger");
+    try tmp.dir.writeFile(io, .{ .sub_path = "source/.ledger/value", .data = "replacement" });
+    try std.testing.expectError(error.PreparationSourceChanged, source.revalidate(locator));
+    const source_scope = source.scope().?;
+    const bytes = try durable_store.readRegularFileNoSymlink(
+        source_scope.fs,
+        allocator,
+        "value",
+        32,
+    );
+    defer allocator.free(bytes);
+    try std.testing.expectEqualStrings("original", bytes);
+}
+
+test "source admission observes a control directory appearing or changing" {
+    const io = std.testing.io;
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const locator = try tmp.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(locator);
+    var empty = try SourceRoot.open(allocator, io, locator, null);
+    defer empty.deinit();
+    try std.testing.expectEqual(null, empty.scope());
+    try empty.revalidate(locator);
+    try tmp.dir.createDir(io, ".ledger", .default_dir);
+    try std.testing.expectError(error.PreparationSourceChanged, empty.revalidate(locator));
+    var present = try SourceRoot.open(allocator, io, locator, null);
+    defer present.deinit();
+    try tmp.dir.rename(".ledger", tmp.dir, "old-control", io);
+    try tmp.dir.createDir(io, ".ledger", .default_dir);
+    try std.testing.expectError(error.PreparationSourceChanged, present.revalidate(locator));
+}
+
+test "source file handles reject traversal and symlinks and survive path replacement" {
+    const io = std.testing.io;
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, ".ledger/nested");
+    try tmp.dir.writeFile(io, .{ .sub_path = ".ledger/nested/value", .data = "original" });
+    try tmp.dir.symLink(io, "value", ".ledger/nested/link", .{});
+    const locator = try tmp.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(locator);
+    var source = try SourceRoot.open(allocator, io, locator, null);
+    defer source.deinit();
+    const invalid_paths = [_][]const u8{
+        "", "/nested/value", "../value", "nested/../value", "nested//value",
+    };
+    for (invalid_paths) |path| {
+        try std.testing.expectError(error.InvalidSourcePath, source.openControlFile(path));
+    }
+    try std.testing.expectError(error.SymlinkComponent, source.openControlFile("nested/link"));
+    try std.testing.expectError(error.NotFile, source.openControlFile("nested"));
+    const file = try source.openControlFile("nested/value");
+    defer file.close(io);
+    try tmp.dir.rename(".ledger/nested", tmp.dir, "old", io);
+    try tmp.dir.createDirPath(io, ".ledger/nested");
+    try tmp.dir.writeFile(io, .{ .sub_path = ".ledger/nested/value", .data = "new" });
+    var reader = file.reader(io, &.{});
+    const bytes = try reader.interface.allocRemaining(allocator, .limited(32));
+    defer allocator.free(bytes);
+    try std.testing.expectEqualStrings("original", bytes);
+}
+
+test "source revalidation checks its admitted managed identity" {
+    const io = std.testing.io;
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDir(io, ".ledger", .default_dir);
+    try tmp.dir.writeFile(io, .{
+        .sub_path = marker_name,
+        .data = "{\"schema\":\"ledger-storage-root/v1\",\"store_id\":\"original\"}",
+    });
+    const locator = try tmp.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(locator);
+    var source = try SourceRoot.open(allocator, io, locator, "original");
+    defer source.deinit();
+    try source.revalidate(locator);
+    try tmp.dir.writeFile(io, .{
+        .sub_path = marker_name,
+        .data = "{\"schema\":\"ledger-storage-root/v1\",\"store_id\":\"replacement\"}",
+    });
+    try std.testing.expectError(error.StorageRootIdentityMismatch, source.revalidate(locator));
+    try std.testing.expectError(error.StorageRootIdentityMismatch, source.revalidateControl());
+}
+
+test "control revalidation retains the admitted root locator" {
+    const io = std.testing.io;
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "source/.ledger");
+    const locator = try tmp.dir.realPathFileAlloc(io, "source", allocator);
+    defer allocator.free(locator);
+    var source = try SourceRoot.open(allocator, io, locator, null);
+    defer source.deinit();
+    try source.revalidateControl();
+    try tmp.dir.rename("source", tmp.dir, "original", io);
+    try tmp.dir.createDirPath(io, "source/.ledger");
+    try std.testing.expectError(error.PreparationSourceChanged, source.revalidateControl());
+}
+
+test "apply rejects an empty replaced root before creating coordination state" {
+    const io = std.testing.io;
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDir(io, "source", .default_dir);
+    const locator = try tmp.dir.realPathFileAlloc(io, "source", allocator);
+    defer allocator.free(locator);
+    var source = try SourceRoot.open(allocator, io, locator, null);
+    defer source.deinit();
+    try tmp.dir.rename("source", tmp.dir, "original", io);
+    try tmp.dir.createDir(io, "source", .default_dir);
+    var mutated = false;
+    try std.testing.expectError(error.PreparationSourceChanged, source.prepareControlForApply(
+        &mutated,
+    ));
+    try std.testing.expect(!mutated);
+    for ([_][]const u8{ "source/.ledger", "original/.ledger" }) |path| {
+        try std.testing.expectError(error.FileNotFound, tmp.dir.statFile(io, path, .{
+            .follow_symlinks = false,
+        }));
+    }
 }

@@ -329,6 +329,7 @@ pub fn readSlot(
         definition_id,
         slot,
         false,
+        false,
     );
 }
 
@@ -346,6 +347,25 @@ pub fn readSlotOrMissing(
         definition_id,
         slot,
         true,
+        false,
+    );
+}
+
+pub fn readPreparationSlot(
+    scope: *storage_root.Scope,
+    allocator: std.mem.Allocator,
+    repo_root: []const u8,
+    definition_id: []const u8,
+    slot: storage.ResolvedSlot,
+) !SlotSnapshot {
+    return readSlotInternal(
+        scope,
+        allocator,
+        repo_root,
+        definition_id,
+        slot,
+        true,
+        true,
     );
 }
 
@@ -356,6 +376,7 @@ fn readSlotInternal(
     definition_id: []const u8,
     slot: storage.ResolvedSlot,
     allow_missing: bool,
+    allow_unbound: bool,
 ) !SlotSnapshot {
     if (!storage_root.validRepoRoot(scope, repo_root)) return error.RepositoryRootNotAbsolute;
     const path = try std.fs.path.join(
@@ -408,6 +429,7 @@ fn readSlotInternal(
         slot,
         content,
         read_custody,
+        allow_unbound,
     );
 }
 
@@ -420,6 +442,7 @@ fn finishPresentSlot(
     slot: storage.ResolvedSlot,
     content: []u8,
     read_custody: ?durable_store.CasReadLockPair,
+    allow_unbound: bool,
 ) !SlotSnapshot {
     errdefer allocator.free(content);
     const revision = try definition_core.canonical_json.digestBytesAlloc(
@@ -438,7 +461,7 @@ fn finishPresentSlot(
         null,
     );
     errdefer binding.deinit(allocator);
-    if (!binding.exists) return error.StoreSlotWithoutBinding;
+    if (!binding.exists and !allow_unbound) return error.StoreSlotWithoutBinding;
     if (read_custody == null and try slotReadCustodyAppeared(
         scope,
         allocator,
@@ -739,6 +762,50 @@ fn readBindingSnapshotInternal(
         error.FileNotFound => return missingBindingSnapshot(allocator),
         else => return err,
     };
+    return finishBindingSnapshot(
+        allocator,
+        bytes,
+        definition_id,
+        slot_name,
+        logical_path,
+        current_revision,
+        idempotency,
+        verify_current_revision,
+    );
+}
+
+pub fn parseBindingSnapshot(
+    allocator: std.mem.Allocator,
+    bytes: []const u8,
+    definition_id: []const u8,
+    slot_name: []const u8,
+    logical_path: []const u8,
+    current_revision: []const u8,
+) !BindingSnapshot {
+    if (bytes.len > binding_max_bytes) return error.FileTooBig;
+    try definition_core.json.digest(current_revision);
+    return finishBindingSnapshot(
+        allocator,
+        try allocator.dupe(u8, bytes),
+        definition_id,
+        slot_name,
+        logical_path,
+        current_revision,
+        null,
+        true,
+    );
+}
+
+fn finishBindingSnapshot(
+    allocator: std.mem.Allocator,
+    bytes: []u8,
+    definition_id: []const u8,
+    slot_name: []const u8,
+    logical_path: []const u8,
+    current_revision: ?[]const u8,
+    idempotency: ?IdempotencyQuery,
+    verify_current_revision: bool,
+) !BindingSnapshot {
     errdefer allocator.free(bytes);
     const digest = try definition_core.canonical_json.digestBytesAlloc(
         allocator,
@@ -1285,19 +1352,23 @@ pub fn bindingPathAlloc(
     repo_root: []const u8,
     logical_path: []const u8,
 ) ![]u8 {
+    const relative = try bindingRelativePathAlloc(allocator, logical_path);
+    defer allocator.free(relative);
+    return std.fs.path.join(
+        allocator,
+        &.{ repo_root, storage_root.controlComponent(scope), relative },
+    );
+}
+
+pub fn bindingRelativePathAlloc(allocator: std.mem.Allocator, logical_path: []const u8) ![]u8 {
     const digest = try definition_core.canonical_json.digestBytesAlloc(
         allocator,
         logical_path,
     );
     defer allocator.free(digest);
-    const file_name = try allocator.print(
-        "{s}.jsonl",
+    return allocator.print(
+        ".bindings/{s}.jsonl",
         .{digest[7..]},
-    );
-    defer allocator.free(file_name);
-    return std.fs.path.join(
-        allocator,
-        &.{ repo_root, storage_root.controlComponent(scope), ".bindings", file_name },
     );
 }
 
@@ -1649,5 +1720,84 @@ test "existing slot without a binding fails custody integrity" {
             "example/events",
             slot,
         ),
+    );
+    var prepared = try readPreparationSlot(
+        scope,
+        std.testing.allocator,
+        root,
+        "example/events",
+        slot,
+    );
+    defer prepared.deinit(std.testing.allocator);
+    try std.testing.expect(prepared.exists);
+    try std.testing.expect(!prepared.binding.exists);
+    try std.testing.expectEqualStrings("{}\n", prepared.content);
+    try std.testing.expectEqual(@as(usize, 0), prepared.binding.rows.len);
+    try std.testing.expectError(
+        error.StoreSlotWithoutBinding,
+        readSlot(scope, std.testing.allocator, root, "example/events", slot),
+    );
+    var bounded = slot;
+    bounded.max_bytes = 2;
+    try std.testing.expectError(
+        error.FileTooBig,
+        readPreparationSlot(scope, std.testing.allocator, root, "example/events", bounded),
+    );
+}
+
+test "preparation custody keeps malformed stale and orphaned bindings as errors" {
+    const allocator = std.testing.allocator;
+    var scope_storage = storage_root.Scope.init(.init(std.testing.io, std.Io.Dir.cwd()));
+    const scope = &scope_storage;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, ".ledger/example");
+    try tmp.dir.createDirPath(std.testing.io, ".ledger/.bindings");
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", allocator);
+    defer allocator.free(root);
+    const slot: storage.ResolvedSlot = .{
+        .name = "events",
+        .relative_path = "example/events.jsonl",
+        .owned_path = null,
+        .kind = .event_log,
+        .codec = .jsonl,
+        .max_bytes = 4096,
+    };
+    var missing = try readPreparationSlot(scope, allocator, root, "example/events", slot);
+    defer missing.deinit(allocator);
+    try std.testing.expect(!missing.exists and !missing.binding.exists);
+    try writeTestBoundSlot(scope, root, slot, "{}\n");
+    var bound = try readPreparationSlot(scope, allocator, root, "example/events", slot);
+    defer bound.deinit(allocator);
+    try std.testing.expect(bound.binding.exists);
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = ".ledger/example/events.jsonl",
+        .data = "{\"changed\":true}\n",
+    });
+    try std.testing.expectError(
+        error.StoreBindingRevisionMismatch,
+        readPreparationSlot(scope, allocator, root, "example/events", slot),
+    );
+    const binding_path = try bindingPathAlloc(scope, allocator, root, slot.relative_path);
+    defer allocator.free(binding_path);
+    const cases = [_]struct { bytes: []const u8, err: anyerror }{
+        .{ .bytes = "", .err = error.InvalidStoreBinding },
+        .{ .bytes = "{}\n", .err = error.MissingField },
+    };
+    for (cases) |case| {
+        try scope.fs.directory().writeFile(scope.fs.io, .{
+            .sub_path = binding_path,
+            .data = case.bytes,
+        });
+        try std.testing.expectError(
+            case.err,
+            readPreparationSlot(scope, allocator, root, "example/events", slot),
+        );
+    }
+    try writeTestBoundSlot(scope, root, slot, "{}\n");
+    try tmp.dir.deleteFile(std.testing.io, ".ledger/example/events.jsonl");
+    try std.testing.expectError(
+        error.StoreBindingWithoutSlot,
+        readPreparationSlot(scope, allocator, root, "example/events", slot),
     );
 }

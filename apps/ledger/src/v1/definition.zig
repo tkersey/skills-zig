@@ -1,6 +1,8 @@
 const std = @import("std");
 const definition_core = @import("definition_core");
 const source_graph = @import("source_graph.zig");
+const lifecycle = @import("lifecycle.zig");
+const storage = @import("storage.zig");
 
 pub const schema = "ledger-artifact-definition/v1";
 pub const abi = "ledger-artifact-abi/v1";
@@ -99,6 +101,7 @@ pub const Operator = enum {
     array_count_equal,
     array_integer_sum_lte,
     rebind_existing,
+    artifact_lifecycle,
 
     pub fn id(self: Operator) []const u8 {
         return switch (self) {
@@ -160,6 +163,7 @@ pub const Operator = enum {
             .create_new => "create-new",
             .bind_existing => "bind-existing",
             .rebind_existing => "rebind-existing",
+            .artifact_lifecycle => "artifact-lifecycle",
             .exclusive_custody => "exclusive-custody",
             .atomic_transaction => "atomic-transaction",
             .id_lookup => "id-lookup",
@@ -220,7 +224,7 @@ pub const Operator = enum {
     pub fn supported(self: Operator) bool {
         comptime {
             const fields = @typeInfo(Operator).@"enum".field_names;
-            if (fields.len != 89 or
+            if (fields.len != 90 or
                 !std.mem.eql(u8, fields[46], "set_order"))
             {
                 @compileError("update the explicit operator admission set");
@@ -234,6 +238,7 @@ pub const Codec = enum {
     json,
     jsonl,
     text,
+    bytes,
 
     pub fn parse(text: []const u8) !Codec {
         inline for (
@@ -322,6 +327,8 @@ pub const Plan = struct {
     canonicalization_json: []u8,
     identity_json: []u8,
     storage_json: []u8,
+    lifecycle_json: ?[]u8 = null,
+    lifecycle_plan: ?lifecycle.Plan = null,
 
     pub fn deinit(self: *Plan, allocator: std.mem.Allocator) void {
         const Frame = struct { plan: *Plan, next_import: usize = 0 };
@@ -361,6 +368,8 @@ pub const Plan = struct {
         allocator.free(self.canonicalization_json);
         allocator.free(self.identity_json);
         allocator.free(self.storage_json);
+        if (self.lifecycle_json) |bytes| allocator.free(bytes);
+        if (self.lifecycle_plan) |*plan| plan.deinit();
         self.* = undefined;
     }
 
@@ -643,7 +652,7 @@ fn finishCompiledPlan(
     if (frame.declared_id) |expected| {
         if (!std.mem.eql(u8, expected, owned_id)) return error.ImportedDefinitionIdMismatch;
     }
-    return .{
+    var plan: Plan = .{
         .id = owned_id,
         .owner = owned_owner,
         .closure_digest = closure_digest,
@@ -661,6 +670,17 @@ fn finishCompiledPlan(
         .identity_json = body.identity_json,
         .storage_json = body.storage_json,
     };
+    if (root.get("lifecycle")) |raw| try attachLifecycle(allocator, &plan, raw);
+    return plan;
+}
+
+fn attachLifecycle(allocator: std.mem.Allocator, plan: *Plan, raw: std.json.Value) !void {
+    if (!plan.requires(.artifact_lifecycle)) return error.UndeclaredArtifactOperator;
+    const canonical = try definition_core.canonical_json.canonicalJsonAlloc(allocator, raw);
+    errdefer allocator.free(canonical);
+    const compiled = try storage.compileLifecycle(allocator, plan, raw);
+    plan.lifecycle_json = canonical;
+    plan.lifecycle_plan = compiled;
 }
 
 fn validateDefinitionRoot(root: std.json.ObjectMap) !void {
@@ -681,6 +701,7 @@ fn validateDefinitionRoot(root: std.json.ObjectMap) !void {
         "projections",
         "diagnostics",
         "bounds",
+        "lifecycle",
     });
     try definition_core.json.requireFields(root, &.{
         "schema",
@@ -743,6 +764,7 @@ fn compileDefinitionHeader(
         ),
     );
     errdefer deinitInputs(allocator, inputs);
+    try validateInputOperators(inputs, operator_mask);
     const storage_object = try definition_core.json.object(
         try definition_core.json.field(root, "storage"),
     );
@@ -761,6 +783,14 @@ fn compileDefinitionHeader(
         .bounds = bounds,
         .imports = &.{},
     };
+}
+
+fn validateInputOperators(inputs: []const Input, operator_mask: u128) !void {
+    for (inputs) |input| {
+        if (input.codec == .bytes and (operator_mask & operatorBit(.artifact_lifecycle)) == 0) {
+            return error.UndeclaredArtifactOperator;
+        }
+    }
 }
 
 const DefinitionBody = struct {
@@ -937,7 +967,7 @@ pub fn encodeCacheWithDetail(
     detail: CacheDetail,
     encoder: *definition_core.cache.Encoder,
 ) !void {
-    try encoder.writeU16(6);
+    try encoder.writeU16(7);
     try encoder.writeEnum(detail);
     try encodeCachePlan(plan, detail, encoder);
 }
@@ -1005,7 +1035,9 @@ fn encodePlanSuffix(
     detail: CacheDetail,
     encoder: *definition_core.cache.Encoder,
 ) !void {
-    if (detail == .full) {
+    const has_lifecycle = plan.lifecycle_json != null;
+    try encoder.writeBool(has_lifecycle);
+    if (detail == .full or has_lifecycle) {
         try encoder.writeCount(plan.pointers.len);
         for (plan.pointers) |pointer| try encoder.writeBytes(pointer);
         try encoder.writeCount(plan.rules.len);
@@ -1028,11 +1060,12 @@ fn encodePlanSuffix(
     try encoder.writeUsize(plan.bounds.max_output_bytes);
     try encoder.writeUsize(plan.bounds.max_diagnostics);
     try encoder.writeUsize(plan.bounds.max_reducer_states);
-    if (detail == .full) {
+    if (detail == .full or has_lifecycle) {
         try encoder.writeBytes(plan.canonicalization_json);
         try encoder.writeBytes(plan.identity_json);
         try encoder.writeBytes(plan.storage_json);
     }
+    if (plan.lifecycle_json) |bytes| try encoder.writeBytes(bytes);
 }
 
 pub fn decodeCache(
@@ -1047,7 +1080,7 @@ pub fn decodeCacheWithDetail(
     expected_detail: CacheDetail,
     decoder: *definition_core.cache.Decoder,
 ) !Plan {
-    if (try decoder.readU16() != 6) return error.LedgerPlanCacheVersionMismatch;
+    if (try decoder.readU16() != 7) return error.LedgerPlanCacheVersionMismatch;
     if (try decoder.readEnum(CacheDetail) != expected_detail) {
         return error.LedgerPlanCacheDetailMismatch;
     }
@@ -1180,6 +1213,7 @@ fn decodePlanPrefix(
     errdefer parameter_declarations.deinit(allocator);
     const inputs = try decodeInputs(allocator, decoder);
     errdefer deinitInputs(allocator, inputs);
+    try validateInputOperators(inputs, operator_mask);
     const storage_kind = try decoder.readEnum(StorageKind);
     const import_count = try decoder.readCount(max_imported_definitions);
     const imports = try allocator.alloc(Plan, import_count);
@@ -1211,9 +1245,11 @@ fn decodePlanSuffix(
     decoder: *definition_core.cache.Decoder,
     prefix: *DecodedPrefix,
 ) !Plan {
+    const has_lifecycle = try decoder.readBool();
+    const effective_detail: CacheDetail = if (has_lifecycle) .full else detail;
     var compiled = try decodeCompiledDefinition(
         allocator,
-        detail,
+        effective_detail,
         decoder,
         prefix,
     );
@@ -1221,23 +1257,23 @@ fn decodePlanSuffix(
     const bounds = try decodeBounds(decoder);
     const canonicalization_json = try decodeDefinitionJson(
         allocator,
-        detail,
+        effective_detail,
         decoder,
     );
     errdefer allocator.free(canonicalization_json);
     const identity_json = try decodeDefinitionJson(
         allocator,
-        detail,
+        effective_detail,
         decoder,
     );
     errdefer allocator.free(identity_json);
     const storage_json = try decodeDefinitionJson(
         allocator,
-        detail,
+        effective_detail,
         decoder,
     );
     errdefer allocator.free(storage_json);
-    return .{
+    var plan: Plan = .{
         .id = prefix.id,
         .owner = prefix.owner,
         .closure_digest = prefix.closure_digest,
@@ -1255,6 +1291,17 @@ fn decodePlanSuffix(
         .identity_json = identity_json,
         .storage_json = storage_json,
     };
+    if (has_lifecycle) {
+        const bytes = try decoder.readBytesAlloc(allocator, 4 * 1024 * 1024);
+        defer allocator.free(bytes);
+        var parsed = try std.json.parseFromSlice(std.json.Value, allocator, bytes, .{
+            .duplicate_field_behavior = .@"error",
+            .parse_numbers = false,
+        });
+        defer parsed.deinit();
+        try attachLifecycle(allocator, &plan, parsed.value);
+    }
+    return plan;
 }
 
 const DecodedDefinition = struct {
@@ -1950,6 +1997,8 @@ test "artifact definition compiles structural rules and effect plans" {
     try std.testing.expectEqual(@as(usize, 2), plan.pointers.len);
     try std.testing.expectEqual(@as(usize, 1), plan.operations.len);
     try std.testing.expectEqual(@as(usize, 1), plan.projections.len);
+    try std.testing.expect(plan.lifecycle_json == null);
+    try std.testing.expect(plan.lifecycle_plan == null);
 
     var encoder = definition_core.cache.Encoder.init(
         std.testing.allocator,
@@ -1974,6 +2023,252 @@ test "artifact definition compiles structural rules and effect plans" {
     try std.testing.expectEqual(plan.rules.len, cached.rules.len);
     try std.testing.expectEqual(plan.operations.len, cached.operations.len);
     try std.testing.expectEqual(plan.projections.len, cached.projections.len);
+}
+
+const lifecycle_definition_json =
+    \\{"schema":"ledger-artifact-definition/v1","id":"example/lifecycle","owner":"example",
+    \\"requires":{"abi":"ledger-artifact-abi/v1","operators":["artifact-lifecycle","compare-and-append"]},
+    \\"inputs":{"event":{"codec":"json","max_bytes":4096},"payload":{"codec":"bytes","max_bytes":4}},
+    \\"canonicalization":{},"shape":{},"constraints":{"laws":[]},"identity":{},
+    \\"storage":{"kind":"event-log","slots":{
+    \\"events":{"path":"example/events.jsonl","kind":"event-log","codec":"jsonl","max_bytes":65536},
+    \\"attachments":{"kind":"attachment","codec":"bytes","max_bytes":4096}}},
+    \\"operations":{"append":{"effects":[{"op":"compare-and-append","slot":"events","input":"event"}]}},
+    \\"projections":{},"lifecycle":{"schema":"ledger-artifact-lifecycle/v1",
+    \\"slots":{"attachments":{"retention":{"kind":"until-release","grace_seconds":0}}},
+    \\"references":[{"source_slot":"events","pointer":"/attachment","cardinality":"optional-one","strength":"provenance"}],
+    \\"operations":{"append":[{"op":"release","artifact":{"input":"event","pointer":"/attachment"}}]},
+    \\"bounds":{"max_references_per_record":64,"max_effects_per_operation":16,"max_holds_per_artifact":64}},
+    \\"bounds":{"max_input_bytes":8192,"max_store_bytes":65536,"max_records":100,
+    \\"max_output_bytes":4096,"max_diagnostics":16,"max_reducer_states":16}}
+;
+
+fn lifecycleTestClosure(bytes: []const u8) !definition_core.Closure {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "artifact.json", .data = bytes });
+    return definition_core.closure.loadFromDir(
+        std.testing.io,
+        std.testing.allocator,
+        &tmp.dir,
+        "artifact.json",
+        .{},
+    );
+}
+
+fn expectLifecycleDefinitionCache(plan: *const Plan, detail: CacheDetail) !void {
+    const allocator = std.testing.allocator;
+    var encoder = definition_core.cache.Encoder.init(allocator, 1024 * 1024);
+    defer encoder.deinit();
+    try encodeCacheWithDetail(plan, detail, &encoder);
+    const bytes = try encoder.toOwnedSlice();
+    defer allocator.free(bytes);
+    var decoder = definition_core.cache.Decoder.init(bytes);
+    var decoded = try decodeCacheWithDetail(allocator, detail, &decoder);
+    defer decoded.deinit(allocator);
+    try decoder.finish();
+    try std.testing.expectEqualStrings(plan.lifecycle_json.?, decoded.lifecycle_json.?);
+    try std.testing.expectEqualSlices(u8, &plan.closure_digest, &decoded.closure_digest);
+    try std.testing.expectEqual(plan.operations.len, decoded.operations.len);
+    try std.testing.expectEqual(@as(usize, 1), decoded.lifecycle_plan.?.references.len);
+    try std.testing.expectEqualStrings(
+        "event",
+        decoded.lifecycle_plan.?.operations[0].effects[0].release.input,
+    );
+}
+
+test "lifecycle definition compiles actual declarations and preserves closure and cache identity" {
+    const allocator = std.testing.allocator;
+    var closure = try lifecycleTestClosure(lifecycle_definition_json);
+    defer closure.deinit(allocator);
+    const original = try allocator.dupe(u8, closure.find("artifact.json").?.canonical_json);
+    defer allocator.free(original);
+    var plan = try compile(allocator, &closure, "artifact.json");
+    defer plan.deinit(allocator);
+    try std.testing.expect(plan.requires(.artifact_lifecycle));
+    try std.testing.expectEqual(@as(u16, 1), Operator.artifact_lifecycle.version());
+    try std.testing.expectEqual(@as(usize, 1), plan.lifecycle_plan.?.slots.len);
+    try std.testing.expectEqualStrings(original, closure.find("artifact.json").?.canonical_json);
+    try expectLifecycleDefinitionCache(&plan, .full);
+    try expectLifecycleDefinitionCache(&plan, .runtime_metadata);
+    var description: std.Io.Writer.Allocating = .init(allocator);
+    defer description.deinit();
+    try @import("envelope.zig").writeDefinitionDescriptionJson(&description.writer, &plan, .{});
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, description.written(), .{});
+    defer parsed.deinit();
+    const surface = parsed.value.object.get("lifecycle").?.object;
+    try std.testing.expectEqualStrings(lifecycle.schema, surface.get("schema").?.string);
+    try std.testing.expectEqual(
+        @as(i64, 64),
+        surface.get("bounds").?.object.get("max_holds_per_artifact").?.integer,
+    );
+    try std.testing.expect(!parsed.value.object.get("authority_granted").?.bool);
+}
+
+test "lifecycle definitions reject missing operators and inconsistent slot declarations" {
+    const allocator = std.testing.allocator;
+    const cases = [_]struct { before: []const u8, after: []const u8, err: anyerror }{
+        .{
+            .before = "\"artifact-lifecycle\",",
+            .after = "",
+            .err = error.UndeclaredArtifactOperator,
+        },
+        .{
+            .before = "\"input\":\"event\",\"pointer\"",
+            .after = "\"input\":\"payload\",\"pointer\"",
+            .err = error.InvalidLifecycleInput,
+        },
+        .{
+            .before = "\"source_slot\":\"events\"",
+            .after = "\"source_slot\":\"absent\"",
+            .err = error.UnknownLifecycleSlot,
+        },
+        .{
+            .before = "\"kind\":\"attachment\",\"codec\":\"bytes\"",
+            .after = "\"kind\":\"attachment\",\"codec\":\"json\"",
+            .err = error.AttachmentSlotRequiresBytes,
+        },
+        .{
+            .before = "\"kind\":\"attachment\",",
+            .after = "\"path\":\"chosen/by/owner\",\"kind\":\"attachment\",",
+            .err = error.UnknownField,
+        },
+    };
+    for (cases) |case| {
+        const bytes = try std.mem.replaceOwned(
+            u8,
+            allocator,
+            lifecycle_definition_json,
+            case.before,
+            case.after,
+        );
+        defer allocator.free(bytes);
+        var closure = try lifecycleTestClosure(bytes);
+        defer closure.deinit(allocator);
+        try std.testing.expectError(case.err, compile(allocator, &closure, "artifact.json"));
+    }
+}
+
+test "lifecycle operator gate applies without attachments or byte inputs" {
+    const allocator = std.testing.allocator;
+    const insertion =
+        "\"lifecycle\":{\"schema\":\"ledger-artifact-lifecycle/v1\",\"slots\":{}," ++
+        "\"references\":[],\"operations\":{},\"bounds\":{\"max_references_per_record\":0," ++
+        "\"max_effects_per_operation\":0,\"max_holds_per_artifact\":0}},\"bounds\":";
+    const bytes = try std.mem.replaceOwned(
+        u8,
+        allocator,
+        @embedFile("fixtures/event-definition.json"),
+        "\"bounds\":",
+        insertion,
+    );
+    defer allocator.free(bytes);
+    var closure = try lifecycleTestClosure(bytes);
+    defer closure.deinit(allocator);
+    try std.testing.expectError(
+        error.UndeclaredArtifactOperator,
+        compile(allocator, &closure, "artifact.json"),
+    );
+    const declared_bytes = try std.mem.replaceOwned(
+        u8,
+        allocator,
+        bytes,
+        "\"operators\":[",
+        "\"operators\":[\"artifact-lifecycle\",",
+    );
+    defer allocator.free(declared_bytes);
+    var declared_closure = try lifecycleTestClosure(declared_bytes);
+    defer declared_closure.deinit(allocator);
+    var plan = try compile(allocator, &declared_closure, "artifact.json");
+    defer plan.deinit(allocator);
+    try std.testing.expect(plan.lifecycle_plan.?.retentionForSlot("events") == .retain);
+}
+
+test "lifecycle attachment slot cache rejects ordinary path resolution" {
+    const allocator = std.testing.allocator;
+    var closure = try lifecycleTestClosure(lifecycle_definition_json);
+    defer closure.deinit(allocator);
+    var plan = try compile(allocator, &closure, "artifact.json");
+    defer plan.deinit(allocator);
+    var stored = try storage.compile(allocator, &plan);
+    defer stored.deinit(allocator);
+    var encoder = definition_core.cache.Encoder.init(allocator, 1024 * 1024);
+    defer encoder.deinit();
+    try storage.encodeCache(&stored, &encoder);
+    const bytes = try encoder.toOwnedSlice();
+    defer allocator.free(bytes);
+    var decoder = definition_core.cache.Decoder.init(bytes);
+    var decoded = try storage.decodeCache(allocator, &decoder);
+    defer decoded.deinit(allocator);
+    try decoder.finish();
+    try storage.validateCachePlan(&decoded, &plan);
+    const attachment = decoded.slots[decoded.findSlot("attachments").?];
+    try std.testing.expectEqual(storage.SlotKind.attachment, attachment.kind);
+    try std.testing.expectEqual(@as(usize, 0), attachment.relative_path.len);
+    var bindings = try definition_core.parameters.bind(
+        allocator,
+        &plan.parameter_declarations,
+        &.{},
+    );
+    defer bindings.deinit(allocator);
+    try std.testing.expectError(
+        error.AttachmentInstanceRequired,
+        storage.resolve(allocator, &decoded, &bindings),
+    );
+    try std.testing.expectError(
+        error.AttachmentInstanceRequired,
+        storage.resolveSlotPathAlloc(allocator, attachment, &bindings, &.{}),
+    );
+    try std.testing.expect(!storage.pathTemplateMatches(attachment, ".ledger"));
+}
+
+test "lifecycle byte inputs preserve exact digest and enforce declared length" {
+    const allocator = std.testing.allocator;
+    var closure = try lifecycleTestClosure(lifecycle_definition_json);
+    defer closure.deinit(allocator);
+    var plan = try compile(allocator, &closure, "artifact.json");
+    defer plan.deinit(allocator);
+    const validation = @import("validation.zig");
+    var validator = try validation.compile(allocator, &plan);
+    defer validator.deinit(allocator);
+    const payload = "\xff\x00\x80\xfe";
+    var execution = try validation.execute(allocator, &validator, &.{
+        .{ .name = "event", .bytes = "{}" },
+        .{ .name = "payload", .bytes = payload },
+    });
+    defer execution.deinit();
+    try std.testing.expect(execution.isValid());
+    const digest = try definition_core.canonical_json.digestBytesAlloc(allocator, payload);
+    defer allocator.free(digest);
+    try std.testing.expectEqualStrings(digest, execution.inputDigest("payload").?);
+    var too_large = try validation.execute(allocator, &validator, &.{
+        .{ .name = "event", .bytes = "{}" },
+        .{ .name = "payload", .bytes = "12345" },
+    });
+    defer too_large.deinit();
+    try std.testing.expect(!too_large.isValid());
+    try std.testing.expect(too_large.inputDigest("payload") == null);
+}
+
+fn lifecycleCompileAllocationProbe(
+    allocator: std.mem.Allocator,
+    closure: *const definition_core.Closure,
+) !void {
+    var plan = compile(allocator, closure, "artifact.json") catch |err| switch (err) {
+        error.WriteFailed => return error.OutOfMemory,
+        else => return err,
+    };
+    defer plan.deinit(allocator);
+}
+
+test "lifecycle definition ownership unwinds allocation failures" {
+    var closure = try lifecycleTestClosure(lifecycle_definition_json);
+    defer closure.deinit(std.testing.allocator);
+    try @import("test_support").checkAllAllocationFailures(
+        std.testing.allocator,
+        lifecycleCompileAllocationProbe,
+        .{&closure},
+    );
 }
 
 test "artifact definition rejects executable hooks" {

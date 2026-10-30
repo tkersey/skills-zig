@@ -86,6 +86,10 @@ pub fn writeDefinitionDescriptionJson(
     try writeDescriptionNames(writer, plan);
     try writeDescriptionBounds(writer, plan);
     try writeCompileStatsJson(writer, compile_stats);
+    if (plan.lifecycle_json) |bytes| {
+        try writer.writeAll(",\"lifecycle\":");
+        try writer.writeAll(bytes);
+    }
     try writer.writeAll(
         ",\"passive\":true,\"authority_granted\":false}",
     );

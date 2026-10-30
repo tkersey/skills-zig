@@ -66,6 +66,29 @@ pub fn unsigned(value: std.json.Value) !usize {
     return std.math.cast(usize, number) orelse error.ExpectedUnsigned;
 }
 
+pub fn unsigned64(value: std.json.Value) !u64 {
+    if (value == .integer) return std.math.cast(u64, value.integer) orelse error.ExpectedUnsigned;
+    const text = switch (value) {
+        .number_string => |text| text,
+        else => return error.ExpectedInteger,
+    };
+    const number = exact_number.parse(text) orelse return error.ExpectedInteger;
+    if (number.negative) return error.ExpectedUnsigned;
+    if (number.significant_len == 0) return 0;
+    if (number.scale < 0) return error.ExpectedInteger;
+    const zeros = std.math.cast(usize, number.scale) orelse return error.ExpectedUnsigned;
+    const digits = std.math.add(usize, number.significant_len, zeros) catch
+        return error.ExpectedUnsigned;
+    if (digits > 20) return error.ExpectedUnsigned;
+    var result: u64 = 0;
+    for (0..digits) |index| {
+        const digit: u64 = if (index < number.significant_len) number.digit(index) - '0' else 0;
+        result = std.math.mul(u64, result, 10) catch return error.ExpectedUnsigned;
+        result = std.math.add(u64, result, digit) catch return error.ExpectedUnsigned;
+    }
+    return result;
+}
+
 pub fn requireExactKeys(map: std.json.ObjectMap, allowed: []const []const u8) !void {
     var iterator = map.iterator();
     while (iterator.next()) |entry| {

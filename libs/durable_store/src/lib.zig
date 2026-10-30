@@ -6,6 +6,23 @@ const fs_authority = @import("fs_authority.zig");
 const record_codec = @import("record_codec.zig");
 const filesystem = @import("filesystem.zig");
 const transactions = @import("transactions.zig");
+const reservations = @import("reservations.zig");
+
+pub const ReservationBudget = reservations.Budget;
+pub const ReservationCharge = reservations.Charge;
+pub const ReservationPolicy = reservations.Policy;
+pub const ReservationStore = reservations.Store;
+pub const ReservationRequest = reservations.Request;
+pub const ReservationReceipt = reservations.Receipt;
+pub const ReservationSnapshot = reservations.Snapshot;
+pub const ReservationDependencyOptions = reservations.DependencyOptions;
+pub const ReservationDependencyEvidence = reservations.DependencyEvidence;
+pub const ReservationDependencySnapshot = reservations.DependencySnapshot;
+pub const ReservationFreeSpaceObservation = reservations.FreeSpaceObservation;
+pub const ReservationCommitOptions = reservations.CommitOptions;
+pub const ReservationTargetClass = reservations.TargetClass;
+pub const ReservationTargetClassification = reservations.TargetClassification;
+pub const ReservedTransactionReceipt = transactions.ControlledTransactionReceipt;
 
 const staged_file = @import("staged_file.zig");
 pub const PublicationOutcome = staged_file.PublicationOutcome;
@@ -14,6 +31,9 @@ pub const publishReplacement = staged_file.publishReplacement;
 pub const publishCreateNew = staged_file.publishCreateNew;
 pub const PrivateDirectory = @import("private_directory.zig").PrivateDirectory;
 pub const Fs = fs_authority.Fs;
+pub const OpenDirectoryIdentity = filesystem.OpenDirectoryIdentity;
+pub const openDirectoryIdentity = filesystem.openDirectoryIdentity;
+pub const openRegularFileNoSymlink = filesystem.openRegularFileNoSymlink;
 pub const JsonlIssue = record_codec.JsonlIssue;
 pub const JsonlValidation = record_codec.JsonlValidation;
 pub const EventRecord = event.EventRecord;
@@ -69,6 +89,22 @@ pub const readJsonlSnapshot = transactions.readJsonlSnapshot;
 pub const commitJsonlSnapshotCas = transactions.commitJsonlSnapshotCas;
 pub const commitTextTransaction = transactions.commitTextTransaction;
 pub const inspectTransaction = transactions.inspectTransaction;
+pub const TransactionDependency = transactions.TransactionDependency;
+pub const TransactionDependencies = transactions.TransactionDependencies;
+pub const enumerateTransactionDependencies = transactions.enumerateTransactionDependencies;
+pub const inspectTransactionDependencies = transactions.inspectTransactionDependencies;
+pub const TransactionDependencyLimits = transactions.TransactionDependencyLimits;
+pub const TransactionDependencyLocation = transactions.TransactionDependencyLocation;
+pub const ensureTransactionDependencyCoordination =
+    transactions.ensureTransactionDependencyCoordination;
+pub const TransactionDependencySnapshot = transactions.TransactionDependencySnapshot;
+pub const TransactionPublicationCustody = transactions.TransactionPublicationCustody;
+pub const snapshotTransactionDependencies = transactions.snapshotTransactionDependencies;
+pub const snapshotTransactionDependenciesAt = transactions.snapshotTransactionDependenciesAt;
+pub const transaction_dependency_max_selected_paths =
+    transactions.transaction_dependency_max_selected_paths;
+pub const transaction_dependency_max_journal_bytes =
+    transactions.transaction_dependency_max_journal_bytes;
 pub const inspectLegacyLeaseRecoveryCandidates = transactions.inspectLegacyLeaseRecoveryCandidates;
 pub const deinitLegacyLeaseRecoveryCandidates = transactions.deinitLegacyLeaseRecoveryCandidates;
 pub const reclaimLegacyLease = transactions.reclaimLegacyLease;
@@ -87,6 +123,7 @@ pub const eventStoreLockPathAlloc = filesystem.eventStoreLockPathAlloc;
 pub const rejectCasControlTargetPath = filesystem.rejectCasControlTargetPath;
 pub const CasReadLockPair = filesystem.CasReadLockPair;
 pub const acquireCasReadLockPair = filesystem.acquireCasReadLockPair;
+pub const acquireCasAdvisoryLockObserved = filesystem.acquireCasAdvisoryLockObserved;
 pub const casAdvisoryLockExists = filesystem.casAdvisoryLockExists;
 pub const fileExists = filesystem.fileExists;
 pub const fileSize = filesystem.fileSize;
@@ -131,4 +168,5 @@ test {
     _ = @import("record_codec.zig");
     _ = @import("filesystem.zig");
     _ = @import("transactions.zig");
+    _ = @import("reservations.zig");
 }

@@ -13,6 +13,7 @@ const replay = @import("replay.zig");
 const revision_archive = @import("revision_archive.zig");
 const segmented_event_log = @import("segmented_event_log.zig");
 const storage = @import("storage.zig");
+const storage_preparation = @import("storage_preparation.zig");
 const validation = @import("validation.zig");
 
 const recovery_lock_retry_interval_ms: i64 = 25;
@@ -296,10 +297,7 @@ const TransactionPaths = struct {
         repo_root: []const u8,
         require_revisions: bool,
     ) !TransactionPaths {
-        const ledger_root = try std.fs.path.join(
-            allocator,
-            &.{ repo_root, storage_root.controlComponent(scope) },
-        );
+        const ledger_root = try storage_root.controlPathAlloc(scope, allocator, repo_root);
         errdefer allocator.free(ledger_root);
         const paths: TransactionPaths = .{
             .ledger_root = ledger_root,
@@ -1311,22 +1309,18 @@ fn prepareExistingBinding(
         source.content.bytes,
         parameters,
     );
-    const replay_parameter_names = try replayParameterNamesAlloc(
-        allocator,
-        event_protocol,
-        effect.slot_index,
-    );
-    defer allocator.free(replay_parameter_names);
     const binding_after = try appendExistingBindingAlloc(
         allocator,
         definition_plan,
         slot,
         operation_name,
-        &source,
+        if (effect.kind == .rebind_existing) "" else source.before.bytes,
+        source.slot_digest,
+        source.content.bytes.len,
         record_count,
         parameters,
-        replay_parameter_names,
-        effect.kind == .rebind_existing,
+        event_protocol,
+        effect.slot_index,
     );
     errdefer allocator.free(binding_after);
     const binding_before_digest = try optionalDupe(allocator, source.before.digest);
@@ -1350,29 +1344,37 @@ fn appendExistingBindingAlloc(
     definition_plan: *const definition.Plan,
     slot: storage.ResolvedSlot,
     operation_name: []const u8,
-    source: *const ExistingBindingSource,
+    before: []const u8,
+    content_digest: []const u8,
+    content_len: usize,
     record_count: ?usize,
     parameters: *const definition_core.parameters.Bindings,
-    replay_parameter_names: []const []const u8,
-    replace_stale: bool,
+    event_protocol: ?*const protocol.Plan,
+    slot_index: u16,
 ) ![]u8 {
+    const replay_parameter_names = try replayParameterNamesAlloc(
+        allocator,
+        event_protocol,
+        slot_index,
+    );
+    defer allocator.free(replay_parameter_names);
     return custody.appendBindingRowAlloc(
         allocator,
-        if (replace_stale) "" else source.before.bytes,
+        before,
         definition_plan,
         slot,
         operation_name,
-        source.slot_digest,
-        source.slot_digest,
+        content_digest,
+        content_digest,
         .{
             .kind = .existing_store_binding,
             .record_start = if (record_count) |_| 0 else null,
             .record_end = record_count,
             .extent_start = 0,
-            .extent_end = source.content.bytes.len,
+            .extent_end = content_len,
         },
         null,
-        source.slot_digest,
+        content_digest,
         null,
         parameters,
         replay_parameter_names,
@@ -1494,6 +1496,95 @@ fn bindingSourceMaxBytes(slot: storage.ResolvedSlot) usize {
         segmented_event_log.legacy_event_max_bytes
     else
         slot.max_bytes;
+}
+
+pub fn validateUnboundContent(
+    allocator: std.mem.Allocator,
+    definition_plan: *const definition.Plan,
+    validation_plan: *const validation.Plan,
+    effect: storage.Effect,
+    slot: storage.ResolvedSlot,
+    event_protocol: ?*const protocol.Plan,
+    content: []const u8,
+    parameters: *const definition_core.parameters.Bindings,
+) !?usize {
+    if (effect.kind != .bind_existing) return error.PreparationRequiresBindExisting;
+    if (content.len > bindingSourceMaxBytes(slot)) return error.FileTooBig;
+    return validateExistingContent(
+        allocator,
+        definition_plan,
+        validation_plan,
+        effect,
+        slot,
+        event_protocol,
+        effect.slot_index,
+        content,
+        parameters,
+    );
+}
+
+pub fn renderUnboundBinding(
+    allocator: std.mem.Allocator,
+    definition_plan: *const definition.Plan,
+    validation_plan: *const validation.Plan,
+    effect: storage.Effect,
+    slot: storage.ResolvedSlot,
+    event_protocol: ?*const protocol.Plan,
+    operation_name: []const u8,
+    content: []const u8,
+    parameters: *const definition_core.parameters.Bindings,
+) ![]u8 {
+    const record_count = try validateUnboundContent(
+        allocator,
+        definition_plan,
+        validation_plan,
+        effect,
+        slot,
+        event_protocol,
+        content,
+        parameters,
+    );
+    const digest = try definition_core.canonical_json.digestBytesAlloc(allocator, content);
+    defer allocator.free(digest);
+    return appendExistingBindingAlloc(
+        allocator,
+        definition_plan,
+        slot,
+        operation_name,
+        "",
+        digest,
+        content.len,
+        record_count,
+        parameters,
+        event_protocol,
+        effect.slot_index,
+    );
+}
+
+pub fn unboundBindingSizeBound(
+    allocator: std.mem.Allocator,
+    definition_plan: *const definition.Plan,
+    slot: storage.ResolvedSlot,
+    operation_name: []const u8,
+    parameters: *const definition_core.parameters.Bindings,
+    event_protocol: ?*const protocol.Plan,
+    slot_index: u16,
+) !usize {
+    const bytes = try appendExistingBindingAlloc(
+        allocator,
+        definition_plan,
+        slot,
+        operation_name,
+        "",
+        &definition_plan.closure_digest,
+        slot.max_bytes,
+        if (slot.kind == .event_log) definition_plan.bounds.max_records else null,
+        parameters,
+        event_protocol,
+        slot_index,
+    );
+    defer allocator.free(bytes);
+    return bytes.len;
 }
 
 fn validateExistingContent(
@@ -6567,6 +6658,126 @@ test "historical replay uses the parameter names archived with each row" {
     try std.testing.expect(second.storage_mutated);
 }
 
+fn optionalStaticPartitionDefinitionAlloc(allocator: std.mem.Allocator) ![]u8 {
+    const optional = try std.mem.replaceOwned(
+        u8,
+        allocator,
+        renamed_partition_definition,
+        "\"required\":true",
+        "\"required\":false",
+    );
+    defer allocator.free(optional);
+    const static_path = try std.mem.replaceOwned(
+        u8,
+        allocator,
+        optional,
+        "example/{stream}/renamed.jsonl",
+        "example/renamed.jsonl",
+    );
+    defer allocator.free(static_path);
+    const declared = try std.mem.replaceOwned(
+        u8,
+        allocator,
+        static_path,
+        "\"body-digest\"",
+        "\"bind-existing\",\"body-digest\"",
+    );
+    defer allocator.free(declared);
+    return std.mem.replaceOwned(
+        u8,
+        allocator,
+        declared,
+        "\"operations\":{",
+        "\"operations\":{\"bind-existing\":{\"effects\":[{" ++
+            "\"op\":\"bind-existing\",\"slot\":\"events\",\"input\":\"event\"}]},",
+    );
+}
+
+fn expectArchivedPartitionInstallationCharge(plans: *const TransactionTestPlans) !void {
+    const allocator = std.testing.allocator;
+    const bundle = @import("storage_bundle.zig");
+    const admission = @import("storage_admission.zig");
+    var parameters = try plans.bind(&.{});
+    defer parameters.deinit(allocator);
+    try std.testing.expectEqual(@as(usize, 0), parameters.items.len);
+    var source = try storage_root.SourceRoot.open(allocator, std.testing.io, plans.repo_root, null);
+    defer source.deinit();
+    var selected = try storage_preparation.DeclaredSnapshot.load(
+        allocator,
+        &source,
+        &plans.definition_plan,
+        &plans.storage_plan,
+        &parameters,
+        1024 * 1024,
+    );
+    defer selected.deinit(allocator);
+    try std.testing.expect(selected.slots[0].binding.exists);
+    const target: bundle.Target = .{ .store_id = "target", .generation = "before" };
+    const limits: bundle.Limits = .{ .payload_bytes = 1024 * 1024 };
+    var captured = try bundle.captureDeclared(allocator, &selected, .{
+        .closure = &plans.closure,
+        .entry_path = plans.entry_path,
+        .target = target,
+        .limits = limits,
+    });
+    defer captured.deinit();
+    var candidate = try admission.prepare(allocator, &captured, &parameters, .{ .limits = limits });
+    defer candidate.deinit();
+    try std.testing.expectEqual(@as(usize, 1), candidate.records_validated);
+    const binding_path = try custody.bindingRelativePathAlloc(allocator, "example/renamed.jsonl");
+    defer allocator.free(binding_path);
+    var preserved = false;
+    for (candidate.files) |file| {
+        if (!std.mem.eql(u8, file.path, binding_path)) continue;
+        try std.testing.expectEqualStrings(selected.slots[0].binding.bytes, file.content.?);
+        preserved = true;
+    }
+    try std.testing.expect(preserved);
+    const charge = try admission.installationCharge(
+        allocator,
+        &plans.definition_plan,
+        &plans.storage_plan,
+        &parameters,
+        target,
+        limits,
+    );
+    try std.testing.expect(charge.logical_total >= captured.payload_bytes);
+}
+
+test "installation sizing accepts bound history with archived optional partition parameters" {
+    const allocator = std.testing.allocator;
+    var scope = storage_root.Scope.init(durable_store.Fs.init(std.testing.io, std.Io.Dir.cwd()));
+    const source = try optionalStaticPartitionDefinitionAlloc(allocator);
+    defer allocator.free(source);
+    var plans = try TransactionTestPlans.init(&scope, source, "optional-partition.json");
+    defer plans.deinit();
+    var event_protocol = (try protocol.compile(
+        allocator,
+        &plans.definition_plan,
+        &plans.storage_plan,
+    )).?;
+    defer event_protocol.deinit(allocator);
+    var parameters = try plans.bind(&.{.{ .name = "stream", .raw_value = "alpha" }});
+    defer parameters.deinit(allocator);
+    var event = try chainedEventAlloc(
+        allocator,
+        1,
+        "created",
+        null,
+        "{\"partition_id\":\"alpha\",\"status\":\"open\"}",
+    );
+    defer event.deinit(allocator);
+    var appended = try plans.execute(
+        &event_protocol,
+        "append",
+        &.{.{ .name = "event", .bytes = event.bytes }},
+        &parameters,
+    );
+    defer appended.deinit(allocator);
+    try std.testing.expect(appended.storage_mutated);
+    try expectArchivedPartitionInstallationCharge(&plans);
+}
+
 const document_history_definition =
     "{\"schema\":\"ledger-artifact-definition/v1\"," ++
     "\"id\":\"example/document-history\",\"owner\":\"example\",\"requires\":{" ++
@@ -6760,6 +6971,7 @@ fn expectDocumentReplayAndCorruption(
     try std.testing.expectEqual(@as(usize, 1), stats.records_validated);
     try std.testing.expectEqual(@as(usize, 1), stats.definition_versions);
     try std.testing.expectEqualStrings("{\"value\":2}", snapshot.content);
+    try expectDocumentDependencies(scope, plans, resolved.slot(0), &snapshot);
     try corruptDocumentRevision(scope, plans, &snapshot);
     try std.testing.expectError(
         error.RevisionArchiveDigestMismatch,
@@ -6784,6 +6996,52 @@ fn expectDocumentReplayAndCorruption(
             false,
         ),
     );
+}
+
+const DocumentDependencyProbe = struct {
+    definition_digest: []const u8,
+    revision_digest: []const u8,
+    revision_max_bytes: usize,
+    definitions: usize = 0,
+    revisions: usize = 0,
+
+    pub fn visit(self: *DocumentDependencyProbe, dependency: replay.Dependency) !void {
+        switch (dependency) {
+            .definition_closure => |digest| {
+                try std.testing.expectEqualStrings(self.definition_digest, digest);
+                self.definitions += 1;
+            },
+            .revision => |revision| {
+                try std.testing.expectEqualStrings(self.revision_digest, revision.digest);
+                try std.testing.expectEqual(self.revision_max_bytes, revision.max_bytes);
+                self.revisions += 1;
+            },
+        }
+    }
+};
+
+fn expectDocumentDependencies(
+    scope: *storage_root.Scope,
+    plans: *const TransactionTestPlans,
+    slot: storage.ResolvedSlot,
+    snapshot: *const custody.SlotSnapshot,
+) !void {
+    var dependencies = DocumentDependencyProbe{
+        .definition_digest = &plans.definition_plan.closure_digest,
+        .revision_digest = snapshot.binding.rows[1].revision_before.?,
+        .revision_max_bytes = slot.max_bytes,
+    };
+    try replay.visitBindingDependencies(
+        scope,
+        std.testing.allocator,
+        plans.repo_root,
+        plans.definition_plan.id,
+        slot,
+        snapshot.binding.rows,
+        &dependencies,
+    );
+    try std.testing.expectEqual(@as(usize, 2), dependencies.definitions);
+    try std.testing.expectEqual(@as(usize, 1), dependencies.revisions);
 }
 
 fn corruptDocumentRevision(
@@ -6837,6 +7095,153 @@ test "document replacements replay from immutable prior revisions" {
         &parameters,
         &duplicate_parameters,
     );
+}
+
+fn inspectDocumentRestoration(
+    plans: *const TransactionTestPlans,
+    parameters: *const definition_core.parameters.Bindings,
+    bytes: []const u8,
+) !storage_preparation.Restoration {
+    var resolved = try storage.resolve(std.testing.allocator, &plans.storage_plan, parameters);
+    defer resolved.deinit(std.testing.allocator);
+    return storage_preparation.inspectRestoration(
+        plans.scope,
+        std.testing.allocator,
+        &plans.definition_plan,
+        plans.repo_root,
+        resolved.slot(0),
+        parameters,
+        bytes,
+        false,
+    );
+}
+
+fn restoreDocumentFixture(plans: *const TransactionTestPlans) !definition_core.parameters.Bindings {
+    var parameters = try plans.bind(&.{.{ .name = "request", .raw_value = "replace-once" }});
+    errdefer parameters.deinit(std.testing.allocator);
+    var replaced = try createAndReplaceDocument(plans, &parameters);
+    defer replaced.deinit(std.testing.allocator);
+    const path = try std.fs.path.join(
+        std.testing.allocator,
+        &.{
+            plans.repo_root,
+            storage_root.controlComponent(plans.scope),
+            plans.storage_plan.slots[0].relative_path,
+        },
+    );
+    defer std.testing.allocator.free(path);
+    try plans.scope.fs.directory().deleteFile(plans.scope.fs.io, path);
+    return parameters;
+}
+
+test "preparation restores exact bound bytes through native transaction without rebinding" {
+    var scope = storage_root.Scope.init(.init(std.testing.io, std.Io.Dir.cwd()));
+    var plans = try TransactionTestPlans.init(&scope, document_history_definition, "document.json");
+    defer plans.deinit();
+    var parameters = try restoreDocumentFixture(&plans);
+    defer parameters.deinit(std.testing.allocator);
+    try std.testing.expectError(
+        error.StoreBindingRevisionMismatch,
+        inspectDocumentRestoration(&plans, &parameters, "{\"value\":9}"),
+    );
+    var restoration = try inspectDocumentRestoration(&plans, &parameters, "{\"value\":2}");
+    defer restoration.deinit(std.testing.allocator);
+    try std.testing.expect(!restoration.candidate.exists);
+    try std.testing.expectEqual(@as(usize, 1), restoration.records_validated);
+    const mutations = restoration.releaseForPublication();
+    var paths = try TransactionPaths.init(&scope, std.testing.allocator, plans.repo_root, false);
+    defer paths.deinit(std.testing.allocator);
+    const transaction_id = try commitMutationsAlloc(
+        &scope,
+        std.testing.allocator,
+        &paths,
+        &mutations,
+    );
+    defer std.testing.allocator.free(transaction_id);
+    try expectRestoredDocument(&plans, &parameters, &restoration);
+    try std.testing.expectError(
+        error.RestorationTargetPresent,
+        inspectDocumentRestoration(&plans, &parameters, "{\"value\":2}"),
+    );
+}
+
+fn expectRestoredDocument(
+    plans: *const TransactionTestPlans,
+    parameters: *const definition_core.parameters.Bindings,
+    restoration: *const storage_preparation.Restoration,
+) !void {
+    var resolved = try storage.resolve(std.testing.allocator, &plans.storage_plan, parameters);
+    defer resolved.deinit(std.testing.allocator);
+    var snapshot = try custody.readSlot(
+        plans.scope,
+        std.testing.allocator,
+        plans.repo_root,
+        plans.definition_plan.id,
+        resolved.slot(0),
+    );
+    defer snapshot.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("{\"value\":2}", snapshot.content);
+    try std.testing.expectEqualStrings(restoration.candidate.binding.bytes, snapshot.binding.bytes);
+    var stats = try replay.validateSlot(
+        plans.scope,
+        std.testing.allocator,
+        plans.repo_root,
+        plans.definition_plan.id,
+        resolved.slot(0),
+        &snapshot,
+        parameters,
+        plans.definition_plan.bounds.max_records,
+        false,
+    );
+    defer stats.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 1), stats.records_validated);
+}
+
+test "preparation restoration refuses intervening slot and binding changes" {
+    for ([_]bool{ false, true }) |change_binding| {
+        var scope = storage_root.Scope.init(.init(std.testing.io, std.Io.Dir.cwd()));
+        var plans = try TransactionTestPlans.init(
+            &scope,
+            document_history_definition,
+            "document.json",
+        );
+        defer plans.deinit();
+        var parameters = try restoreDocumentFixture(&plans);
+        defer parameters.deinit(std.testing.allocator);
+        var restoration = try inspectDocumentRestoration(&plans, &parameters, "{\"value\":2}");
+        defer restoration.deinit(std.testing.allocator);
+        const mutations = restoration.releaseForPublication();
+        const changed_path = if (change_binding)
+            restoration.binding_path
+        else
+            restoration.candidate.path;
+        try durable_store.writeTextAtomic(scope.fs, std.testing.allocator, changed_path, "changed");
+        var paths = try TransactionPaths.init(
+            &scope,
+            std.testing.allocator,
+            plans.repo_root,
+            false,
+        );
+        defer paths.deinit(std.testing.allocator);
+        try std.testing.expectError(
+            if (change_binding) error.DigestMismatch else error.ExpectationMismatch,
+            commitMutationsAlloc(&scope, std.testing.allocator, &paths, &mutations),
+        );
+        const observed = try durable_store.readRegularFileNoSymlink(
+            scope.fs,
+            std.testing.allocator,
+            changed_path,
+            1024,
+        );
+        defer std.testing.allocator.free(observed);
+        try std.testing.expectEqualStrings("changed", observed);
+        if (change_binding) {
+            try std.testing.expectError(
+                error.FileNotFound,
+                scope.fs.directory().statFile(scope.fs.io, restoration.candidate.path, .{}),
+            );
+        }
+    }
 }
 
 const replaced_event_log_definition =
@@ -7017,6 +7422,188 @@ test "transaction fails closed for an unbound existing store" {
             &parameters,
         ),
     );
+}
+
+fn validatePreparationTestContent(
+    plans: *const TransactionTestPlans,
+    parameters: *const definition_core.parameters.Bindings,
+    effect: storage.Effect,
+    slot: storage.ResolvedSlot,
+    bytes: []const u8,
+) !?usize {
+    return validateUnboundContent(
+        std.testing.allocator,
+        &plans.definition_plan,
+        &plans.validation_plan,
+        effect,
+        slot,
+        null,
+        bytes,
+        parameters,
+    );
+}
+
+fn renderPreparationTestBinding(
+    plans: *const TransactionTestPlans,
+    parameters: *const definition_core.parameters.Bindings,
+    effect: storage.Effect,
+    slot: storage.ResolvedSlot,
+    content: []const u8,
+) ![]u8 {
+    return renderUnboundBinding(
+        std.testing.allocator,
+        &plans.definition_plan,
+        &plans.validation_plan,
+        effect,
+        slot,
+        null,
+        "bind-existing",
+        content,
+        parameters,
+    );
+}
+
+test "preparation binding renderer matches native bind existing exact bytes" {
+    const allocator = std.testing.allocator;
+    var scope_storage = storage_root.Scope.init(.init(std.testing.io, std.Io.Dir.cwd()));
+    var plans = try TransactionTestPlans.init(
+        &scope_storage,
+        plain_event_definition,
+        "artifact.json",
+    );
+    defer plans.deinit();
+    var parameters = try plans.bind(&.{});
+    defer parameters.deinit(allocator);
+    var resolved = try storage.resolve(allocator, &plans.storage_plan, &parameters);
+    defer resolved.deinit(allocator);
+    const effect = resolved.findOperation("bind-existing").?.effects[0];
+    const slot = resolved.slot(effect.slot_index);
+    const content = plain_event_existing_noncanonical ++ "\n";
+    const rendered = try renderPreparationTestBinding(&plans, &parameters, effect, slot, content);
+    defer allocator.free(rendered);
+    try std.testing.expectError(error.FileNotFound, plans.repo_tmp.dir.statFile(
+        std.testing.io,
+        ".ledger",
+        .{ .follow_symlinks = false },
+    ));
+    try plans.repo_tmp.dir.createDirPath(std.testing.io, ".ledger/example");
+    try plans.repo_tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = ".ledger/example/plain-events.jsonl",
+        .data = content,
+    });
+    var result = try plans.execute(null, "bind-existing", &.{}, &parameters);
+    defer result.deinit(allocator);
+    try std.testing.expect(result.storage_mutated);
+    try std.testing.expectEqualStrings("bound", result.effects[0].result);
+    const path = try custody.bindingPathAlloc(
+        &scope_storage,
+        allocator,
+        plans.repo_root,
+        slot.relative_path,
+    );
+    defer allocator.free(path);
+    const committed = try durable_store.readRegularFileNoSymlink(
+        scope_storage.fs,
+        allocator,
+        path,
+        custody.binding_max_bytes,
+    );
+    defer allocator.free(committed);
+    try std.testing.expectEqualStrings(committed, rendered);
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, rendered, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqual(@as(i64, 1), parsed.value.object.get("record_end").?.integer);
+    try std.testing.expectEqual(
+        @as(i64, @intCast(content.len)),
+        parsed.value.object.get("extent_end").?.integer,
+    );
+    const digest = try definition_core.canonical_json.digestBytesAlloc(allocator, content);
+    defer allocator.free(digest);
+    try std.testing.expectEqualStrings(digest, parsed.value.object.get("revision_after").?.string);
+    try std.testing.expectEqualStrings(
+        digest,
+        parsed.value.object.get("canonical_input_digest").?.string,
+    );
+}
+
+test "preparation binding renderer rejects invalid content and rebind" {
+    const allocator = std.testing.allocator;
+    var scope_storage = storage_root.Scope.init(.init(std.testing.io, std.Io.Dir.cwd()));
+    var plans = try TransactionTestPlans.init(
+        &scope_storage,
+        @embedFile("fixtures/event-definition.json"),
+        "artifact.json",
+    );
+    defer plans.deinit();
+    var parameters = try plans.bind(&.{});
+    defer parameters.deinit(allocator);
+    var resolved = try storage.resolve(allocator, &plans.storage_plan, &parameters);
+    defer resolved.deinit(allocator);
+    const effect = resolved.findOperation("bind-existing").?.effects[0];
+    const slot = resolved.slot(effect.slot_index);
+    try std.testing.expectError(
+        error.ExistingStoreValidationFailed,
+        renderPreparationTestBinding(&plans, &parameters, effect, slot, "{}\n"),
+    );
+    var rebind = effect;
+    rebind.kind = .rebind_existing;
+    try std.testing.expectError(
+        error.PreparationRequiresBindExisting,
+        renderPreparationTestBinding(
+            &plans,
+            &parameters,
+            rebind,
+            slot,
+            "{\"kind\":\"existing\",\"value\":1}\n",
+        ),
+    );
+}
+
+test "preparation unbound validation uses bind existing law and rejects rebind" {
+    const allocator = std.testing.allocator;
+    var scope_storage = storage_root.Scope.init(.init(std.testing.io, std.Io.Dir.cwd()));
+    var plans = try TransactionTestPlans.init(
+        &scope_storage,
+        @embedFile("fixtures/event-definition.json"),
+        "artifact.json",
+    );
+    defer plans.deinit();
+    var parameters = try plans.bind(&.{});
+    defer parameters.deinit(allocator);
+    var resolved = try storage.resolve(allocator, &plans.storage_plan, &parameters);
+    defer resolved.deinit(allocator);
+    const effect = resolved.findOperation("bind-existing").?.effects[0];
+    const slot = resolved.slot(effect.slot_index);
+    const bytes = "{\"kind\":\"existing\",\"value\":1}\n";
+    const count = try validatePreparationTestContent(&plans, &parameters, effect, slot, bytes);
+    try std.testing.expectEqual(@as(?usize, 1), count);
+    try std.testing.expectError(
+        error.ExistingStoreValidationFailed,
+        validatePreparationTestContent(&plans, &parameters, effect, slot, "{}\n"),
+    );
+    try std.testing.expectError(
+        error.ExistingStoreEmpty,
+        validatePreparationTestContent(&plans, &parameters, effect, slot, ""),
+    );
+    var bounded = slot;
+    bounded.max_bytes = bytes.len - 1;
+    try std.testing.expectError(
+        error.FileTooBig,
+        validatePreparationTestContent(&plans, &parameters, effect, bounded, bytes),
+    );
+    var invalid = effect;
+    for ([_]storage.EffectKind{ .rebind_existing, .compare_append }) |kind| {
+        invalid.kind = kind;
+        try std.testing.expectError(
+            error.PreparationRequiresBindExisting,
+            validatePreparationTestContent(&plans, &parameters, invalid, slot, bytes),
+        );
+    }
+    try std.testing.expectError(error.FileNotFound, plans.repo_tmp.dir.statFile(
+        std.testing.io,
+        ".ledger",
+        .{ .follow_symlinks = false },
+    ));
 }
 
 const content_idempotency_definition =

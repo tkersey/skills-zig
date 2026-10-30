@@ -2330,7 +2330,7 @@ fn writeCapabilityOperators(writer: *std.Io.Writer) !void {
 
 fn writeCapabilityTail(writer: *std.Io.Writer) !void {
     try writer.writeAll(
-        "],\"codecs\":[\"json\",\"jsonl\",\"text\"]," ++
+        "],\"codecs\":[\"json\",\"jsonl\",\"text\",\"bytes\"]," ++
             "\"storage_adapters\":[\"pure\",\"addressed-document\",\"event-log\"]," ++
             "\"features\":{\"bounded_checkpoint_replay_v1\":true," ++
             "\"full_history_doctor_v1\":true," ++
@@ -2349,7 +2349,10 @@ fn writeCapabilityTail(writer: *std.Io.Writer) !void {
             "\"max_historical_definition_bytes\":{d}," ++
             "\"max_historical_definition_versions\":{d}," ++
             "\"max_projection_table_cells\":{d}," ++
-            "\"max_projection_table_columns\":{d}}}," ++
+            "\"max_projection_table_columns\":{d}," ++
+            "\"max_lifecycle_slots\":{d},\"max_lifecycle_references\":{d}," ++
+            "\"max_references_per_record\":{d},\"max_lifecycle_effects_per_operation\":{d}," ++
+            "\"max_holds_per_artifact\":{d},\"max_lifecycle_grace_seconds\":{d}}}," ++
             "\"result_schemas\":[\"ledger-capabilities/v1\"," ++
             "\"ledger-command-error/v1\"," ++
             "\"ledger-storage-root-error/v1\"," ++
@@ -2371,6 +2374,12 @@ fn writeCapabilityTail(writer: *std.Io.Writer) !void {
             ledger.replay.max_historical_definition_versions,
             max_projection_table_cells,
             max_projection_table_columns,
+            ledger.lifecycle.max_slots,
+            ledger.lifecycle.max_references,
+            ledger.lifecycle.max_references_per_record,
+            ledger.lifecycle.max_effects_per_operation,
+            ledger.lifecycle.max_holds_per_artifact,
+            ledger.lifecycle.max_grace_seconds,
         },
     );
 }
@@ -2535,6 +2544,36 @@ fn isHelp(token: []const u8) bool {
 
 fn isOnlyHelp(argv: []const []const u8) bool {
     return argv.len == 1 and isHelp(argv[0]);
+}
+
+test "capabilities advertise lifecycle operator and exact native parser bounds" {
+    const allocator = std.testing.allocator;
+    var output: std.Io.Writer.Allocating = .init(allocator);
+    defer output.deinit();
+    try emitCapabilitiesJson(&output.writer);
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, output.written(), .{});
+    defer parsed.deinit();
+    const root = parsed.value.object;
+    var found = false;
+    for (root.get("operators").?.array.items) |operator| {
+        if (!std.mem.eql(u8, operator.object.get("id").?.string, "artifact-lifecycle")) continue;
+        try std.testing.expectEqual(@as(i64, 1), operator.object.get("version").?.integer);
+        found = true;
+    }
+    try std.testing.expect(found);
+    const bounds = root.get("bounds").?.object;
+    try std.testing.expectEqual(@as(i64, 256), bounds.get("max_lifecycle_slots").?.integer);
+    try std.testing.expectEqual(@as(i64, 256), bounds.get("max_lifecycle_references").?.integer);
+    try std.testing.expectEqual(@as(i64, 4096), bounds.get("max_references_per_record").?.integer);
+    try std.testing.expectEqual(
+        @as(i64, 128),
+        bounds.get("max_lifecycle_effects_per_operation").?.integer,
+    );
+    try std.testing.expectEqual(@as(i64, 1024), bounds.get("max_holds_per_artifact").?.integer);
+    try std.testing.expectEqual(
+        @as(i64, 315576000),
+        bounds.get("max_lifecycle_grace_seconds").?.integer,
+    );
 }
 
 fn isVersion(token: []const u8) bool {

@@ -828,6 +828,157 @@ pub const Snapshot = struct {
     }
 };
 
+pub const PinnedSnapshot = struct {
+    snapshot: Snapshot,
+    generation: ?ReadGeneration,
+
+    pub fn load(
+        scope: *storage_root.Scope,
+        allocator: std.mem.Allocator,
+        repo_root: []const u8,
+        logical_path: []const u8,
+    ) !PinnedSnapshot {
+        var snapshot = try Snapshot.load(scope, allocator, repo_root, logical_path);
+        errdefer snapshot.deinit(allocator);
+        if (!snapshot.head_exists) return error.SegmentedHeadMissing;
+        var generation = try ReadGeneration.acquire(
+            scope,
+            allocator,
+            &snapshot.paths,
+            &snapshot.head,
+        );
+        errdefer generation.deinit();
+        var locked_head = try readOptionalFile(
+            scope,
+            allocator,
+            snapshot.paths.manifest,
+            64 * 1024,
+        );
+        defer locked_head.deinit(allocator);
+        if (!locked_head.exists or !std.mem.eql(u8, snapshot.head_bytes, locked_head.bytes)) {
+            return error.SegmentedSnapshotGenerationChanged;
+        }
+        return .{ .snapshot = snapshot, .generation = generation };
+    }
+
+    pub fn deinit(self: *PinnedSnapshot, allocator: std.mem.Allocator) void {
+        if (self.generation) |*generation| generation.deinit();
+        self.snapshot.deinit(allocator);
+        self.* = undefined;
+    }
+};
+
+pub const Dependency = struct {
+    path: []u8,
+    max_bytes: usize,
+    kind: enum { head, legacy_event, legacy_binding, event_segment, binding_segment, checkpoint },
+
+    pub fn deinit(self: *Dependency, allocator: std.mem.Allocator) void {
+        allocator.free(self.path);
+        self.* = undefined;
+    }
+};
+
+pub const DependencyIterator = struct {
+    pinned: *const PinnedSnapshot,
+    phase: enum { head, legacy_event, legacy_binding, events, bindings, checkpoint, done } = .head,
+    index: u64 = 0,
+
+    pub fn next(self: *DependencyIterator, allocator: std.mem.Allocator) !?Dependency {
+        if (self.pinned.generation == null) return error.SegmentedGenerationCustodyMissing;
+        const snapshot = &self.pinned.snapshot;
+        for (std.meta.tags(@FieldType(DependencyIterator, "phase"))) |_| switch (self.phase) {
+            .head => return try self.fixed(
+                allocator,
+                snapshot.paths.manifest,
+                64 * 1024,
+                .head,
+                .legacy_event,
+            ),
+            .legacy_event => return try self.fixed(
+                allocator,
+                snapshot.paths.legacy_event,
+                legacy_event_tombstone.len,
+                .legacy_event,
+                .legacy_binding,
+            ),
+            .legacy_binding => return try self.fixed(
+                allocator,
+                snapshot.paths.legacy_binding,
+                legacy_binding_tombstone.len,
+                .legacy_binding,
+                .events,
+            ),
+            .events => {
+                if (self.index > snapshot.head.event_index) return error.InvalidDependencyCursor;
+                if (self.index == snapshot.head.event_index and !snapshot.event_exists) {
+                    self.phase = .bindings;
+                    self.index = 0;
+                    continue;
+                }
+                const path = try snapshot.paths.eventSegmentAlloc(allocator, self.index);
+                self.advance(snapshot.head.event_index, .bindings);
+                return .{ .path = path, .max_bytes = event_segment_bytes, .kind = .event_segment };
+            },
+            .bindings => {
+                if (self.index > snapshot.head.binding_index) return error.InvalidDependencyCursor;
+                if (self.index == snapshot.head.binding_index and !snapshot.binding_exists) {
+                    self.phase = .checkpoint;
+                    self.index = 0;
+                    continue;
+                }
+                const path = try snapshot.paths.bindingSegmentAlloc(allocator, self.index);
+                self.advance(snapshot.head.binding_index, .checkpoint);
+                return .{
+                    .path = path,
+                    .max_bytes = binding_segment_bytes,
+                    .kind = .binding_segment,
+                };
+            },
+            .checkpoint => {
+                if (snapshot.checkpoint_path) |path| {
+                    return try self.fixed(
+                        allocator,
+                        path,
+                        checkpoint.max_checkpoint_bytes,
+                        .checkpoint,
+                        .done,
+                    );
+                }
+                self.phase = .done;
+            },
+            .done => return null,
+        };
+        unreachable;
+    }
+
+    fn fixed(
+        self: *DependencyIterator,
+        allocator: std.mem.Allocator,
+        path: []const u8,
+        max_bytes: usize,
+        kind: @FieldType(Dependency, "kind"),
+        next_phase: @FieldType(DependencyIterator, "phase"),
+    ) !Dependency {
+        const owned = try allocator.dupe(u8, path);
+        self.phase = next_phase;
+        return .{ .path = owned, .max_bytes = max_bytes, .kind = kind };
+    }
+
+    fn advance(
+        self: *DependencyIterator,
+        last: u64,
+        next_phase: @FieldType(DependencyIterator, "phase"),
+    ) void {
+        if (self.index == last) {
+            self.phase = next_phase;
+            self.index = 0;
+        } else {
+            self.index += 1;
+        }
+    }
+};
+
 fn acquireAbsentHeadCustody(
     scope: *storage_root.Scope,
     allocator: std.mem.Allocator,
@@ -2138,6 +2289,83 @@ test "segmented snapshot custody excludes mixed writer generations" {
     try std.testing.expectEqualStrings(event_bytes, snapshot.event_bytes);
     try std.testing.expectEqualStrings(binding_bytes, snapshot.binding_bytes);
     try std.testing.expectEqual(@as(u64, 2), snapshot.head.total_event_records);
+}
+
+test "segmented pinned snapshot retains generation custody until released" {
+    var scope = storage_root.Scope.init(.init(std.testing.io, std.Io.Dir.cwd()));
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", allocator);
+    defer allocator.free(root);
+    const logical_path = "example/pinned/events.jsonl";
+    var paths = try Paths.init(&scope, allocator, root, logical_path);
+    defer paths.deinit(allocator);
+    const event_path = try paths.eventSegmentAlloc(allocator, 0);
+    defer allocator.free(event_path);
+    const binding_path = try paths.bindingSegmentAlloc(allocator, 0);
+    defer allocator.free(binding_path);
+    const transactions = try std.fs.path.join(allocator, &.{ root, ".ledger", ".transactions" });
+    defer allocator.free(transactions);
+    var head = try Head.init(allocator, logical_path);
+    defer head.deinit(allocator);
+    const event = "{\"sequence\":1}\n";
+    const binding = "{\"binding\":1}\n";
+    _ = try head.append(event, binding);
+    const head_bytes = try head.encodeAlloc(allocator);
+    defer allocator.free(head_bytes);
+    var receipt = try commitInitialGeneration(
+        &scope,
+        allocator,
+        transactions,
+        event_path,
+        binding_path,
+        paths.manifest,
+        head_bytes,
+    );
+    defer receipt.deinit(allocator);
+    var pinned = try PinnedSnapshot.load(&scope, allocator, root, logical_path);
+    defer pinned.deinit(allocator);
+    try std.testing.expectEqualStrings(event, pinned.snapshot.event_bytes);
+    try expectInitialDependencies(&pinned);
+    var writer: GenerationWriterContext = .{
+        .scope = &scope,
+        .transactions = transactions,
+        .event_path = event_path,
+        .binding_path = binding_path,
+        .manifest_path = paths.manifest,
+        .event_bytes = event,
+        .binding_bytes = binding,
+        .head_bytes = head_bytes,
+    };
+    try expectGenerationWriterBlocked(&writer, &pinned.generation.?);
+    pinned.generation = null;
+    var unlocked = DependencyIterator{ .pinned = &pinned };
+    try std.testing.expectError(error.SegmentedGenerationCustodyMissing, unlocked.next(allocator));
+    const retry = try std.Thread.spawn(.{}, runGenerationWriter, .{&writer});
+    retry.join();
+    if (writer.result) |err| return err;
+}
+
+fn expectInitialDependencies(pinned: *const PinnedSnapshot) !void {
+    var iterator = DependencyIterator{ .pinned = pinned };
+    const expected = [_]@FieldType(Dependency, "kind"){
+        .head, .legacy_event, .legacy_binding, .event_segment, .binding_segment,
+    };
+    for (expected) |kind| {
+        var dependency = (try iterator.next(std.testing.allocator)) orelse
+            return error.MissingSegmentedDependency;
+        defer dependency.deinit(std.testing.allocator);
+        try std.testing.expectEqual(kind, dependency.kind);
+        try std.testing.expect(dependency.max_bytes > 0);
+    }
+    try std.testing.expectEqual(null, try iterator.next(std.testing.allocator));
+    var invalid = DependencyIterator{
+        .pinned = pinned,
+        .phase = .events,
+        .index = std.math.maxInt(u64),
+    };
+    try std.testing.expectError(error.InvalidDependencyCursor, invalid.next(std.testing.allocator));
 }
 
 test "segmented snapshot accepts an absent head with stale advisory custody" {

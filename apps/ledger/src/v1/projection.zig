@@ -6099,6 +6099,7 @@ fn executeStoredProjection(
             &output.writer,
             stats,
         ),
+        .bytes => return error.AttachmentInstanceRequired,
     }
 }
 

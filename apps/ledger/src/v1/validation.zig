@@ -5216,6 +5216,7 @@ fn parseLoadedInput(
                 "text input is not valid UTF-8",
             );
         },
+        .bytes => {},
     }
 }
 

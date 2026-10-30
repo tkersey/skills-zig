@@ -5,14 +5,17 @@ const durable_store = @import("durable_store");
 const definition = @import("definition.zig");
 const document = @import("document.zig");
 const segmented_event_log = @import("segmented_event_log.zig");
+const lifecycle = @import("lifecycle.zig");
 
 pub const SlotKind = enum {
     document,
     event_log,
+    attachment,
 
     fn parse(text: []const u8) !SlotKind {
         if (std.mem.eql(u8, text, "document")) return .document;
         if (std.mem.eql(u8, text, "event-log")) return .event_log;
+        if (std.mem.eql(u8, text, "attachment")) return .attachment;
         return error.UnsupportedSlotKind;
     }
 };
@@ -555,7 +558,7 @@ pub const Plan = struct {
 
 pub const ResolvedPlan = struct {
     storage_kind: definition.StorageKind,
-    slot_buffer: [64]ResolvedSlot,
+    slot_buffer: [lifecycle.max_slots]ResolvedSlot,
     slot_count: usize,
     operations: []const Operation,
 
@@ -622,6 +625,65 @@ pub fn compile(
     };
 }
 
+pub fn compileLifecycle(
+    allocator: std.mem.Allocator,
+    definition_plan: *const definition.Plan,
+    source: std.json.Value,
+) !lifecycle.Plan {
+    var parsed = try std.json.parseFromSlice(
+        std.json.Value,
+        allocator,
+        definition_plan.storage_json,
+        .{ .duplicate_field_behavior = .@"error", .parse_numbers = false },
+    );
+    defer parsed.deinit();
+    const slots = try compileSlots(
+        allocator,
+        definition_plan,
+        try definition_core.json.object(parsed.value),
+    );
+    defer deinitSlots(allocator, slots);
+    const slot_views = try allocator.alloc(lifecycle.Slot, slots.len);
+    defer allocator.free(slot_views);
+    for (slots, slot_views) |slot, *view| {
+        view.* = .{
+            .name = slot.name,
+            .kind = switch (slot.kind) {
+                .document => .document,
+                .event_log => .event_log,
+                .attachment => .attachment,
+            },
+            .codec = lifecycleCodec(slot.codec),
+        };
+    }
+    const input_views = try allocator.alloc(lifecycle.Input, definition_plan.inputs.len);
+    defer allocator.free(input_views);
+    for (definition_plan.inputs, input_views) |input, *view| {
+        view.* = .{
+            .name = input.name,
+            .codec = lifecycleCodec(input.codec),
+            .validated = input.codec == .json,
+        };
+    }
+    const names = try allocator.alloc([]const u8, definition_plan.operations.len);
+    defer allocator.free(names);
+    for (definition_plan.operations, names) |operation, *name| name.* = operation.name;
+    return lifecycle.compile(allocator, source, .{
+        .slots = slot_views,
+        .inputs = input_views,
+        .operations = names,
+    });
+}
+
+fn lifecycleCodec(codec: definition.Codec) lifecycle.Codec {
+    return switch (codec) {
+        .json => .json,
+        .jsonl => .jsonl,
+        .text => .text,
+        .bytes => .bytes,
+    };
+}
+
 pub fn resolve(
     allocator: std.mem.Allocator,
     plan: *const Plan,
@@ -644,6 +706,7 @@ pub fn resolveWithGenerated(
     };
     errdefer resolved.deinit(allocator);
     for (plan.slots, 0..) |slot, index| {
+        if (slot.kind == .attachment) return error.AttachmentInstanceRequired;
         const owned_path = if (pathIsParameterized(slot.path_segments))
             try resolvePathAlloc(
                 allocator,
@@ -678,6 +741,7 @@ pub fn resolveWithGenerated(
 }
 
 pub fn pathTemplateMatches(slot: Slot, actual_path: []const u8) bool {
+    if (slot.kind == .attachment) return false;
     validateLogicalSlotPath(actual_path) catch return false;
     var components = std.mem.splitScalar(u8, actual_path, '/');
     for (slot.path_segments) |segment| {
@@ -702,7 +766,7 @@ pub fn encodeCache(
     plan: *const Plan,
     encoder: *definition_core.cache.Encoder,
 ) !void {
-    try encoder.writeU16(14);
+    try encoder.writeU16(15);
     try encoder.writeEnum(plan.storage_kind);
     try encodeCacheSlots(plan.slots, encoder);
     try encodeCacheOperations(plan.operations, encoder);
@@ -852,7 +916,7 @@ pub fn decodeCache(
     allocator: std.mem.Allocator,
     decoder: *definition_core.cache.Decoder,
 ) !Plan {
-    if (try decoder.readU16() != 14) {
+    if (try decoder.readU16() != 15) {
         return error.LedgerStorageCacheVersionMismatch;
     }
     const storage_kind = try decoder.readEnum(definition.StorageKind);
@@ -920,7 +984,12 @@ fn validateCacheSlots(
     slots: []const Slot,
     definition_plan: *const definition.Plan,
 ) !void {
+    const maximum = if (definition_plan.requires(.artifact_lifecycle)) lifecycle.max_slots else 64;
+    if (slots.len > maximum) return error.CacheStoragePlanMismatch;
     for (slots) |slot| {
+        if (slot.kind == .attachment and !definition_plan.requires(.artifact_lifecycle)) {
+            return error.CacheStoragePlanMismatch;
+        }
         if (slot.layout == .monolithic and
             slot.max_bytes > definition_plan.bounds.max_store_bytes)
         {
@@ -1103,7 +1172,7 @@ fn decodeCacheSlots(
     allocator: std.mem.Allocator,
     decoder: *definition_core.cache.Decoder,
 ) ![]Slot {
-    const count = try decoder.readCount(64);
+    const count = try decoder.readCount(lifecycle.max_slots);
     const slots = try allocator.alloc(Slot, count);
     var initialized: usize = 0;
     errdefer {
@@ -1147,12 +1216,14 @@ fn decodeCacheSlot(
         for (path_segments) |*segment| segment.deinit(allocator);
         allocator.free(path_segments);
     }
-    try validateEncodedPathTemplate(
-        allocator,
-        relative_path,
-        path_segments,
-    );
     const kind = try decoder.readEnum(SlotKind);
+    if (kind == .attachment) {
+        if (relative_path.len != 0 or path_segments.len != 0) {
+            return error.AttachmentPathForbidden;
+        }
+    } else {
+        try validateEncodedPathTemplate(allocator, relative_path, path_segments);
+    }
     const codec = try decoder.readEnum(definition.Codec);
     try validateDecodedSlotCodec(kind, codec);
     const max_bytes = try decoder.readUsize();
@@ -1162,6 +1233,7 @@ fn decodeCacheSlot(
     const layout = try decoder.readEnum(SlotLayout);
     try validateSlotLayout(kind, codec, layout, max_bytes);
     for (prior_slots) |prior| {
+        if (prior.kind == .attachment or kind == .attachment) continue;
         if (slotPathsAmbiguous(
             prior.relative_path,
             relative_path,
@@ -1183,7 +1255,6 @@ fn decodeCachePathSegments(
     decoder: *definition_core.cache.Decoder,
 ) ![]PathSegment {
     const count = try decoder.readCount(128);
-    if (count == 0) return error.InvalidStoragePathTemplate;
     const segments = try allocator.alloc(PathSegment, count);
     var initialized: usize = 0;
     errdefer {
@@ -1210,6 +1281,9 @@ fn validateDecodedSlotCodec(
     kind: SlotKind,
     codec: definition.Codec,
 ) !void {
+    if (kind == .attachment) {
+        if (codec != .bytes) return error.AttachmentSlotRequiresBytes;
+    } else if (codec == .bytes) return error.BytesSlotRequiresAttachment;
     if (kind == .event_log and codec != .jsonl) {
         return error.EventLogSlotRequiresJsonl;
     }
@@ -2205,7 +2279,8 @@ fn compileSlots(
     const slot_map = try definition_core.json.object(
         try definition_core.json.field(object, "slots"),
     );
-    if (slot_map.count() == 0 or slot_map.count() > 64) {
+    const maximum = if (definition_plan.requires(.artifact_lifecycle)) lifecycle.max_slots else 64;
+    if (slot_map.count() == 0 or slot_map.count() > maximum) {
         return error.InvalidStorageSlotCount;
     }
     var slots: std.ArrayList(Slot) = .empty;
@@ -2244,6 +2319,11 @@ fn compileSlot(
 ) !Slot {
     try definition_core.json.safeIdentifier(name, 128);
     const object = try definition_core.json.object(raw);
+    if (object.get("kind")) |kind| {
+        if (std.mem.eql(u8, try definition_core.json.string(kind), "attachment")) {
+            return compileAttachmentSlot(allocator, definition_plan, name, object);
+        }
+    }
     try definition_core.json.requireExactKeys(
         object,
         &.{ "path", "kind", "codec", "max_bytes", "layout" },
@@ -2298,6 +2378,39 @@ fn compileSlot(
     };
 }
 
+fn compileAttachmentSlot(
+    allocator: std.mem.Allocator,
+    definition_plan: *const definition.Plan,
+    name: []const u8,
+    object: std.json.ObjectMap,
+) !Slot {
+    if (!definition_plan.requires(.artifact_lifecycle)) return error.UndeclaredArtifactOperator;
+    try definition_core.json.requireExactKeys(object, &.{ "kind", "codec", "max_bytes" });
+    try definition_core.json.requireFields(object, &.{ "kind", "codec", "max_bytes" });
+    const codec = try definition.Codec.parse(
+        try definition_core.json.requiredString(object, "codec"),
+    );
+    try validateDecodedSlotCodec(.attachment, codec);
+    const max_bytes = try definition_core.json.unsigned(
+        try definition_core.json.field(object, "max_bytes"),
+    );
+    if (max_bytes == 0 or max_bytes > 4 * 1024 * 1024 * 1024) {
+        return error.StorageSlotBoundsExceeded;
+    }
+    const owned_name = try allocator.dupe(u8, name);
+    errdefer allocator.free(owned_name);
+    const path = try allocator.alloc(u8, 0);
+    errdefer allocator.free(path);
+    return .{
+        .name = owned_name,
+        .relative_path = path,
+        .path_segments = try allocator.alloc(PathSegment, 0),
+        .kind = .attachment,
+        .codec = .bytes,
+        .max_bytes = max_bytes,
+    };
+}
+
 fn validateSlotLayout(
     kind: SlotKind,
     codec: definition.Codec,
@@ -2319,6 +2432,7 @@ fn validateSlotLayout(
 fn validateSlotPathAmbiguity(slots: []const Slot) !void {
     for (slots, 0..) |left, index| {
         for (slots[index + 1 ..]) |right| {
+            if (left.kind == .attachment or right.kind == .attachment) continue;
             if (slotPathsAmbiguous(
                 left.relative_path,
                 right.relative_path,
@@ -2607,6 +2721,7 @@ fn compileEffectTarget(
         object,
         "slot",
     )) orelse return error.UnknownStorageSlot;
+    if (slots[slot_index].kind == .attachment) return error.AttachmentPublicationRequired;
     const input_index = findInput(
         definition_plan.inputs,
         try definition_core.json.requiredString(object, "input"),
@@ -5238,6 +5353,7 @@ pub fn resolveSlotPathAlloc(
     parameters: *const definition_core.parameters.Bindings,
     generated: []const document.Value,
 ) ![]u8 {
+    if (slot.kind == .attachment) return error.AttachmentInstanceRequired;
     return resolvePathAlloc(
         allocator,
         slot.path_segments,
@@ -5253,6 +5369,7 @@ pub fn enumerateMatchingPathsAlloc(
     slot: Slot,
     max_paths: usize,
 ) ![][]u8 {
+    if (slot.kind == .attachment) return error.AttachmentInstanceRequired;
     if (!storage_root.validRepoRoot(scope, repo_root)) {
         return error.RepositoryRootNotAbsolute;
     }

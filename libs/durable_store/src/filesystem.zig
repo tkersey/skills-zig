@@ -374,6 +374,22 @@ const HostFileLocation = struct {
     mount_id: ?u64,
 };
 
+pub const OpenDirectoryIdentity = struct {
+    device: u64,
+    mount_id: ?u64,
+    inode: std.Io.File.INode,
+};
+
+pub fn openDirectoryIdentity(io: std.Io, directory: std.Io.Dir) !OpenDirectoryIdentity {
+    if (@import("builtin").os.tag == .windows) return error.DirectoryIdentityUnsupported;
+    const stat = try directory.stat(io);
+    const location = try hostFileLocation(.{
+        .handle = directory.handle,
+        .flags = .{ .nonblocking = true },
+    });
+    return .{ .device = location.device, .mount_id = location.mount_id, .inode = stat.inode };
+}
+
 fn hostFileLocation(file: std.Io.File) !HostFileLocation {
     return switch (@import("builtin").os.tag) {
         .linux => linuxFileLocation(file),
@@ -2040,26 +2056,72 @@ pub fn readRegularFileNoSymlink(
     path: []const u8,
     max_bytes: usize,
 ) ![]u8 {
-    const stat = (try statRegularFileNoSymlink(fs, path)) orelse
-        return error.FileNotFound;
-    if (stat.size > max_bytes) return error.FileTooBig;
-
-    var file = if (std.fs.path.isAbsolute(path))
-        try std.Io.Dir.openFileAbsolute(
-            fs.io,
-            path,
-            .{ .allow_directory = false, .follow_symlinks = false },
-        )
-    else
-        try fs.directory().openFile(
-            fs.io,
-            path,
-            .{ .allow_directory = false, .follow_symlinks = false },
-        );
+    var file = try openRegularFileNoSymlink(fs, path);
     defer file.close(fs.io);
-
+    const stat = try file.stat(fs.io);
+    if (stat.size > max_bytes) return error.FileTooBig;
     var reader = file.reader(fs.io, &.{});
-    return reader.interface.allocRemaining(allocator, .limited(max_bytes + 1));
+    reader.mode = .positional_simple;
+    return reader.interface.allocRemaining(allocator, .limited(max_bytes)) catch |err|
+        switch (err) {
+            error.StreamTooLong => error.FileTooBig,
+            error.ReadFailed => reader.err orelse error.ReadFailed,
+            else => err,
+        };
+}
+
+pub fn openRegularFileNoSymlink(fs: Fs, path: []const u8) !std.Io.File {
+    if (std.mem.indexOfScalar(u8, path, 0) != null) return error.BadPathName;
+    if (std.mem.endsWith(u8, path, "/")) return error.NotFile;
+    var components = std.fs.path.componentIterator(path);
+    var component = components.next() orelse return error.NotFile;
+    var parent = fs.directory();
+    var owns_parent = false;
+    defer if (owns_parent) parent.close(fs.io);
+    if (std.fs.path.isAbsolute(path)) {
+        parent = try std.Io.Dir.openDirAbsolute(fs.io, components.root().?, .{
+            .follow_symlinks = false,
+        });
+        owns_parent = true;
+    }
+    while (components.next()) |next| {
+        const opened = parent.openDir(fs.io, component.name, .{
+            .follow_symlinks = false,
+        }) catch |err| {
+            const stat = parent.statFile(fs.io, component.name, .{
+                .follow_symlinks = false,
+            }) catch return err;
+            if (stat.kind == .sym_link) return error.SymlinkComponent;
+            return err;
+        };
+        if (owns_parent) parent.close(fs.io);
+        parent = opened;
+        owns_parent = true;
+        component = next;
+    }
+    return openRegularLeaf(fs.io, parent, component.name);
+}
+
+fn openRegularLeaf(io: std.Io, parent: std.Io.Dir, leaf: []const u8) !std.Io.File {
+    const file = if (@import("builtin").os.tag == .windows)
+        try parent.openFile(io, leaf, .{ .follow_symlinks = false })
+    else file: {
+        const handle = std.posix.openat(parent.handle, leaf, .{
+            .ACCMODE = .RDONLY,
+            .NONBLOCK = true,
+            .NOFOLLOW = true,
+            .CLOEXEC = true,
+        }, 0) catch |err| switch (err) {
+            error.SymLinkLoop => return error.SymlinkComponent,
+            else => return err,
+        };
+        break :file std.Io.File{ .handle = handle, .flags = .{ .nonblocking = true } };
+    };
+    errdefer file.close(io);
+    const kind = (try file.stat(io)).kind;
+    if (kind == .sym_link) return error.SymlinkComponent;
+    if (kind != .file) return error.NotFile;
+    return file;
 }
 
 pub fn freeStringList(allocator: std.mem.Allocator, list: []const []u8) void {
@@ -3164,6 +3226,102 @@ test "readRegularFileNoSymlink rejects symlink and oversized file" {
         error.SymlinkComponent,
         readRegularFileNoSymlink(fs, std.testing.allocator, link, 4),
     );
+}
+
+const GrowingReadProbe = struct {
+    threadlocal var directory: std.Io.Dir = undefined;
+    threadlocal var grow: bool = false;
+
+    fn read(
+        userdata: ?*anyopaque,
+        file: std.Io.File,
+        buffers: []const []u8,
+        offset: u64,
+    ) std.Io.File.ReadPositionalError!usize {
+        if (grow) {
+            grow = false;
+            directory.writeFile(std.testing.io, .{
+                .sub_path = "growing",
+                .data = "abcde",
+            }) catch return error.InputOutput;
+        }
+        return std.testing.io.vtable.fileReadPositional(userdata, file, buffers, offset);
+    }
+};
+
+test "regular bounded read rejects growth after size observation" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "growing", .data = "abcd" });
+    GrowingReadProbe.directory = tmp.dir;
+    GrowingReadProbe.grow = true;
+    defer GrowingReadProbe.grow = false;
+    var vtable = io.vtable.*;
+    vtable.fileReadPositional = GrowingReadProbe.read;
+    const injected: std.Io = .{ .userdata = io.userdata, .vtable = &vtable };
+    const fs = Fs.anchored(injected, tmp.dir);
+    const result = readRegularFileNoSymlink(fs, std.testing.allocator, "growing", 4);
+    defer if (result) |bytes| std.testing.allocator.free(bytes) else |_| {};
+    try std.testing.expectError(error.FileTooBig, result);
+    try std.testing.expect(!GrowingReadProbe.grow);
+}
+
+const ReplacedReadParentProbe = struct {
+    threadlocal var directory: std.Io.Dir = undefined;
+    threadlocal var replace: bool = false;
+
+    fn open(
+        userdata: ?*anyopaque,
+        parent: std.Io.Dir,
+        path: []const u8,
+        options: std.Io.Dir.OpenOptions,
+    ) std.Io.Dir.OpenError!std.Io.Dir {
+        const opened = try std.testing.io.vtable.dirOpenDir(userdata, parent, path, options);
+        errdefer opened.close(std.testing.io);
+        if (replace and std.mem.eql(u8, path, "parent")) {
+            replace = false;
+            directory.rename("parent", directory, "original", std.testing.io) catch
+                return error.Unexpected;
+            directory.symLink(std.testing.io, "outside", "parent", .{
+                .is_directory = true,
+            }) catch return error.Unexpected;
+        }
+        return opened;
+    }
+};
+
+test "regular reads retain traversed parents and reject symlink components" {
+    const io = std.testing.io;
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "parent/inside");
+    try tmp.dir.createDirPath(io, "outside/inside");
+    try tmp.dir.writeFile(io, .{ .sub_path = "parent/inside/value", .data = "held" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "outside/inside/value", .data = "other" });
+    ReplacedReadParentProbe.directory = tmp.dir;
+    ReplacedReadParentProbe.replace = true;
+    defer ReplacedReadParentProbe.replace = false;
+    var vtable = io.vtable.*;
+    vtable.dirOpenDir = ReplacedReadParentProbe.open;
+    const injected: std.Io = .{ .userdata = io.userdata, .vtable = &vtable };
+    const fs = Fs.anchored(injected, tmp.dir);
+    const bytes = try readRegularFileNoSymlink(fs, allocator, "parent/inside/value", 16);
+    defer allocator.free(bytes);
+    try std.testing.expectEqualStrings("held", bytes);
+    try std.testing.expect(!ReplacedReadParentProbe.replace);
+    try std.testing.expectError(error.SymlinkComponent, readRegularFileNoSymlink(
+        fs,
+        allocator,
+        "parent/inside/value",
+        16,
+    ));
+    try std.testing.expectError(error.NotFile, openRegularFileNoSymlink(fs, "original"));
+    const trailing_separator = "original/inside/value/";
+    const nul_component = "original\x00value";
+    try std.testing.expectError(error.NotFile, openRegularFileNoSymlink(fs, trailing_separator));
+    try std.testing.expectError(error.BadPathName, openRegularFileNoSymlink(fs, nul_component));
 }
 
 test "listSortedRegularFilesNoSymlink sorts and rejects symlink entries" {

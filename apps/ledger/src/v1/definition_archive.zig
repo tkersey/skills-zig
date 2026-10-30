@@ -80,13 +80,17 @@ pub fn pathAlloc(
     repo_root: []const u8,
     digest: []const u8,
 ) ![]u8 {
-    try definition_core.json.digest(digest);
-    const name = try allocator.print("{s}.json", .{digest[7..]});
-    defer allocator.free(name);
+    const relative = try relativePathAlloc(allocator, digest);
+    defer allocator.free(relative);
     return std.fs.path.join(
         allocator,
-        &.{ repo_root, storage_root.controlComponent(scope), ".definitions", name },
+        &.{ repo_root, storage_root.controlComponent(scope), relative },
     );
+}
+
+pub fn relativePathAlloc(allocator: std.mem.Allocator, digest: []const u8) ![]u8 {
+    try definition_core.json.digest(digest);
+    return allocator.print(".definitions/{s}.json", .{digest[7..]});
 }
 
 pub fn load(
@@ -105,6 +109,16 @@ pub fn load(
         max_bytes,
     );
     defer allocator.free(bytes);
+    return parse(allocator, bytes, expected_digest);
+}
+
+pub fn parse(
+    allocator: std.mem.Allocator,
+    bytes: []const u8,
+    expected_digest: []const u8,
+) !Loaded {
+    if (bytes.len > max_bytes) return error.DefinitionArchiveTooLarge;
+    try definition_core.json.digest(expected_digest);
     var parsed = std.json.parseFromSlice(
         std.json.Value,
         allocator,

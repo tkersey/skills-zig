@@ -24,16 +24,7 @@ pub fn prepare(
     if (!storage_root.validRepoRoot(scope, repo_root)) {
         return error.RepositoryRootNotAbsolute;
     }
-    if (content.len > max_bytes) return error.RevisionArchiveTooLarge;
-    try definition_core.json.digest(revision);
-    const actual = try definition_core.canonical_json.digestBytesAlloc(
-        allocator,
-        content,
-    );
-    defer allocator.free(actual);
-    if (!std.mem.eql(u8, actual, revision)) {
-        return error.RevisionArchiveDigestMismatch;
-    }
+    try validateContent(allocator, revision, content, max_bytes);
     const path = try pathAlloc(scope, allocator, repo_root, revision);
     errdefer allocator.free(path);
     try durable_store.rejectSymlinkComponents(scope.fs, path);
@@ -82,6 +73,18 @@ pub fn load(
         else => return err,
     };
     errdefer allocator.free(content);
+    try validateContent(allocator, revision, content, max_bytes);
+    return content;
+}
+
+pub fn validateContent(
+    allocator: std.mem.Allocator,
+    revision: []const u8,
+    content: []const u8,
+    max_bytes: usize,
+) !void {
+    if (content.len > max_bytes) return error.RevisionArchiveTooLarge;
+    try definition_core.json.digest(revision);
     const actual = try definition_core.canonical_json.digestBytesAlloc(
         allocator,
         content,
@@ -90,7 +93,6 @@ pub fn load(
     if (!std.mem.eql(u8, actual, revision)) {
         return error.RevisionArchiveDigestMismatch;
     }
-    return content;
 }
 
 pub fn pathAlloc(
@@ -99,16 +101,17 @@ pub fn pathAlloc(
     repo_root: []const u8,
     revision: []const u8,
 ) ![]u8 {
-    try definition_core.json.digest(revision);
-    const file_name = try allocator.print(
-        "{s}.bin",
-        .{revision[7..]},
-    );
-    defer allocator.free(file_name);
+    const relative = try relativePathAlloc(allocator, revision);
+    defer allocator.free(relative);
     return std.fs.path.join(
         allocator,
-        &.{ repo_root, storage_root.controlComponent(scope), ".revisions", file_name },
+        &.{ repo_root, storage_root.controlComponent(scope), relative },
     );
+}
+
+pub fn relativePathAlloc(allocator: std.mem.Allocator, revision: []const u8) ![]u8 {
+    try definition_core.json.digest(revision);
+    return allocator.print(".revisions/{s}.bin", .{revision[7..]});
 }
 
 test "revision archive is immutable and content addressed" {

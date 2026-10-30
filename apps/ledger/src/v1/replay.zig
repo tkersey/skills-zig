@@ -34,10 +34,67 @@ const ArchivedPlan = struct {
     }
 };
 
+const DependencySource = union(enum) {
+    native: struct { scope: *storage_root.Scope, repo_root: []const u8 },
+    captured: CapturedReader,
+
+    fn loadDefinition(
+        self: DependencySource,
+        allocator: std.mem.Allocator,
+        digest: []const u8,
+    ) !definition_archive.Loaded {
+        return switch (self) {
+            .native => |source| definition_archive.load(
+                source.scope,
+                allocator,
+                source.repo_root,
+                digest,
+            ),
+            .captured => |reader| captured: {
+                const bytes = try reader.read(
+                    reader.context,
+                    allocator,
+                    .{ .definition_closure = digest },
+                );
+                defer allocator.free(bytes);
+                break :captured try definition_archive.parse(allocator, bytes, digest);
+            },
+        };
+    }
+
+    fn loadRevision(
+        self: DependencySource,
+        allocator: std.mem.Allocator,
+        digest: []const u8,
+        max_bytes: usize,
+    ) ![]u8 {
+        return switch (self) {
+            .native => |source| revision_archive.load(
+                source.scope,
+                allocator,
+                source.repo_root,
+                digest,
+                max_bytes,
+            ),
+            .captured => |reader| captured: {
+                const bytes = reader.read(reader.context, allocator, .{ .revision = .{
+                    .digest = digest,
+                    .max_bytes = max_bytes,
+                } }) catch |err| switch (err) {
+                    error.FileNotFound => return error.RevisionArchiveMissing,
+                    else => return err,
+                };
+                errdefer allocator.free(bytes);
+                try revision_archive.validateContent(allocator, digest, bytes, max_bytes);
+                break :captured bytes;
+            },
+        };
+    }
+};
+
 const PlanCache = struct {
-    scope: *storage_root.Scope,
+    source: DependencySource,
     allocator: std.mem.Allocator,
-    repo_root: []const u8,
     definition_id: []const u8,
     plans: std.ArrayList(ArchivedPlan) = .empty,
     indices: std.StringHashMapUnmanaged(usize) = .empty,
@@ -55,12 +112,7 @@ const PlanCache = struct {
         if (self.indices.get(digest)) |index| {
             return &self.plans.items[index];
         }
-        var archive = try definition_archive.load(
-            self.scope,
-            self.allocator,
-            self.repo_root,
-            digest,
-        );
+        var archive = try self.source.loadDefinition(self.allocator, digest);
         var archive_owned = true;
         errdefer if (archive_owned) archive.deinit(self.allocator);
         if (!std.mem.eql(u8, archive.definition_id, self.definition_id)) {
@@ -176,9 +228,8 @@ pub fn validateSegmentedHistoryArchives(
     snapshot: *const segmented_event_log.Snapshot,
 ) !void {
     var cache = PlanCache{
-        .scope = scope,
+        .source = .{ .native = .{ .scope = scope, .repo_root = repo_root } },
         .allocator = allocator,
-        .repo_root = repo_root,
         .definition_id = definition_id,
         .rolling = true,
     };
@@ -255,9 +306,8 @@ pub fn validateSegmentedHistoryObserved(
         return error.SegmentedReplayCheckpointMissing;
     }
     var cache = PlanCache{
-        .scope = scope,
+        .source = .{ .native = .{ .scope = scope, .repo_root = repo_root } },
         .allocator = allocator,
-        .repo_root = repo_root,
         .definition_id = definition_id,
         .rolling = true,
     };
@@ -389,6 +439,79 @@ const IgnoreRecords = struct {
     pub fn observe(_: *@This(), _: std.json.Value) !void {}
 };
 
+pub const Dependency = union(enum) {
+    definition_closure: []const u8,
+    revision: struct { digest: []const u8, max_bytes: usize },
+};
+
+pub fn visitBindingDependencies(
+    scope: *storage_root.Scope,
+    allocator: std.mem.Allocator,
+    repo_root: []const u8,
+    definition_id: []const u8,
+    slot: storage.ResolvedSlot,
+    rows: []const custody.BindingRow,
+    visitor: anytype,
+) !void {
+    var cache = PlanCache{
+        .source = .{ .native = .{ .scope = scope, .repo_root = repo_root } },
+        .allocator = allocator,
+        .definition_id = definition_id,
+        .rolling = true,
+    };
+    defer cache.deinit();
+    for (rows) |row| try visitRowDependencies(&cache, slot, row, visitor);
+}
+
+pub fn visitSegmentedBindingDependencies(
+    scope: *storage_root.Scope,
+    allocator: std.mem.Allocator,
+    repo_root: []const u8,
+    definition_id: []const u8,
+    slot: storage.ResolvedSlot,
+    pinned: *const segmented_event_log.PinnedSnapshot,
+    visitor: anytype,
+) !void {
+    if (pinned.generation == null) return error.SegmentedGenerationCustodyMissing;
+    const snapshot = &pinned.snapshot;
+    var cache = PlanCache{
+        .source = .{ .native = .{ .scope = scope, .repo_root = repo_root } },
+        .allocator = allocator,
+        .definition_id = definition_id,
+        .rolling = true,
+    };
+    defer cache.deinit();
+    var genesis = try segmented_event_log.Head.init(allocator, slot.relative_path);
+    defer genesis.deinit(allocator);
+    const genesis_revision = try genesis.revisionAlloc(allocator);
+    defer allocator.free(genesis_revision);
+    var rows = HistoryRowCursor.init(allocator, snapshot, definition_id, slot, genesis_revision);
+    defer rows.deinit();
+    var index: u64 = 0;
+    while (index < snapshot.head.total_binding_rows) : (index += 1) {
+        try visitRowDependencies(&cache, slot, try rows.current(), visitor);
+        try rows.advance();
+    }
+    try rows.finish();
+}
+
+fn visitRowDependencies(
+    cache: *PlanCache,
+    slot: storage.ResolvedSlot,
+    row: custody.BindingRow,
+    visitor: anytype,
+) !void {
+    const resolved = try resolveEffect(cache, slot, row);
+    try visitor.visit(Dependency{ .definition_closure = row.definition_digest });
+    if (requiresPriorRevision(row, resolved)) {
+        const revision = row.revision_before orelse return error.HistoricalReplaceWithoutState;
+        try visitor.visit(Dependency{ .revision = .{
+            .digest = revision,
+            .max_bytes = resolved.slot.max_bytes,
+        } });
+    }
+}
+
 fn notifyObserver(
     observer: anytype,
     value: std.json.Value,
@@ -442,13 +565,89 @@ pub fn validateSlotObserved(
     protocol_required: bool,
     observer: anytype,
 ) !Stats {
+    return validateMaterializedSlot(
+        allocator,
+        .{ .native = .{ .scope = scope, .repo_root = repo_root } },
+        definition_id,
+        slot,
+        snapshot,
+        parameters,
+        current_max_records,
+        protocol_required,
+        observer,
+    );
+}
+
+pub const CapturedReader = struct {
+    context: ?*anyopaque = null,
+    read: *const fn (?*anyopaque, std.mem.Allocator, Dependency) anyerror![]u8,
+};
+
+pub fn validateCapturedSlot(
+    allocator: std.mem.Allocator,
+    definition_id: []const u8,
+    slot: storage.ResolvedSlot,
+    snapshot: *const custody.SlotSnapshot,
+    parameters: *const definition_core.parameters.Bindings,
+    current_max_records: usize,
+    protocol_required: bool,
+    reader: CapturedReader,
+) !Stats {
+    var observer: IgnoreRecords = .{};
+    return validateCapturedSlotObserved(
+        allocator,
+        definition_id,
+        slot,
+        snapshot,
+        parameters,
+        current_max_records,
+        protocol_required,
+        reader,
+        &observer,
+    );
+}
+
+pub fn validateCapturedSlotObserved(
+    allocator: std.mem.Allocator,
+    definition_id: []const u8,
+    slot: storage.ResolvedSlot,
+    snapshot: *const custody.SlotSnapshot,
+    parameters: *const definition_core.parameters.Bindings,
+    current_max_records: usize,
+    protocol_required: bool,
+    reader: CapturedReader,
+    observer: anytype,
+) !Stats {
+    return validateMaterializedSlot(
+        allocator,
+        .{ .captured = reader },
+        definition_id,
+        slot,
+        snapshot,
+        parameters,
+        current_max_records,
+        protocol_required,
+        observer,
+    );
+}
+
+fn validateMaterializedSlot(
+    allocator: std.mem.Allocator,
+    source: DependencySource,
+    definition_id: []const u8,
+    slot: storage.ResolvedSlot,
+    snapshot: *const custody.SlotSnapshot,
+    parameters: *const definition_core.parameters.Bindings,
+    current_max_records: usize,
+    protocol_required: bool,
+    observer: anytype,
+) !Stats {
     if (current_max_records == 0 or current_max_records > 10_000_000) {
         return error.InvalidReplayRecordBound;
     }
     var cache = PlanCache{
-        .scope = scope,
+        .source = source,
         .allocator = allocator,
-        .repo_root = repo_root,
         .definition_id = definition_id,
     };
     defer cache.deinit();
@@ -519,9 +718,8 @@ pub fn validateReplaySlotObserved(
         return error.InvalidStoreBinding;
     }
     var cache = PlanCache{
-        .scope = scope,
+        .source = .{ .native = .{ .scope = scope, .repo_root = repo_root } },
         .allocator = allocator,
-        .repo_root = repo_root,
         .definition_id = definition_id,
     };
     defer cache.deinit();
@@ -600,9 +798,8 @@ pub fn validateSegmentedSnapshotObserved(
         return error.InvalidReplayRecordBound;
     }
     var cache = PlanCache{
-        .scope = scope,
+        .source = .{ .native = .{ .scope = scope, .repo_root = repo_root } },
         .allocator = allocator,
-        .repo_root = repo_root,
         .definition_id = definition_id,
         .rolling = true,
     };
@@ -1343,7 +1540,11 @@ fn validateStreamedEventEpoch(
         bindings.deinit(allocator);
     };
     errdefer if (validator.protocol_state) |*state| state.deinit(allocator);
-    var backend = durable_store.PersistentEventStore.init(cache.scope.fs, path);
+    const source = switch (cache.source) {
+        .native => |source| source,
+        .captured => return error.CapturedReplayRequiresMaterializedHistory,
+    };
+    var backend = durable_store.PersistentEventStore.init(source.scope.fs, path);
     var summary = try backend.eventStore().scan(
         allocator,
         current_slot.max_bytes,
@@ -1421,9 +1622,7 @@ fn validateHistory(
     var epoch_start: usize = 0;
     for (snapshot.binding.rows, 0..) |row, index| {
         const resolved = try resolveEffect(cache, current_slot, row);
-        if (row.kind == .admission and
-            resolved.effect.kind == .compare_replace)
-        {
+        if (requiresPriorRevision(row, resolved)) {
             if (protocol_required) {
                 return error.ProtocolHistoryMustBeAppendOnly;
             }
@@ -1432,10 +1631,8 @@ fn validateHistory(
             }
             const prior_revision = row.revision_before orelse
                 return error.HistoricalReplaceWithoutState;
-            const prior_content = try revision_archive.load(
-                cache.scope,
+            const prior_content = try cache.source.loadRevision(
                 allocator,
-                cache.repo_root,
                 prior_revision,
                 resolved.slot.max_bytes,
             );
@@ -1475,6 +1672,10 @@ const ResolvedEffect = struct {
     effect: storage.Effect,
     slot: storage.Slot,
 };
+
+fn requiresPriorRevision(row: custody.BindingRow, resolved: ResolvedEffect) bool {
+    return row.kind == .admission and resolved.effect.kind == .compare_replace;
+}
 
 fn resolveEffect(
     cache: *PlanCache,
@@ -1527,6 +1728,7 @@ fn validateEpoch(
         return error.HistoricalRevisionMismatch;
     }
     return switch (current_slot.kind) {
+        .attachment => error.AttachmentInstanceRequired,
         .document => if (protocol_required)
             error.ProtocolRequiresEventLogStorage
         else
@@ -2216,9 +2418,8 @@ test "segmented rolling replay retains a bounded recent plan set" {
     try archiveReplayTestDefinitions(scope, repo_root, &first, &second);
     try expectArchiveInsertionAllocationFailure(scope, repo_root, first.digestSlice());
     var cache = PlanCache{
-        .scope = scope,
+        .source = .{ .native = .{ .scope = scope, .repo_root = repo_root } },
         .allocator = allocator,
-        .repo_root = repo_root,
         .definition_id = "example/plain-protocol",
         .rolling = true,
     };
@@ -2267,9 +2468,8 @@ fn archiveInsertionAllocationCount(
         .resize_fail_index = 0,
     });
     var cache: PlanCache = .{
-        .scope = scope,
+        .source = .{ .native = .{ .scope = scope, .repo_root = repo_root } },
         .allocator = failing.allocator(),
-        .repo_root = repo_root,
         .definition_id = "example/plain-protocol",
     };
     defer cache.deinit();
@@ -2292,9 +2492,8 @@ fn expectArchiveInsertionAllocationFailure(
             .resize_fail_index = 0,
         });
         var cache: PlanCache = .{
-            .scope = scope,
+            .source = .{ .native = .{ .scope = scope, .repo_root = repo_root } },
             .allocator = failing.allocator(),
-            .repo_root = repo_root,
             .definition_id = "example/plain-protocol",
         };
         defer cache.deinit();
@@ -2304,4 +2503,112 @@ fn expectArchiveInsertionAllocationFailure(
         try std.testing.expectEqual(@as(u32, 0), cache.indices.count());
         try std.testing.expectEqual(@as(usize, 0), cache.definition_bytes);
     }
+}
+
+const CapturedDependencyTestReader = struct {
+    bytes: ?[]const u8,
+
+    fn read(context: ?*anyopaque, allocator: std.mem.Allocator, _: Dependency) ![]u8 {
+        const self: *@This() = @ptrCast(@alignCast(context.?));
+        return allocator.dupe(u8, self.bytes orelse return error.FileNotFound);
+    }
+
+    fn source(self: *@This()) DependencySource {
+        return .{ .captured = .{ .context = self, .read = read } };
+    }
+};
+
+test "captured revisions enforce native digest and byte bounds" {
+    const allocator = std.testing.allocator;
+    const original = "original revision";
+    const digest = try definition_core.canonical_json.digestBytesAlloc(allocator, original);
+    defer allocator.free(digest);
+    var reader = CapturedDependencyTestReader{ .bytes = original };
+    const source = reader.source();
+    const loaded = try source.loadRevision(allocator, digest, original.len);
+    defer allocator.free(loaded);
+    try std.testing.expectEqualStrings(original, loaded);
+    try std.testing.expectError(error.RevisionArchiveTooLarge, source.loadRevision(
+        allocator,
+        digest,
+        original.len - 1,
+    ));
+    reader.bytes = "tampered revision";
+    try std.testing.expectError(error.RevisionArchiveDigestMismatch, source.loadRevision(
+        allocator,
+        digest,
+        original.len,
+    ));
+    reader.bytes = null;
+    try std.testing.expectError(error.RevisionArchiveMissing, source.loadRevision(
+        allocator,
+        digest,
+        original.len,
+    ));
+}
+
+test "captured definitions verify closure digest and owner before replay" {
+    const allocator = std.testing.allocator;
+    var definitions = std.testing.tmpDir(.{});
+    defer definitions.cleanup();
+    try definitions.dir.writeFile(std.testing.io, .{
+        .sub_path = "definition.json",
+        .data = @embedFile("fixtures/plain-event-definition.json"),
+    });
+    var closure = try definition_core.closure.loadFromDir(
+        std.testing.io,
+        allocator,
+        &definitions.dir,
+        "definition.json",
+        .{},
+    );
+    defer closure.deinit(allocator);
+    const archive = try definition_archive.renderAlloc(
+        allocator,
+        "example/plain-protocol",
+        "definition.json",
+        &closure,
+    );
+    defer allocator.free(archive);
+    var reader = CapturedDependencyTestReader{ .bytes = archive };
+    var cache = PlanCache{
+        .source = reader.source(),
+        .allocator = allocator,
+        .definition_id = "example/plain-protocol",
+    };
+    defer cache.deinit();
+    const plan = try cache.get(closure.digestSlice());
+    try std.testing.expectEqualStrings("example/plain-protocol", plan.definition_plan.id);
+    var wrong_owner = PlanCache{
+        .source = reader.source(),
+        .allocator = allocator,
+        .definition_id = "another/owner",
+    };
+    defer wrong_owner.deinit();
+    try std.testing.expectError(
+        error.DefinitionArchiveOwnerMismatch,
+        wrong_owner.get(closure.digestSlice()),
+    );
+    const wrong_digest = try definition_core.canonical_json.digestBytesAlloc(
+        allocator,
+        "other closure",
+    );
+    defer allocator.free(wrong_digest);
+    try std.testing.expectError(error.DefinitionArchiveDigestMismatch, cache.get(wrong_digest));
+    const tampered = try std.mem.replaceOwned(u8, allocator, archive, "65536", "65535");
+    defer allocator.free(tampered);
+    try std.testing.expect(!std.mem.eql(u8, archive, tampered));
+    reader.bytes = tampered;
+    var uncached = PlanCache{
+        .source = reader.source(),
+        .allocator = allocator,
+        .definition_id = "example/plain-protocol",
+    };
+    defer uncached.deinit();
+    try std.testing.expectError(
+        error.DefinitionArchiveDigestMismatch,
+        uncached.get(closure.digestSlice()),
+    );
+    reader.bytes = null;
+    try std.testing.expectError(error.FileNotFound, uncached.get(closure.digestSlice()));
 }

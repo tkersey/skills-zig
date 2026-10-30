@@ -1084,6 +1084,7 @@ fn canonicalize(
             plan.normalize_line_endings,
             plan.trailing_newline,
         ),
+        .bytes => error.UnsupportedByteMaterialization,
     };
 }
 
@@ -1103,6 +1104,7 @@ pub fn canonicalizeInputAlloc(
         ),
         .jsonl => canonicalizeJsonl(allocator, bytes),
         .text => allocator.dupe(u8, bytes),
+        .bytes => error.UnsupportedByteMaterialization,
     };
 }
 
