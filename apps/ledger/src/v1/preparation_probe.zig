@@ -8,19 +8,18 @@ const Fault = enum {
     none,
     publication,
     capture,
+    creation,
+    bootstrap,
     verification,
-    cleanup,
-    partial_cleanup,
-    finalization,
+    inspection,
 };
 var original: *const std.Io.VTable = undefined;
 var fault: Fault = .none;
 var triggered: std.atomic.Value(bool) = .init(false);
 var committed: std.atomic.Value(bool) = .init(false);
 const no_handle = std.math.maxInt(usize);
-var payload_handle: std.atomic.Value(usize) = .init(no_handle);
+var stage_handle: std.atomic.Value(usize) = .init(no_handle);
 var marker_handle: std.atomic.Value(usize) = .init(no_handle);
-var payload_deletions: usize = 0;
 
 var measurement_io: std.Io = undefined;
 var measurement_allocator: std.mem.Allocator = undefined;
@@ -50,11 +49,14 @@ const Measurements = struct {
     target_bytes_written: u64 = 0,
     positional_bytes_written: u64 = 0,
     streaming_bytes_written: u64 = 0,
-    reclaimed_payload_bytes: u64 = 0,
+    native_stage_bytes_written: u64 = 0,
+    native_stage_creations: usize = 0,
+    reclaimed_native_bytes: u64 = 0,
     initial: Sizes = .{},
     retained: Sizes = .{},
     peak_working_bytes: u64 = 0,
     peak_native_working_bytes: u64 = 0,
+    peak_native_audit_bytes: u64 = 0,
     peak_additional_working_bytes: u64 = 0,
     samples: usize = 0,
 };
@@ -99,7 +101,6 @@ pub fn main(init: std.process.Init) !void {
     var vtable = original.*;
     vtable.dirRename = rename;
     vtable.dirCreateFile = createFile;
-    vtable.dirOpenFile = openFile;
     vtable.dirDeleteFile = deleteFile;
     vtable.fileWritePositional = writePositional;
     vtable.fileReadPositional = readPositional;
@@ -125,24 +126,22 @@ fn createFile(
     options: std.Io.Dir.CreateFileOptions,
 ) std.Io.File.OpenError!std.Io.File {
     const file = try original.dirCreateFile(userdata, directory, path, options);
+    const native_stage = std.mem.startsWith(u8, std.fs.path.basename(path), ".ledger-dtx-stage-");
+    if (native_stage) {
+        stage_handle.store(@intCast(file.handle), .monotonic);
+        measurements.native_stage_creations += 1;
+    }
     if (std.mem.eql(u8, std.fs.path.basename(path), "commit.json")) {
         marker_handle.store(@intCast(file.handle), .monotonic);
     }
     sample();
-    return file;
-}
-
-fn openFile(
-    userdata: ?*anyopaque,
-    directory: std.Io.Dir,
-    path: []const u8,
-    options: std.Io.Dir.OpenFileOptions,
-) std.Io.File.OpenError!std.Io.File {
-    const file = try original.dirOpenFile(userdata, directory, path, options);
-    if (fault == .capture and options.mode == .read_write and
-        std.mem.startsWith(u8, std.fs.path.basename(path), "payload-"))
+    if ((fault == .creation and native_stage) or
+        (fault == .bootstrap and std.mem.eql(u8, std.fs.path.basename(path), "transaction.json") and
+            journalDirectory(directory)))
     {
-        payload_handle.store(@intCast(file.handle), .monotonic);
+        triggered.store(true, .monotonic);
+        report();
+        std.process.exit(99);
     }
     return file;
 }
@@ -155,16 +154,10 @@ fn writePositional(
     splat: usize,
     offset: u64,
 ) std.Io.File.WritePositionalError!usize {
-    if (failFinalization(header, data)) return error.NoSpaceLeft;
     const count = try original.fileWritePositional(userdata, file, header, data, splat, offset);
     observeWrite(file, count, false);
-    if (fault == .capture and count != 0 and
-        payload_handle.load(.monotonic) == @as(usize, @intCast(file.handle)))
-    {
-        triggered.store(true, .monotonic);
-        report();
-        std.process.exit(99);
-    }
+    reportCompletedOutput(file, header, data, count);
+    captureFault(file, count);
     return count;
 }
 
@@ -178,7 +171,7 @@ fn syncFile(userdata: ?*anyopaque, file: std.Io.File) std.Io.File.SyncError!void
 fn closeFiles(userdata: ?*anyopaque, files: []const std.Io.File) void {
     for (files) |file| {
         const handle: usize = @intCast(file.handle);
-        if (payload_handle.load(.monotonic) == handle) payload_handle.store(no_handle, .monotonic);
+        if (stage_handle.load(.monotonic) == handle) stage_handle.store(no_handle, .monotonic);
         if (marker_handle.load(.monotonic) == handle) marker_handle.store(no_handle, .monotonic);
     }
     original.fileClose(userdata, files);
@@ -192,6 +185,13 @@ fn readPositional(
 ) std.Io.File.ReadPositionalError!usize {
     if (fault == .verification and committed.load(.monotonic) and
         !triggered.swap(true, .monotonic)) return error.InputOutput;
+    if (fault == .inspection) {
+        var buffer: [4096]u8 = undefined;
+        const length = original.fileRealPath(userdata, file, &buffer) catch
+            @panic("probe cannot identify inspected file");
+        if (std.mem.endsWith(u8, buffer[0..length], "/.preparation.json") and
+            !triggered.swap(true, .monotonic)) return error.InputOutput;
+    }
     const count = try original.fileReadPositional(userdata, file, data, offset);
     observeRead(file, count);
     return count;
@@ -202,18 +202,15 @@ fn deleteFile(
     directory: std.Io.Dir,
     path: []const u8,
 ) std.Io.Dir.DeleteFileError!void {
-    const payload = std.mem.startsWith(u8, std.fs.path.basename(path), "payload-");
-    if ((fault == .cleanup or (fault == .partial_cleanup and payload_deletions == 1)) and
-        payload and
-        !triggered.swap(true, .monotonic)) return error.AccessDenied;
-    const payload_bytes = if (measurement_path != null and payload)
-        (directory.statFile(measurement_io, path, .{ .follow_symlinks = false }) catch
-            @panic("probe cannot stat deleted payload")).size
+    const stat = if (measurement_path != null and journalDirectory(directory))
+        directory.statFile(measurement_io, path, .{ .follow_symlinks = false }) catch null
     else
-        0;
+        null;
+    const journal_file = if (stat) |value| value.kind == .file else false;
     try original.dirDeleteFile(userdata, directory, path);
-    if (payload) payload_deletions += 1;
-    measurements.reclaimed_payload_bytes += payload_bytes;
+    if (journal_file) {
+        measurements.reclaimed_native_bytes += stat.?.size;
+    }
     sample();
 }
 
@@ -228,7 +225,7 @@ fn rename(
     sample();
     if (fault == .publication and
         std.mem.startsWith(u8, old_sub_path, ".ledger-dtx-stage-") and
-        std.mem.eql(u8, new_sub_path, "operation.json"))
+        std.mem.eql(u8, new_sub_path, ".preparation.json"))
     {
         triggered.store(true, .monotonic);
         report();
@@ -243,10 +240,7 @@ fn observeRead(file: std.Io.File, count: usize) void {
 
 fn observeWrite(file: std.Io.File, count: usize, streaming: bool) void {
     if (measurement_path == null) return;
-    if (file.handle <= 2) {
-        report();
-        return;
-    }
+    if (file.handle <= 2) return;
     var path_buffer: [4096]u8 = undefined;
     const length = original.fileRealPath(measurement_io.userdata, file, &path_buffer) catch
         @panic("probe cannot identify written file");
@@ -255,6 +249,9 @@ fn observeWrite(file: std.Io.File, count: usize, streaming: bool) void {
         path.len > measurement_root_path.len and path[measurement_root_path.len] == '/')
     {
         measurements.target_bytes_written += count;
+        if (std.mem.startsWith(u8, std.fs.path.basename(path), ".ledger-dtx-stage-")) {
+            measurements.native_stage_bytes_written += count;
+        }
         if (streaming) {
             measurements.streaming_bytes_written += count;
         } else {
@@ -268,16 +265,12 @@ fn operate(
     userdata: ?*anyopaque,
     operation: std.Io.Operation,
 ) std.Io.Cancelable!std.Io.Operation.Result {
-    if (operation == .file_write_streaming) {
-        const write = operation.file_write_streaming;
-        if (failFinalization(write.header, write.data)) {
-            return .{ .file_write_streaming = error.NoSpaceLeft };
-        }
-    }
     const result = try original.operate(userdata, operation);
     switch (operation) {
         .file_write_streaming => |write| if (result.file_write_streaming) |count| {
             observeWrite(write.file, count, true);
+            reportCompletedOutput(write.file, write.header, write.data, count);
+            captureFault(write.file, count);
         } else |_| {},
         .file_read_streaming => |read| if (result.file_read_streaming) |count| {
             observeRead(read.file, count);
@@ -287,12 +280,35 @@ fn operate(
     return result;
 }
 
-fn failFinalization(header: []const u8, data: []const []const u8) bool {
-    if (fault != .finalization or payload_deletions == 0) return false;
-    const needle = "\"phase\":\"finalized\"";
-    var finalizing = std.mem.indexOf(u8, header, needle) != null;
-    for (data) |part| finalizing = finalizing or std.mem.indexOf(u8, part, needle) != null;
-    return finalizing and !triggered.swap(true, .monotonic);
+fn reportCompletedOutput(
+    file: std.Io.File,
+    header: []const u8,
+    data: []const []const u8,
+    count: usize,
+) void {
+    if (file.handle != 1 or count == 0) return;
+    var last = header;
+    for (data) |part| {
+        if (part.len != 0) last = part;
+    }
+    if (std.mem.endsWith(u8, last, "\n")) report();
+}
+
+fn captureFault(file: std.Io.File, count: usize) void {
+    if (fault == .capture and count != 0 and
+        stage_handle.load(.monotonic) == @as(usize, @intCast(file.handle)))
+    {
+        triggered.store(true, .monotonic);
+        report();
+        std.process.exit(99);
+    }
+}
+
+fn journalDirectory(directory: std.Io.Dir) bool {
+    var buffer: [4096]u8 = undefined;
+    const length = original.dirRealPath(measurement_io.userdata, directory, &buffer) catch
+        @panic("probe cannot identify journal directory");
+    return std.mem.indexOf(u8, buffer[0..length], "/.transactions/") != null;
 }
 
 fn createFileAtomic(
@@ -337,6 +353,10 @@ fn sample() void {
     measurements.peak_native_working_bytes = @max(
         measurements.peak_native_working_bytes,
         sizes.native_working_bytes,
+    );
+    measurements.peak_native_audit_bytes = @max(
+        measurements.peak_native_audit_bytes,
+        sizes.native_audit_bytes,
     );
     measurements.peak_additional_working_bytes = measurements.peak_working_bytes -|
         measurements.initial.working();
@@ -402,7 +422,9 @@ fn inspectDirectory(sizes: *Sizes) !void {
 fn addFileSize(path: []const u8, name: []const u8, size: u64, sizes: *Sizes) !void {
     const lock = std.mem.endsWith(u8, name, ".lock") or
         std.mem.endsWith(u8, name, ".lock.advisory");
-    if (lock or std.mem.eql(u8, path, ".fencing.counter")) {
+    if (lock or std.mem.eql(u8, path, ".fencing.counter") or
+        std.mem.eql(u8, path, ".preparation.json"))
+    {
         sizes.native_audit_bytes += size;
     } else if (std.mem.startsWith(u8, path, ".preparation/")) {
         sizes.preparation_bytes += size;

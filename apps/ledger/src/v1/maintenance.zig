@@ -57,7 +57,7 @@ pub fn execute(
         .free_bytes = space.availableBytes(scope.fs.directory()),
     };
     inspectAndFinalize(scope, selection, allocator, limits, apply, &result) catch |err| {
-        result.outcome = switch (err) {
+        result.outcome = switch (@as(anyerror, err)) {
             error.PreparationFileBoundExceeded,
             error.PreparationSpaceBoundExceeded,
             error.ReadBudgetExceeded,
@@ -90,18 +90,7 @@ fn inspectAndFinalize(
 ) !void {
     if (selection) |target| try target.revalidateBudgeted(allocator, scope.fs.read_budget);
     try work.inspectObserved(scope, allocator, limits, &result.preparation);
-    const observed = result.preparation.?;
-    if (apply and observed.phase != .absent and observed.phase != .finalized) {
-        var workspace = try work.Workspace.acquire(scope, allocator);
-        defer workspace.deinit();
-        result.phase = "cleanup";
-        var latest: ?work.Report = null;
-        defer if (latest) |report| {
-            result.preparation = report;
-            if (!report.complete) result.phase = @tagName(report.activity);
-        };
-        try workspace.reconcileObserved(limits, true, &latest);
-    }
+    _ = apply;
     var directory = try scope.fs.directory().openDir(scope.fs.io, ".", .{ .iterate = true });
     defer directory.close(scope.fs.io);
     var iterator = directory.iterate();

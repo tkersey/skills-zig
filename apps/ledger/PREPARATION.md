@@ -5,13 +5,27 @@ Paths below are relative to the admitted managed `.ledger` directory. Preparatio
 | Path | Creator | Required lifetime | Coordination | Release witness |
 | --- | --- | --- | --- | --- |
 | `.preparation.cas.lock.advisory` | Existing native CAS lock implementation | Persistent coordination resource | Existing native advisory lock protocol | Never reclaimed by preparation or maintenance |
-| `.preparation/operation.json` | Preparation | One replaceable latest operation record | Exclusive preparation advisory lock; ready-to-installed transition participates in the native target transaction | Retained after finalization, with payload witnesses removed; never independently authorizes commit |
-| `.preparation/payload-N` | Preparation, exclusive creation | Capture through native publication resolution | Exclusive preparation advisory lock; creation inode and declared size recorded before payload writes | No pending native transaction, recognized operation record, matching single-link file inode and bounded length; completed captures also require the recorded digest |
-| Temporary replacement file in `.preparation` | Existing atomic publication helper | Atomic operation-record replacement | Exclusive preparation advisory lock | Existing helper's own failure cleanup only; an unrecognized leftover blocks preparation cleanup and is retained |
-| `.transactions`, fencing files, target CAS lock sidecars | Existing native transaction machinery | Existing native lifetime rules | Existing native transaction protocol | No new deletion rule |
+| `.preparation.json` | Native publication transaction | One bounded replaceable receipt with selected witnesses and flat provenance | Same transaction and expected-before checks as selected history | Retained after finalization; never independently advances publication |
+| `.transactions/<transaction>/transaction.json`, `commit.json`, and listed native stage files | Existing native transaction machinery | Native preparing record precedes every bulk stage; stages become canonical files by native rename | Existing native transaction and recovery locks | Existing native recovery and compaction rules; no new reclamation policy |
+| Fencing files and CAS advisory sidecars | Existing native coordination | Persistent coordination resources | Existing native protocols | Never reclaimed by preparation or maintenance |
 | Canonical history, bindings, definitions, revisions, caches, foreign files | Existing owners | Existing history and owner rules | Existing owner protocols | Outside preparation cleanup scope |
 
-Payload count and total bytes use the invocation's preparation limits. The operation record is at most 1 MiB, with at most 64 KiB of flat provenance JSON. Atomic replacement needs at most one additional record-sized temporary file; native publication staging is accounted separately. Unknown artifacts, ownership mismatches, incomplete native publication, or exhausted inspection limits stop cleanup. Maintenance inspects native pending work but does not recover it. Interrupted capture can restart only after its recorded files are released under these conditions. A retry uses the same workspace and replaces the latest record.
+Selected bytes are captured and validated within the invocation's memory and I/O
+bounds, then staged once by the native transaction. There is no separate payload
+copy or operation-record update protocol. The receipt is at most 1 MiB with at
+most 64 KiB of flat provenance. One unresolved transaction blocks another capture;
+valid preparing journals allow native rollback of incomplete staging. A malformed
+initial native journal remains an explicit unknown: retries retain that metadata
+and stop before another transaction or bulk stage. Universal automatic recovery
+from damaged native metadata is not claimed.
+
+Maintenance never advances unresolved transactions or compacts their audit journals.
+Successful native publication renames every bulk stage into canonical history;
+there is no independent preparation payload to reclaim. Required native metadata
+retains its existing lifetime and is observed separately. Normal preparation
+uses existing native recovery and compaction when unresolved work is present.
+An old `.preparation` directory is retained as unknown work rather than bypassed
+or removed. No new native artifact deletion policy is introduced.
 
 ## Commands and bounds
 
@@ -47,15 +61,16 @@ is inside the operation counter. The derived stream-count ceiling is 16 times
 
 Logical staged bytes,
 estimated peak additional bytes and available space are separate observations;
-free-space inspection is not a reservation. Required transaction staging is
-additional to the selected preparation payload. Maintenance's top-level file
+free-space inspection is not a reservation. Native transaction staging is the sole durable selected-payload workspace. Maintenance's top-level file
 lengths are partial metadata observations; nested/foreign sizes and physical
 blocks freed remain unknown. No whole-store inventory is implied.
-`staged_bytes` measures the selected payload written into the workspace and is
-unknown if staging fails partway. Native transaction write traffic and actual
+`staged_bytes` measures selected payload staged by the successful native transaction,
+excluding matching immutable files reused in place; it is unknown after interrupted staging. Native transaction write traffic and actual
 peak working bytes remain explicitly unknown; the peak field labeled estimated
-is not a measurement. Successful finalization reports reclaimed logical payload
-bytes separately from native audit/recovery metadata retained under existing rules.
+is not a measurement. Successful publication transfers staged bytes rather than deleting a duplicate;
+`reclaimed_bytes` is zero for that transfer. If existing native recovery mutates
+working storage, its reclaimed logical byte count remains unknown unless measured.
+Native audit metadata and the bounded receipt are retained separately.
 
 ## Outcomes
 
@@ -75,13 +90,12 @@ the existing native error envelope. No failure is an empty-history observation.
 Its `installed` flag records an earlier native installation, not installation of
 the currently selected owner. `observed_by` identifies inspection or reconciliation;
 an inspection observation retained across a failed recovery is historical evidence,
-not certification of that recovery. `activity` identifies inspection or cleanup,
-and `complete: false` marks partial observations. A failed prior cleanup reports
-`recovery-required` and `prior-cleanup` while preserving known installed state;
-the current request is blocked, but that earlier publication is not uncertain.
+not certification of that recovery. `activity` identifies the observation,
+and `complete: false` marks partial observations. Unresolved or malformed native work reports `recovery-required` and is retained;
+a receipt never overrides the native publication outcome.
 `committed-with-later-failure` identifies this invocation's committed transaction.
-Reclaimed bytes include completed deletions even when a later deletion or receipt
-write fails. New capture uses its own observations and cannot inherit an older
+Known observations survive later failures; native recovery reports
+`reclaimed_bytes: null` when its deletion count is unavailable. New capture uses its own observations and cannot inherit an older
 installation's success.
 
 Maintenance JSON uses `ledger-maintenance-result/v1`. `healthy` returns exit 0;
@@ -103,7 +117,7 @@ The mixed-version integration fixture qualifies native macOS Ledger 1.5.5 with
 old-writer combinations require the quiescent cutover route unless separately
 qualified; participating 1.6 writers use the native coordination on Linux/macOS.
 
-The `.preparation` control record adds no owner-data format. Existing readers and
+The `.preparation.json` receipt adds no owner-data format. Existing readers and
 healthy segmented access keep their existing routes. Unsupported preparation
 layouts fail before recovery or workspace creation. Broad historical migration
 remains separately selected; this command neither replaces it nor reclaims its

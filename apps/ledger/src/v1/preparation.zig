@@ -65,7 +65,7 @@ pub const Result = struct {
     write_scope: []const u8 = "selected-preparation-payload",
     native_bytes_written: ?usize = null,
     peak_additional_working_bytes: ?usize = null,
-    reclaimed_bytes: usize = 0,
+    reclaimed_bytes: ?u64 = 0,
     prior_preparation: ?work.Report = null,
     estimated_peak_additional_bytes: usize = 0,
     free_bytes: ?u64 = null,
@@ -286,9 +286,16 @@ const Execution = struct {
     fn acquireWorkspace(self: *Execution) !void {
         if (self.workspace != null) return;
         self.workspace = try work.Workspace.acquire(self.scope, self.allocator);
-        self.result.phase = "recovery";
-        if (try transaction.recoverRepositoryTransactions(self.scope, self.allocator, ".")) {
-            transaction.markStorageMutated(self.scope);
+        if (try durable_store.countPendingTransactions(
+            self.scope.fs,
+            self.allocator,
+            ".transactions",
+        ) != 0) {
+            self.result.phase = "recovery";
+            if (try transaction.recoverRepositoryTransactions(self.scope, self.allocator, ".")) {
+                transaction.markStorageMutated(self.scope);
+                self.workspace.?.reclaimed_bytes = null;
+            }
         }
         self.result.phase = "prior-reconciliation";
         var observation: ?work.Report = null;
@@ -515,7 +522,6 @@ const Execution = struct {
         self.result.phase = "capture";
         self.result.staged_bytes = null;
         try self.workspace.?.stage(chosen, provenance, self.options.limits);
-        self.result.staged_bytes = chosen.bytes;
         try self.revalidateSources();
         try self.selection.revalidateBudgeted(self.allocator, self.budget);
         self.result.phase = "publication";
@@ -524,6 +530,7 @@ const Execution = struct {
             self.allocator,
             chosen,
             &self.workspace.?,
+            &self.result.staged_bytes,
         );
         self.result.outcome = "prepared";
         self.result.phase = "committed";
@@ -609,6 +616,7 @@ fn publish(
     allocator: std.mem.Allocator,
     history: *const History,
     workspace: *const work.Workspace,
+    staged_bytes: *?usize,
 ) ![]u8 {
     const control_root = try std.fs.path.join(
         allocator,
@@ -632,10 +640,12 @@ fn publish(
         paths.deinit(allocator);
     }
     try paths.ensureTotalCapacity(allocator, history.files.items.len);
+    var staged: usize = 0;
     for (history.files.items, 0..) |file, index| {
         const path = try std.fs.path.join(allocator, &.{ control_root, file.path });
         paths.appendAssumeCapacity(path);
         mutations[index] = try selectedMutation(scope, allocator, path, file);
+        if (mutations[index].action == .write) staged += file.bytes.len;
     }
     mutations[mutations.len - 1] = try workspace.publicationMutation();
     mutations[mutations.len - 1].path = operation_path;
@@ -657,6 +667,7 @@ fn publish(
     );
     defer receipt.deinit(allocator);
     transaction.markStorageMutated(scope);
+    staged_bytes.* = staged;
     const transaction_id = @constCast(receipt.transaction_id);
     receipt.transaction_id = &.{};
     return transaction_id;
