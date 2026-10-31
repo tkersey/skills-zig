@@ -115,7 +115,7 @@ pub fn execute(
         .preparation_pending = preparation_status.pending,
         .preparation_error = preparation_status.failure,
         .slots = slots,
-        .healthy = healthy,
+        .healthy = healthy and !preparation_status.pending,
     };
 }
 

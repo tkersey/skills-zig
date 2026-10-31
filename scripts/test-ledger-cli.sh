@@ -806,6 +806,51 @@ test ! -e "$preparation_target/.ledger/.preparation"
   --format jsonl >"$preparation_dir/projection.jsonl"
 cmp -s "$preparation_dir/expected.jsonl" "$preparation_dir/projection.jsonl"
 
+for preparation_doctor_case in finalized absent malformed legacy; do
+  preparation_doctor_root="$preparation_dir/doctor-$preparation_doctor_case"
+  cp -R "$preparation_target" "$preparation_doctor_root"
+  preparation_doctor_expected_status=0
+  case "$preparation_doctor_case" in
+    absent) rm "$preparation_doctor_root/.ledger/.preparation.json" ;;
+    malformed)
+      printf '{' >"$preparation_doctor_root/.ledger/.preparation.json"
+      preparation_doctor_expected_status=2
+      ;;
+    legacy)
+      mkdir "$preparation_doctor_root/.ledger/.preparation"
+      preparation_doctor_expected_status=2
+      ;;
+  esac
+  preparation_fingerprint "$preparation_doctor_root" >"$preparation_dir/doctor-before"
+  preparation_doctor_status=0
+  "$binary" doctor --definition "$event_definition" \
+    --store-root "$preparation_doctor_root" --store-id preparation-smoke \
+    --format json >"$preparation_dir/doctor-$preparation_doctor_case.json" || preparation_doctor_status=$?
+  test "$preparation_doctor_status" -eq "$preparation_doctor_expected_status"
+  "$json_cli" -e --argjson healthy "$([ "$preparation_doctor_expected_status" -eq 0 ] && printf true || printf false)" '
+    .healthy == $healthy and .preparation_pending == ($healthy | not) and
+    (.preparation_error == null) == $healthy and .pending_transactions == 0 and
+    .storage_mutated == false and (.slots | length) == 1 and
+    (.slots | all(.healthy and .binding_rows == 2))
+  ' "$preparation_dir/doctor-$preparation_doctor_case.json" >/dev/null
+  preparation_doctor_status=0
+  "$binary" doctor --definition "$event_definition" \
+    --store-root "$preparation_doctor_root" --store-id preparation-smoke \
+    --format text >"$preparation_dir/doctor-$preparation_doctor_case.txt" || preparation_doctor_status=$?
+  test "$preparation_doctor_status" -eq "$preparation_doctor_expected_status"
+  if [ "$preparation_doctor_expected_status" -eq 0 ]; then
+    grep -q '^healthy ' "$preparation_dir/doctor-$preparation_doctor_case.txt"
+  else
+    grep -q '^unhealthy ' "$preparation_dir/doctor-$preparation_doctor_case.txt"
+  fi
+  preparation_fingerprint "$preparation_doctor_root" >"$preparation_dir/doctor-after"
+  cmp -s "$preparation_dir/doctor-before" "$preparation_dir/doctor-after"
+  "$binary" project --definition "$event_definition" --projection all \
+    --store-root "$preparation_doctor_root" --store-id preparation-smoke \
+    --format jsonl >"$preparation_dir/doctor-projection.jsonl"
+  cmp -s "$preparation_dir/expected.jsonl" "$preparation_dir/doctor-projection.jsonl"
+done
+
 preparation_fingerprint "$preparation_prefix" >"$preparation_dir/prefix-before"
 preparation_expect_failure reconciliation-required "$preparation_dir/prefix-inspect.json" \
   prepare --definition "$event_definition" --store-root "$preparation_prefix" \
