@@ -35,12 +35,27 @@ Inspection does not create locks, workspaces, catalog associations or health fil
 | `--max-files` | 512 | 2–1023 |
 | `--max-read-bytes` | 1,073,741,824 (1 GiB) | 1–17,179,869,184 |
 
-Read accounting includes repeated native validation reads. Logical staged bytes,
+Read accounting covers operation I/O, including source admission, relevant
+markers/manifests, repeated native validation, publication, recovery, installed
+verification and cleanup. The same allowance follows the filesystem authority;
+rejected streams retain their charges. The initial CLI definition load (at most
+128 files and 4 MiB total) and initial target marker admission (4 KiB) are separately
+bounded invocation inputs. Their actual transferred-byte count is unavailable;
+`bytes_read` does not claim to measure total process I/O. Final target revalidation
+is inside the operation counter. The derived stream-count ceiling is 16 times
+`max_files` for preparation and four times `max_files` for maintenance.
+
+Logical staged bytes,
 estimated peak additional bytes and available space are separate observations;
 free-space inspection is not a reservation. Required transaction staging is
 additional to the selected preparation payload. Maintenance's top-level file
 lengths are partial metadata observations; nested/foreign sizes and physical
 blocks freed remain unknown. No whole-store inventory is implied.
+`staged_bytes` measures the selected payload written into the workspace and is
+unknown if staging fails partway. Native transaction write traffic and actual
+peak working bytes remain explicitly unknown; the peak field labeled estimated
+is not a measurement. Successful finalization reports reclaimed logical payload
+bytes separately from native audit/recovery metadata retained under existing rules.
 
 ## Outcomes
 
@@ -49,11 +64,12 @@ phase, limits, read and staging counters, observations, known mutation state and
 any transaction identity. `covered`, `empty`, `ready` and `prepared` return exit 0;
 `empty` means no admitted history, not permission to initialize or replace an
 established owner. `ready` is inspection evidence, not an execution token.
-`reconciliation-required`, `recovery-required` and `committed-with-later-failure`
-return exit 2. The latter preserves the committed installation and names the
-failed later phase; retry reuses it. Native admission errors retain the existing
-error envelope and specific error code, including unsupported layout, divergence,
-quiescence requirements and exhausted bounds.
+`reconciliation-required`, `recovery-required`, `busy`, `incomplete`, `unsupported`,
+`failure` and `committed-with-later-failure` return exit 2. The latter preserves the committed installation and names the
+failed later phase; retry reuses it. Operation failures preserve measured counters,
+the specific `error_code`, phase and mutation observation in the preparation
+result. Argument/definition/layout admission errors before operation entry retain
+the existing native error envelope. No failure is an empty-history observation.
 
 Maintenance JSON uses `ledger-maintenance-result/v1`. `healthy` returns exit 0;
 `blocked`, `incomplete` and `failure` return exit 2 with the error code and measured
@@ -69,6 +85,10 @@ including an absent control directory, requires actual quiescence established by
 the host and `--confirm-no-legacy-writers`; a missing PID or elapsed time is
 insufficient. Preparation does not establish quiescence itself. Unsupported old
 writers must be stopped or upgraded before cutover.
+The mixed-version integration fixture qualifies native macOS Ledger 1.5.5 with
+1.6 preparation, old-reader projection and subsequent old-writer capture. Other
+old-writer combinations require the quiescent cutover route unless separately
+qualified; participating 1.6 writers use the native coordination on Linux/macOS.
 
 The `.preparation` control record adds no owner-data format. Existing readers and
 healthy segmented access keep their existing routes. Unsupported preparation

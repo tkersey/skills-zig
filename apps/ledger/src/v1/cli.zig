@@ -76,6 +76,7 @@ const Help =
     \\  Prepare and maintain inspect by default. Apply requires existing custody authority.
     \\  Preparation supports static monolithic histories; maintenance releases only owned work.
     \\  Default bounds: 67108864 staged bytes, 512 files, 1073741824 read bytes.
+    \\  Read bounds include native recovery; initial definition/marker admission has its own bounds.
     \\
     \\Definitions are passive JSON. Ledger grants no semantic authority and does not read sessions.
     \\
@@ -335,11 +336,9 @@ fn runMaintain(
         } else return error.UnknownOption;
     }
     selection.enterControl(scope);
-    try selection.revalidate(allocator);
-    var result = try ledger.maintenance.execute(scope, allocator, limits, apply);
+    var result = try ledger.maintenance.execute(scope, selection, allocator, limits, apply);
     result.store_id = selection.store_id;
     result.store_root = selection.supplied_root;
-    try selection.revalidate(allocator);
     var writer = std.Io.File.stdout().writer(scope.fs.io, &.{});
     if (format == .json) {
         try std.json.Stringify.value(result, .{}, &writer.interface);
@@ -466,7 +465,6 @@ fn runPrepare(
     );
     defer bindings.deinit(allocator);
     selection.enterControl(scope);
-    try selection.revalidate(allocator);
     var result = ledger.preparation.execute(
         scope,
         selection,
@@ -482,12 +480,6 @@ fn runPrepare(
         return 2;
     };
     defer result.deinit(allocator);
-    selection.revalidate(allocator) catch |err| {
-        if (result.transaction_id == null) return err;
-        result.outcome = "committed-with-later-failure";
-        result.phase = "target-revalidation";
-        result.error_code = @errorName(err);
-    };
     result.store_id = selection.store_id;
     result.store_root = selection.supplied_root;
     return emitPreparation(scope, args.format, result);
@@ -509,10 +501,11 @@ fn emitPreparation(
         );
     }
     try writer.interface.flush();
-    const failed = std.mem.eql(u8, result.outcome, "reconciliation-required") or
-        std.mem.eql(u8, result.outcome, "recovery-required") or
-        std.mem.eql(u8, result.outcome, "committed-with-later-failure");
-    return if (failed) 2 else 0;
+    const succeeded = std.mem.eql(u8, result.outcome, "covered") or
+        std.mem.eql(u8, result.outcome, "empty") or
+        std.mem.eql(u8, result.outcome, "ready") or
+        std.mem.eql(u8, result.outcome, "prepared");
+    return if (succeeded) 0 else 2;
 }
 
 fn runDefinitionCommand(

@@ -5,6 +5,7 @@ const std = @import("std");
 /// Construction does not admit a path or replace per-operation identity checks.
 pub const Fs = struct {
     io: std.Io,
+    read_budget: ?*ReadBudget = null,
     root: union(enum) { cwd: std.Io.Dir, pinned: std.Io.Dir },
 
     pub fn init(io: std.Io, dir: std.Io.Dir) Fs {
@@ -15,6 +16,10 @@ pub const Fs = struct {
         return .{ .io = io, .root = .{ .pinned = dir } };
     }
 
+    pub fn reanchor(self: Fs, dir: std.Io.Dir) Fs {
+        return .{ .io = self.io, .root = .{ .pinned = dir }, .read_budget = self.read_budget };
+    }
+
     pub fn directory(self: Fs) std.Io.Dir {
         return switch (self.root) {
             .cwd, .pinned => |dir| dir,
@@ -23,6 +28,98 @@ pub const Fs = struct {
 
     pub fn isPinned(self: Fs) bool {
         return self.root == .pinned;
+    }
+};
+
+pub const ReadBudget = struct {
+    max_bytes: usize,
+    max_files: usize,
+    bytes: usize = 0,
+    files: usize = 0,
+
+    pub fn begin(self: *ReadBudget) !void {
+        std.debug.assert(self.files <= self.max_files);
+        if (self.files == self.max_files) return error.ReadFileBudgetExceeded;
+        self.files += 1;
+    }
+};
+
+pub const FileRead = struct {
+    fs: Fs,
+    file: std.Io.File,
+    max_bytes: usize,
+    offset: usize = 0,
+    failure: ?anyerror = null,
+    interface: std.Io.Reader = .{
+        .vtable = &.{ .stream = stream },
+        .buffer = &.{},
+        .seek = 0,
+        .end = 0,
+    },
+
+    pub fn init(fs: Fs, file: std.Io.File, max_bytes: usize) !FileRead {
+        if (fs.read_budget) |budget| try budget.begin();
+        return initCounted(fs, file, max_bytes);
+    }
+
+    pub fn initCounted(fs: Fs, file: std.Io.File, max_bytes: usize) !FileRead {
+        if (fs.read_budget) |budget| {
+            const stat = try file.stat(fs.io);
+            if (stat.kind != .file) return error.NotFile;
+            if (stat.size > max_bytes) return error.FileTooBig;
+            std.debug.assert(budget.bytes <= budget.max_bytes);
+            if (stat.size > budget.max_bytes - budget.bytes) return error.ReadBudgetExceeded;
+        }
+        return .{ .fs = fs, .file = file, .max_bytes = max_bytes };
+    }
+
+    pub fn read(self: *FileRead, buffer: []u8) !usize {
+        std.debug.assert(buffer.len > 0);
+        var request = buffer.len;
+        if (self.fs.read_budget) |budget| {
+            if (self.offset > self.max_bytes) return error.FileTooBig;
+            const remaining = budget.max_bytes - budget.bytes;
+            if (remaining == 0) {
+                const stat = try self.file.stat(self.fs.io);
+                if (stat.kind == .file and stat.size <= self.offset) return 0;
+                return error.ReadBudgetExceeded;
+            }
+            request = @min(request, @min(remaining, self.max_bytes - self.offset +| 1));
+        }
+        const count = try self.file.readPositional(self.fs.io, &.{buffer[0..request]}, self.offset);
+        if (self.fs.read_budget) |budget| budget.bytes += count;
+        self.offset = std.math.add(usize, self.offset, count) catch return error.FileTooBig;
+        return count;
+    }
+
+    pub fn alloc(self: *FileRead, allocator: std.mem.Allocator) ![]u8 {
+        var bytes: std.ArrayList(u8) = .empty;
+        errdefer bytes.deinit(allocator);
+        var buffer: [16 * 1024]u8 = undefined;
+        while (bytes.items.len <= self.max_bytes) {
+            const count = try self.read(&buffer);
+            if (count == 0) return bytes.toOwnedSlice(allocator);
+            if (count > self.max_bytes - bytes.items.len) return error.FileTooBig;
+            try bytes.appendSlice(allocator, buffer[0..count]);
+        }
+        unreachable;
+    }
+
+    fn stream(
+        reader: *std.Io.Reader,
+        writer: *std.Io.Writer,
+        limit: std.Io.Limit,
+    ) std.Io.Reader.StreamError!usize {
+        const self: *FileRead = @fieldParentPtr("interface", reader);
+        const buffer = limit.slice(try writer.writableSliceGreedy(1));
+        if (buffer.len == 0) return 0;
+        const count = self.read(buffer) catch |err| {
+            self.failure = err;
+            return error.ReadFailed;
+        };
+        if (count == 0) return error.EndOfStream;
+        writer.advance(count);
+        return count;
     }
 };
 

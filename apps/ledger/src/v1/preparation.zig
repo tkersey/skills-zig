@@ -61,12 +61,18 @@ pub const Result = struct {
     bytes_read: usize = 0,
     file_reads: usize = 0,
     selected_bytes: usize = 0,
-    staged_bytes: usize = 0,
+    staged_bytes: ?usize = 0,
+    write_scope: []const u8 = "selected-preparation-payload",
+    native_bytes_written: ?usize = null,
+    peak_additional_working_bytes: ?usize = null,
+    reclaimed_bytes: usize = 0,
     estimated_peak_additional_bytes: usize = 0,
     free_bytes: ?u64 = null,
     records: usize = 0,
     transaction_id: ?[]u8 = null,
     error_code: ?[]const u8 = null,
+    read_scope: []const u8 = "preparation-operation-including-native-recovery",
+    invocation_input_bytes: ?usize = null,
     observations: []Observation,
 
     pub fn deinit(self: *Result, allocator: std.mem.Allocator) void {
@@ -84,7 +90,12 @@ const OpenedSource = struct {
     root: std.Io.Dir,
     control: ?std.Io.Dir,
 
-    fn open(io: std.Io, allocator: std.mem.Allocator, source: Source) !OpenedSource {
+    fn open(
+        io: std.Io,
+        allocator: std.mem.Allocator,
+        source: Source,
+        budget: *storage_root.ReadBudget,
+    ) !OpenedSource {
         if (std.mem.indexOf(u8, source.root, "/.preparation/") != null or
             std.mem.endsWith(u8, source.root, "/.preparation"))
         {
@@ -93,7 +104,7 @@ const OpenedSource = struct {
         const root = try storage_root.openRoot(io, source.root);
         errdefer root.close(io);
         const control = if (source.store_id) |id|
-            try storage_root.checkedRoot(allocator, io, source.root, id)
+            try storage_root.checkedRootBudgeted(allocator, io, source.root, id, budget)
         else
             root.openDir(io, ".ledger", .{ .follow_symlinks = false }) catch |err| switch (err) {
                 error.FileNotFound => null,
@@ -108,8 +119,13 @@ const OpenedSource = struct {
         self.* = undefined;
     }
 
-    fn revalidate(self: *const OpenedSource, io: std.Io, allocator: std.mem.Allocator) !void {
-        var current = try OpenedSource.open(io, allocator, self.source);
+    fn revalidate(
+        self: *const OpenedSource,
+        io: std.Io,
+        allocator: std.mem.Allocator,
+        budget: *storage_root.ReadBudget,
+    ) !void {
+        var current = try OpenedSource.open(io, allocator, self.source, budget);
         defer current.deinit(io);
         if ((try self.root.stat(io)).inode != (try current.root.stat(io)).inode) {
             return error.PreparationSourceChanged;
@@ -142,9 +158,9 @@ pub fn execute(
         .max_bytes = options.limits.max_read_bytes,
         .max_files = options.limits.max_files * 16,
     };
-    const previous_budget = scope.read_budget;
-    scope.read_budget = &budget;
-    defer scope.read_budget = previous_budget;
+    const previous_budget = scope.fs.read_budget;
+    scope.fs.read_budget = &budget;
+    defer scope.fs.read_budget = previous_budget;
     var execution: Execution = .{
         .scope = scope,
         .selection = selection,
@@ -164,10 +180,7 @@ pub fn execute(
     };
     defer execution.deinit();
     errdefer execution.result.deinit(allocator);
-    if (!try execution.resolvePriorWork()) return execution.finish();
-    execution.target = try execution.readTarget();
-    try execution.admitSources(sources);
-    try execution.decide();
+    execution.run(sources) catch |err| execution.recordFailure(err);
     return execution.finish();
 }
 
@@ -190,6 +203,31 @@ const Execution = struct {
     observations: std.ArrayList(Observation) = .empty,
     best: ?usize = null,
     target_covers: bool = true,
+
+    fn run(self: *Execution, sources: []const Source) !void {
+        try self.selection.revalidateBudgeted(self.allocator, self.budget);
+        if (try self.resolvePriorWork()) {
+            self.target = try self.readTarget();
+            try self.admitSources(sources);
+            try self.decide();
+        }
+        const previous_phase = self.result.phase;
+        self.result.phase = "target-revalidation";
+        try self.selection.revalidateBudgeted(self.allocator, self.budget);
+        self.result.phase = previous_phase;
+    }
+
+    fn recordFailure(self: *Execution, err: anyerror) void {
+        self.result.error_code = @errorName(err);
+        self.result.outcome = if (self.result.transaction_id != null)
+            "committed-with-later-failure"
+        else if (err == error.LockBusy or err == error.EventStoreBusy)
+            "busy"
+        else if (std.mem.eql(u8, self.result.phase, "publication"))
+            "recovery-required"
+        else
+            failureOutcome(err);
+    }
 
     fn deinit(self: *Execution) void {
         if (self.workspace) |*workspace| workspace.deinit();
@@ -240,7 +278,8 @@ const Execution = struct {
         if (try transaction.recoverRepositoryTransactions(self.scope, self.allocator, ".")) {
             transaction.markStorageMutated(self.scope);
         }
-        _ = try self.workspace.?.reconcile(self.options.limits, true);
+        const cleanup = try self.workspace.?.reconcile(self.options.limits, true);
+        self.result.reclaimed_bytes += cleanup.reclaimed_bytes;
         self.result.phase = "preparation";
     }
 
@@ -299,7 +338,7 @@ const Execution = struct {
         try self.histories.ensureTotalCapacity(self.allocator, sources.len);
         for (sources) |source| try self.admitSource(source);
         try self.revalidateSources();
-        try self.selection.revalidate(self.allocator);
+        try self.selection.revalidateBudgeted(self.allocator, self.budget);
     }
 
     fn admitSource(self: *Execution, source: Source) !void {
@@ -307,6 +346,7 @@ const Execution = struct {
             self.scope.fs.io,
             self.allocator,
             source,
+            self.budget,
         ));
         const current = &self.opened.items[self.opened.items.len - 1];
         var history = try self.captureSource(current);
@@ -346,8 +386,7 @@ const Execution = struct {
     fn captureSource(self: *Execution, source: *const OpenedSource) !History {
         if (source.control) |control| {
             var scope: storage_root.Scope = .{
-                .fs = .anchored(self.scope.fs.io, control),
-                .read_budget = self.budget,
+                .fs = self.scope.fs.reanchor(control),
             };
             if (!source.source.archive) try durable_store.ensureNoPendingTransactions(
                 scope.fs,
@@ -367,11 +406,10 @@ const Execution = struct {
 
     fn revalidateSources(self: *Execution) !void {
         for (self.opened.items, self.histories.items) |*source, *history| {
-            try source.revalidate(self.scope.fs.io, self.allocator);
+            try source.revalidate(self.scope.fs.io, self.allocator, self.budget);
             if (source.control) |control| {
                 var scope: storage_root.Scope = .{
-                    .fs = .anchored(self.scope.fs.io, control),
-                    .read_budget = self.budget,
+                    .fs = self.scope.fs.reanchor(control),
                 };
                 try recheckHistory(&scope, self.allocator, self.slot, history);
             }
@@ -449,10 +487,13 @@ const Execution = struct {
             .{},
         );
         defer self.allocator.free(provenance);
+        self.result.phase = "capture";
+        self.result.staged_bytes = null;
         try self.workspace.?.stage(chosen, provenance, self.options.limits);
         self.result.staged_bytes = chosen.bytes;
         try self.revalidateSources();
-        try self.selection.revalidate(self.allocator);
+        try self.selection.revalidateBudgeted(self.allocator, self.budget);
+        self.result.phase = "publication";
         self.result.transaction_id = try publish(
             self.scope,
             self.allocator,
@@ -475,10 +516,30 @@ const Execution = struct {
             return error.PreparationInstalledHistoryMismatch;
         }
         self.result.phase = "cleanup";
-        _ = try self.workspace.?.reconcile(self.options.limits, true);
+        const cleanup = try self.workspace.?.reconcile(self.options.limits, true);
+        self.result.reclaimed_bytes += cleanup.reclaimed_bytes;
         self.result.phase = "committed";
     }
 };
+
+fn failureOutcome(err: anyerror) []const u8 {
+    return switch (err) {
+        error.LockBusy, error.EventStoreBusy => "busy",
+        error.TransactionRecoveryRequired, error.PreparationOwnershipUnknown => "recovery-required",
+        error.PreparationDivergentHistory,
+        error.PreparationBindingConflict,
+        => "reconciliation-required",
+        error.ReadBudgetExceeded,
+        error.ReadFileBudgetExceeded,
+        error.PreparationFileBoundExceeded,
+        error.PreparationSpaceBoundExceeded,
+        error.TooManyFiles,
+        error.FileTooBig,
+        => "incomplete",
+        error.UnsupportedPreparationLayout => "unsupported",
+        else => "failure",
+    };
+}
 
 fn releaseHistoryLocks(history: *History) void {
     if (history.read_custody) |*locks| {
@@ -624,7 +685,11 @@ fn validateArchive(
     }
     var directory = try storage_root.openRoot(io, parent);
     defer directory.close(io);
-    var scope: storage_root.Scope = .{ .fs = .anchored(io, directory), .read_budget = budget };
+    var scope: storage_root.Scope = .{ .fs = .{
+        .io = io,
+        .root = .{ .pinned = directory },
+        .read_budget = budget,
+    } };
     const bytes = try scope.readFile(allocator, "manifest.json", 32 * 1024 * 1024);
     defer allocator.free(bytes);
     var parsed = try std.json.parseFromSlice(std.json.Value, allocator, bytes, .{

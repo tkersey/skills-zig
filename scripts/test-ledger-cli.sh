@@ -709,7 +709,7 @@ preparation_expect_failure() {
   "$binary" "$@" >"$output" || status=$?
   test "$status" -eq 2
   "$json_cli" -e --arg expected "$expected" \
-    '.code == $expected or .outcome == $expected' "$output" >/dev/null
+    '.code == $expected or .error_code == $expected or .outcome == $expected' "$output" >/dev/null
 }
 
 for preparation_root in "$preparation_target" "$preparation_prefix" "$preparation_empty" "$preparation_conflict" "$preparation_archive_target"; do
@@ -732,6 +732,20 @@ dd if=/dev/zero of="$preparation_source/.ledger/unrelated-cas/oversized.bin" bs=
 test "$(wc -c <"$preparation_source/.ledger/unrelated-cas/oversized.bin")" -gt 2147483648
 
 preparation_fingerprint "$preparation_target" >"$preparation_dir/inspect-before"
+preparation_expect_failure ReadBudgetExceeded "$preparation_dir/read-bound.json" \
+  prepare --definition "$event_definition" --store-root "$preparation_target" \
+  --store-id preparation-smoke --source-root "$preparation_source" --apply \
+  --max-read-bytes 1 --format json
+"$json_cli" -e '.outcome == "incomplete" and .storage_mutated == false and .bytes_read == 0 and .file_reads > 0 and .read_scope == "preparation-operation-including-native-recovery"' \
+  "$preparation_dir/read-bound.json" >/dev/null
+preparation_maintenance_status=0
+"$binary" maintain --store-root "$preparation_target" --store-id preparation-smoke \
+  --apply --max-read-bytes 1 --format json >"$preparation_dir/maintenance-read-bound.json" || preparation_maintenance_status=$?
+test "$preparation_maintenance_status" -eq 2
+"$json_cli" -e '.outcome == "incomplete" and .error_code == "ReadBudgetExceeded" and .storage_mutated == false and .bytes_read == 0' \
+  "$preparation_dir/maintenance-read-bound.json" >/dev/null
+preparation_fingerprint "$preparation_target" >"$preparation_dir/read-bound-after"
+cmp -s "$preparation_dir/inspect-before" "$preparation_dir/read-bound-after"
 "$binary" prepare --definition "$event_definition" \
   --store-root "$preparation_target" --store-id preparation-smoke \
   --source-root "$preparation_source" --format json >"$preparation_dir/inspect.json"
@@ -748,7 +762,7 @@ test ! -e "$preparation_target/.ledger/.preparation"
 "$binary" prepare --definition "$event_definition" \
   --store-root "$preparation_target" --store-id preparation-smoke \
   --source-root "$preparation_source" --apply --format json >"$preparation_dir/applied.json"
-"$json_cli" -e '.outcome == "prepared" and .records == 2 and .phase == "committed" and .selected_bytes < 1048576 and .bytes_read < 1048576' \
+"$json_cli" -e '.outcome == "prepared" and .records == 2 and .phase == "committed" and .selected_bytes < 1048576 and .bytes_read < 1048576 and .reclaimed_bytes == .selected_bytes and .staged_bytes == .selected_bytes' \
   "$preparation_dir/applied.json" >/dev/null
 cmp -s "$preparation_dir/expected.jsonl" "$preparation_target/.ledger/example/events.jsonl"
 test ! -e "$preparation_target/.ledger/unrelated-cas"
@@ -840,7 +854,8 @@ for ((preparation_retry=0; preparation_retry<100; preparation_retry++)); do
     --store-id preparation-smoke --source-root "$preparation_source" --apply --format json \
     >"$preparation_dir/cleanup-failure-latest.json" || preparation_fault_status=$?
   test "$preparation_fault_status" -eq 2
-  "$json_cli" -e '.code == "AccessDenied"' "$preparation_dir/cleanup-failure-latest.json" >/dev/null
+  "$json_cli" -e '.schema == "ledger-preparation-result/v1" and .error_code == "AccessDenied" and .bytes_read > 0' \
+    "$preparation_dir/cleanup-failure-latest.json" >/dev/null
   preparation_fingerprint "$preparation_cleanup_retries/.ledger/.transactions" >"$preparation_dir/cleanup-journals-latest"
   if test "$preparation_retry" -eq 0; then
     cp "$preparation_dir/cleanup-journals-latest" "$preparation_dir/cleanup-journals-first"
@@ -988,7 +1003,7 @@ preparation_status=0
   --store-id preparation-smoke --source-archive "$preparation_archive" --format json \
   >"$preparation_dir/required-corrupt.json" || preparation_status=$?
 test "$preparation_status" -eq 2
-"$json_cli" -e '.schema == "ledger-transaction-error/v1" and .storage_mutated == false' \
+"$json_cli" -e '.schema == "ledger-preparation-result/v1" and .error_code != null and .storage_mutated == false and .bytes_read > 0' \
   "$preparation_dir/required-corrupt.json" >/dev/null
 test ! -e "$preparation_empty/.ledger/example/events.jsonl"
 cp "$preparation_dir/required-before.json" "$preparation_required"

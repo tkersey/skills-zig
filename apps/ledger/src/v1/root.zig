@@ -383,7 +383,7 @@ test "preparation captures selected history without inventorying unrelated paylo
     defer unrelated.close(std.testing.io);
     try unrelated.setLength(std.testing.io, 3 * 1024 * 1024 * 1024);
     var budget: storage_root.ReadBudget = .{ .max_bytes = 1024 * 1024, .max_files = 64 };
-    scope.read_budget = &budget;
+    scope.fs.read_budget = &budget;
     var history = try preparation.captureHistory(
         &scope,
         allocator,

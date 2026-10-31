@@ -737,18 +737,21 @@ fn digestRegularFileNoSymlinkAtAlloc(
     if (stat.kind != .file) return error.NotFile;
     if (stat.nlink > 1) return error.HardlinkTarget;
     if (stat.size > max_bytes) return error.FileTooBig;
-    var file = try dir.openFile(
-        fs.io,
-        base,
-        .{ .allow_directory = false, .follow_symlinks = false },
-    );
+    var file = if (fs.read_budget != null)
+        try filesystem.openRegularRead(fs.reanchor(dir.*), base)
+    else
+        try dir.openFile(
+            fs.io,
+            base,
+            .{ .allow_directory = false, .follow_symlinks = false },
+        );
     defer file.close(fs.io);
-    var reader = file.reader(fs.io, &.{});
+    var reader = try fs_authority.FileRead.init(fs, file, max_bytes);
     var hasher = std.crypto.hash.sha2.Sha256.init(.{});
     var observed: usize = 0;
     var buffer: [64 * 1024]u8 = undefined;
     while (observed <= max_bytes) {
-        const count = try reader.interface.readSliceShort(&buffer);
+        const count = try reader.read(&buffer);
         if (count == 0) break;
         observed = std.math.add(usize, observed, count) catch
             return error.FileTooBig;
@@ -798,14 +801,21 @@ fn readRegularFileNoSymlinkAt(
     if (stat.kind == .sym_link) return error.SymlinkComponent;
     if (stat.kind != .file) return error.NotFile;
     if (stat.size > max_bytes) return error.FileTooBig;
-    var file = try dir.openFile(
-        fs.io,
-        base,
-        .{ .allow_directory = false, .follow_symlinks = false },
-    );
+    var file = if (fs.read_budget != null)
+        try filesystem.openRegularRead(fs.reanchor(dir.*), base)
+    else
+        try dir.openFile(
+            fs.io,
+            base,
+            .{ .allow_directory = false, .follow_symlinks = false },
+        );
     defer file.close(fs.io);
     const opened = try file.stat(fs.io);
     if (opened.kind != .file or opened.nlink > 1) return error.HardlinkTarget;
+    if (fs.read_budget != null) {
+        var reader = try fs_authority.FileRead.init(fs, file, max_bytes);
+        return reader.alloc(allocator);
+    }
     var reader = file.reader(fs.io, &.{});
     return reader.interface.allocRemaining(allocator, .limited(max_bytes + 1));
 }
@@ -1787,15 +1797,18 @@ fn stageAppendedTransactionWrite(
     var hash = std.crypto.hash.sha2.Sha256.init(.{});
     var copied: usize = 0;
     if (before_exists) {
-        var source = try target.dir.openFile(fs.io, target.base, .{
-            .allow_directory = false,
-            .follow_symlinks = false,
-        });
+        var source = if (fs.read_budget != null)
+            try filesystem.openRegularRead(fs.reanchor(target.dir), target.base)
+        else
+            try target.dir.openFile(fs.io, target.base, .{
+                .allow_directory = false,
+                .follow_symlinks = false,
+            });
         defer source.close(fs.io);
-        var reader = source.reader(fs.io, &.{});
+        var reader = try fs_authority.FileRead.init(fs, source, max_bytes);
         var buffer: [jsonl_core.chunk_size]u8 = undefined;
         while (copied <= max_bytes) {
-            const count = try reader.interface.readSliceShort(&buffer);
+            const count = try reader.read(&buffer);
             if (count == 0) break;
             copied = std.math.add(usize, copied, count) catch
                 return error.FileTooBig;
@@ -1913,10 +1926,13 @@ fn publishVerifiedStagedFile(
     if (entry.nlink != 1) return error.HardlinkTarget;
     if (entry.size > max_bytes) return error.FileTooBig;
 
-    var source = try staged_dir.openFile(fs.io, staged_ref, .{
-        .allow_directory = false,
-        .follow_symlinks = false,
-    });
+    var source = if (fs.read_budget != null)
+        try filesystem.openRegularRead(fs.reanchor(staged_dir.*), staged_ref)
+    else
+        try staged_dir.openFile(fs.io, staged_ref, .{
+            .allow_directory = false,
+            .follow_symlinks = false,
+        });
     defer source.close(fs.io);
     const opened = try source.stat(fs.io);
     if (opened.kind != .file or opened.nlink != 1) {
@@ -1966,12 +1982,12 @@ fn copyStagedFileAndHash(
     destination: std.Io.File,
     max_bytes: usize,
 ) !StagedFileCopy {
-    var reader = source.reader(fs.io, &.{});
+    var reader = try fs_authority.FileRead.init(fs, source, max_bytes);
     var hasher = std.crypto.hash.sha2.Sha256.init(.{});
     var observed: usize = 0;
     var buffer: [jsonl_core.chunk_size]u8 = undefined;
     while (observed <= max_bytes) {
-        const count = try reader.interface.readSliceShort(&buffer);
+        const count = try reader.read(&buffer);
         if (count == 0) break;
         observed = std.math.add(usize, observed, count) catch
             return error.FileTooBig;
@@ -10789,4 +10805,112 @@ test "checkpoint sequences reject overflow before journal allocation" {
             .{},
         ),
     );
+}
+
+const NativeReadCounter = struct {
+    var bytes: usize = 0;
+
+    fn io(vtable: *std.Io.VTable) std.Io {
+        bytes = 0;
+        vtable.* = std.testing.io.vtable.*;
+        vtable.fileReadPositional = read;
+        return .{ .userdata = std.testing.io.userdata, .vtable = vtable };
+    }
+
+    fn read(
+        userdata: ?*anyopaque,
+        file: std.Io.File,
+        buffers: []const []u8,
+        offset: u64,
+    ) std.Io.File.ReadPositionalError!usize {
+        const count = try std.testing.io.vtable.fileReadPositional(userdata, file, buffers, offset);
+        bytes += count;
+        return count;
+    }
+};
+
+test "native publication rejects a 64 byte target under one shared read byte" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "operation.json",
+        .data = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+    });
+    var vtable: std.Io.VTable = undefined;
+    var fs = Fs.anchored(NativeReadCounter.io(&vtable), tmp.dir);
+    var budget: fs_authority.ReadBudget = .{ .max_bytes = 1, .max_files = 128 };
+    fs.read_budget = &budget;
+    try std.testing.expectError(error.ReadBudgetExceeded, commitTextTransaction(
+        fs,
+        allocator,
+        "./.transactions",
+        &.{.{
+            .path = "./operation.json",
+            .text = "fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210",
+            .expectation = .{ .expected_exists = true },
+            .content_mode = .raw,
+            .max_bytes = 64,
+        }},
+        .{ .owner = .{
+            .process_id = 0,
+            .session_id = "read-budget-probe",
+            .executor = "ledger",
+        }, .fencing_counter_path = "./.fencing.counter" },
+    ));
+    try std.testing.expectEqual(NativeReadCounter.bytes, budget.bytes);
+    try std.testing.expectEqual(@as(usize, 0), budget.bytes);
+    try std.testing.expect(budget.files > 0);
+}
+
+test "native append publication inspection and recovery charge actual repeated reads" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "operation.json", .data = "1234" });
+    const before_digest = try digestBytesAlloc(allocator, "1234");
+    defer allocator.free(before_digest);
+    const after_digest = try digestBytesAlloc(allocator, "12345678");
+    defer allocator.free(after_digest);
+    var vtable: std.Io.VTable = undefined;
+    var fs = Fs.anchored(NativeReadCounter.io(&vtable), tmp.dir);
+    var budget: fs_authority.ReadBudget = .{ .max_bytes = 1024 * 1024, .max_files = 128 };
+    fs.read_budget = &budget;
+    const receipt = try commitTextTransaction(fs, allocator, "./.transactions", &.{.{
+        .path = "./operation.json",
+        .text = "5678",
+        .action = .append,
+        .expected_digest_after = after_digest,
+        .expectation = .{ .expected_exists = true, .expected_digest = before_digest },
+        .content_mode = .raw,
+        .max_bytes = 64,
+    }}, .{ .owner = .{
+        .process_id = 0,
+        .session_id = "read-budget-probe",
+        .executor = "ledger",
+    }, .fencing_counter_path = "./.fencing.counter" });
+    defer receipt.deinit(allocator);
+    try std.testing.expectEqual(TransactionState.committed, receipt.state);
+    try std.testing.expectEqual(NativeReadCounter.bytes, budget.bytes);
+    try std.testing.expect(budget.bytes >= 4);
+    const published_bytes = budget.bytes;
+    budget.max_bytes = published_bytes + 1;
+    try std.testing.expectError(
+        error.ReadBudgetExceeded,
+        inspectTransaction(fs, allocator, receipt.transaction_dir),
+    );
+    try std.testing.expectEqual(NativeReadCounter.bytes, budget.bytes);
+    try std.testing.expectEqual(published_bytes, budget.bytes);
+    budget.max_bytes = 1024 * 1024;
+    var status = try inspectTransaction(fs, allocator, receipt.transaction_dir);
+    defer status.deinit(allocator);
+    try std.testing.expectEqual(RecoveryDecision.already_committed, status.decision);
+    try std.testing.expect(budget.bytes > published_bytes);
+    try std.testing.expectEqual(NativeReadCounter.bytes, budget.bytes);
+    const inspected_bytes = budget.bytes;
+    var recovered = try recoverTransaction(fs, allocator, receipt.transaction_dir);
+    defer recovered.deinit(allocator);
+    try std.testing.expectEqual(RecoveryDecision.already_committed, recovered.decision);
+    try std.testing.expect(budget.bytes > inspected_bytes);
+    try std.testing.expectEqual(NativeReadCounter.bytes, budget.bytes);
 }

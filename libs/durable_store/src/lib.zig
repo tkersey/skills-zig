@@ -14,6 +14,7 @@ pub const publishReplacement = staged_file.publishReplacement;
 pub const publishCreateNew = staged_file.publishCreateNew;
 pub const PrivateDirectory = @import("private_directory.zig").PrivateDirectory;
 pub const Fs = fs_authority.Fs;
+pub const ReadBudget = fs_authority.ReadBudget;
 pub const JsonlIssue = record_codec.JsonlIssue;
 pub const JsonlValidation = record_codec.JsonlValidation;
 pub const EventRecord = event.EventRecord;

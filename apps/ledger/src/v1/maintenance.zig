@@ -30,12 +30,15 @@ pub const Result = struct {
     limits: preparation.Limits,
     bytes_read: usize = 0,
     file_reads: usize = 0,
+    read_scope: []const u8 = "maintenance-operation-including-native-inspection",
+    invocation_input_bytes: ?usize = null,
     free_bytes: ?u64,
     measurements: Measurements = .{},
 };
 
 pub fn execute(
     scope: *storage_root.Scope,
+    selection: ?*const storage_root.Selection,
     allocator: std.mem.Allocator,
     limits: preparation.Limits,
     apply: bool,
@@ -46,18 +49,19 @@ pub fn execute(
         .max_bytes = limits.max_read_bytes,
         .max_files = limits.max_files * 4,
     };
-    const previous_budget = scope.read_budget;
-    scope.read_budget = &budget;
-    defer scope.read_budget = previous_budget;
+    const previous_budget = scope.fs.read_budget;
+    scope.fs.read_budget = &budget;
+    defer scope.fs.read_budget = previous_budget;
     var result: Result = .{
         .limits = limits,
         .free_bytes = space.availableBytes(scope.fs.directory()),
     };
-    inspectAndFinalize(scope, allocator, limits, apply, &result) catch |err| {
+    inspectAndFinalize(scope, selection, allocator, limits, apply, &result) catch |err| {
         result.outcome = switch (err) {
             error.PreparationFileBoundExceeded,
             error.PreparationSpaceBoundExceeded,
-            error.PreparationReadBoundExceeded,
+            error.ReadBudgetExceeded,
+            error.ReadFileBudgetExceeded,
             error.TooManyFiles,
             error.FileTooBig,
             => "incomplete",
@@ -78,11 +82,13 @@ pub fn execute(
 
 fn inspectAndFinalize(
     scope: *storage_root.Scope,
+    selection: ?*const storage_root.Selection,
     allocator: std.mem.Allocator,
     limits: preparation.Limits,
     apply: bool,
     result: *Result,
 ) !void {
+    if (selection) |target| try target.revalidateBudgeted(allocator, scope.fs.read_budget);
     result.preparation = try work.inspect(scope, allocator, limits);
     const observed = result.preparation.?;
     if (apply and observed.phase != .absent and observed.phase != .finalized) {
@@ -111,6 +117,7 @@ fn inspectAndFinalize(
             else => result.measurements.foreign_entry_count += 1,
         }
     }
+    if (selection) |target| try target.revalidateBudgeted(allocator, scope.fs.read_budget);
 }
 
 test "maintenance inspection is nonmutating and preserves unknown files" {
@@ -120,11 +127,11 @@ test "maintenance inspection is nonmutating and preserves unknown files" {
     try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "foreign", .data = "retained" });
     var scope = storage_root.Scope.init(.anchored(std.testing.io, tmp.dir));
     const before = try tmp.dir.stat(std.testing.io);
-    const inspected = try execute(&scope, allocator, .{}, false);
+    const inspected = try execute(&scope, null, allocator, .{}, false);
     try std.testing.expectEqualStrings("healthy", inspected.outcome);
     try std.testing.expectEqual(@as(?bool, false), inspected.storage_mutated);
     try std.testing.expectEqual(before.mtime, (try tmp.dir.stat(std.testing.io)).mtime);
-    const applied = try execute(&scope, allocator, .{}, true);
+    const applied = try execute(&scope, null, allocator, .{}, true);
     try std.testing.expectEqual(@as(?bool, false), applied.storage_mutated);
     const bytes = try scope.readFile(allocator, "foreign", 64);
     defer allocator.free(bytes);
