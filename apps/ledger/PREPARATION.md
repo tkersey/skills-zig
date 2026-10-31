@@ -13,7 +13,10 @@ Paths below are relative to the admitted managed `.ledger` directory. Preparatio
 Selected bytes are captured and validated within the invocation's memory and I/O
 bounds, then staged once by the native transaction. There is no separate payload
 copy or operation-record update protocol. The receipt is at most 1 MiB with at
-most 64 KiB of flat provenance. One unresolved transaction blocks another capture;
+most 64 KiB of flat provenance. Inspecting a retained receipt validates its metadata
+within the read allowance; its historical payload lengths do not consume a later
+owner's capture allowance. New capture still enforces its selected byte/file limits.
+One unresolved transaction blocks another capture;
 valid preparing journals allow native rollback of incomplete staging. A malformed
 initial native journal remains an explicit unknown: retries retain that metadata
 and stop before another transaction or bulk stage. Universal automatic recovery
@@ -94,6 +97,9 @@ not certification of that recovery. `activity` identifies the observation,
 and `complete: false` marks partial observations. Unresolved or malformed native work reports `recovery-required` and is retained;
 a receipt never overrides the native publication outcome.
 `committed-with-later-failure` identifies this invocation's committed transaction.
+Budget exhaustion before unresolved work is established reports `incomplete`;
+known pending publication retains `recovery-required` even if further reads cannot
+finish. A phase label alone does not establish pending work.
 Known observations survive later failures; native recovery reports
 `reclaimed_bytes: null` when its deletion count is unavailable. New capture uses its own observations and cannot inherit an older
 installation's success.
@@ -107,7 +113,9 @@ or workflow authority. Native transactions remain the publication authority.
 
 Participating writers must use the existing Ledger native event, binding and
 transaction coordination. Selected-source handles and metadata are revalidated
-before publication. A source without the necessary existing coordination,
+before publication. Directory identity compares device and inode through opened
+handles; ordinary directory timestamp changes do not replace that identity.
+A source without the necessary existing coordination,
 including an absent control directory, requires actual quiescence established by
 the host and `--confirm-no-legacy-writers`; a missing PID or elapsed time is
 insufficient. Preparation does not establish quiescence itself. Unsupported old
@@ -123,3 +131,9 @@ layouts fail before recovery or workspace creation. Broad historical migration
 remains separately selected; this command neither replaces it nor reclaims its
 archives. The integration qualifies concrete Review Fold, Learnings and Negative
 Ledger definitions without native owner-specific dispatch.
+
+Coverage follows validated native binding history. For nonprotocol histories with
+`compare_replace`, an older payload is compared with its corresponding archived
+epoch in the newer candidate, rather than only the newer current payload. Required
+definitions and revisions must still match. A target behind a later replacement
+reports reconciliation-required; preparation does not advance it.

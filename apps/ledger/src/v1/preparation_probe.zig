@@ -12,11 +12,13 @@ const Fault = enum {
     bootstrap,
     verification,
     inspection,
+    recovery,
 };
 var original: *const std.Io.VTable = undefined;
 var fault: Fault = .none;
 var triggered: std.atomic.Value(bool) = .init(false);
 var committed: std.atomic.Value(bool) = .init(false);
+var recovery_deleted: std.atomic.Value(bool) = .init(false);
 const no_handle = std.math.maxInt(usize);
 var stage_handle: std.atomic.Value(usize) = .init(no_handle);
 var marker_handle: std.atomic.Value(usize) = .init(no_handle);
@@ -202,13 +204,17 @@ fn deleteFile(
     directory: std.Io.Dir,
     path: []const u8,
 ) std.Io.Dir.DeleteFileError!void {
-    const stat = if (measurement_path != null and journalDirectory(directory))
+    const stat = if ((measurement_path != null or fault == .recovery) and
+        journalDirectory(directory))
         directory.statFile(measurement_io, path, .{ .follow_symlinks = false }) catch null
     else
         null;
     const journal_file = if (stat) |value| value.kind == .file else false;
+    if (fault == .recovery and journal_file and recovery_deleted.load(.monotonic) and
+        !triggered.swap(true, .monotonic)) return error.AccessDenied;
     try original.dirDeleteFile(userdata, directory, path);
     if (journal_file) {
+        recovery_deleted.store(true, .monotonic);
         measurements.reclaimed_native_bytes += stat.?.size;
     }
     sample();

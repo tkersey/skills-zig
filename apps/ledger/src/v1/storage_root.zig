@@ -68,7 +68,7 @@ pub const Selection = struct {
             budget,
         );
         defer current.close(self.io);
-        if ((try control.stat(self.io)).inode != (try current.stat(self.io)).inode) {
+        if (!try durable_store.sameDirectoryObject(self.io, control, current)) {
             return error.PreparationTargetChanged;
         }
     }

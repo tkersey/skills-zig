@@ -1412,13 +1412,20 @@ pub const RevisionDependency = struct {
     max_bytes: usize,
 };
 
+pub const HistoryEpoch = struct {
+    binding_rows: usize,
+    revision_index: usize,
+};
+
 pub const HistoryDependencies = struct {
     definitions: []const []const u8,
     revisions: []const RevisionDependency,
+    epochs: []const HistoryEpoch,
 
     pub fn deinit(self: *HistoryDependencies, allocator: std.mem.Allocator) void {
         allocator.free(self.definitions);
         allocator.free(self.revisions);
+        allocator.free(self.epochs);
         self.* = undefined;
     }
 };
@@ -1444,6 +1451,8 @@ pub fn collectHistoryDependencies(
     defer definitions.deinit(allocator);
     var revisions: std.ArrayList(RevisionDependency) = .empty;
     defer revisions.deinit(allocator);
+    var epochs: std.ArrayList(HistoryEpoch) = .empty;
+    defer epochs.deinit(allocator);
     var revision_indices: std.StringHashMapUnmanaged(usize) = .empty;
     defer revision_indices.deinit(allocator);
     var epoch_start: usize = 0;
@@ -1474,13 +1483,20 @@ pub fn collectHistoryDependencies(
             });
             try revision_indices.putNoClobber(allocator, digest, revisions.items.len - 1);
         }
+        try epochs.append(allocator, .{
+            .binding_rows = index,
+            .revision_index = revision_indices.get(digest).?,
+        });
         epoch_start = index;
     }
     const definition_digests = try definitions.toOwnedSlice(allocator);
     errdefer allocator.free(definition_digests);
+    const revision_dependencies = try revisions.toOwnedSlice(allocator);
+    errdefer allocator.free(revision_dependencies);
     return .{
         .definitions = definition_digests,
-        .revisions = try revisions.toOwnedSlice(allocator),
+        .revisions = revision_dependencies,
+        .epochs = try epochs.toOwnedSlice(allocator),
     };
 }
 

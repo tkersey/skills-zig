@@ -128,12 +128,12 @@ const OpenedSource = struct {
     ) !void {
         var current = try OpenedSource.open(io, allocator, self.source, budget);
         defer current.deinit(io);
-        if ((try self.root.stat(io)).inode != (try current.root.stat(io)).inode) {
+        if (!try durable_store.sameDirectoryObject(io, self.root, current.root)) {
             return error.PreparationSourceChanged;
         }
         if (self.control) |control| {
             const present = current.control orelse return error.PreparationSourceChanged;
-            if ((try control.stat(io)).inode != (try present.stat(io)).inode) {
+            if (!try durable_store.sameDirectoryObject(io, control, present)) {
                 return error.PreparationSourceChanged;
             }
         } else if (current.control != null) return error.PreparationSourceChanged;
@@ -204,6 +204,7 @@ const Execution = struct {
     observations: std.ArrayList(Observation) = .empty,
     best: ?usize = null,
     target_covers: bool = true,
+    recovery_required: bool = false,
 
     fn run(self: *Execution, sources: []const Source) !void {
         try self.selection.revalidateBudgeted(self.allocator, self.budget);
@@ -220,16 +221,20 @@ const Execution = struct {
 
     fn recordFailure(self: *Execution, err: anyerror) void {
         self.result.error_code = @errorName(err);
+        const outcome = failureOutcome(err);
         self.result.outcome = if (self.result.transaction_id != null)
             "committed-with-later-failure"
         else if (err == error.LockBusy or err == error.EventStoreBusy)
             "busy"
-        else if (std.mem.eql(u8, self.result.phase, "publication") or
-            std.mem.eql(u8, self.result.phase, "recovery") or
-            std.mem.startsWith(u8, self.result.phase, "prior-"))
+        else if (self.recovery_required or
+            std.mem.eql(u8, self.result.phase, "publication"))
+            "recovery-required"
+        else if (std.mem.eql(u8, outcome, "incomplete"))
+            outcome
+        else if (std.mem.startsWith(u8, self.result.phase, "prior-"))
             "recovery-required"
         else
-            failureOutcome(err);
+            outcome;
     }
 
     fn deinit(self: *Execution) void {
@@ -253,7 +258,6 @@ const Execution = struct {
         self.result.bytes_read = self.budget.bytes;
         self.result.file_reads = self.budget.files;
         self.result.storage_mutated = self.scope.mutation_state;
-        if (self.workspace) |workspace| self.result.reclaimed_bytes = workspace.reclaimed_bytes;
         return self.result;
     }
 
@@ -271,6 +275,7 @@ const Execution = struct {
             const existing = observation.?;
             needed = existing.phase != .absent and existing.phase != .finalized;
         }
+        self.recovery_required = needed;
         if (!needed) {
             self.result.phase = "preparation";
             return true;
@@ -291,16 +296,19 @@ const Execution = struct {
             self.allocator,
             ".transactions",
         ) != 0) {
+            self.recovery_required = true;
             self.result.phase = "recovery";
+            const previous_reclaimed = self.result.reclaimed_bytes;
+            self.result.reclaimed_bytes = null;
             if (try transaction.recoverRepositoryTransactions(self.scope, self.allocator, ".")) {
                 transaction.markStorageMutated(self.scope);
-                self.workspace.?.reclaimed_bytes = null;
-            }
+            } else self.result.reclaimed_bytes = previous_reclaimed;
         }
         self.result.phase = "prior-reconciliation";
         var observation: ?work.Report = null;
         defer self.retainPriorObservation(observation);
         try self.workspace.?.reconcileObserved(self.options.limits, true, &observation);
+        self.recovery_required = false;
         self.result.phase = "preparation";
     }
 
@@ -524,13 +532,12 @@ const Execution = struct {
         try self.workspace.?.stage(chosen, provenance, self.options.limits);
         try self.revalidateSources();
         try self.selection.revalidateBudgeted(self.allocator, self.budget);
-        self.result.phase = "publication";
         self.result.transaction_id = try publish(
             self.scope,
             self.allocator,
             chosen,
             &self.workspace.?,
-            &self.result.staged_bytes,
+            &self.result,
         );
         self.result.outcome = "prepared";
         self.result.phase = "committed";
@@ -564,6 +571,8 @@ fn failureOutcome(err: anyerror) []const u8 {
         error.ReadFileBudgetExceeded,
         error.PreparationFileBoundExceeded,
         error.PreparationSpaceBoundExceeded,
+        error.PreparationMetadataBoundExceeded,
+        error.HistoricalDependencyBoundExceeded,
         error.TooManyFiles,
         error.FileTooBig,
         => "incomplete",
@@ -616,7 +625,7 @@ fn publish(
     allocator: std.mem.Allocator,
     history: *const History,
     workspace: *const work.Workspace,
-    staged_bytes: *?usize,
+    result: *Result,
 ) ![]u8 {
     const control_root = try std.fs.path.join(
         allocator,
@@ -649,6 +658,7 @@ fn publish(
     }
     mutations[mutations.len - 1] = try workspace.publicationMutation();
     mutations[mutations.len - 1].path = operation_path;
+    result.phase = "publication";
     transaction.markStorageMutationUnknown(scope);
     var receipt = try durable_store.commitTextTransaction(
         scope.fs,
@@ -667,7 +677,7 @@ fn publish(
     );
     defer receipt.deinit(allocator);
     transaction.markStorageMutated(scope);
-    staged_bytes.* = staged;
+    result.staged_bytes = staged;
     const transaction_id = @constCast(receipt.transaction_id);
     receipt.transaction_id = &.{};
     return transaction_id;
@@ -782,6 +792,9 @@ pub const File = struct {
 
 pub const History = struct {
     files: std.ArrayList(File) = .empty,
+    epochs: []const replay.HistoryEpoch = &.{},
+    revision_offset: usize = 0,
+    binding_rows: usize = 0,
     read_custody: ?durable_store.CasReadLockPair = null,
     bytes: usize = 0,
     records: usize = 0,
@@ -791,6 +804,7 @@ pub const History = struct {
         if (self.read_custody) |*locks| locks.deinit();
         for (self.files.items) |*file| file.deinit(allocator);
         self.files.deinit(allocator);
+        allocator.free(self.epochs);
         self.* = undefined;
     }
 
@@ -820,8 +834,13 @@ pub const History = struct {
     pub fn covers(self: *const History, other: *const History) bool {
         if (!other.exists) return true;
         if (!self.exists) return false;
-        if (!completePrefix(other.files.items[0].bytes, self.files.items[0].bytes)) return false;
         if (!completePrefix(other.files.items[1].bytes, self.files.items[1].bytes)) return false;
+        const covering_bytes = for (self.epochs) |epoch| {
+            if (epoch.binding_rows >= other.binding_rows) {
+                break self.files.items[self.revision_offset + epoch.revision_index].bytes;
+            }
+        } else self.files.items[0].bytes;
+        if (!completePrefix(other.files.items[0].bytes, covering_bytes)) return false;
         for (other.files.items[2..]) |required| {
             var found = false;
             for (self.files.items[2..]) |candidate| {
@@ -919,6 +938,7 @@ pub fn captureHistory(
         &result,
     );
     result.records = stats.records_validated;
+    result.binding_rows = snapshot.binding.rows.len;
     result.exists = true;
     return result;
 }
@@ -974,6 +994,7 @@ fn captureMetadata(
         defer allocator.free(bytes);
         try result.append(allocator, try controlRelative(scope, repo_root, path), bytes, limits);
     }
+    result.revision_offset = result.files.items.len;
     for (dependencies.revisions) |revision| {
         const path = try revision_archive.pathAlloc(scope, allocator, repo_root, revision.digest);
         defer allocator.free(path);
@@ -987,6 +1008,8 @@ fn captureMetadata(
         defer allocator.free(bytes);
         try result.append(allocator, try controlRelative(scope, repo_root, path), bytes, limits);
     }
+    result.epochs = dependencies.epochs;
+    dependencies.epochs = &.{};
 }
 
 fn controlRelative(

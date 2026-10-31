@@ -382,6 +382,21 @@ fn hostFileLocation(file: std.Io.File) !HostFileLocation {
     };
 }
 
+pub fn sameDirectoryObject(io: std.Io, left: std.Io.Dir, right: std.Io.Dir) !bool {
+    if (@import("builtin").os.tag == .windows) return error.UnsupportedDirectoryIdentity;
+    const left_stat = try left.stat(io);
+    const right_stat = try right.stat(io);
+    const left_location = try hostFileLocation(.{
+        .handle = left.handle,
+        .flags = .{ .nonblocking = false },
+    });
+    const right_location = try hostFileLocation(.{
+        .handle = right.handle,
+        .flags = .{ .nonblocking = false },
+    });
+    return left_location.device == right_location.device and left_stat.inode == right_stat.inode;
+}
+
 fn linuxFileLocation(file: std.Io.File) !HostFileLocation {
     const linux = std.os.linux;
     for (0..host_syscall_attempts_max) |_| {
@@ -414,10 +429,43 @@ fn posixFileLocation(file: std.Io.File) !HostFileLocation {
     if (std.posix.system.fstat(file.handle, &host_stat) != 0) {
         return error.TransactionRecoveryRequired;
     }
+    const Device = @Int(.unsigned, @bitSizeOf(@TypeOf(host_stat.dev)));
     return .{
-        .device = @intCast(host_stat.dev),
+        .device = @as(Device, @bitCast(host_stat.dev)),
         .mount_id = null,
     };
+}
+
+test "directory identity includes device and survives unrelated directory writes" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+    const io = std.testing.io;
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    var same = try temporary.dir.openDir(io, ".", .{});
+    defer same.close(io);
+    try temporary.dir.writeFile(io, .{ .sub_path = "new-entry", .data = "retained" });
+    try std.testing.expect(try sameDirectoryObject(io, temporary.dir, same));
+    var other = try std.Io.Dir.openDirAbsolute(io, "/dev", .{});
+    defer other.close(io);
+    const CollidingInodes = struct {
+        original: std.Io,
+
+        fn stat(userdata: ?*anyopaque, directory: std.Io.Dir) std.Io.Dir.StatError!std.Io.Dir.Stat {
+            const self: *@This() = @ptrCast(@alignCast(userdata.?));
+            var value = try directory.stat(self.original);
+            value.inode = 1;
+            return value;
+        }
+    };
+    var context: CollidingInodes = .{ .original = io };
+    var vtable = io.vtable.*;
+    vtable.dirStat = CollidingInodes.stat;
+    const colliding: std.Io = .{ .userdata = &context, .vtable = &vtable };
+    try std.testing.expectEqual(
+        (try temporary.dir.stat(colliding)).inode,
+        (try other.stat(colliding)).inode,
+    );
+    try std.testing.expect(!try sameDirectoryObject(colliding, temporary.dir, other));
 }
 
 test "host object identity collapses hardlinked path aliases" {

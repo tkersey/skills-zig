@@ -35,7 +35,6 @@ pub const Workspace = struct {
     guard: std.Io.File,
     before_digest: ?[]u8 = null,
     installed_record: ?[]u8 = null,
-    reclaimed_bytes: ?u64 = 0,
 
     pub fn acquire(scope: *storage_root.Scope, allocator: std.mem.Allocator) !Workspace {
         if (!scope.fs.isPinned()) return error.PreparationRequiresManagedRoot;
@@ -74,7 +73,6 @@ pub const Workspace = struct {
         observation.* = null;
         defer if (observation.*) |*report| {
             report.observed_by = .reconciliation;
-            self.reclaimed_bytes = addKnown(self.reclaimed_bytes, report.reclaimed_bytes);
         };
         try reconcileLocked(self.scope, self.allocator, limits, apply, observation);
     }
@@ -112,7 +110,7 @@ pub const Workspace = struct {
         }
         if (total != history.bytes) return error.PreparationSizeMismatch;
         const record: Record = .{ .files = witnesses, .provenance = parsed.value };
-        try validateRecord(record, limits);
+        try validateRecord(record);
         const previous = self.scope.readFile(
             self.allocator,
             record_path,
@@ -199,7 +197,7 @@ fn reconcileLocked(
         .duplicate_field_behavior = .@"error",
     });
     defer parsed.deinit();
-    try validateRecord(parsed.value, limits);
+    try validateRecord(parsed.value);
     observation.* = .{ .phase = .finalized, .installed = true };
     const report = &observation.*.?;
     _ = apply;
@@ -216,22 +214,13 @@ fn rejectLegacyWorkspace(scope: *storage_root.Scope) !void {
     return error.PreparationOwnershipUnknown;
 }
 
-fn validateRecord(record: Record, limits: preparation.Limits) !void {
+fn validateRecord(record: Record) !void {
     if (!std.mem.eql(u8, record.schema, record_schema)) return error.PreparationOwnershipUnknown;
-    if (record.files.len == 0 or record.files.len > limits.max_files) {
-        return error.PreparationFileBoundExceeded;
-    }
-    var total: usize = 0;
+    if (record.files.len == 0) return error.PreparationOwnershipUnknown;
     for (record.files) |file| {
         if (file.path.len == 0 or file.path.len > 4096) return error.PreparationOwnershipUnknown;
         try definition_core.json.digest(file.digest);
-        if (file.length > limits.max_bytes - total) return error.PreparationSpaceBoundExceeded;
-        total += file.length;
     }
-}
-
-fn addKnown(left: ?u64, right: ?u64) ?u64 {
-    return std.math.add(u64, left orelse return null, right orelse return null) catch null;
 }
 
 fn testHistory() !preparation.History {
@@ -275,6 +264,10 @@ test "native publication leaves no duplicate preparation payload and preserves a
     defer workspace.deinit();
     var history = try testHistory();
     defer history.deinit(allocator);
+    try std.testing.expectError(
+        error.PreparationSpaceBoundExceeded,
+        workspace.stage(&history, "{}", .{ .max_bytes = 1 }),
+    );
     try workspace.stage(&history, "{\"sources\":[\"fixture\"]}", .{});
     const mutations = [_]durable_store.TransactionMutation{
         .{
@@ -297,7 +290,7 @@ test "native publication leaves no duplicate preparation payload and preserves a
         },
     );
     defer receipt.deinit(allocator);
-    const observed = try workspace.reconcile(.{}, false);
+    const observed = try workspace.reconcile(.{ .max_bytes = 1, .max_files = 2 }, false);
     try std.testing.expectEqual(Phase.finalized, observed.phase);
     try std.testing.expect(observed.installed and observed.bytes == 0);
     const finalized = try workspace.reconcile(.{}, true);

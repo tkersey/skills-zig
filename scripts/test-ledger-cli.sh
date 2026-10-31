@@ -1144,3 +1144,135 @@ preparation_fingerprint "$preparation_target/.ledger" >"$preparation_dir/retries
 cmp -s "$preparation_dir/retries-before" "$preparation_dir/retries-after"
 cmp -s "$preparation_dir/expected.jsonl" "$preparation_target/.ledger/example/events.jsonl"
 cmp -s "$preparation_dir/binding-before" "$preparation_binding"
+
+preparation_expect_failure HistoricalDependencyBoundExceeded "$preparation_dir/dependency-limit.json" \
+  prepare --definition "$event_definition" --store-root "$preparation_empty" \
+  --store-id preparation-smoke --source-root "$preparation_source" --max-files 2 --format json
+"$json_cli" -e '.outcome == "incomplete" and .storage_mutated == false' \
+  "$preparation_dir/dependency-limit.json" >/dev/null
+"$binary" prepare --definition "$event_definition" --store-root "$preparation_empty" \
+  --store-id preparation-smoke --source-root "$preparation_source" --max-files 3 --format json \
+  >"$preparation_dir/dependency-exact.json"
+"$json_cli" -e '.outcome == "ready" and .records == 2 and .storage_mutated == false' \
+  "$preparation_dir/dependency-exact.json" >/dev/null
+
+preparation_prior_limit=$(( $(wc -c <"$preparation_target/.ledger-root.json") + 1 ))
+preparation_fingerprint "$preparation_target" >"$preparation_dir/prior-limit-before"
+preparation_expect_failure ReadBudgetExceeded "$preparation_dir/prior-limit.json" \
+  prepare --definition "$event_definition" --store-root "$preparation_target" \
+  --store-id preparation-smoke --max-read-bytes "$preparation_prior_limit" --format json
+"$json_cli" -e '.outcome == "incomplete" and .phase == "prior-inspection" and .storage_mutated == false' \
+  "$preparation_dir/prior-limit.json" >/dev/null
+preparation_fingerprint "$preparation_target" >"$preparation_dir/prior-limit-after"
+cmp -s "$preparation_dir/prior-limit-before" "$preparation_dir/prior-limit-after"
+
+preparation_partial="$preparation_dir/partial-recovery"
+preparation_init "$preparation_partial"
+preparation_fault_status=0
+LEDGER_PREPARATION_FAULT=capture "$preparation_probe" prepare --definition "$event_definition" \
+  --store-root "$preparation_partial" --store-id preparation-smoke \
+  --source-root "$preparation_source" --apply --format json \
+  >"$preparation_dir/partial-capture.json" || preparation_fault_status=$?
+test "$preparation_fault_status" -eq 99
+preparation_expect_failure recovery-required "$preparation_dir/partial-inspect.json" \
+  prepare --definition "$event_definition" --store-root "$preparation_partial" \
+  --store-id preparation-smoke --format json
+preparation_pending_limit=$(( $("$json_cli" -r '.bytes_read' "$preparation_dir/partial-inspect.json") - $(wc -c <"$preparation_partial/.ledger-root.json") + 1 ))
+preparation_expect_failure ReadBudgetExceeded "$preparation_dir/pending-limit.json" \
+  prepare --definition "$event_definition" --store-root "$preparation_partial" \
+  --store-id preparation-smoke --apply --max-read-bytes "$preparation_pending_limit" --format json
+"$json_cli" -e '.outcome == "recovery-required" and .storage_mutated == false' \
+  "$preparation_dir/pending-limit.json" >/dev/null
+test "$(find "$preparation_partial/.ledger" -name '.ledger-dtx-stage-*' -type f | wc -l)" -eq 1
+preparation_fault_status=0
+LEDGER_PREPARATION_FAULT=recovery LEDGER_PREPARATION_MEASURE="$preparation_dir/partial-measurement.json" \
+  "$preparation_probe" prepare --definition "$event_definition" \
+  --store-root "$preparation_partial" --store-id preparation-smoke \
+  --source-root "$preparation_source" --apply --format json \
+  >"$preparation_dir/partial-recovery.json" || preparation_fault_status=$?
+test "$preparation_fault_status" -eq 2
+"$json_cli" -e '.outcome == "recovery-required" and .phase == "recovery" and .error_code == "AccessDenied" and .storage_mutated == true and .reclaimed_bytes == null' \
+  "$preparation_dir/partial-recovery.json" >/dev/null
+"$json_cli" -e '.reclaimed_native_bytes > 0' "$preparation_dir/partial-measurement.json" >/dev/null
+test -z "$(find "$preparation_partial/.ledger" -name '.ledger-dtx-stage-*' -type f -print -quit)"
+"$binary" prepare --definition "$event_definition" --store-root "$preparation_partial" \
+  --store-id preparation-smoke --source-root "$preparation_source" --apply --format json \
+  >"$preparation_dir/partial-recovered.json"
+"$json_cli" -e '.outcome == "prepared" and .records == 2' "$preparation_dir/partial-recovered.json" >/dev/null
+preparation_project_expected "$preparation_partial" "$preparation_dir/partial-projection.jsonl"
+
+preparation_small_definition="$preparation_dir/small-definition.json"
+"$json_cli" -c '.id = "example/small" | .storage.slots.events.path = "example/small.jsonl"' \
+  "$event_definition" >"$preparation_small_definition"
+"$binary" prepare --definition "$preparation_small_definition" --store-root "$preparation_target" \
+  --store-id preparation-smoke --max-bytes 1 --max-files 2 --format json \
+  >"$preparation_dir/prior-receipt-small-limits.json"
+"$json_cli" -e '.outcome == "empty" and .storage_mutated == false and .prior_preparation.complete == true' \
+  "$preparation_dir/prior-receipt-small-limits.json" >/dev/null
+"$binary" maintain --store-root "$preparation_target" --store-id preparation-smoke \
+  --max-bytes 1 --format json >"$preparation_dir/prior-receipt-maintain.json"
+"$json_cli" -e '.outcome == "healthy" and .preparation.installed == true' \
+  "$preparation_dir/prior-receipt-maintain.json" >/dev/null
+preparation_small_source="$preparation_dir/small-source"
+mkdir "$preparation_small_source"
+"$binary" transact --definition "$preparation_small_definition" --operation append \
+  --repo "$preparation_small_source" --input "event=$event_input" --param request=small \
+  --format json >"$preparation_dir/small-source.json"
+"$binary" prepare --definition "$preparation_small_definition" --store-root "$preparation_empty" \
+  --store-id preparation-smoke --source-root "$preparation_small_source" --format json \
+  >"$preparation_dir/small-inspect.json"
+preparation_small_bytes=$("$json_cli" -r '.selected_bytes' "$preparation_dir/small-inspect.json")
+test "$preparation_small_bytes" -lt "$preparation_selected_bytes"
+"$binary" prepare --definition "$preparation_small_definition" --store-root "$preparation_target" \
+  --store-id preparation-smoke --source-root "$preparation_small_source" \
+  --max-bytes "$preparation_small_bytes" --apply --format json >"$preparation_dir/small-applied.json"
+"$json_cli" -e '.outcome == "prepared" and .records == 1' "$preparation_dir/small-applied.json" >/dev/null
+"$binary" project --definition "$preparation_small_definition" --projection all \
+  --store-root "$preparation_target" --store-id preparation-smoke --format jsonl \
+  >"$preparation_dir/small-projection.jsonl"
+"$json_cli" -c . "$event_input" >"$preparation_dir/small-expected.jsonl"
+cmp -s "$preparation_dir/small-expected.jsonl" "$preparation_dir/small-projection.jsonl"
+preparation_project_expected "$preparation_target" "$preparation_dir/prior-owner-preserved.jsonl"
+
+preparation_replacement_definition="$preparation_dir/replacement-definition.json"
+"$json_cli" -c '.parameters |= del(.stream) | .storage.slots.events.path = "example/snapshots.jsonl"' \
+  "$event_snapshot_definition" >"$preparation_replacement_definition"
+preparation_replacement_source="$preparation_dir/replacement-source"
+preparation_replacement_old="$preparation_dir/replacement-old"
+preparation_replacement_target="$preparation_dir/replacement-target"
+preparation_replacement_prefix="$preparation_dir/replacement-prefix"
+mkdir "$preparation_replacement_source" "$preparation_replacement_old"
+preparation_init "$preparation_replacement_target"
+preparation_init "$preparation_replacement_prefix"
+"$binary" transact --definition "$preparation_replacement_definition" --operation create \
+  --repo "$preparation_replacement_source" --input "snapshot=$event_snapshot_initial" --format json \
+  >"$preparation_dir/replacement-create.json"
+cp -R "$preparation_replacement_source/.ledger" "$preparation_replacement_old/.ledger"
+cp -R "$preparation_replacement_source/.ledger/." "$preparation_replacement_prefix/.ledger/"
+"$binary" transact --definition "$preparation_replacement_definition" --operation replace \
+  --repo "$preparation_replacement_source" --input "snapshot=$event_snapshot_replacement" \
+  --param request=replace --format json >"$preparation_dir/replacement-write.json"
+"$binary" prepare --definition "$preparation_replacement_definition" \
+  --store-root "$preparation_replacement_target" --store-id preparation-smoke \
+  --source-root "$preparation_replacement_old" --source-root "$preparation_replacement_source" \
+  --apply --format json >"$preparation_dir/replacement-applied.json"
+"$json_cli" -e '.outcome == "prepared"' "$preparation_dir/replacement-applied.json" >/dev/null
+"$binary" project --definition "$preparation_replacement_definition" --projection all \
+  --store-root "$preparation_replacement_target" --store-id preparation-smoke --format jsonl \
+  >"$preparation_dir/replacement-projection.jsonl"
+cmp -s "$event_snapshot_replacement" "$preparation_dir/replacement-projection.jsonl"
+preparation_fingerprint "$preparation_replacement_target" >"$preparation_dir/replacement-covered-before"
+"$binary" prepare --definition "$preparation_replacement_definition" \
+  --store-root "$preparation_replacement_target" --store-id preparation-smoke \
+  --source-root "$preparation_replacement_old" --apply --format json \
+  >"$preparation_dir/replacement-covered.json"
+"$json_cli" -e '.outcome == "covered" and .storage_mutated == false' "$preparation_dir/replacement-covered.json" >/dev/null
+preparation_fingerprint "$preparation_replacement_target" >"$preparation_dir/replacement-covered-after"
+cmp -s "$preparation_dir/replacement-covered-before" "$preparation_dir/replacement-covered-after"
+preparation_fingerprint "$preparation_replacement_prefix" >"$preparation_dir/replacement-prefix-before"
+preparation_expect_failure reconciliation-required "$preparation_dir/replacement-prefix.json" \
+  prepare --definition "$preparation_replacement_definition" \
+  --store-root "$preparation_replacement_prefix" --store-id preparation-smoke \
+  --source-root "$preparation_replacement_source" --apply --format json
+preparation_fingerprint "$preparation_replacement_prefix" >"$preparation_dir/replacement-prefix-after"
+cmp -s "$preparation_dir/replacement-prefix-before" "$preparation_dir/replacement-prefix-after"

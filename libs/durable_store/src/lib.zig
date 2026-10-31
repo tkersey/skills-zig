@@ -93,6 +93,7 @@ pub const acquireCasAdvisoryLockObserved = filesystem.acquireCasAdvisoryLockObse
 pub const casAdvisoryLockExists = filesystem.casAdvisoryLockExists;
 pub const fileExists = filesystem.fileExists;
 pub const fileSize = filesystem.fileSize;
+pub const sameDirectoryObject = filesystem.sameDirectoryObject;
 pub const readFileAlloc = filesystem.readFileAlloc;
 pub const ensureParentPath = filesystem.ensureParentPath;
 pub const rejectSymlinkComponents = filesystem.rejectSymlinkComponents;
