@@ -903,7 +903,14 @@ for ((preparation_retry=0; preparation_retry<100; preparation_retry++)); do
     .retained.native_audit_bytes <= .initial.native_audit_bytes and
     .reclaimed_payload_bytes == 0
   ' "$preparation_dir/cleanup-measurement-latest.json" >/dev/null
-  "$json_cli" -e '.schema == "ledger-preparation-result/v1" and .error_code == "AccessDenied" and .bytes_read > 0' \
+  "$json_cli" -e '
+    .schema == "ledger-preparation-result/v1" and .error_code == "AccessDenied" and
+    .outcome == "recovery-required" and .phase == "prior-cleanup" and
+    .transaction_id == null and .prior_preparation.installed == true and
+    .prior_preparation.observed_by == "reconciliation" and
+    .prior_preparation.activity == "cleanup" and .prior_preparation.complete == false and
+    .bytes_read > 0
+  ' \
     "$preparation_dir/cleanup-failure-latest.json" >/dev/null
   preparation_fingerprint "$preparation_cleanup_retries/.ledger/.transactions" >"$preparation_dir/cleanup-journals-latest"
   if test "$preparation_retry" -eq 0; then
@@ -957,11 +964,13 @@ for preparation_fault in capture publication verification cleanup; do
     preparation_expect_failure recovery-required "$preparation_dir/publication-inspect.json" \
       prepare --definition "$event_definition" --store-root "$preparation_fault_root" \
       --store-id preparation-smoke --source-root "$preparation_source" --format json
+    "$json_cli" -e '.transaction_id == null and .prior_preparation == null' \
+      "$preparation_dir/publication-inspect.json" >/dev/null
     preparation_maintenance_status=0
     "$binary" maintain --store-root "$preparation_fault_root" --store-id preparation-smoke \
       --apply --format json >"$preparation_dir/publication-maintain.json" || preparation_maintenance_status=$?
     test "$preparation_maintenance_status" -eq 2
-    "$json_cli" -e '.outcome == "blocked" and .error_code == "TransactionRecoveryRequired"' \
+    "$json_cli" -e '.outcome == "blocked" and .error_code == "TransactionRecoveryRequired" and .preparation == null' \
       "$preparation_dir/publication-maintain.json" >/dev/null
     preparation_fingerprint "$preparation_fault_root" >"$preparation_dir/publication-blocked-after"
     cmp -s "$preparation_dir/publication-blocked-before" "$preparation_dir/publication-blocked-after"
@@ -1022,6 +1031,133 @@ for preparation_fault in capture publication verification cleanup; do
   preparation_fingerprint "$preparation_fault_root" >"$preparation_dir/recovered-after"
   cmp -s "$preparation_dir/recovered-before" "$preparation_dir/recovered-after"
 done
+
+for preparation_cleanup_operation in prepare maintain; do
+  for preparation_cleanup_fault in partial_cleanup finalization; do
+    preparation_partial_root="$preparation_dir/$preparation_cleanup_operation-$preparation_cleanup_fault"
+    preparation_init "$preparation_partial_root"
+    preparation_fault_status=0
+    LEDGER_PREPARATION_FAULT=cleanup "$preparation_probe" prepare \
+      --definition "$event_definition" --store-root "$preparation_partial_root" \
+      --store-id preparation-smoke --source-root "$preparation_source" --apply --format json \
+      >"$preparation_dir/partial-setup.json" || preparation_fault_status=$?
+    test "$preparation_fault_status" -eq 2
+    "$json_cli" -e '.outcome == "committed-with-later-failure" and .reclaimed_bytes == 0' \
+      "$preparation_dir/partial-setup.json" >/dev/null
+    preparation_original_transaction=$("$json_cli" -r '.transaction_id' "$preparation_dir/partial-setup.json")
+    preparation_cleanup_args=("$preparation_cleanup_operation")
+    if test "$preparation_cleanup_operation" = prepare; then
+      preparation_cleanup_args+=(--definition "$event_definition" --source-root "$preparation_source")
+    fi
+    preparation_fault_status=0
+    LEDGER_PREPARATION_MEASURE="$preparation_dir/partial-measurement.json" \
+      LEDGER_PREPARATION_FAULT="$preparation_cleanup_fault" "$preparation_probe" \
+      "${preparation_cleanup_args[@]}" --store-root "$preparation_partial_root" \
+      --store-id preparation-smoke --apply --format json \
+      >"$preparation_dir/partial-result.json" || preparation_fault_status=$?
+    test "$preparation_fault_status" -eq 2
+    preparation_measurement_check "$preparation_dir/partial-measurement.json"
+    "$json_cli" -e --arg operation "$preparation_cleanup_operation" \
+      --arg fault "$preparation_cleanup_fault" --argjson selected "$preparation_selected_bytes" \
+      --slurpfile observed "$preparation_dir/partial-measurement.json" '
+      (if $operation == "prepare" then
+        .outcome == "recovery-required" and .phase == "prior-cleanup" and
+        .transaction_id == null and .reclaimed_bytes == $observed[0].reclaimed_payload_bytes
+      else .outcome == "failure" and .phase == "cleanup" end) and
+      .error_code == (if $fault == "partial_cleanup" then "AccessDenied" else "NoSpaceLeft" end) and
+      ((if $operation == "prepare" then .prior_preparation else .preparation end) |
+        .phase == "installed" and .installed == true and .complete == false and
+        .observed_by == "reconciliation" and .activity == "cleanup" and
+        .reclaimed_bytes == $observed[0].reclaimed_payload_bytes and
+        .bytes + .reclaimed_bytes == $selected and
+        (if $fault == "partial_cleanup" then
+          .reclaimed_bytes > 0 and .reclaimed_bytes < $selected and .files > 0
+        else .reclaimed_bytes == $selected and .files == 0 and .bytes == 0 end))
+    ' "$preparation_dir/partial-result.json" >/dev/null
+    cmp -s "$preparation_dir/expected.jsonl" "$preparation_partial_root/.ledger/example/events.jsonl"
+    test ! -e "$preparation_partial_root/.ledger/.preparation/payload-0"
+    "$json_cli" -e '.phase == "installed" and .installed == true' \
+      "$preparation_partial_root/.ledger/.preparation/operation.json" >/dev/null
+    preparation_first_reclaimed=$("$json_cli" -r '.reclaimed_payload_bytes' "$preparation_dir/partial-measurement.json")
+    LEDGER_PREPARATION_MEASURE="$preparation_dir/partial-recovery-measurement.json" \
+      "$preparation_probe" "${preparation_cleanup_args[@]}" --store-root "$preparation_partial_root" \
+      --store-id preparation-smoke --apply --format json >"$preparation_dir/partial-recovery.json"
+    preparation_measurement_check "$preparation_dir/partial-recovery-measurement.json"
+    "$json_cli" -e --arg operation "$preparation_cleanup_operation" \
+      --argjson reclaimed "$preparation_first_reclaimed" --argjson selected "$preparation_selected_bytes" \
+      --slurpfile observed "$preparation_dir/partial-recovery-measurement.json" '
+      (if $operation == "prepare" then
+        .outcome == "covered" and .transaction_id == null and .staged_bytes == 0 and
+        .reclaimed_bytes == $observed[0].reclaimed_payload_bytes
+      else .outcome == "healthy" end) and
+      ((if $operation == "prepare" then .prior_preparation else .preparation end) |
+        .phase == "finalized" and .installed == true and .complete == true and
+        .reclaimed_bytes == $observed[0].reclaimed_payload_bytes) and
+      $observed[0].reclaimed_payload_bytes + $reclaimed == $selected
+    ' "$preparation_dir/partial-recovery.json" >/dev/null
+    while IFS= read -r preparation_journal; do
+      test "$(basename "$(dirname "$preparation_journal")")" = "$preparation_original_transaction"
+    done < <(find "$preparation_partial_root/.ledger/.transactions" -name transaction.json -type f)
+    test -z "$(find "$preparation_partial_root/.ledger/.preparation" -name 'payload-*' -print -quit)"
+    "$binary" project --definition "$event_definition" --projection all \
+      --store-root "$preparation_partial_root" --store-id preparation-smoke --format jsonl \
+      >"$preparation_dir/partial-projection.jsonl"
+    cmp -s "$preparation_dir/expected.jsonl" "$preparation_dir/partial-projection.jsonl"
+  done
+done
+
+preparation_corrupt_root="$preparation_dir/installed-payload-corrupt"
+preparation_init "$preparation_corrupt_root"
+preparation_fault_status=0
+LEDGER_PREPARATION_FAULT=cleanup "$preparation_probe" prepare --definition "$event_definition" \
+  --store-root "$preparation_corrupt_root" --store-id preparation-smoke \
+  --source-root "$preparation_source" --apply --format json \
+  >"$preparation_dir/corrupt-setup.json" || preparation_fault_status=$?
+test "$preparation_fault_status" -eq 2
+cp "$preparation_corrupt_root/.ledger/.preparation/payload-0" "$preparation_dir/corrupt-original"
+printf X | dd of="$preparation_corrupt_root/.ledger/.preparation/payload-0" bs=1 count=1 conv=notrunc 2>/dev/null
+preparation_fingerprint "$preparation_corrupt_root" >"$preparation_dir/corrupt-before"
+for preparation_corrupt_operation in prepare maintain; do
+  preparation_corrupt_args=("$preparation_corrupt_operation")
+  if test "$preparation_corrupt_operation" = prepare; then
+    preparation_corrupt_args+=(--definition "$event_definition" --source-root "$preparation_source")
+  fi
+  preparation_fault_status=0
+  LEDGER_PREPARATION_MEASURE="$preparation_dir/corrupt-measurement.json" \
+    "$preparation_probe" "${preparation_corrupt_args[@]}" --store-root "$preparation_corrupt_root" \
+    --store-id preparation-smoke --apply --format json \
+    >"$preparation_dir/corrupt-result.json" || preparation_fault_status=$?
+  test "$preparation_fault_status" -eq 2
+  preparation_measurement_check "$preparation_dir/corrupt-measurement.json"
+  "$json_cli" -e --arg operation "$preparation_corrupt_operation" '
+    .error_code == "PreparationOwnershipUnknown" and .storage_mutated == false and
+    (if $operation == "prepare" then
+      .outcome == "recovery-required" and .phase == "prior-inspection" and .transaction_id == null
+    else .outcome == "blocked" and .phase == "inspection" end) and
+    ((if $operation == "prepare" then .prior_preparation else .preparation end) |
+      .installed == true and .phase == "installed" and .complete == false and
+      .observed_by == "inspection" and .activity == "inspection" and .reclaimed_bytes == 0)
+  ' "$preparation_dir/corrupt-result.json" >/dev/null
+  "$json_cli" -e '.target_bytes_written == 0 and .reclaimed_payload_bytes == 0 and .initial == .retained' \
+    "$preparation_dir/corrupt-measurement.json" >/dev/null
+  preparation_fingerprint "$preparation_corrupt_root" >"$preparation_dir/corrupt-after"
+  cmp -s "$preparation_dir/corrupt-before" "$preparation_dir/corrupt-after"
+  cmp -s "$preparation_dir/expected.jsonl" "$preparation_corrupt_root/.ledger/example/events.jsonl"
+done
+cat "$preparation_dir/corrupt-original" >"$preparation_corrupt_root/.ledger/.preparation/payload-0"
+LEDGER_PREPARATION_MEASURE="$preparation_dir/corrupt-recovery-measurement.json" \
+  "$preparation_probe" prepare --definition "$event_definition" --store-root "$preparation_corrupt_root" \
+  --store-id preparation-smoke --source-root "$preparation_source" --apply --format json \
+  >"$preparation_dir/corrupt-recovery.json"
+"$json_cli" -e --argjson selected "$preparation_selected_bytes" \
+  --slurpfile observed "$preparation_dir/corrupt-recovery-measurement.json" '
+  .outcome == "covered" and .transaction_id == null and .staged_bytes == 0 and
+  .reclaimed_bytes == $selected and .reclaimed_bytes == $observed[0].reclaimed_payload_bytes
+' "$preparation_dir/corrupt-recovery.json" >/dev/null
+"$binary" project --definition "$event_definition" --projection all \
+  --store-root "$preparation_corrupt_root" --store-id preparation-smoke --format jsonl \
+  >"$preparation_dir/corrupt-projection.jsonl"
+cmp -s "$preparation_dir/expected.jsonl" "$preparation_dir/corrupt-projection.jsonl"
 
 cp -R "$preparation_source/.ledger/.bindings" "$preparation_source/.ledger/.definitions" "$preparation_conflict/.ledger/"
 preparation_conflicting_binding=$(find "$preparation_conflict/.ledger/.bindings" -name '*.jsonl' -type f -print -quit)

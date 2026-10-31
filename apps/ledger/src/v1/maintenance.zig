@@ -89,13 +89,18 @@ fn inspectAndFinalize(
     result: *Result,
 ) !void {
     if (selection) |target| try target.revalidateBudgeted(allocator, scope.fs.read_budget);
-    result.preparation = try work.inspect(scope, allocator, limits);
+    try work.inspectObserved(scope, allocator, limits, &result.preparation);
     const observed = result.preparation.?;
     if (apply and observed.phase != .absent and observed.phase != .finalized) {
         var workspace = try work.Workspace.acquire(scope, allocator);
         defer workspace.deinit();
         result.phase = "cleanup";
-        result.preparation = try workspace.reconcile(limits, true);
+        var latest: ?work.Report = null;
+        defer if (latest) |report| {
+            result.preparation = report;
+            if (!report.complete) result.phase = @tagName(report.activity);
+        };
+        try workspace.reconcileObserved(limits, true, &latest);
     }
     var directory = try scope.fs.directory().openDir(scope.fs.io, ".", .{ .iterate = true });
     defer directory.close(scope.fs.io);

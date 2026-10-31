@@ -71,6 +71,19 @@ the specific `error_code`, phase and mutation observation in the preparation
 result. Argument/definition/layout admission errors before operation entry retain
 the existing native error envelope. No failure is an empty-history observation.
 
+`prior_preparation` retains the store-wide work observation when a later step fails.
+Its `installed` flag records an earlier native installation, not installation of
+the currently selected owner. `observed_by` identifies inspection or reconciliation;
+an inspection observation retained across a failed recovery is historical evidence,
+not certification of that recovery. `activity` identifies inspection or cleanup,
+and `complete: false` marks partial observations. A failed prior cleanup reports
+`recovery-required` and `prior-cleanup` while preserving known installed state;
+the current request is blocked, but that earlier publication is not uncertain.
+`committed-with-later-failure` identifies this invocation's committed transaction.
+Reclaimed bytes include completed deletions even when a later deletion or receipt
+write fails. New capture uses its own observations and cannot inherit an older
+installation's success.
+
 Maintenance JSON uses `ledger-maintenance-result/v1`. `healthy` returns exit 0;
 `blocked`, `incomplete` and `failure` return exit 2 with the error code and measured
 coverage. Mutation can be false, true or unknown. Neither schema grants semantic

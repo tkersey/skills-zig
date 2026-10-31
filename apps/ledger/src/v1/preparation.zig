@@ -66,6 +66,7 @@ pub const Result = struct {
     native_bytes_written: ?usize = null,
     peak_additional_working_bytes: ?usize = null,
     reclaimed_bytes: usize = 0,
+    prior_preparation: ?work.Report = null,
     estimated_peak_additional_bytes: usize = 0,
     free_bytes: ?u64 = null,
     records: usize = 0,
@@ -223,7 +224,9 @@ const Execution = struct {
             "committed-with-later-failure"
         else if (err == error.LockBusy or err == error.EventStoreBusy)
             "busy"
-        else if (std.mem.eql(u8, self.result.phase, "publication"))
+        else if (std.mem.eql(u8, self.result.phase, "publication") or
+            std.mem.eql(u8, self.result.phase, "recovery") or
+            std.mem.startsWith(u8, self.result.phase, "prior-"))
             "recovery-required"
         else
             failureOutcome(err);
@@ -250,20 +253,28 @@ const Execution = struct {
         self.result.bytes_read = self.budget.bytes;
         self.result.file_reads = self.budget.files;
         self.result.storage_mutated = self.scope.mutation_state;
+        if (self.workspace) |workspace| self.result.reclaimed_bytes = workspace.reclaimed_bytes;
         return self.result;
     }
 
     fn resolvePriorWork(self: *Execution) !bool {
+        self.result.phase = "prior-inspection";
         var needed = try durable_store.countPendingTransactions(
             self.scope.fs,
             self.allocator,
             ".transactions",
         ) != 0;
         if (!needed) {
-            const existing = try work.inspect(self.scope, self.allocator, self.options.limits);
+            var observation: ?work.Report = null;
+            defer self.retainPriorObservation(observation);
+            try work.inspectObserved(self.scope, self.allocator, self.options.limits, &observation);
+            const existing = observation.?;
             needed = existing.phase != .absent and existing.phase != .finalized;
         }
-        if (!needed) return true;
+        if (!needed) {
+            self.result.phase = "preparation";
+            return true;
+        }
         if (!self.options.apply) {
             self.result.outcome = "recovery-required";
             return false;
@@ -275,12 +286,26 @@ const Execution = struct {
     fn acquireWorkspace(self: *Execution) !void {
         if (self.workspace != null) return;
         self.workspace = try work.Workspace.acquire(self.scope, self.allocator);
+        self.result.phase = "recovery";
         if (try transaction.recoverRepositoryTransactions(self.scope, self.allocator, ".")) {
             transaction.markStorageMutated(self.scope);
         }
-        const cleanup = try self.workspace.?.reconcile(self.options.limits, true);
-        self.result.reclaimed_bytes += cleanup.reclaimed_bytes;
+        self.result.phase = "prior-reconciliation";
+        var observation: ?work.Report = null;
+        defer self.retainPriorObservation(observation);
+        try self.workspace.?.reconcileObserved(self.options.limits, true, &observation);
         self.result.phase = "preparation";
+    }
+
+    fn retainPriorObservation(self: *Execution, observation: ?work.Report) void {
+        const observed = observation orelse return;
+        self.result.prior_preparation = observed;
+        if (std.mem.startsWith(u8, self.result.phase, "prior-")) {
+            self.result.phase = switch (observed.activity) {
+                .inspection => "prior-inspection",
+                .cleanup => "prior-cleanup",
+            };
+        }
     }
 
     fn capture(self: *Execution, scope: *storage_root.Scope, coordinated: bool) !History {
@@ -516,8 +541,7 @@ const Execution = struct {
             return error.PreparationInstalledHistoryMismatch;
         }
         self.result.phase = "cleanup";
-        const cleanup = try self.workspace.?.reconcile(self.options.limits, true);
-        self.result.reclaimed_bytes += cleanup.reclaimed_bytes;
+        _ = try self.workspace.?.reconcile(self.options.limits, true);
         self.result.phase = "committed";
     }
 };

@@ -15,6 +15,9 @@ pub const Phase = enum { absent, capturing, ready, installed, finalized };
 pub const Report = struct {
     phase: Phase = .absent,
     installed: bool = false,
+    observed_by: enum { inspection, reconciliation } = .inspection,
+    activity: enum { inspection, cleanup } = .inspection,
+    complete: bool = false,
     files: usize = 0,
     bytes: usize = 0,
     reclaimed_bytes: usize = 0,
@@ -41,6 +44,7 @@ pub const Workspace = struct {
     guard: std.Io.File,
     ready_digest: ?[]u8 = null,
     installed_record: ?[]u8 = null,
+    reclaimed_bytes: usize = 0,
 
     pub fn acquire(scope: *storage_root.Scope, allocator: std.mem.Allocator) !Workspace {
         if (!scope.fs.isPinned()) return error.PreparationRequiresManagedRoot;
@@ -65,7 +69,23 @@ pub const Workspace = struct {
     }
 
     pub fn reconcile(self: *Workspace, limits: preparation.Limits, apply: bool) !Report {
-        return reconcileLocked(self.scope, self.allocator, limits, apply);
+        var observation: ?Report = null;
+        try self.reconcileObserved(limits, apply, &observation);
+        return observation.?;
+    }
+
+    pub fn reconcileObserved(
+        self: *Workspace,
+        limits: preparation.Limits,
+        apply: bool,
+        observation: *?Report,
+    ) !void {
+        observation.* = null;
+        defer if (observation.*) |*report| {
+            report.observed_by = .reconciliation;
+            self.reclaimed_bytes += report.reclaimed_bytes;
+        };
+        try reconcileLocked(self.scope, self.allocator, limits, apply, observation);
     }
 
     pub fn stage(
@@ -257,6 +277,18 @@ pub fn inspect(
     allocator: std.mem.Allocator,
     limits: preparation.Limits,
 ) !Report {
+    var observation: ?Report = null;
+    try inspectObserved(scope, allocator, limits, &observation);
+    return observation.?;
+}
+
+pub fn inspectObserved(
+    scope: *storage_root.Scope,
+    allocator: std.mem.Allocator,
+    limits: preparation.Limits,
+    observation: *?Report,
+) !void {
+    observation.* = null;
     if (!scope.fs.isPinned()) return error.PreparationRequiresManagedRoot;
     var guard = try durable_store.acquireCasReadLockPair(
         scope.fs,
@@ -266,7 +298,7 @@ pub fn inspect(
     );
     defer guard.deinit();
     if (guard.count == 0 and try workspaceExists(scope)) return error.PreparationOwnershipUnknown;
-    return reconcileLocked(scope, allocator, limits, false);
+    try reconcileLocked(scope, allocator, limits, false, observation);
 }
 
 fn reconcileLocked(
@@ -274,10 +306,14 @@ fn reconcileLocked(
     allocator: std.mem.Allocator,
     limits: preparation.Limits,
     apply: bool,
-) !Report {
+    observation: *?Report,
+) !void {
     try limits.validate();
     try durable_store.ensureNoPendingTransactions(scope.fs, allocator, ".transactions");
-    if (!try workspaceExists(scope)) return .{};
+    if (!try workspaceExists(scope)) {
+        observation.* = .{ .complete = true };
+        return;
+    }
     const record_bytes = scope.readFile(allocator, record_path, record_max_bytes) catch |err|
         switch (err) {
             error.FileNotFound => return error.PreparationOwnershipUnknown,
@@ -290,15 +326,21 @@ fn reconcileLocked(
     defer parsed.deinit();
     const record = parsed.value;
     try validateRecord(record, limits);
+    observation.* = .{ .phase = record.phase, .installed = record.installed };
+    const result = &observation.*.?;
     var directory = try scope.fs.directory().openDir(scope.fs.io, workspace_path, .{
         .iterate = true,
         .follow_symlinks = false,
     });
     defer directory.close(scope.fs.io);
-    var result = try inspectPayloads(scope, allocator, directory, record, limits);
-    if (!apply or record.phase == .finalized) return result;
+    try inspectPayloads(scope, allocator, directory, record, limits, result);
+    if (!apply or record.phase == .finalized) {
+        result.complete = true;
+        return;
+    }
     try durable_store.ensureNoPendingTransactions(scope.fs, allocator, ".transactions");
-    result.reclaimed_bytes = try releasePayloads(scope, directory, record.files);
+    result.activity = .cleanup;
+    try releasePayloads(scope, directory, record.files, result);
     var finalized = record;
     finalized.phase = .finalized;
     finalized.files = &.{};
@@ -306,8 +348,8 @@ fn reconcileLocked(
     result.phase = .finalized;
     result.files = 0;
     result.bytes = 0;
+    result.complete = true;
     scope.mutation_state = true;
-    return result;
 }
 
 fn inspectPayloads(
@@ -316,8 +358,8 @@ fn inspectPayloads(
     directory: std.Io.Dir,
     record: Record,
     limits: preparation.Limits,
-) !Report {
-    var result: Report = .{ .phase = record.phase, .installed = record.installed };
+    result: *Report,
+) !void {
     var iterator = directory.iterate();
     var entries: usize = 0;
     while (try iterator.next(scope.fs.io)) |entry| {
@@ -337,7 +379,6 @@ fn inspectPayloads(
         result.files += 1;
         result.bytes += @intCast(stat.size);
     }
-    return result;
 }
 
 fn verifyPayloadDigest(
@@ -361,8 +402,8 @@ fn releasePayloads(
     scope: *storage_root.Scope,
     directory: std.Io.Dir,
     witnesses: []const Witness,
-) !usize {
-    var reclaimed_bytes: usize = 0;
+    result: *Report,
+) !void {
     for (witnesses, 0..) |witness, index| {
         var name_buffer: [40]u8 = undefined;
         const name = try payloadName(&name_buffer, index);
@@ -373,12 +414,17 @@ fn releasePayloads(
             else => return err,
         };
         try checkWitness(stat, witness);
+        const remaining_files = std.math.sub(usize, result.files, 1) catch
+            return error.PreparationOwnershipUnknown;
+        const remaining_bytes = std.math.sub(usize, result.bytes, @intCast(stat.size)) catch
+            return error.PreparationOwnershipUnknown;
         if (scope.mutation_state != true) scope.mutation_state = null;
         try directory.deleteFile(scope.fs.io, name);
         scope.mutation_state = true;
-        reclaimed_bytes += @intCast(stat.size);
+        result.files = remaining_files;
+        result.bytes = remaining_bytes;
+        result.reclaimed_bytes += @intCast(stat.size);
     }
-    return reclaimed_bytes;
 }
 
 fn workspaceExists(scope: *storage_root.Scope) !bool {

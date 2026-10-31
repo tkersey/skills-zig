@@ -4,7 +4,15 @@ const ledger_main = @import("main.zig");
 pub const panic = ledger_main.panic;
 pub const std_options = ledger_main.std_options;
 
-const Fault = enum { none, publication, capture, verification, cleanup };
+const Fault = enum {
+    none,
+    publication,
+    capture,
+    verification,
+    cleanup,
+    partial_cleanup,
+    finalization,
+};
 var original: *const std.Io.VTable = undefined;
 var fault: Fault = .none;
 var triggered: std.atomic.Value(bool) = .init(false);
@@ -12,12 +20,13 @@ var committed: std.atomic.Value(bool) = .init(false);
 const no_handle = std.math.maxInt(usize);
 var payload_handle: std.atomic.Value(usize) = .init(no_handle);
 var marker_handle: std.atomic.Value(usize) = .init(no_handle);
+var payload_deletions: usize = 0;
 
 var measurement_io: std.Io = undefined;
 var measurement_allocator: std.mem.Allocator = undefined;
 var measurement_path: ?[]const u8 = null;
 var measurement_root: std.Io.Dir = undefined;
-var measurement_root_path: []const u8 = undefined;
+var measurement_root_path: [:0]const u8 = undefined;
 var measurements: Measurements = .{};
 
 const Sizes = struct {
@@ -51,8 +60,14 @@ const Measurements = struct {
 };
 
 pub fn main(init: std.process.Init) !void {
+    var observed_directory: ?std.Io.Dir = null;
+    defer if (observed_directory) |directory| directory.close(init.io);
+    var observed_path: ?[:0]const u8 = null;
+    defer if (observed_path) |path| init.gpa.free(path);
     const argv = try init.minimal.args.toSlice(init.arena.allocator());
-    if (argv.len > 1 and std.mem.eql(u8, argv[1], "prepare")) {
+    if (argv.len > 1 and (std.mem.eql(u8, argv[1], "prepare") or
+        std.mem.eql(u8, argv[1], "maintain")))
+    {
         if (init.environ_map.get("LEDGER_PREPARATION_FAULT")) |name| {
             fault = std.meta.stringToEnum(Fault, name) orelse
                 return error.InvalidPreparationProbeFault;
@@ -70,7 +85,9 @@ pub fn main(init: std.process.Init) !void {
             return error.PreparationProbeMissingRoot, .{});
         defer root.close(init.io);
         measurement_root = try root.openDir(init.io, ".ledger", .{ .iterate = true });
+        observed_directory = measurement_root;
         measurement_root_path = try measurement_root.realPathFileAlloc(init.io, ".", init.gpa);
+        observed_path = measurement_root_path;
         if (std.mem.startsWith(u8, path, measurement_root_path)) {
             return error.PreparationProbeReportInsideTarget;
         }
@@ -138,6 +155,7 @@ fn writePositional(
     splat: usize,
     offset: u64,
 ) std.Io.File.WritePositionalError!usize {
+    if (failFinalization(header, data)) return error.NoSpaceLeft;
     const count = try original.fileWritePositional(userdata, file, header, data, splat, offset);
     observeWrite(file, count, false);
     if (fault == .capture and count != 0 and
@@ -184,16 +202,17 @@ fn deleteFile(
     directory: std.Io.Dir,
     path: []const u8,
 ) std.Io.Dir.DeleteFileError!void {
-    if (fault == .cleanup and
-        std.mem.startsWith(u8, std.fs.path.basename(path), "payload-") and
+    const payload = std.mem.startsWith(u8, std.fs.path.basename(path), "payload-");
+    if ((fault == .cleanup or (fault == .partial_cleanup and payload_deletions == 1)) and
+        payload and
         !triggered.swap(true, .monotonic)) return error.AccessDenied;
-    const payload_bytes = if (measurement_path != null and
-        std.mem.startsWith(u8, std.fs.path.basename(path), "payload-"))
+    const payload_bytes = if (measurement_path != null and payload)
         (directory.statFile(measurement_io, path, .{ .follow_symlinks = false }) catch
             @panic("probe cannot stat deleted payload")).size
     else
         0;
     try original.dirDeleteFile(userdata, directory, path);
+    if (payload) payload_deletions += 1;
     measurements.reclaimed_payload_bytes += payload_bytes;
     sample();
 }
@@ -249,6 +268,12 @@ fn operate(
     userdata: ?*anyopaque,
     operation: std.Io.Operation,
 ) std.Io.Cancelable!std.Io.Operation.Result {
+    if (operation == .file_write_streaming) {
+        const write = operation.file_write_streaming;
+        if (failFinalization(write.header, write.data)) {
+            return .{ .file_write_streaming = error.NoSpaceLeft };
+        }
+    }
     const result = try original.operate(userdata, operation);
     switch (operation) {
         .file_write_streaming => |write| if (result.file_write_streaming) |count| {
@@ -260,6 +285,14 @@ fn operate(
         else => {},
     }
     return result;
+}
+
+fn failFinalization(header: []const u8, data: []const []const u8) bool {
+    if (fault != .finalization or payload_deletions == 0) return false;
+    const needle = "\"phase\":\"finalized\"";
+    var finalizing = std.mem.indexOf(u8, header, needle) != null;
+    for (data) |part| finalizing = finalizing or std.mem.indexOf(u8, part, needle) != null;
+    return finalizing and !triggered.swap(true, .monotonic);
 }
 
 fn createFileAtomic(
