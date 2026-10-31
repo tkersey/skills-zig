@@ -428,12 +428,16 @@ pub fn writeDoctorJson(
     try writer.writeAll(",\"abi\":\"");
     try writer.writeAll(definition.abi);
     try writer.print(
-        "\"}},\"healthy\":{s},\"pending_transactions\":{d},\"slots\":[",
+        "\"}},\"healthy\":{s},\"pending_transactions\":{d}," ++
+            "\"preparation_pending\":{s},\"preparation_error\":",
         .{
             if (result.healthy) "true" else "false",
             result.pending_transactions,
+            if (result.preparation_pending) "true" else "false",
         },
     );
+    try std.json.Stringify.value(result.preparation_error, .{}, writer);
+    try writer.writeAll(",\"slots\":[");
     for (result.slots, 0..) |slot, index| {
         if (index != 0) try writer.writeByte(',');
         try writer.writeAll("{\"name\":");

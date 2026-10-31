@@ -11,16 +11,75 @@ const marker_schema = "ledger-storage-root/v1";
 pub const Scope = struct {
     fs: durable_store.Fs,
     mutation_state: ?bool = false,
+    read_budget: ?*ReadBudget = null,
 
     pub fn init(fs: durable_store.Fs) Scope {
         return .{ .fs = fs };
     }
+
+    pub fn readFile(
+        self: *Scope,
+        allocator: std.mem.Allocator,
+        path: []const u8,
+        max_bytes: usize,
+    ) ![]u8 {
+        const budget = self.read_budget orelse return durable_store.readRegularFileNoSymlink(
+            self.fs,
+            allocator,
+            path,
+            max_bytes,
+        );
+        if (budget.files == budget.max_files) return error.PreparationFileBoundExceeded;
+        budget.files += 1;
+        try durable_store.rejectSymlinkComponents(self.fs, path);
+        const path_z = try allocator.dupeSentinel(u8, path, 0);
+        defer allocator.free(path_z);
+        const fd = try std.posix.openat(self.fs.directory().handle, path_z, .{
+            .ACCMODE = .RDONLY,
+            .NONBLOCK = true,
+            .NOFOLLOW = true,
+            .CLOEXEC = true,
+        }, 0);
+        const file: std.Io.File = .{ .handle = fd, .flags = .{ .nonblocking = true } };
+        defer file.close(self.fs.io);
+        const stat = try file.stat(self.fs.io);
+        if (stat.kind != .file) return error.NotFile;
+        if (stat.size > max_bytes) return error.FileTooBig;
+        if (stat.size > budget.max_bytes - budget.bytes) return error.PreparationReadBoundExceeded;
+        var bytes: std.ArrayList(u8) = .empty;
+        errdefer bytes.deinit(allocator);
+        var buffer: [16 * 1024]u8 = undefined;
+        while (bytes.items.len <= max_bytes) {
+            const remaining = budget.max_bytes - budget.bytes;
+            if (remaining == 0) return error.PreparationReadBoundExceeded;
+            const request = @min(buffer.len, @min(remaining, max_bytes - bytes.items.len + 1));
+            const count = try file.readPositional(
+                self.fs.io,
+                &.{buffer[0..request]},
+                bytes.items.len,
+            );
+            budget.bytes += count;
+            if (count == 0) break;
+            if (count > max_bytes - bytes.items.len) return error.FileTooBig;
+            try bytes.appendSlice(allocator, buffer[0..count]);
+        }
+        return bytes.toOwnedSlice(allocator);
+    }
+};
+
+pub const ReadBudget = struct {
+    max_bytes: usize,
+    max_files: usize,
+    bytes: usize = 0,
+    files: usize = 0,
 };
 
 pub const Selection = struct {
     argv: []const []const u8,
     control: ?std.Io.Dir = null,
     io: std.Io,
+    supplied_root: ?[]const u8 = null,
+    store_id: ?[]const u8 = null,
 
     pub fn deinit(self: *Selection, allocator: std.mem.Allocator) void {
         allocator.free(self.argv);
@@ -35,6 +94,15 @@ pub const Selection = struct {
     /// Enter only after command input paths have been read in invocation scope.
     pub fn enterControl(self: *const Selection, scope: *Scope) void {
         if (self.control) |control| scope.fs = .anchored(self.io, control);
+    }
+
+    pub fn revalidate(self: *const Selection, allocator: std.mem.Allocator) !void {
+        const control = self.control orelse return error.PreparationRequiresManagedTarget;
+        const current = try checkedRoot(allocator, self.io, self.supplied_root.?, self.store_id.?);
+        defer current.close(self.io);
+        if ((try control.stat(self.io)).inode != (try current.stat(self.io)).inode) {
+            return error.PreparationTargetChanged;
+        }
     }
 };
 
@@ -117,6 +185,8 @@ pub fn prepare(
         .argv = try args.toOwnedSlice(allocator),
         .control = control,
         .io = io,
+        .supplied_root = root_arg,
+        .store_id = expected_id,
     };
 }
 
@@ -127,6 +197,8 @@ fn isDurableCommand(command: []const u8) bool {
         "doctor",
         "migrate-segmented",
         "recovery",
+        "prepare",
+        "maintain",
     }) |name| {
         if (std.mem.eql(u8, command, name)) return true;
     }
@@ -146,24 +218,49 @@ fn takesValue(arg: []const u8) bool {
         "--resource",
         "--lock-id",
         "--fencing-token",
+        "--source-root",
+        "--source-store",
+        "--source-archive",
+        "--max-bytes",
+        "--max-files",
+        "--max-read-bytes",
     }) |name| {
         if (std.mem.eql(u8, arg, name)) return true;
     }
     return false;
 }
 
-fn checkedRoot(
+pub fn checkedRoot(
     allocator: std.mem.Allocator,
     io: std.Io,
     supplied_root: []const u8,
     expected_id: []const u8,
 ) !std.Io.Dir {
-    if (!std.fs.path.isAbsolute(supplied_root)) return error.StorageRootNotAbsolute;
     if (expected_id.len == 0 or expected_id.len > 256) return error.InvalidStoreIdentity;
+    var root_dir = try openRoot(io, supplied_root);
+    defer root_dir.close(io);
+    const control = root_dir.openDir(io, ".ledger", .{
+        .follow_symlinks = false,
+    }) catch |err| {
+        try checkMarker(allocator, io, root_dir, expected_id);
+        return switch (err) {
+            error.FileNotFound => error.StorageRootMissing,
+            error.NotDir => error.StorageRootNotDirectory,
+            error.SymLinkLoop => error.SymlinkComponent,
+            else => err,
+        };
+    };
+    errdefer control.close(io);
+    try checkMarker(allocator, io, root_dir, expected_id);
+    return control;
+}
+
+pub fn openRoot(io: std.Io, supplied_root: []const u8) !std.Io.Dir {
+    if (!std.fs.path.isAbsolute(supplied_root)) return error.StorageRootNotAbsolute;
     var root_dir = try std.Io.Dir.openDirAbsolute(io, "/", .{
         .follow_symlinks = false,
     });
-    defer root_dir.close(io);
+    errdefer root_dir.close(io);
     var components = std.fs.path.componentIterator(supplied_root);
     while (components.next()) |component| {
         if (std.mem.eql(u8, component.name, ".") or
@@ -182,20 +279,7 @@ fn checkedRoot(
         root_dir.close(io);
         root_dir = next;
     }
-    const control = root_dir.openDir(io, ".ledger", .{
-        .follow_symlinks = false,
-    }) catch |err| {
-        try checkMarker(allocator, io, root_dir, expected_id);
-        return switch (err) {
-            error.FileNotFound => error.StorageRootMissing,
-            error.NotDir => error.StorageRootNotDirectory,
-            error.SymLinkLoop => error.SymlinkComponent,
-            else => err,
-        };
-    };
-    errdefer control.close(io);
-    try checkMarker(allocator, io, root_dir, expected_id);
-    return control;
+    return root_dir;
 }
 
 fn checkMarker(
@@ -413,4 +497,178 @@ test "managed admission propagates supplied I/O cancellation" {
     try std.testing.expectError(error.Canceled, prepare(std.testing.allocator, io, &.{
         "ledger", "doctor", "--store-root", "/", "--store-id", "cancelled",
     }));
+}
+
+const BoundedReadMutationTest = struct {
+    const Change = enum { grow, truncate, replace };
+    var directory: std.Io.Dir = undefined;
+    var change: Change = .grow;
+    var changed = false;
+    var mutation_error: ?anyerror = null;
+    var observed_bytes: usize = 0;
+    var requested_bytes: usize = 0;
+
+    fn configure(dir: std.Io.Dir, mode: Change, vtable: *std.Io.VTable) std.Io {
+        directory = dir;
+        change = mode;
+        changed = false;
+        mutation_error = null;
+        observed_bytes = 0;
+        requested_bytes = 0;
+        vtable.* = std.testing.io.vtable.*;
+        vtable.fileStat = stat;
+        vtable.fileReadPositional = read;
+        return .{ .userdata = std.testing.io.userdata, .vtable = vtable };
+    }
+
+    fn stat(userdata: ?*anyopaque, file: std.Io.File) std.Io.File.StatError!std.Io.File.Stat {
+        const result = try std.testing.io.vtable.fileStat(userdata, file);
+        if (!changed) {
+            changed = true;
+            mutate() catch |err| {
+                mutation_error = err;
+                return error.Unexpected;
+            };
+        }
+        return result;
+    }
+
+    fn mutate() !void {
+        const bytes: []const u8 = switch (change) {
+            .grow => "abcdefghij",
+            .truncate => "ab",
+            .replace => blk: {
+                try directory.rename("selected", directory, "opened-original", std.testing.io);
+                break :blk "replacement";
+            },
+        };
+        try directory.writeFile(std.testing.io, .{ .sub_path = "selected", .data = bytes });
+    }
+
+    fn read(
+        userdata: ?*anyopaque,
+        file: std.Io.File,
+        buffers: []const []u8,
+        offset: u64,
+    ) std.Io.File.ReadPositionalError!usize {
+        for (buffers) |buffer| requested_bytes += buffer.len;
+        const count = try std.testing.io.vtable.fileReadPositional(userdata, file, buffers, offset);
+        observed_bytes += count;
+        return count;
+    }
+};
+
+test "bounded preparation reads charge rejected growth against aggregate limits" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "selected", .data = "a" });
+    var vtable: std.Io.VTable = undefined;
+    const io = BoundedReadMutationTest.configure(tmp.dir, .grow, &vtable);
+    var budget: ReadBudget = .{ .max_bytes = 9, .max_files = 2 };
+    var scope: Scope = .{ .fs = .anchored(io, tmp.dir), .read_budget = &budget };
+    try std.testing.expectError(error.FileTooBig, scope.readFile(
+        std.testing.allocator,
+        "selected",
+        4,
+    ));
+    try std.testing.expect(BoundedReadMutationTest.changed);
+    try std.testing.expectEqual(null, BoundedReadMutationTest.mutation_error);
+    try std.testing.expectEqual(@as(usize, 5), budget.bytes);
+    try std.testing.expectEqual(@as(usize, 5), BoundedReadMutationTest.observed_bytes);
+    try std.testing.expectEqual(@as(usize, 5), BoundedReadMutationTest.requested_bytes);
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "selected", .data = "a" });
+    BoundedReadMutationTest.changed = false;
+    try std.testing.expectError(error.PreparationReadBoundExceeded, scope.readFile(
+        std.testing.allocator,
+        "selected",
+        4,
+    ));
+    try std.testing.expect(BoundedReadMutationTest.changed);
+    try std.testing.expectEqual(null, BoundedReadMutationTest.mutation_error);
+    try std.testing.expectEqual(@as(usize, 9), budget.bytes);
+    try std.testing.expectEqual(@as(usize, 9), BoundedReadMutationTest.observed_bytes);
+    try std.testing.expectEqual(@as(usize, 9), BoundedReadMutationTest.requested_bytes);
+    try std.testing.expectEqual(@as(usize, 2), budget.files);
+    try std.testing.expectError(error.PreparationFileBoundExceeded, scope.readFile(
+        std.testing.allocator,
+        "selected",
+        4,
+    ));
+    try std.testing.expectEqual(@as(usize, 9), BoundedReadMutationTest.observed_bytes);
+}
+
+test "bounded preparation reads measure truncation from the opened stream" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "selected", .data = "abcdef" });
+    var vtable: std.Io.VTable = undefined;
+    const io = BoundedReadMutationTest.configure(tmp.dir, .truncate, &vtable);
+    var budget: ReadBudget = .{ .max_bytes = 32, .max_files = 1 };
+    var scope: Scope = .{ .fs = .anchored(io, tmp.dir), .read_budget = &budget };
+    const bytes = try scope.readFile(std.testing.allocator, "selected", 6);
+    defer std.testing.allocator.free(bytes);
+    try std.testing.expect(BoundedReadMutationTest.changed);
+    try std.testing.expectEqual(null, BoundedReadMutationTest.mutation_error);
+    try std.testing.expectEqualStrings("ab", bytes);
+    try std.testing.expectEqual(@as(usize, 2), budget.bytes);
+    try std.testing.expectEqual(@as(usize, 2), BoundedReadMutationTest.observed_bytes);
+    try std.testing.expectEqual(@as(usize, 1), budget.files);
+}
+
+test "bounded preparation reads preserve opened bytes after pathname replacement" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "selected", .data = "before" });
+    var vtable: std.Io.VTable = undefined;
+    const io = BoundedReadMutationTest.configure(tmp.dir, .replace, &vtable);
+    var budget: ReadBudget = .{ .max_bytes = 32, .max_files = 1 };
+    var scope: Scope = .{ .fs = .anchored(io, tmp.dir), .read_budget = &budget };
+    const bytes = try scope.readFile(std.testing.allocator, "selected", 6);
+    defer std.testing.allocator.free(bytes);
+    try std.testing.expect(BoundedReadMutationTest.changed);
+    try std.testing.expectEqual(null, BoundedReadMutationTest.mutation_error);
+    try std.testing.expectEqualStrings("before", bytes);
+    try std.testing.expectEqual(@as(usize, 6), budget.bytes);
+    try std.testing.expectEqual(@as(usize, 6), BoundedReadMutationTest.observed_bytes);
+    const replacement = try tmp.dir.readFileAlloc(
+        std.testing.io,
+        "selected",
+        std.testing.allocator,
+        .limited(32),
+    );
+    defer std.testing.allocator.free(replacement);
+    try std.testing.expectEqualStrings("replacement", replacement);
+}
+
+test "bounded preparation reads reject symlinks and special files before payload reads" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "selected", .data = "before" });
+    try tmp.dir.symLink(std.testing.io, "selected", "link", .{});
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
+    defer std.testing.allocator.free(root);
+    const fifo = try std.fs.path.join(std.testing.allocator, &.{ root, "fifo" });
+    defer std.testing.allocator.free(fifo);
+    const result = try std.process.run(std.testing.allocator, std.testing.io, .{
+        .argv = &.{ "mkfifo", fifo },
+        .stdout_limit = .limited(1024),
+        .stderr_limit = .limited(1024),
+    });
+    defer std.testing.allocator.free(result.stdout);
+    defer std.testing.allocator.free(result.stderr);
+    if (result.term != .exited or result.term.exited != 0) return error.MkfifoFailed;
+    var budget: ReadBudget = .{ .max_bytes = 32, .max_files = 2 };
+    var scope: Scope = .{ .fs = .anchored(std.testing.io, tmp.dir), .read_budget = &budget };
+    try std.testing.expectError(error.SymlinkComponent, scope.readFile(
+        std.testing.allocator,
+        "link",
+        32,
+    ));
+    try std.testing.expectError(error.NotFile, scope.readFile(
+        std.testing.allocator,
+        "fifo",
+        32,
+    ));
+    try std.testing.expectEqual(@as(usize, 0), budget.bytes);
+    try std.testing.expectEqual(@as(usize, 2), budget.files);
 }

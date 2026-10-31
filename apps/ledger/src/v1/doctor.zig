@@ -1,4 +1,5 @@
 const std = @import("std");
+const preparation_work = @import("preparation_work.zig");
 const storage_root = @import("storage_root");
 const definition_core = @import("definition_core");
 const durable_store = @import("durable_store");
@@ -41,6 +42,8 @@ pub const Result = struct {
     definition_id: []u8,
     definition_digest: [71]u8,
     pending_transactions: usize,
+    preparation_pending: bool = false,
+    preparation_error: ?[]const u8 = null,
     slots: []SlotStatus,
     healthy: bool,
     authority_granted: bool = false,
@@ -104,13 +107,36 @@ pub fn execute(
         initialized += 1;
         if (!slots[index].healthy) healthy = false;
     }
+    const preparation_status = inspectPreparation(scope, allocator);
     return .{
         .definition_id = try allocator.dupe(u8, definition_plan.id),
         .definition_digest = definition_plan.closure_digest,
         .pending_transactions = pending_transactions,
+        .preparation_pending = preparation_status.pending,
+        .preparation_error = preparation_status.failure,
         .slots = slots,
         .healthy = healthy,
     };
+}
+
+const PreparationStatus = struct {
+    pending: bool = false,
+    failure: ?[]const u8 = null,
+};
+
+fn inspectPreparation(scope: *storage_root.Scope, allocator: std.mem.Allocator) PreparationStatus {
+    var status: PreparationStatus = .{};
+    if (storage_root.isActive(scope)) {
+        const report = preparation_work.inspect(scope, allocator, .{}) catch |err| blk: {
+            status.pending = true;
+            status.failure = @errorName(err);
+            break :blk null;
+        };
+        if (report) |value| {
+            status.pending = value.phase != .absent and value.phase != .finalized;
+        }
+    }
+    return status;
 }
 
 fn classifySlotError(

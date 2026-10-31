@@ -22,6 +22,8 @@ pub const state_reducer = @import("state_reducer.zig");
 pub const segmented_event_log = @import("segmented_event_log.zig");
 pub const doctor = @import("doctor.zig");
 pub const migration = @import("migration.zig");
+pub const preparation = @import("preparation.zig");
+pub const maintenance = @import("maintenance.zig");
 pub const envelope = @import("envelope.zig");
 pub const checkpoint = @import("checkpoint.zig");
 
@@ -45,6 +47,8 @@ test {
     _ = segmented_event_log;
     _ = doctor;
     _ = migration;
+    _ = preparation;
+    _ = maintenance;
     _ = envelope;
     _ = checkpoint;
 }
@@ -362,6 +366,43 @@ test "plain protocol binds appends replays and folds without rewriting history" 
     try std.testing.expectEqualStrings(original, after_binding);
     try appendPlainEvent(scope, &plans, repo_root);
     try expectPlainProjection(scope, &plans, repo_root);
+}
+
+test "preparation captures selected history without inventorying unrelated payload" {
+    const allocator = std.testing.allocator;
+    var scope = storage_root.Scope.init(.init(std.testing.io, std.Io.Dir.cwd()));
+    var plans = try compilePlainPlans();
+    defer plans.deinit();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", allocator);
+    defer allocator.free(root);
+    try appendPlainCreatedEvent(&scope, &plans, root);
+    try appendPlainEvent(&scope, &plans, root);
+    var unrelated = try tmp.dir.createFile(std.testing.io, ".ledger/unrelated-cas-payload", .{});
+    defer unrelated.close(std.testing.io);
+    try unrelated.setLength(std.testing.io, 3 * 1024 * 1024 * 1024);
+    var budget: storage_root.ReadBudget = .{ .max_bytes = 1024 * 1024, .max_files = 64 };
+    scope.read_budget = &budget;
+    var history = try preparation.captureHistory(
+        &scope,
+        allocator,
+        root,
+        &plans.artifact,
+        try preparation.selectedSlot(&plans.store),
+        &plans.parameters,
+        true,
+        .{},
+        true,
+    );
+    defer history.deinit(allocator);
+    try std.testing.expectEqual(@as(usize, 2), history.records);
+    try std.testing.expectEqual(@as(usize, 3), history.files.items.len);
+    try std.testing.expect(budget.bytes < 1024 * 1024);
+    try std.testing.expect(history.bytes < 1024 * 1024);
+    try std.testing.expectEqualStrings("example/plain.jsonl", history.files.items[0].path);
+    try std.testing.expect(std.mem.startsWith(u8, history.files.items[1].path, ".bindings/"));
+    try std.testing.expect(std.mem.startsWith(u8, history.files.items[2].path, ".definitions/"));
 }
 
 test "segmented sorted fold preserves source order through checkpoint and append" {

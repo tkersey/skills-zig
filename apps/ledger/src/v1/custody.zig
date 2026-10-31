@@ -378,8 +378,7 @@ fn readSlotInternal(
         binding_path,
     );
     errdefer if (read_custody) |*custody_lock| custody_lock.deinit();
-    const content = durable_store.readRegularFileNoSymlink(
-        scope.fs,
+    const content = scope.readFile(
         allocator,
         path,
         slot.max_bytes,
@@ -536,8 +535,7 @@ fn rejectOrphanedBinding(
         logical_path,
     );
     defer allocator.free(binding_path);
-    const bytes = durable_store.readRegularFileNoSymlink(
-        scope.fs,
+    const bytes = scope.readFile(
         allocator,
         binding_path,
         binding_max_bytes,
@@ -730,8 +728,7 @@ fn readBindingSnapshotInternal(
     idempotency: ?IdempotencyQuery,
     verify_current_revision: bool,
 ) !BindingSnapshot {
-    const bytes = durable_store.readRegularFileNoSymlink(
-        scope.fs,
+    const bytes = scope.readFile(
         allocator,
         path,
         binding_max_bytes,

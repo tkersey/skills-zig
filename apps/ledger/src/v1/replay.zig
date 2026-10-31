@@ -1407,6 +1407,83 @@ const HistoryResult = struct {
     append_context: ?durable_store.EventAppendContext = null,
 };
 
+pub const RevisionDependency = struct {
+    digest: []const u8,
+    max_bytes: usize,
+};
+
+pub const HistoryDependencies = struct {
+    definitions: []const []const u8,
+    revisions: []const RevisionDependency,
+
+    pub fn deinit(self: *HistoryDependencies, allocator: std.mem.Allocator) void {
+        allocator.free(self.definitions);
+        allocator.free(self.revisions);
+        self.* = undefined;
+    }
+};
+
+pub fn collectHistoryDependencies(
+    scope: *storage_root.Scope,
+    allocator: std.mem.Allocator,
+    repo_root: []const u8,
+    definition_id: []const u8,
+    slot: storage.ResolvedSlot,
+    snapshot: *const custody.SlotSnapshot,
+    max_dependencies: usize,
+) !HistoryDependencies {
+    if (snapshot.binding.rows.len == 0) return error.InvalidStoreBinding;
+    var cache = PlanCache{
+        .scope = scope,
+        .allocator = allocator,
+        .repo_root = repo_root,
+        .definition_id = definition_id,
+    };
+    defer cache.deinit();
+    var definitions: std.ArrayList([]const u8) = .empty;
+    defer definitions.deinit(allocator);
+    var revisions: std.ArrayList(RevisionDependency) = .empty;
+    defer revisions.deinit(allocator);
+    var revision_indices: std.StringHashMapUnmanaged(usize) = .empty;
+    defer revision_indices.deinit(allocator);
+    var epoch_start: usize = 0;
+    for (snapshot.binding.rows, 0..) |row, index| {
+        const unseen_definition = !cache.indices.contains(row.definition_digest);
+        if (unseen_definition and definitions.items.len + revisions.items.len >=
+            max_dependencies)
+        {
+            return error.HistoricalDependencyBoundExceeded;
+        }
+        const resolved = try resolveEffect(&cache, slot, row);
+        if (unseen_definition) try definitions.append(allocator, row.definition_digest);
+        if (row.kind != .admission or resolved.effect.kind != .compare_replace) continue;
+        if (index == epoch_start) return error.HistoricalReplaceWithoutState;
+        const digest = row.revision_before orelse return error.HistoricalReplaceWithoutState;
+        if (revision_indices.get(digest)) |revision_index| {
+            revisions.items[revision_index].max_bytes = @max(
+                revisions.items[revision_index].max_bytes,
+                resolved.slot.max_bytes,
+            );
+        } else {
+            if (definitions.items.len + revisions.items.len >= max_dependencies) {
+                return error.HistoricalDependencyBoundExceeded;
+            }
+            try revisions.append(allocator, .{
+                .digest = digest,
+                .max_bytes = resolved.slot.max_bytes,
+            });
+            try revision_indices.putNoClobber(allocator, digest, revisions.items.len - 1);
+        }
+        epoch_start = index;
+    }
+    const definition_digests = try definitions.toOwnedSlice(allocator);
+    errdefer allocator.free(definition_digests);
+    return .{
+        .definitions = definition_digests,
+        .revisions = try revisions.toOwnedSlice(allocator),
+    };
+}
+
 fn validateHistory(
     allocator: std.mem.Allocator,
     cache: *PlanCache,
@@ -2165,6 +2242,161 @@ fn findEffectForSlot(
     return null;
 }
 
+test "history dependencies retain definitions and only replacement revisions" {
+    const allocator = std.testing.allocator;
+    var scope_storage = storage_root.Scope.init(.init(std.testing.io, std.Io.Dir.cwd()));
+    const scope = &scope_storage;
+    const first_source = @embedFile("fixtures/event-snapshot-definition.json");
+    const second_source = try std.mem.replaceOwned(
+        u8,
+        allocator,
+        first_source,
+        "4096",
+        "8192",
+    );
+    defer allocator.free(second_source);
+    var definitions = std.testing.tmpDir(.{});
+    defer definitions.cleanup();
+    var repo = std.testing.tmpDir(.{});
+    defer repo.cleanup();
+    try repo.dir.createDirPath(std.testing.io, ".ledger/.definitions");
+    const repo_root = try repo.dir.realPathFileAlloc(std.testing.io, ".", allocator);
+    defer allocator.free(repo_root);
+    var closures: [2]definition_core.Closure = undefined;
+    var loaded: usize = 0;
+    defer for (closures[0..loaded]) |*closure| closure.deinit(allocator);
+    const entries = [_][]const u8{ "first.json", "second.json" };
+    for (entries, [_][]const u8{ first_source, second_source }, 0..) |entry, source, index| {
+        try definitions.dir.writeFile(std.testing.io, .{ .sub_path = entry, .data = source });
+        closures[index] = try definition_core.closure.loadFromDir(
+            scope.fs.io,
+            allocator,
+            &definitions.dir,
+            entry,
+            .{},
+        );
+        loaded += 1;
+        const content = try definition_archive.renderAlloc(
+            allocator,
+            "example/event-snapshot",
+            entry,
+            &closures[index],
+        );
+        defer allocator.free(content);
+        const path = try definition_archive.pathAlloc(
+            scope,
+            allocator,
+            repo_root,
+            closures[index].digestSlice(),
+        );
+        defer allocator.free(path);
+        try durable_store.writeTextAtomic(scope.fs, allocator, path, content);
+    }
+    try expectReplacementDependencies(scope, repo_root, &closures);
+}
+
+fn expectReplacementDependencies(
+    scope: *storage_root.Scope,
+    repo_root: []const u8,
+    closures: *const [2]definition_core.Closure,
+) !void {
+    const allocator = std.testing.allocator;
+    const revision = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    var rows = [_]custody.BindingRow{
+        historyDependencyTestRow(closures[0].digestSlice(), "create", null, revision),
+        historyDependencyTestRow(closures[0].digestSlice(), "replace", revision, revision),
+        historyDependencyTestRow(closures[1].digestSlice(), "replace", revision, revision),
+    };
+    var snapshot = historyDependencyTestSnapshot(rows[0..1]);
+    const slot: storage.ResolvedSlot = .{
+        .name = "events",
+        .relative_path = "example/selected/snapshots.jsonl",
+        .owned_path = null,
+        .kind = .event_log,
+        .codec = .jsonl,
+        .max_bytes = 8192,
+    };
+    var initial = try collectHistoryDependencies(
+        scope,
+        allocator,
+        repo_root,
+        "example/event-snapshot",
+        slot,
+        &snapshot,
+        1,
+    );
+    defer initial.deinit(allocator);
+    try std.testing.expectEqual(@as(usize, 1), initial.definitions.len);
+    try std.testing.expectEqual(@as(usize, 0), initial.revisions.len);
+    snapshot.binding.rows = &rows;
+    var dependencies = try collectHistoryDependencies(
+        scope,
+        allocator,
+        repo_root,
+        "example/event-snapshot",
+        slot,
+        &snapshot,
+        3,
+    );
+    defer dependencies.deinit(allocator);
+    try std.testing.expectEqual(@as(usize, 2), dependencies.definitions.len);
+    try std.testing.expectEqualStrings(closures[0].digestSlice(), dependencies.definitions[0]);
+    try std.testing.expectEqualStrings(closures[1].digestSlice(), dependencies.definitions[1]);
+    try std.testing.expectEqual(@as(usize, 1), dependencies.revisions.len);
+    try std.testing.expectEqualStrings(revision, dependencies.revisions[0].digest);
+    try std.testing.expectEqual(@as(usize, 8192), dependencies.revisions[0].max_bytes);
+    try std.testing.expectError(error.HistoricalDependencyBoundExceeded, collectHistoryDependencies(
+        scope,
+        allocator,
+        repo_root,
+        "example/event-snapshot",
+        slot,
+        &snapshot,
+        2,
+    ));
+}
+
+fn historyDependencyTestRow(
+    digest: []const u8,
+    operation: []const u8,
+    before: ?[]const u8,
+    after: []const u8,
+) custody.BindingRow {
+    return .{
+        .kind = .admission,
+        .definition_digest = @constCast(digest),
+        .operation = @constCast(operation),
+        .input_digest = @constCast(after),
+        .canonical_input_digest = @constCast(after),
+        .parameter_environment = null,
+        .revision_before = if (before) |value| @constCast(value) else null,
+        .revision_after = @constCast(after),
+        .idempotency_key = null,
+        .record_start = 0,
+        .record_end = 1,
+        .extent_start = 0,
+        .extent_end = 1,
+    };
+}
+
+fn historyDependencyTestSnapshot(rows: []custody.BindingRow) custody.SlotSnapshot {
+    return .{
+        .exists = true,
+        .path = @constCast(""),
+        .content = @constCast(""),
+        .revision = rows[rows.len - 1].revision_after,
+        .binding = .{
+            .exists = true,
+            .bytes = @constCast(""),
+            .digest = null,
+            .last_revision = null,
+            .rows = rows,
+            .idempotency_match = false,
+            .idempotency_match_index = null,
+        },
+    };
+}
+
 test "segmented rolling replay retains a bounded recent plan set" {
     var scope_storage = storage_root.Scope.init(.init(std.testing.io, std.Io.Dir.cwd()));
     const scope = &scope_storage;
@@ -2228,6 +2460,43 @@ test "segmented rolling replay retains a bounded recent plan set" {
     _ = try cache.get(first.digestSlice());
     _ = try cache.get(second.digestSlice());
     try std.testing.expectEqual(@as(usize, 2), cache.plans.items.len);
+    try expectAppendDependencies(scope, repo_root, first.digestSlice(), second.digestSlice());
+}
+
+fn expectAppendDependencies(
+    scope: *storage_root.Scope,
+    repo_root: []const u8,
+    first_digest: []const u8,
+    second_digest: []const u8,
+) !void {
+    const allocator = std.testing.allocator;
+    const revision = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    var rows = [_]custody.BindingRow{
+        historyDependencyTestRow(first_digest, "bind-existing", null, revision),
+        historyDependencyTestRow(second_digest, "append", revision, revision),
+    };
+    rows[0].kind = .existing_store_binding;
+    const snapshot = historyDependencyTestSnapshot(&rows);
+    const slot: storage.ResolvedSlot = .{
+        .name = "events",
+        .relative_path = "example/plain.jsonl",
+        .owned_path = null,
+        .kind = .event_log,
+        .codec = .jsonl,
+        .max_bytes = 65536,
+    };
+    var dependencies = try collectHistoryDependencies(
+        scope,
+        allocator,
+        repo_root,
+        "example/plain-protocol",
+        slot,
+        &snapshot,
+        2,
+    );
+    defer dependencies.deinit(allocator);
+    try std.testing.expectEqual(@as(usize, 2), dependencies.definitions.len);
+    try std.testing.expectEqual(@as(usize, 0), dependencies.revisions.len);
 }
 
 fn archiveReplayTestDefinitions(
