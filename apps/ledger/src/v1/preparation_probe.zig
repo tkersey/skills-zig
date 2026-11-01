@@ -150,7 +150,8 @@ fn createFile(
         marker_handle.store(@intCast(file.handle), .monotonic);
     }
     if ((fault == .journal_failure or fault == .journal_cleanup_failure) and
-        std.mem.eql(u8, std.fs.path.basename(path), "transaction.json") and journalDirectory(directory))
+        std.mem.eql(u8, std.fs.path.basename(path), "transaction.json") and
+        journalDirectory(directory))
     {
         journal_handle.store(@intCast(file.handle), .monotonic);
     }
@@ -190,7 +191,11 @@ fn syncFile(userdata: ?*anyopaque, file: std.Io.File) std.Io.File.SyncError!void
         var path_buffer: [4096]u8 = undefined;
         const path_length = original.fileRealPath(userdata, file, &path_buffer) catch
             @panic("probe cannot identify synced file");
-        journal_directory = std.mem.startsWith(u8, std.fs.path.basename(path_buffer[0..path_length]), "dtx-");
+        journal_directory = std.mem.startsWith(
+            u8,
+            std.fs.path.basename(path_buffer[0..path_length]),
+            "dtx-",
+        );
     }
     if (fault == .committed_sync and committed.load(.monotonic) and journal_directory and
         !triggered.swap(true, .monotonic)) return error.InputOutput;

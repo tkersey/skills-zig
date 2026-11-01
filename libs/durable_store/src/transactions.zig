@@ -1237,7 +1237,14 @@ pub fn commitTextTransaction(
 ) !CommitTransactionReceipt {
     var observation: CommitTransactionObservation = .{};
     defer observation.deinit(allocator);
-    return commitTextTransactionObserved(fs, allocator, transactions_dir, mutations, options, &observation);
+    return commitTextTransactionObserved(
+        fs,
+        allocator,
+        transactions_dir,
+        mutations,
+        options,
+        &observation,
+    );
 }
 
 pub const CommitTransactionObservation = struct {
@@ -5043,7 +5050,14 @@ fn countPendingTransactionsBounded(
     max_pending: usize,
     max_entries: usize,
 ) !usize {
-    return scanPendingTransactions(fs, allocator, transactions_dir, max_pending, max_entries, false);
+    return scanPendingTransactions(
+        fs,
+        allocator,
+        transactions_dir,
+        max_pending,
+        max_entries,
+        false,
+    );
 }
 
 fn scanPendingTransactions(
@@ -10966,17 +10980,29 @@ test "native publication observation distinguishes the same budget failure acros
         if (allowance == 0) {
             try std.testing.expectEqual(.unpublished, observation.publication);
             try std.testing.expect(observation.transaction_id == null);
-            try std.testing.expect(!try hasPendingTransactions(unbudgeted, allocator, ".transactions"));
+            try std.testing.expect(!try hasPendingTransactions(
+                unbudgeted,
+                allocator,
+                ".transactions",
+            ));
         } else {
             try std.testing.expectEqual(.pending, observation.publication);
             const id = observation.transaction_id orelse return error.MissingTransactionIdentity;
             const journal = try std.fs.path.join(allocator, &.{ "./.transactions", id });
             defer allocator.free(journal);
-            try std.testing.expect(try hasPendingTransactions(unbudgeted, allocator, ".transactions"));
+            try std.testing.expect(try hasPendingTransactions(
+                unbudgeted,
+                allocator,
+                ".transactions",
+            ));
             var recovered = try recoverTransaction(unbudgeted, allocator, journal);
             defer recovered.deinit(allocator);
             try std.testing.expectEqualStrings(id, recovered.transaction_id);
-            try std.testing.expect(!try hasPendingTransactions(unbudgeted, allocator, ".transactions"));
+            try std.testing.expect(!try hasPendingTransactions(
+                unbudgeted,
+                allocator,
+                ".transactions",
+            ));
         }
     }
 }
@@ -10989,14 +11015,23 @@ test "native pending existence retains a positive witness without reading later 
     try tmp.dir.createDir(std.testing.io, "two", .default_dir);
     var iter = tmp.dir.iterate();
     const first = (try iter.next(std.testing.io)).?;
-    const other = if (std.mem.eql(u8, first.name, "one")) "two/transaction.json" else "one/transaction.json";
-    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = other, .data = "unreadable-under-zero-budget" });
+    const other = if (std.mem.eql(u8, first.name, "one"))
+        "two/transaction.json"
+    else
+        "one/transaction.json";
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = other,
+        .data = "unreadable-under-zero-budget",
+    });
     var fs = Fs.anchored(std.testing.io, tmp.dir);
     var budget: fs_authority.ReadBudget = .{ .max_bytes = 0, .max_files = 128 };
     fs.read_budget = &budget;
     try std.testing.expect(try hasPendingTransactions(fs, allocator, "."));
     try std.testing.expectEqual(@as(usize, 0), budget.bytes);
-    try std.testing.expectError(error.ReadBudgetExceeded, countPendingTransactions(fs, allocator, "."));
+    try std.testing.expectError(
+        error.ReadBudgetExceeded,
+        countPendingTransactions(fs, allocator, "."),
+    );
 }
 
 test "native append publication inspection and recovery charge actual repeated reads" {

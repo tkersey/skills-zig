@@ -237,7 +237,8 @@ const Execution = struct {
             "committed-with-later-failure"
         else if (self.publication == .unknown)
             "unknown"
-        else if (self.recovery_required or self.publication == .pending or self.prior_work_uncertain)
+        else if (self.recovery_required or self.publication == .pending or
+            self.prior_work_uncertain)
             "recovery-required"
         else if (err == error.LockBusy or err == error.EventStoreBusy)
             "busy"
@@ -288,7 +289,12 @@ const Execution = struct {
         if (!needed) {
             var observation: ?work.Report = null;
             defer self.retainPriorObservation(observation);
-            work.inspectObserved(self.scope, self.allocator, self.options.limits, &observation) catch |err| {
+            work.inspectObserved(
+                self.scope,
+                self.allocator,
+                self.options.limits,
+                &observation,
+            ) catch |err| {
                 self.retainPriorFailure(err);
                 return err;
             };
@@ -730,17 +736,7 @@ fn publish(
     transaction.markStorageMutationUnknown(scope);
     var observation: durable_store.CommitTransactionObservation = .{};
     defer observation.deinit(allocator);
-    defer {
-        publication.* = observation.publication;
-        if (observation.publication == .pending or observation.publication == .committed) {
-            transaction.markStorageMutated(scope);
-        }
-        if (observation.publication == .committed) result.staged_bytes = staged;
-        if (observation.transaction_id) |id| {
-            result.transaction_id = @constCast(id);
-            observation.transaction_id = null;
-        }
-    }
+    defer publication.* = retainPublication(scope, result, &observation, staged);
     var receipt = try durable_store.commitTextTransactionObserved(
         scope.fs,
         allocator,
@@ -761,6 +757,23 @@ fn publish(
     const transaction_id = @constCast(receipt.transaction_id);
     receipt.transaction_id = &.{};
     return transaction_id;
+}
+
+fn retainPublication(
+    scope: *storage_root.Scope,
+    result: *Result,
+    observation: *durable_store.CommitTransactionObservation,
+    staged: usize,
+) durable_store.CommitTransactionObservation.Publication {
+    if (observation.publication == .pending or observation.publication == .committed) {
+        transaction.markStorageMutated(scope);
+    }
+    if (observation.publication == .committed) result.staged_bytes = staged;
+    if (observation.transaction_id) |id| {
+        result.transaction_id = @constCast(id);
+        observation.transaction_id = null;
+    }
+    return observation.publication;
 }
 
 fn selectedMutation(
