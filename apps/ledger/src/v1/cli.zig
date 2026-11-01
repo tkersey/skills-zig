@@ -28,6 +28,11 @@ const Help =
     \\
     \\usage: ledger <command> [options]
     \\
+    \\host context commands:
+    \\  ledger context --catalog-root <absolute-path>
+    \\    [--workspace <absolute-path>] [--store-id <id>]
+    \\    Run ledger context --help for registration and preparation modes.
+    \\
     \\definition commands:
     \\  ledger definition check --definition <file> [--format json|text]
     \\  ledger definition describe --definition <file> [--format json|text]
@@ -49,6 +54,14 @@ const Help =
     \\  ledger migrate-segmented --definition <file> --repo <path>
     \\    [--param <name>=<value>]... [--format json|text]
     \\
+    \\preparation commands:
+    \\  ledger prepare --definition <file> --store-root <path> --store-id <id>
+    \\    [--source-root <path> | --source-store <id>=<path> | --source-archive <original-tree>]...
+    \\    [--param <name>=<value>]... [--apply] [--confirm-no-legacy-writers]
+    \\    [--max-bytes <n>] [--max-files <n>] [--max-read-bytes <n>] [--format json|text]
+    \\  ledger maintain --store-root <path> --store-id <id> [--apply]
+    \\    [--max-bytes <n>] [--max-files <n>] [--max-read-bytes <n>] [--format json|text]
+    \\
     \\recovery commands:
     \\  ledger recovery inspect --repo <path> --transaction <id>
     \\    [--format json|text]
@@ -64,7 +77,12 @@ const Help =
     \\  Durable commands also accept --store-root <absolute-directory> --store-id <id>
     \\  instead of --repo. The caller selects and initializes the root; Ledger verifies
     \\  its identity marker and keeps all logical slots beneath its .ledger directory.
-    \\  No Git discovery, default location, registration, migration, or fallback occurs.
+    \\  Engine commands do not discover Git or select a default location.
+    \\  Use the separate context command for explicit catalog lookup and registration.
+    \\  Prepare and maintain inspect by default. Apply requires existing custody authority.
+    \\  Preparation supports static monolithic histories; maintenance releases only owned work.
+    \\  Default bounds: 67108864 staged bytes, 512 files, 1073741824 read bytes.
+    \\  Read bounds include native recovery; initial definition/marker admission has its own bounds.
     \\
     \\Definitions are passive JSON. Ledger grants no semantic authority and does not read sessions.
     \\
@@ -272,7 +290,228 @@ fn runSubcommand(
     if (std.mem.eql(u8, command, "recovery")) {
         return runRecoveryCommand(scope, selection, allocator, argv);
     }
+    if ((std.mem.eql(u8, command, "prepare") or std.mem.eql(u8, command, "maintain")) and
+        isOnlyHelp(argv))
+    {
+        try writeStdout(scope, Help);
+        return 0;
+    }
+    if (std.mem.eql(u8, command, "prepare")) {
+        return runPrepare(scope, selection, allocator, environment, argv);
+    }
+    if (std.mem.eql(u8, command, "maintain")) {
+        return runMaintain(scope, selection, allocator, argv);
+    }
     return runOperationCommand(scope, selection, allocator, environment, command, argv);
+}
+
+fn runMaintain(
+    scope: *storage_root.Scope,
+    selection: *const storage_root.Selection,
+    allocator: std.mem.Allocator,
+    argv: []const []const u8,
+) !u8 {
+    if (selection.control == null) return error.MaintenanceRequiresManagedTarget;
+    var limits: ledger.preparation.Limits = .{};
+    var apply = false;
+    var format: Format = .json;
+    var seen: std.StringHashMapUnmanaged(void) = .empty;
+    defer seen.deinit(allocator);
+    var index: usize = 0;
+    while (index < argv.len) : (index += 1) {
+        const name = argv[index];
+        if (seen.contains(name)) return error.DuplicateOption;
+        try seen.put(allocator, name, {});
+        if (std.mem.eql(u8, name, "--apply")) {
+            apply = true;
+            continue;
+        }
+        index += 1;
+        if (index == argv.len) return error.MissingOptionValue;
+        const value = argv[index];
+        if (std.mem.eql(u8, name, "--repo")) {
+            if (!std.mem.eql(u8, value, ".")) return error.MaintenanceRequiresManagedTarget;
+        } else if (std.mem.eql(u8, name, "--format")) {
+            format = try Format.parse(value);
+        } else if (std.mem.eql(u8, name, "--max-bytes")) {
+            limits.max_bytes = try std.fmt.parseInt(usize, value, 10);
+        } else if (std.mem.eql(u8, name, "--max-files")) {
+            limits.max_files = try std.fmt.parseInt(usize, value, 10);
+        } else if (std.mem.eql(u8, name, "--max-read-bytes")) {
+            limits.max_read_bytes = try std.fmt.parseInt(usize, value, 10);
+        } else return error.UnknownOption;
+    }
+    selection.enterControl(scope);
+    var result = try ledger.maintenance.execute(scope, selection, allocator, limits, apply);
+    result.store_id = selection.store_id;
+    result.store_root = selection.supplied_root;
+    var writer = std.Io.File.stdout().writer(scope.fs.io, &.{});
+    if (format == .json) {
+        try std.json.Stringify.value(result, .{}, &writer.interface);
+        try writer.interface.writeByte('\n');
+    } else {
+        try writer.interface.print(
+            "{s}: {s}; bytes_read={d}\n",
+            .{ selection.store_id.?, result.outcome, result.bytes_read },
+        );
+    }
+    try writer.interface.flush();
+    return if (std.mem.eql(u8, result.outcome, "healthy")) 0 else 2;
+}
+
+const PrepareArgs = struct {
+    definition_path: []const u8,
+    parameters: []const []const u8,
+    sources: []ledger.preparation.Source,
+    options: ledger.preparation.Options,
+    format: Format,
+
+    fn deinit(self: *PrepareArgs, allocator: std.mem.Allocator) void {
+        allocator.free(self.parameters);
+        allocator.free(self.sources);
+        self.* = undefined;
+    }
+};
+
+fn parsePrepareArgs(allocator: std.mem.Allocator, argv: []const []const u8) !PrepareArgs {
+    var definition_path: ?[]const u8 = null;
+    var parameters: std.ArrayList([]const u8) = .empty;
+    errdefer parameters.deinit(allocator);
+    var sources: std.ArrayList(ledger.preparation.Source) = .empty;
+    errdefer sources.deinit(allocator);
+    var options: ledger.preparation.Options = .{};
+    var format: Format = .json;
+    var seen: std.StringHashMapUnmanaged(void) = .empty;
+    defer seen.deinit(allocator);
+    var index: usize = 0;
+    while (index < argv.len) : (index += 1) {
+        const name = argv[index];
+        const repeated = std.mem.eql(u8, name, "--param") or
+            std.mem.startsWith(u8, name, "--source-");
+        if (!repeated) {
+            if (seen.contains(name)) return error.DuplicateOption;
+            try seen.put(allocator, name, {});
+        }
+        if (std.mem.eql(u8, name, "--apply")) {
+            options.apply = true;
+            continue;
+        }
+        if (std.mem.eql(u8, name, "--confirm-no-legacy-writers")) {
+            options.confirm_no_legacy_writers = true;
+            continue;
+        }
+        index += 1;
+        if (index == argv.len) return error.MissingOptionValue;
+        const value = argv[index];
+        if (std.mem.eql(u8, name, "--definition")) {
+            definition_path = value;
+        } else if (std.mem.eql(u8, name, "--repo")) {
+            if (!std.mem.eql(u8, value, ".")) return error.PreparationRequiresManagedTarget;
+        } else if (std.mem.eql(u8, name, "--format")) {
+            format = try Format.parse(value);
+        } else if (std.mem.eql(u8, name, "--param")) {
+            try parameters.append(allocator, value);
+        } else if (std.mem.startsWith(u8, name, "--source-")) {
+            try sources.append(allocator, try parsePreparationSource(name, value));
+        } else if (std.mem.eql(u8, name, "--max-bytes")) {
+            options.limits.max_bytes = try std.fmt.parseInt(usize, value, 10);
+        } else if (std.mem.eql(u8, name, "--max-files")) {
+            options.limits.max_files = try std.fmt.parseInt(usize, value, 10);
+        } else if (std.mem.eql(u8, name, "--max-read-bytes")) {
+            options.limits.max_read_bytes = try std.fmt.parseInt(usize, value, 10);
+        } else return error.UnknownOption;
+        if (sources.items.len > 32) return error.PreparationSourceBoundExceeded;
+    }
+    try options.limits.validate();
+    const path = definition_path orelse return error.MissingDefinition;
+    const owned_parameters = try parameters.toOwnedSlice(allocator);
+    errdefer allocator.free(owned_parameters);
+    return .{
+        .definition_path = path,
+        .parameters = owned_parameters,
+        .sources = try sources.toOwnedSlice(allocator),
+        .options = options,
+        .format = format,
+    };
+}
+
+fn parsePreparationSource(name: []const u8, value: []const u8) !ledger.preparation.Source {
+    if (std.mem.eql(u8, name, "--source-root")) return .{ .root = value };
+    if (std.mem.eql(u8, name, "--source-archive")) return .{ .root = value, .archive = true };
+    if (!std.mem.eql(u8, name, "--source-store")) return error.UnknownOption;
+    const separator = std.mem.indexOfScalar(u8, value, '=') orelse
+        return error.InvalidPreparationSource;
+    if (separator == 0) return error.InvalidPreparationSource;
+    return .{ .store_id = value[0..separator], .root = value[separator + 1 ..] };
+}
+
+fn runPrepare(
+    scope: *storage_root.Scope,
+    selection: *const storage_root.Selection,
+    allocator: std.mem.Allocator,
+    environment: *const std.process.Environ.Map,
+    argv: []const []const u8,
+) !u8 {
+    if (selection.control == null) return error.PreparationRequiresManagedTarget;
+    var args = try parsePrepareArgs(allocator, argv);
+    defer args.deinit(allocator);
+    var context = try loadDefinitionWithCache(
+        scope,
+        allocator,
+        environment,
+        args.definition_path,
+        .{ .kind = .doctor },
+        false,
+    );
+    defer context.deinit(allocator);
+    var bindings = try bindParameters(
+        allocator,
+        &context.definition_plan.parameter_declarations,
+        args.parameters,
+    );
+    defer bindings.deinit(allocator);
+    selection.enterControl(scope);
+    var result = ledger.preparation.execute(
+        scope,
+        selection,
+        allocator,
+        &context.definition_plan,
+        &context.storage_plan.?,
+        &bindings,
+        context.protocol_plan != null,
+        args.sources,
+        args.options,
+    ) catch |err| {
+        try emitTransactionError(scope, err, scope.mutation_state);
+        return 2;
+    };
+    defer result.deinit(allocator);
+    result.store_id = selection.store_id;
+    result.store_root = selection.supplied_root;
+    return emitPreparation(scope, args.format, result);
+}
+
+fn emitPreparation(
+    scope: *storage_root.Scope,
+    format: Format,
+    result: ledger.preparation.Result,
+) !u8 {
+    var writer = std.Io.File.stdout().writer(scope.fs.io, &.{});
+    if (format == .json) {
+        try std.json.Stringify.value(result, .{}, &writer.interface);
+        try writer.interface.writeByte('\n');
+    } else {
+        try writer.interface.print(
+            "{s}: {s}; records={d}; bytes_read={d}\n",
+            .{ result.owner, result.outcome, result.records, result.bytes_read },
+        );
+    }
+    try writer.interface.flush();
+    const succeeded = std.mem.eql(u8, result.outcome, "covered") or
+        std.mem.eql(u8, result.outcome, "empty") or
+        std.mem.eql(u8, result.outcome, "ready") or
+        std.mem.eql(u8, result.outcome, "prepared");
+    return if (succeeded) 0 else 2;
 }
 
 fn runDefinitionCommand(
@@ -1314,6 +1553,17 @@ fn loadDefinition(
     path: []const u8,
     route: ledger.compiled_plan.Route,
 ) !DefinitionContext {
+    return loadDefinitionWithCache(scope, allocator, environment, path, route, true);
+}
+
+pub fn loadDefinitionWithCache(
+    scope: *storage_root.Scope,
+    allocator: std.mem.Allocator,
+    environment: *const std.process.Environ.Map,
+    path: []const u8,
+    route: ledger.compiled_plan.Route,
+    cache_enabled: bool,
+) !DefinitionContext {
     const absolute = try absoluteDefinitionPathAlloc(scope, allocator, path);
     defer allocator.free(absolute);
     const package_location =
@@ -1338,7 +1588,10 @@ fn loadDefinition(
             cwd.?,
             "skills",
         );
-    const cache_dir = try ledgerCacheDirAlloc(scope, allocator, environment);
+    const cache_dir = if (cache_enabled)
+        try ledgerCacheDirAlloc(scope, allocator, environment)
+    else
+        null;
     defer if (cache_dir) |owned| allocator.free(owned);
     return ledger.compiled_plan.load(
         scope,
@@ -1476,7 +1729,7 @@ fn deinitDocuments(
     allocator.free(documents);
 }
 
-fn bindParameters(
+pub fn bindParameters(
     allocator: std.mem.Allocator,
     declarations: *const definition_core.parameters.Declarations,
     specs: []const []const u8,
@@ -2335,7 +2588,10 @@ fn writeCapabilityTail(writer: *std.Io.Writer) !void {
             "\"features\":{\"bounded_checkpoint_replay_v1\":true," ++
             "\"full_history_doctor_v1\":true," ++
             "\"segmented_event_log_v1\":true," ++
-            "\"segmented_migration_v1\":true}," ++
+            "\"segmented_migration_v1\":true," ++
+            "\"bounded_preparation_v1\":true,\"preparation_maintenance_v1\":true," ++
+            "\"explicit_host_context_v1\":true,\"owner_preparation_v1\":true," ++
+            "\"historical_custody_migration_v2\":true}," ++
             "\"cache_format\":",
     );
     try writer.print(
@@ -2353,9 +2609,12 @@ fn writeCapabilityTail(writer: *std.Io.Writer) !void {
             "\"result_schemas\":[\"ledger-capabilities/v1\"," ++
             "\"ledger-command-error/v1\"," ++
             "\"ledger-storage-root-error/v1\"," ++
+            "\"ledger-workspace-context/v1\",\"ledger-workspace-context-error/v1\"," ++
+            "\"ledger-personal-store-list/v1\",\"ledger-custody-migration/v2\"," ++
             "\"ledger-definition-check-result/v1\"," ++
             "\"ledger-definition-description/v1\"," ++
             "\"ledger-doctor-result/v1\"," ++
+            "\"ledger-preparation-result/v1\",\"ledger-maintenance-result/v1\"," ++
             "\"ledger-materialization-result/v1\"," ++
             "\"ledger-segmented-migration-result/v1\"," ++
             "\"ledger-projection-error/v1\"," ++
@@ -2541,8 +2800,12 @@ fn isVersion(token: []const u8) bool {
     return std.mem.eql(u8, token, "-V") or std.mem.eql(u8, token, "--version");
 }
 
-test "final command surface excludes source and positional contract routing" {
-    try std.testing.expect(std.mem.indexOf(u8, Help, "--source") == null);
+test "command surface keeps explicit preparation contexts and excludes legacy source routing" {
+    try std.testing.expect(std.mem.indexOf(u8, Help, "--source ") == null);
+    try std.testing.expect(std.mem.indexOf(u8, Help, "--source-root") != null);
+    try std.testing.expectError(error.UnknownOption, parsePrepareArgs(std.testing.allocator, &.{
+        "--definition", "definition.json", "--source", "/source",
+    }));
     try std.testing.expect(std.mem.indexOf(u8, Help, "capture") == null);
     try std.testing.expect(std.mem.indexOf(u8, Help, "definition check") != null);
     try std.testing.expect(std.mem.indexOf(u8, Help, "materialize") != null);

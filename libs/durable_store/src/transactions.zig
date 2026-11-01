@@ -737,18 +737,21 @@ fn digestRegularFileNoSymlinkAtAlloc(
     if (stat.kind != .file) return error.NotFile;
     if (stat.nlink > 1) return error.HardlinkTarget;
     if (stat.size > max_bytes) return error.FileTooBig;
-    var file = try dir.openFile(
-        fs.io,
-        base,
-        .{ .allow_directory = false, .follow_symlinks = false },
-    );
+    var file = if (fs.read_budget != null)
+        try filesystem.openRegularRead(fs.reanchor(dir.*), base)
+    else
+        try dir.openFile(
+            fs.io,
+            base,
+            .{ .allow_directory = false, .follow_symlinks = false },
+        );
     defer file.close(fs.io);
-    var reader = file.reader(fs.io, &.{});
+    var reader = try fs_authority.FileRead.init(fs, file, max_bytes);
     var hasher = std.crypto.hash.sha2.Sha256.init(.{});
     var observed: usize = 0;
     var buffer: [64 * 1024]u8 = undefined;
     while (observed <= max_bytes) {
-        const count = try reader.interface.readSliceShort(&buffer);
+        const count = try reader.read(&buffer);
         if (count == 0) break;
         observed = std.math.add(usize, observed, count) catch
             return error.FileTooBig;
@@ -798,14 +801,21 @@ fn readRegularFileNoSymlinkAt(
     if (stat.kind == .sym_link) return error.SymlinkComponent;
     if (stat.kind != .file) return error.NotFile;
     if (stat.size > max_bytes) return error.FileTooBig;
-    var file = try dir.openFile(
-        fs.io,
-        base,
-        .{ .allow_directory = false, .follow_symlinks = false },
-    );
+    var file = if (fs.read_budget != null)
+        try filesystem.openRegularRead(fs.reanchor(dir.*), base)
+    else
+        try dir.openFile(
+            fs.io,
+            base,
+            .{ .allow_directory = false, .follow_symlinks = false },
+        );
     defer file.close(fs.io);
     const opened = try file.stat(fs.io);
     if (opened.kind != .file or opened.nlink > 1) return error.HardlinkTarget;
+    if (fs.read_budget != null) {
+        var reader = try fs_authority.FileRead.init(fs, file, max_bytes);
+        return reader.alloc(allocator);
+    }
     var reader = file.reader(fs.io, &.{});
     return reader.interface.allocRemaining(allocator, .limited(max_bytes + 1));
 }
@@ -1225,6 +1235,44 @@ pub fn commitTextTransaction(
     mutations: []const TransactionMutation,
     options: AcquireOptions,
 ) !CommitTransactionReceipt {
+    var observation: CommitTransactionObservation = .{};
+    defer observation.deinit(allocator);
+    return commitTextTransactionObserved(
+        fs,
+        allocator,
+        transactions_dir,
+        mutations,
+        options,
+        &observation,
+    );
+}
+
+pub const CommitTransactionObservation = struct {
+    pub const Publication = enum {
+        unpublished,
+        pending,
+        unknown,
+        committed,
+    };
+    publication: Publication = .unpublished,
+    transaction_id: ?[]const u8 = null,
+
+    pub fn deinit(self: *CommitTransactionObservation, allocator: std.mem.Allocator) void {
+        if (self.transaction_id) |id| allocator.free(id);
+        self.* = .{};
+    }
+};
+
+pub fn commitTextTransactionObserved(
+    fs: Fs,
+    allocator: std.mem.Allocator,
+    transactions_dir: []const u8,
+    mutations: []const TransactionMutation,
+    options: AcquireOptions,
+    observation: *CommitTransactionObservation,
+) !CommitTransactionReceipt {
+    std.debug.assert(observation.transaction_id == null);
+    observation.* = .{};
     try admitTransactionTargets(fs, allocator, transactions_dir, mutations);
     var commit: TransactionCommit = .{
         .fs = fs,
@@ -1233,6 +1281,11 @@ pub fn commitTextTransaction(
         .options = options,
     };
     defer commit.deinit();
+    defer observation.publication = commit.publication;
+    errdefer if (commit.publication != .unpublished) {
+        observation.transaction_id = commit.transaction_id;
+        commit.transaction_id = &.{};
+    };
     try commit.prepare(mutations);
     try commit.prepareRows();
     try commit.persistPreparingRecord();
@@ -1242,6 +1295,7 @@ pub fn commitTextTransaction(
     try commit.publishWrites();
     try commit.writeRecord(.committed);
     try writeCommittedTransactionMarker(fs, allocator, commit.commit_marker_path);
+    commit.publication = .committed;
     try syncDirectoryPath(fs, commit.transaction_dir);
     return commit.takeReceipt();
 }
@@ -1290,6 +1344,7 @@ const TransactionCommit = struct {
     recovery_hash_admission: usize = 0,
     recovery_hash_check_only: usize = 0,
     record_persisted: bool = false,
+    publication: CommitTransactionObservation.Publication = .unpublished,
     stage_dir: ?std.Io.Dir = null,
     cas_locks: []LockFile = &.{},
     cas_lock_count: usize = 0,
@@ -1472,12 +1527,15 @@ const TransactionCommit = struct {
         );
         defer journal_lock.close(fs.io);
         errdefer if (!self.record_persisted) {
+            var cleaned = true;
             fs.directory().deleteTree(fs.io, self.transaction_dir) catch |err| {
+                cleaned = false;
                 fs_authority.warn(fs.io, "journal rollback failed for {s}: {s}; run recovery", .{
                     self.transaction_dir, @errorName(err),
                 });
             };
             syncDirectoryPath(fs, self.transactions_dir) catch |err| {
+                cleaned = false;
                 fs_authority.warn(
                     fs.io,
                     "journal rollback sync failed for {s}: {s}; run recovery",
@@ -1486,7 +1544,9 @@ const TransactionCommit = struct {
                     },
                 );
             };
+            self.publication = if (cleaned) .unpublished else .unknown;
         };
+        self.publication = .unknown;
         try ensureDirectoryPathNoSymlinks(fs, self.transaction_dir);
         try writeCurrentTransactionRecord(
             fs,
@@ -1505,6 +1565,7 @@ const TransactionCommit = struct {
         try syncDirectoryPath(fs, self.transaction_dir);
         try syncDirectoryPath(fs, self.transactions_dir);
         self.record_persisted = true;
+        self.publication = .pending;
     }
 
     fn acquireCompatibilityLocks(self: *TransactionCommit) !void {
@@ -1787,15 +1848,18 @@ fn stageAppendedTransactionWrite(
     var hash = std.crypto.hash.sha2.Sha256.init(.{});
     var copied: usize = 0;
     if (before_exists) {
-        var source = try target.dir.openFile(fs.io, target.base, .{
-            .allow_directory = false,
-            .follow_symlinks = false,
-        });
+        var source = if (fs.read_budget != null)
+            try filesystem.openRegularRead(fs.reanchor(target.dir), target.base)
+        else
+            try target.dir.openFile(fs.io, target.base, .{
+                .allow_directory = false,
+                .follow_symlinks = false,
+            });
         defer source.close(fs.io);
-        var reader = source.reader(fs.io, &.{});
+        var reader = try fs_authority.FileRead.init(fs, source, max_bytes);
         var buffer: [jsonl_core.chunk_size]u8 = undefined;
         while (copied <= max_bytes) {
-            const count = try reader.interface.readSliceShort(&buffer);
+            const count = try reader.read(&buffer);
             if (count == 0) break;
             copied = std.math.add(usize, copied, count) catch
                 return error.FileTooBig;
@@ -1913,10 +1977,13 @@ fn publishVerifiedStagedFile(
     if (entry.nlink != 1) return error.HardlinkTarget;
     if (entry.size > max_bytes) return error.FileTooBig;
 
-    var source = try staged_dir.openFile(fs.io, staged_ref, .{
-        .allow_directory = false,
-        .follow_symlinks = false,
-    });
+    var source = if (fs.read_budget != null)
+        try filesystem.openRegularRead(fs.reanchor(staged_dir.*), staged_ref)
+    else
+        try staged_dir.openFile(fs.io, staged_ref, .{
+            .allow_directory = false,
+            .follow_symlinks = false,
+        });
     defer source.close(fs.io);
     const opened = try source.stat(fs.io);
     if (opened.kind != .file or opened.nlink != 1) {
@@ -1966,12 +2033,12 @@ fn copyStagedFileAndHash(
     destination: std.Io.File,
     max_bytes: usize,
 ) !StagedFileCopy {
-    var reader = source.reader(fs.io, &.{});
+    var reader = try fs_authority.FileRead.init(fs, source, max_bytes);
     var hasher = std.crypto.hash.sha2.Sha256.init(.{});
     var observed: usize = 0;
     var buffer: [jsonl_core.chunk_size]u8 = undefined;
     while (observed <= max_bytes) {
-        const count = try reader.interface.readSliceShort(&buffer);
+        const count = try reader.read(&buffer);
         if (count == 0) break;
         observed = std.math.add(usize, observed, count) catch
             return error.FileTooBig;
@@ -4968,12 +5035,38 @@ pub fn countPendingTransactions(
     );
 }
 
+pub fn hasPendingTransactions(
+    fs: Fs,
+    allocator: std.mem.Allocator,
+    transactions_dir: []const u8,
+) !bool {
+    return try scanPendingTransactions(fs, allocator, transactions_dir, 4096, 8192, true) != 0;
+}
+
 fn countPendingTransactionsBounded(
     fs: Fs,
     allocator: std.mem.Allocator,
     transactions_dir: []const u8,
     max_pending: usize,
     max_entries: usize,
+) !usize {
+    return scanPendingTransactions(
+        fs,
+        allocator,
+        transactions_dir,
+        max_pending,
+        max_entries,
+        false,
+    );
+}
+
+fn scanPendingTransactions(
+    fs: Fs,
+    allocator: std.mem.Allocator,
+    transactions_dir: []const u8,
+    max_pending: usize,
+    max_entries: usize,
+    stop_at_first: bool,
 ) !usize {
     const dir_stat = fs.directory().statFile(
         fs.io,
@@ -5009,6 +5102,7 @@ fn countPendingTransactionsBounded(
         if (entries > max_entries) return error.TooManyFiles;
         if (try transactionEntryPending(fs, allocator, transactions_dir, entry)) {
             try incrementPending(&pending, max_pending);
+            if (stop_at_first) return pending;
         }
     }
     return pending;
@@ -10789,4 +10883,205 @@ test "checkpoint sequences reject overflow before journal allocation" {
             .{},
         ),
     );
+}
+
+const NativeReadCounter = struct {
+    var bytes: usize = 0;
+
+    fn io(vtable: *std.Io.VTable) std.Io {
+        bytes = 0;
+        vtable.* = std.testing.io.vtable.*;
+        vtable.fileReadPositional = read;
+        return .{ .userdata = std.testing.io.userdata, .vtable = vtable };
+    }
+
+    fn read(
+        userdata: ?*anyopaque,
+        file: std.Io.File,
+        buffers: []const []u8,
+        offset: u64,
+    ) std.Io.File.ReadPositionalError!usize {
+        const count = try std.testing.io.vtable.fileReadPositional(userdata, file, buffers, offset);
+        bytes += count;
+        return count;
+    }
+};
+
+test "native publication rejects a 64 byte target under one shared read byte" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "operation.json",
+        .data = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+    });
+    var vtable: std.Io.VTable = undefined;
+    var fs = Fs.anchored(NativeReadCounter.io(&vtable), tmp.dir);
+    var budget: fs_authority.ReadBudget = .{ .max_bytes = 1, .max_files = 128 };
+    fs.read_budget = &budget;
+    try std.testing.expectError(error.ReadBudgetExceeded, commitTextTransaction(
+        fs,
+        allocator,
+        "./.transactions",
+        &.{.{
+            .path = "./operation.json",
+            .text = "fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210",
+            .expectation = .{ .expected_exists = true },
+            .content_mode = .raw,
+            .max_bytes = 64,
+        }},
+        .{ .owner = .{
+            .process_id = 0,
+            .session_id = "read-budget-probe",
+            .executor = "ledger",
+        }, .fencing_counter_path = "./.fencing.counter" },
+    ));
+    try std.testing.expectEqual(NativeReadCounter.bytes, budget.bytes);
+    try std.testing.expectEqual(@as(usize, 0), budget.bytes);
+    try std.testing.expect(budget.files > 0);
+}
+
+test "native publication observation distinguishes the same budget failure across journal custody" {
+    const allocator = std.testing.allocator;
+    for ([_]usize{ 0, 4 }) |allowance| {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "operation.json", .data = "1234" });
+        var vtable: std.Io.VTable = undefined;
+        var fs = Fs.anchored(NativeReadCounter.io(&vtable), tmp.dir);
+        var budget: fs_authority.ReadBudget = .{ .max_bytes = allowance, .max_files = 128 };
+        fs.read_budget = &budget;
+        var observation: CommitTransactionObservation = .{};
+        defer observation.deinit(allocator);
+        try std.testing.expectError(error.ReadBudgetExceeded, commitTextTransactionObserved(
+            fs,
+            allocator,
+            "./.transactions",
+            &.{.{
+                .path = "./operation.json",
+                .text = "5678",
+                .expectation = .{ .expected_exists = true },
+                .content_mode = .raw,
+                .max_bytes = 64,
+            }},
+            .{ .owner = .{
+                .process_id = 0,
+                .session_id = "publication-observation",
+                .executor = "test",
+            } },
+            &observation,
+        ));
+        try std.testing.expectEqual(allowance, budget.bytes);
+        try std.testing.expectEqual(NativeReadCounter.bytes, budget.bytes);
+        const unbudgeted = Fs.anchored(std.testing.io, tmp.dir);
+        const unchanged = try readFileAlloc(unbudgeted, allocator, "operation.json", 64);
+        defer allocator.free(unchanged);
+        try std.testing.expectEqualStrings("1234", unchanged);
+        if (allowance == 0) {
+            try std.testing.expectEqual(.unpublished, observation.publication);
+            try std.testing.expect(observation.transaction_id == null);
+            try std.testing.expect(!try hasPendingTransactions(
+                unbudgeted,
+                allocator,
+                ".transactions",
+            ));
+        } else {
+            try std.testing.expectEqual(.pending, observation.publication);
+            const id = observation.transaction_id orelse return error.MissingTransactionIdentity;
+            const journal = try std.fs.path.join(allocator, &.{ "./.transactions", id });
+            defer allocator.free(journal);
+            try std.testing.expect(try hasPendingTransactions(
+                unbudgeted,
+                allocator,
+                ".transactions",
+            ));
+            var recovered = try recoverTransaction(unbudgeted, allocator, journal);
+            defer recovered.deinit(allocator);
+            try std.testing.expectEqualStrings(id, recovered.transaction_id);
+            try std.testing.expect(!try hasPendingTransactions(
+                unbudgeted,
+                allocator,
+                ".transactions",
+            ));
+        }
+    }
+}
+
+test "native pending existence retains a positive witness without reading later journals" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    try tmp.dir.createDir(std.testing.io, "one", .default_dir);
+    try tmp.dir.createDir(std.testing.io, "two", .default_dir);
+    var iter = tmp.dir.iterate();
+    const first = (try iter.next(std.testing.io)).?;
+    const other = if (std.mem.eql(u8, first.name, "one"))
+        "two/transaction.json"
+    else
+        "one/transaction.json";
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = other,
+        .data = "unreadable-under-zero-budget",
+    });
+    var fs = Fs.anchored(std.testing.io, tmp.dir);
+    var budget: fs_authority.ReadBudget = .{ .max_bytes = 0, .max_files = 128 };
+    fs.read_budget = &budget;
+    try std.testing.expect(try hasPendingTransactions(fs, allocator, "."));
+    try std.testing.expectEqual(@as(usize, 0), budget.bytes);
+    try std.testing.expectError(
+        error.ReadBudgetExceeded,
+        countPendingTransactions(fs, allocator, "."),
+    );
+}
+
+test "native append publication inspection and recovery charge actual repeated reads" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "operation.json", .data = "1234" });
+    const before_digest = try digestBytesAlloc(allocator, "1234");
+    defer allocator.free(before_digest);
+    const after_digest = try digestBytesAlloc(allocator, "12345678");
+    defer allocator.free(after_digest);
+    var vtable: std.Io.VTable = undefined;
+    var fs = Fs.anchored(NativeReadCounter.io(&vtable), tmp.dir);
+    var budget: fs_authority.ReadBudget = .{ .max_bytes = 1024 * 1024, .max_files = 128 };
+    fs.read_budget = &budget;
+    const receipt = try commitTextTransaction(fs, allocator, "./.transactions", &.{.{
+        .path = "./operation.json",
+        .text = "5678",
+        .action = .append,
+        .expected_digest_after = after_digest,
+        .expectation = .{ .expected_exists = true, .expected_digest = before_digest },
+        .content_mode = .raw,
+        .max_bytes = 64,
+    }}, .{ .owner = .{
+        .process_id = 0,
+        .session_id = "read-budget-probe",
+        .executor = "ledger",
+    }, .fencing_counter_path = "./.fencing.counter" });
+    defer receipt.deinit(allocator);
+    try std.testing.expectEqual(TransactionState.committed, receipt.state);
+    try std.testing.expectEqual(NativeReadCounter.bytes, budget.bytes);
+    try std.testing.expect(budget.bytes >= 4);
+    const published_bytes = budget.bytes;
+    budget.max_bytes = published_bytes + 1;
+    try std.testing.expectError(
+        error.ReadBudgetExceeded,
+        inspectTransaction(fs, allocator, receipt.transaction_dir),
+    );
+    try std.testing.expectEqual(NativeReadCounter.bytes, budget.bytes);
+    try std.testing.expectEqual(published_bytes, budget.bytes);
+    budget.max_bytes = 1024 * 1024;
+    var status = try inspectTransaction(fs, allocator, receipt.transaction_dir);
+    defer status.deinit(allocator);
+    try std.testing.expectEqual(RecoveryDecision.already_committed, status.decision);
+    try std.testing.expect(budget.bytes > published_bytes);
+    try std.testing.expectEqual(NativeReadCounter.bytes, budget.bytes);
+    const inspected_bytes = budget.bytes;
+    var recovered = try recoverTransaction(fs, allocator, receipt.transaction_dir);
+    defer recovered.deinit(allocator);
+    try std.testing.expectEqual(RecoveryDecision.already_committed, recovered.decision);
+    try std.testing.expect(budget.bytes > inspected_bytes);
+    try std.testing.expectEqual(NativeReadCounter.bytes, budget.bytes);
 }

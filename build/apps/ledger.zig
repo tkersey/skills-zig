@@ -40,7 +40,8 @@ pub fn build(ctx: BuildContext, shared: SharedModules) DefinitionApp {
         "test-ledger-core",
         "Run Ledger 1.1 artifact-definition compiler tests",
     );
-    const run_ledger_cli_smoke = addLedgerCliSmoke(b, ledger.exe);
+    const preparation_probe = addLedgerPreparationProbe(ctx, ledger_root);
+    const run_ledger_cli_smoke = addLedgerCliSmoke(b, ledger.exe, preparation_probe);
     const test_ledger = b.step("test-ledger", "Run ledger tests");
     test_ledger.dependOn(&run_ledger_tests.step);
     test_ledger.dependOn(&run_storage_root_tests.step);
@@ -141,14 +142,44 @@ fn addLedgerRootAnchorProbe(
     return step;
 }
 
-fn addLedgerCliSmoke(b: *std.Build, ledger: *std.Build.Step.Compile) *std.Build.Step {
+fn addLedgerPreparationProbe(
+    ctx: BuildContext,
+    product: *std.Build.Module,
+) *std.Build.Step.Compile {
+    const root = ctx.module("apps/ledger/src/v1/preparation_probe.zig", &.{});
+    var imports = product.import_table.iterator();
+    while (imports.next()) |entry| root.addImport(entry.key_ptr.*, entry.value_ptr.*);
+    const executable = support.addExecutable(ctx.b, "ledger-preparation-probe", root);
+    const install = ctx.b.addInstallArtifact(executable, .{});
+    const step = ctx.b.step(
+        "build-ledger-preparation-probe",
+        "Build the development-only preparation interruption probe",
+    );
+    step.dependOn(&install.step);
+    return executable;
+}
+
+fn addLedgerCliSmoke(
+    b: *std.Build,
+    ledger: *std.Build.Step.Compile,
+    preparation_probe: *std.Build.Step.Compile,
+) *std.Build.Step {
     const smoke_cmd = b.addSystemCommand(&.{ "bash", "scripts/test-ledger-cli.sh" });
     smoke_cmd.addArtifactArg(ledger);
+    smoke_cmd.addArtifactArg(preparation_probe);
     const step = b.step(
         "test-ledger-cli-smoke",
         "Run Ledger 1.1 definition, validation, and materialization smoke tests",
     );
     step.dependOn(&smoke_cmd.step);
+    const host_cmd = b.addSystemCommand(&.{ "bash", "scripts/test-ledger-host.sh" });
+    host_cmd.addArtifactArg(ledger);
+    const host_step = b.step(
+        "test-ledger-host",
+        "Run native Ledger context and custody integration tests",
+    );
+    host_step.dependOn(&host_cmd.step);
+    step.dependOn(host_step);
     return step;
 }
 

@@ -22,6 +22,8 @@ pub const state_reducer = @import("state_reducer.zig");
 pub const segmented_event_log = @import("segmented_event_log.zig");
 pub const doctor = @import("doctor.zig");
 pub const migration = @import("migration.zig");
+pub const preparation = @import("preparation.zig");
+pub const maintenance = @import("maintenance.zig");
 pub const envelope = @import("envelope.zig");
 pub const checkpoint = @import("checkpoint.zig");
 
@@ -45,6 +47,8 @@ test {
     _ = segmented_event_log;
     _ = doctor;
     _ = migration;
+    _ = preparation;
+    _ = maintenance;
     _ = envelope;
     _ = checkpoint;
 }
@@ -362,6 +366,239 @@ test "plain protocol binds appends replays and folds without rewriting history" 
     try std.testing.expectEqualStrings(original, after_binding);
     try appendPlainEvent(scope, &plans, repo_root);
     try expectPlainProjection(scope, &plans, repo_root);
+}
+
+test "preparation captures selected history without inventorying unrelated payload" {
+    const allocator = std.testing.allocator;
+    var scope = storage_root.Scope.init(.init(std.testing.io, std.Io.Dir.cwd()));
+    var plans = try compilePlainPlans();
+    defer plans.deinit();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", allocator);
+    defer allocator.free(root);
+    try appendPlainCreatedEvent(&scope, &plans, root);
+    try appendPlainEvent(&scope, &plans, root);
+    var unrelated = try tmp.dir.createFile(std.testing.io, ".ledger/unrelated-cas-payload", .{});
+    defer unrelated.close(std.testing.io);
+    try unrelated.setLength(std.testing.io, 3 * 1024 * 1024 * 1024);
+    var budget: storage_root.ReadBudget = .{ .max_bytes = 1024 * 1024, .max_files = 64 };
+    scope.fs.read_budget = &budget;
+    var history = try preparation.captureHistory(
+        &scope,
+        allocator,
+        root,
+        &plans.artifact,
+        try preparation.selectedSlot(&plans.store),
+        &plans.parameters,
+        true,
+        .{},
+        true,
+    );
+    defer history.deinit(allocator);
+    try std.testing.expectEqual(@as(usize, 2), history.records);
+    try std.testing.expectEqual(@as(usize, 3), history.files.items.len);
+    try std.testing.expect(budget.bytes < 1024 * 1024);
+    try std.testing.expect(history.bytes < 1024 * 1024);
+    try std.testing.expectEqualStrings("example/plain.jsonl", history.files.items[0].path);
+    try std.testing.expect(std.mem.startsWith(u8, history.files.items[1].path, ".bindings/"));
+    try std.testing.expect(std.mem.startsWith(u8, history.files.items[2].path, ".definitions/"));
+}
+
+const PreparationHistoryFixture = struct {
+    plans: compiled_plan.PlanSet,
+    parameters: definition_core.parameters.Bindings,
+
+    fn init(scope: *storage_root.Scope) !PreparationHistoryFixture {
+        const allocator = std.testing.allocator;
+        var definitions = std.testing.tmpDir(.{});
+        defer definitions.cleanup();
+        try definitions.dir.writeFile(std.testing.io, .{
+            .sub_path = "history.json",
+            .data =
+            \\{"schema":"ledger-artifact-definition/v1","id":"example/preparation-history","owner":"example",
+            \\ "requires":{"abi":"ledger-artifact-abi/v1","operators":["create-new","compare-and-replace","compare-and-append","bind-existing"]},
+            \\ "parameters":{},"inputs":{"snapshot":{"codec":"jsonl","required":false,"max_bytes":4096},"event":{"codec":"json","required":false,"max_bytes":4096}},
+            \\ "canonicalization":{},"shape":{"documents":{}},"constraints":{"laws":[]},"identity":{},
+            \\ "storage":{"kind":"event-log","slots":{"events":{"path":"example/history.jsonl","kind":"event-log","codec":"jsonl","max_bytes":4096}}},
+            \\ "operations":{"create":{"effects":[{"op":"create-new","slot":"events","input":"snapshot"}]},
+            \\ "replace":{"effects":[{"op":"compare-and-replace","slot":"events","input":"snapshot"}]},
+            \\ "append":{"effects":[{"op":"compare-and-append","slot":"events","input":"event"}]},
+            \\ "bind":{"effects":[{"op":"bind-existing","slot":"events","input":"event"}]}},
+            \\ "projections":{},"diagnostics":{},
+            \\ "bounds":{"max_input_bytes":4096,"max_store_bytes":4096,"max_records":10,"max_output_bytes":4096,"max_diagnostics":16,"max_reducer_states":4}}
+            ,
+        });
+        const root = try definitions.dir.realPathFileAlloc(std.testing.io, ".", allocator);
+        defer allocator.free(root);
+        var plans = try compiled_plan.load(scope, allocator, root, "history.json", .{
+            .kind = .transact,
+            .name = "create",
+        }, "1.6.0", .{});
+        errdefer plans.deinit(allocator);
+        const parameters = try definition_core.parameters.bind(
+            allocator,
+            &plans.definition_plan.parameter_declarations,
+            &.{},
+        );
+        return .{ .plans = plans, .parameters = parameters };
+    }
+
+    fn deinit(self: *PreparationHistoryFixture) void {
+        self.parameters.deinit(std.testing.allocator);
+        self.plans.deinit(std.testing.allocator);
+    }
+
+    fn transact(
+        self: *const PreparationHistoryFixture,
+        scope: *storage_root.Scope,
+        root: []const u8,
+        operation: []const u8,
+        bytes: []const u8,
+    ) !void {
+        const input: validation.InputDocument = .{
+            .name = if (std.mem.eql(u8, operation, "append")) "event" else "snapshot",
+            .bytes = bytes,
+        };
+        var result = try transaction.transact(
+            scope,
+            std.testing.allocator,
+            &self.plans.definition_plan,
+            &self.plans.closure,
+            self.plans.entry_path,
+            &self.plans.validation_plan.?,
+            &self.plans.storage_plan.?,
+            null,
+            operation,
+            root,
+            if (std.mem.eql(u8, operation, "bind")) &.{} else &.{input},
+            &self.parameters,
+        );
+        defer result.deinit(std.testing.allocator);
+        try std.testing.expect(result.storage_mutated);
+    }
+
+    fn capture(
+        self: *const PreparationHistoryFixture,
+        scope: *storage_root.Scope,
+        root: []const u8,
+        protocol_required: bool,
+    ) !preparation.History {
+        var history = try preparation.captureHistory(
+            scope,
+            std.testing.allocator,
+            root,
+            &self.plans.definition_plan,
+            try preparation.selectedSlot(&self.plans.storage_plan.?),
+            &self.parameters,
+            protocol_required,
+            .{},
+            true,
+        );
+        if (history.read_custody) |*locks| locks.deinit();
+        history.read_custody = null;
+        return history;
+    }
+};
+
+test "preparation coverage follows validated replacement epochs" {
+    const allocator = std.testing.allocator;
+    var scope = storage_root.Scope.init(.init(std.testing.io, std.Io.Dir.cwd()));
+    var fixture = try PreparationHistoryFixture.init(&scope);
+    defer fixture.deinit();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", allocator);
+    defer allocator.free(root);
+    try fixture.transact(&scope, root, "create", "{\"value\":1}\n");
+    var first = try fixture.capture(&scope, root, false);
+    defer first.deinit(allocator);
+    try fixture.transact(&scope, root, "replace", "{\"value\":2}\n");
+    var second = try fixture.capture(&scope, root, false);
+    defer second.deinit(allocator);
+    try std.testing.expect(!std.mem.startsWith(
+        u8,
+        second.files.items[0].bytes,
+        first.files.items[0].bytes,
+    ));
+    try std.testing.expect(second.covers(&first));
+    try std.testing.expect(!first.covers(&second));
+    try std.testing.expectError(
+        error.ProtocolHistoryMustBeAppendOnly,
+        fixture.capture(&scope, root, true),
+    );
+    try fixture.transact(&scope, root, "replace", "{\"value\":1}\n");
+    var third = try fixture.capture(&scope, root, false);
+    defer third.deinit(allocator);
+    try std.testing.expectEqualStrings(first.files.items[0].bytes, third.files.items[0].bytes);
+    try std.testing.expect(third.covers(&second));
+    try std.testing.expect(third.covers(&first));
+    try std.testing.expect(!first.covers(&third));
+    try fixture.transact(&scope, root, "replace", "{\"value\":3}\n");
+    var fourth = try fixture.capture(&scope, root, false);
+    defer fourth.deinit(allocator);
+    try std.testing.expectEqual(@as(usize, 3), fourth.epochs.len);
+    try std.testing.expectEqual(fourth.epochs[0].revision_index, fourth.epochs[2].revision_index);
+    try std.testing.expect(fourth.covers(&third));
+    try std.testing.expect(fourth.covers(&second));
+    try std.testing.expect(fourth.covers(&first));
+    var equal = try fixture.capture(&scope, root, false);
+    defer equal.deinit(allocator);
+    try std.testing.expect(fourth.covers(&equal));
+    try std.testing.expect(equal.covers(&fourth));
+    const saved = fourth.files.items[2].bytes[0];
+    fourth.files.items[2].bytes[0] = 'X';
+    try std.testing.expect(!fourth.covers(&first));
+    fourth.files.items[2].bytes[0] = saved;
+    var unrelated = std.testing.tmpDir(.{});
+    defer unrelated.cleanup();
+    const unrelated_root = try unrelated.dir.realPathFileAlloc(std.testing.io, ".", allocator);
+    defer allocator.free(unrelated_root);
+    try fixture.transact(&scope, unrelated_root, "create", "{\"value\":3}\n");
+    var divergent = try fixture.capture(&scope, unrelated_root, false);
+    defer divergent.deinit(allocator);
+    try std.testing.expect(!fourth.covers(&divergent));
+    try std.testing.expect(!divergent.covers(&fourth));
+    const revision_path = try std.fs.path.join(allocator, &.{
+        ".ledger", fourth.files.items[fourth.revision_offset].path,
+    });
+    defer allocator.free(revision_path);
+    try tmp.dir.deleteFile(std.testing.io, revision_path);
+    try std.testing.expectError(error.RevisionArchiveMissing, fixture.capture(&scope, root, false));
+}
+
+test "preparation coverage finds an append prefix inside its archived epoch" {
+    const allocator = std.testing.allocator;
+    var scope = storage_root.Scope.init(.init(std.testing.io, std.Io.Dir.cwd()));
+    var fixture = try PreparationHistoryFixture.init(&scope);
+    defer fixture.deinit();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", allocator);
+    defer allocator.free(root);
+    try tmp.dir.createDirPath(std.testing.io, ".ledger/example");
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = ".ledger/example/history.jsonl",
+        .data = "{\"value\":1}\n",
+    });
+    try fixture.transact(&scope, root, "bind", "");
+    var bound = try fixture.capture(&scope, root, false);
+    defer bound.deinit(allocator);
+    try fixture.transact(&scope, root, "append", "{\"value\":2}");
+    var middle = try fixture.capture(&scope, root, false);
+    defer middle.deinit(allocator);
+    try std.testing.expect(middle.covers(&bound));
+    try std.testing.expect(!bound.covers(&middle));
+    try fixture.transact(&scope, root, "append", "{\"value\":3}");
+    try fixture.transact(&scope, root, "replace", "{\"value\":4}\n");
+    var replaced = try fixture.capture(&scope, root, false);
+    defer replaced.deinit(allocator);
+    try std.testing.expect(replaced.covers(&middle));
+    try std.testing.expect(replaced.covers(&bound));
+    try std.testing.expect(!middle.covers(&replaced));
+    try std.testing.expect(
+        replaced.files.items[replaced.revision_offset].bytes.len > middle.files.items[0].bytes.len,
+    );
 }
 
 test "segmented sorted fold preserves source order through checkpoint and append" {

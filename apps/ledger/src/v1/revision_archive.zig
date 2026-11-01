@@ -37,8 +37,7 @@ pub fn prepare(
     const path = try pathAlloc(scope, allocator, repo_root, revision);
     errdefer allocator.free(path);
     try durable_store.rejectSymlinkComponents(scope.fs, path);
-    const existing = durable_store.readRegularFileNoSymlink(
-        scope.fs,
+    const existing = scope.readFile(
         allocator,
         path,
         max_bytes,
@@ -72,8 +71,7 @@ pub fn load(
     try definition_core.json.digest(revision);
     const path = try pathAlloc(scope, allocator, repo_root, revision);
     defer allocator.free(path);
-    const content = durable_store.readRegularFileNoSymlink(
-        scope.fs,
+    const content = scope.readFile(
         allocator,
         path,
         max_bytes,

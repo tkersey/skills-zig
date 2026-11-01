@@ -1345,6 +1345,45 @@ fn prepareExistingBinding(
     };
 }
 
+/// Compute the native binding maintenance result without creating transaction
+/// paths, publishing metadata, recovering work, or changing the source. The
+/// explicit historical importer uses this same computation to recognize a
+/// completed repair after interruption, including after its host receipt is lost.
+pub fn previewExistingBinding(
+    scope: *storage_root.Scope,
+    allocator: std.mem.Allocator,
+    definition_plan: *const definition.Plan,
+    validation_plan: *const validation.Plan,
+    storage_plan: *const storage.Plan,
+    event_protocol: ?*const protocol.Plan,
+    operation_name: []const u8,
+    repo_root: []const u8,
+    parameters: *const definition_core.parameters.Bindings,
+) ![]u8 {
+    var resolved = try storage.resolve(allocator, storage_plan, parameters);
+    defer resolved.deinit(allocator);
+    const operation = storage_plan.findOperation(operation_name) orelse
+        return error.UnknownStorageOperation;
+    if (operation.effects.len != 1 or !operation.effects[0].kind.isBinding()) {
+        return error.BindingOperationCannotMixEffects;
+    }
+    try rejectSegmentedRebindOperation(&resolved, operation);
+    var prepared = try prepareExistingBinding(
+        scope,
+        allocator,
+        definition_plan,
+        validation_plan,
+        &resolved,
+        event_protocol,
+        operation.effects[0],
+        operation_name,
+        repo_root,
+        parameters,
+    );
+    defer prepared.deinit(allocator);
+    return allocator.dupe(u8, prepared.binding_after);
+}
+
 fn appendExistingBindingAlloc(
     allocator: std.mem.Allocator,
     definition_plan: *const definition.Plan,
