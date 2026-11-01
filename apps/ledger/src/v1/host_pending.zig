@@ -3,6 +3,7 @@ const host = @import("host_context.zig");
 const catalog = host.catalog;
 const workspace = host.workspace;
 const migration_copy = @import("host_migration_copy.zig");
+const migration_archive = @import("host_migration_archive.zig");
 
 const max_sources = 128;
 const marker_name = ".ledger-root.json";
@@ -20,8 +21,6 @@ pub const Registration = struct {
     git_common_dir: ?[]const u8,
 };
 
-/// The declaration owns only a fixed scratch layout, never publication state.
-/// The caller retains this guard until copying and scratch cleanup finish.
 pub fn migrationScratch(
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -66,6 +65,81 @@ pub fn migrationScratch(
     return migration_copy.Scratch.open(io, root);
 }
 
+pub fn archiveScratch(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    associations: *const workspace.Associations,
+    home: []const u8,
+    selected: host.ContextValue,
+    guard: *const Guard,
+) !migration_archive.Scratch {
+    _ = guard;
+    try checkPendingContext(allocator, io, associations, home, selected);
+    try archiveIdentity(allocator, io, associations, home, selected);
+    const control = try catalog.checkedRoot(allocator, io, selected.store_root, selected.store_id);
+    defer control.close(io);
+    const root = try catalog.openDirectory(io, selected.store_root, false);
+    defer root.close(io);
+    const path = try controlsPath(
+        allocator,
+        associations.workspace_root.?,
+        associations.git_common_dir,
+        home,
+    );
+    defer allocator.free(path);
+    const controls = try catalog.openDirectory(io, path, true);
+    defer controls.close(io);
+    return migration_archive.Scratch.open(
+        allocator,
+        io,
+        controls,
+        root,
+        selected.store_id,
+        selected.store_root,
+    );
+}
+
+fn archiveIdentity(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    associations: *const workspace.Associations,
+    home: []const u8,
+    selected: host.ContextValue,
+) !void {
+    var registered = try catalog.read(allocator, io, home);
+    defer registered.deinit();
+    if (registered.value.stores.map.get(selected.store_id)) |path| {
+        if (!std.mem.eql(u8, path, selected.store_root))
+            return error.PendingCustodyConflictsWithCatalog;
+        _ = try registered.select(associations.aliases, selected.store_id, false);
+        return;
+    }
+    if (associations.git_common_dir) |common| {
+        const path = try std.fs.path.join(allocator, &.{ common, catalog.registration_name });
+        defer allocator.free(path);
+        if (try catalog.exists(io, path)) {
+            var registration = try host.readRegistration(allocator, io, path);
+            defer registration.deinit();
+            if (!std.mem.eql(u8, registration.value.store_root, selected.store_root) or
+                !std.mem.eql(u8, registration.value.store_id, selected.store_id))
+                return error.ConflictingLegacyRegistration;
+            return;
+        }
+    }
+    const path = try controlsPath(
+        allocator,
+        associations.workspace_root.?,
+        associations.git_common_dir,
+        home,
+    );
+    defer allocator.free(path);
+    var pending = try pendingTarget(allocator, io, associations, home, path, false);
+    defer pending.deinit();
+    if (!std.mem.eql(u8, pending.value.store_root, selected.store_root) or
+        !std.mem.eql(u8, pending.value.store_id, selected.store_id))
+        return error.PendingCustodyConflictsWithCatalog;
+}
+
 fn declareMigrationCopy(
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -95,8 +169,6 @@ fn declareMigrationCopy(
             return error.UndeclaredMigrationScratch;
         try catalog.writeJson(allocator, io, controls, migration_copy_name, expected, 4096);
     }
-    // A previous declaration rename may have succeeded before directory sync
-    // failed. Make the observed ownership durable before creating any payload.
     const declaration = try controls.openFile(io, migration_copy_name, .{
         .follow_symlinks = false,
     });
@@ -417,7 +489,22 @@ fn pendingRegistration(
     const root = associations.workspace_root orelse return error.PreparationRequiresWorkspace;
     const locator_path = try std.fs.path.join(allocator, &.{ controls_path, "registration.json" });
     if (try catalog.exists(io, locator_path)) {
-        return readPendingRegistration(allocator, io, associations, home, locator_path);
+        const value = try readPendingRegistration(allocator, io, associations, home, locator_path);
+        if (publication_lock != null) {
+            const controls = try catalog.openDirectory(io, controls_path, true);
+            defer controls.close(io);
+            const locator = try controls.openFile(
+                io,
+                "registration.json",
+                .{ .follow_symlinks = false },
+            );
+            defer locator.close(io);
+            const stat = try locator.stat(io);
+            if (stat.kind != .file or stat.nlink != 1) return error.InvalidPendingRegistration;
+            try locator.sync(io);
+            try catalog.sync(io, controls);
+        }
+        return value;
     }
     const lock = publication_lock orelse return error.PendingInitializationRequiresPreparation;
     try rejectUnregisteredCustody(allocator, lock, root, associations.git_common_dir, home);
@@ -430,7 +517,7 @@ fn pendingRegistration(
         .git_common_dir = associations.git_common_dir,
     };
     if (try catalog.exists(io, value.store_root)) return error.PendingTargetAlreadyExists;
-    const controls = try catalog.openDirectory(io, controls_path, false);
+    const controls = try catalog.openDirectory(io, controls_path, true);
     defer controls.close(io);
     try catalog.writeJson(allocator, io, controls, "registration.json", value, 4096);
     return value;
@@ -474,15 +561,20 @@ fn materializePending(
 ) !host.Context {
     const marker_path = try std.fs.path.join(allocator, &.{ value.store_root, marker_name });
     defer allocator.free(marker_path);
-    if (try catalog.exists(io, marker_path)) return host.checkedRoot(
-        allocator,
-        io,
-        value.store_root,
-        value.store_id,
-        associations.workspace_root,
-        associations.git_common_dir,
-        false,
-    );
+    if (try catalog.exists(io, marker_path)) {
+        var checked = try host.checkedRoot(
+            allocator,
+            io,
+            value.store_root,
+            value.store_id,
+            associations.workspace_root,
+            associations.git_common_dir,
+            false,
+        );
+        errdefer checked.deinit();
+        if (publication_lock != null) try syncPending(io, value.store_root, controls_path);
+        return checked;
+    }
     if (publication_lock == null) return error.PendingInitializationRequiresPreparation;
     try checkSkeleton(io, value.store_root);
     const custody = try catalog.openDirectory(io, value.store_root, true);
@@ -496,14 +588,7 @@ fn materializePending(
     defer controls.close(io);
     try prepareMarker(allocator, io, controls, value.store_id);
     try controls.renamePreserve(candidate_name, custody, marker_name, io);
-    try catalog.sync(io, controls);
-    const control = try custody.openDir(io, ".ledger", .{ .follow_symlinks = false });
-    defer control.close(io);
-    try catalog.sync(io, control);
-    try catalog.sync(io, custody);
-    const repos = try catalog.openDirectory(io, std.fs.path.dirname(value.store_root).?, false);
-    defer repos.close(io);
-    try catalog.sync(io, repos);
+    try syncPending(io, value.store_root, controls_path);
     return host.checkedRoot(
         allocator,
         io,
@@ -513,6 +598,30 @@ fn materializePending(
         associations.git_common_dir,
         true,
     );
+}
+
+fn syncPending(io: std.Io, root: []const u8, controls_path: []const u8) !void {
+    const controls = try catalog.openDirectory(io, controls_path, false);
+    defer controls.close(io);
+    try catalog.sync(io, controls);
+    const custody = try catalog.openDirectory(io, root, false);
+    defer custody.close(io);
+    const marker = try custody.openFile(io, marker_name, .{ .follow_symlinks = false });
+    defer marker.close(io);
+    const stat = try marker.stat(io);
+    if (stat.kind != .file or stat.nlink != 1) return error.InvalidPendingMarker;
+    try marker.sync(io);
+    const control = try custody.openDir(io, ".ledger", .{ .follow_symlinks = false });
+    defer control.close(io);
+    try catalog.sync(io, control);
+    try catalog.sync(io, custody);
+    const repos_path = std.fs.path.dirname(root).?;
+    const repos = try catalog.openDirectory(io, repos_path, false);
+    defer repos.close(io);
+    try catalog.sync(io, repos);
+    const home = try catalog.openDirectory(io, std.fs.path.dirname(repos_path).?, false);
+    defer home.close(io);
+    try catalog.sync(io, home);
 }
 
 fn checkSkeleton(io: std.Io, root: []const u8) !void {
@@ -1034,4 +1143,152 @@ test "pending target waits for catalog publication and reuses its initialized id
     var selected = try catalog.read(allocator, io, home);
     defer selected.deinit();
     try std.testing.expectEqual(@as(usize, 1), selected.value.stores.map.count());
+}
+
+const PendingSyncFault = struct {
+    const Kind = enum { registration, marker };
+    var kind: Kind = .registration;
+    var renamed = false;
+    var fail = true;
+    var reached = false;
+    var calls: usize = 0;
+    var mask: u8 = 0;
+    var last_file: ?std.Io.File = null;
+    var last_bit: u8 = 0;
+    var root: []const u8 = "";
+    var controls: []const u8 = "";
+
+    fn install(vtable: *std.Io.VTable, selected: Kind, failing: bool) void {
+        kind = selected;
+        renamed = false;
+        fail = failing;
+        reached = false;
+        calls = 0;
+        mask = 0;
+        last_file = null;
+        last_bit = 0;
+        vtable.dirRename = rename;
+        vtable.dirRenamePreserve = renamePreserve;
+        vtable.dirOpenFile = open;
+        vtable.fileSync = sync;
+    }
+
+    fn rename(
+        userdata: ?*anyopaque,
+        from: std.Io.Dir,
+        name: []const u8,
+        to: std.Io.Dir,
+        leaf: []const u8,
+    ) std.Io.Dir.RenameError!void {
+        try std.testing.io.vtable.dirRename(userdata, from, name, to, leaf);
+        if (kind == .registration and std.mem.eql(u8, leaf, "registration.json")) renamed = true;
+    }
+
+    fn renamePreserve(
+        userdata: ?*anyopaque,
+        from: std.Io.Dir,
+        name: []const u8,
+        to: std.Io.Dir,
+        leaf: []const u8,
+    ) std.Io.Dir.RenamePreserveError!void {
+        try std.testing.io.vtable.dirRenamePreserve(userdata, from, name, to, leaf);
+        if (kind == .marker and std.mem.eql(u8, leaf, marker_name)) renamed = true;
+    }
+
+    fn open(
+        userdata: ?*anyopaque,
+        dir: std.Io.Dir,
+        name: []const u8,
+        options: std.Io.Dir.OpenFileOptions,
+    ) std.Io.File.OpenError!std.Io.File {
+        const file = try std.testing.io.vtable.dirOpenFile(userdata, dir, name, options);
+        last_file = file;
+        last_bit = 0;
+        if (std.mem.eql(u8, name, "registration.json")) last_bit = 1;
+        if (std.mem.eql(u8, name, marker_name)) last_bit = 2;
+        if (root.len == 0 or !std.mem.eql(u8, name, ".")) return file;
+        const path = dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator) catch |err| {
+            std.debug.panic("pending sync probe directory: {s}", .{@errorName(err)});
+        };
+        defer std.testing.allocator.free(path);
+        if (std.mem.eql(u8, std.fs.path.basename(path), ".ledger")) last_bit = 4;
+        if (std.mem.eql(u8, path, root)) last_bit = 8;
+        if (std.mem.eql(u8, path, std.fs.path.dirname(root).?)) last_bit = 16;
+        if (std.mem.eql(u8, path, controls)) last_bit = 32;
+        const home = std.fs.path.dirname(std.fs.path.dirname(root).?).?;
+        if (std.mem.eql(u8, path, home)) last_bit = 64;
+        return file;
+    }
+
+    fn sync(userdata: ?*anyopaque, file: std.Io.File) std.Io.File.SyncError!void {
+        calls += 1;
+        if (fail and renamed) {
+            reached = true;
+            return error.InputOutput;
+        }
+        if (last_file != null and last_file.?.handle == file.handle) mask |= last_bit;
+        return std.testing.io.vtable.fileSync(userdata, file);
+    }
+};
+
+test "pending apply retries durability after locator and marker rename while inspect never syncs" {
+    for (std.enums.values(PendingSyncFault.Kind)) |kind| try testPendingSyncRetry(kind);
+}
+
+fn testPendingSyncRetry(kind: PendingSyncFault.Kind) !void {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const owned = arena.allocator();
+    const root = try tmp.dir.realPathFileAlloc(io, ".", owned);
+    const home = try std.fs.path.join(owned, &.{ root, "home" });
+    var environment = std.process.Environ.Map.init(allocator);
+    defer environment.deinit();
+    try environment.put("GIT_CEILING_DIRECTORIES", std.fs.path.dirname(root).?);
+    const options: host.Options = .{ .catalog_root = home, .workspace = root };
+    var vtable = io.vtable.*;
+    PendingSyncFault.root = "";
+    PendingSyncFault.install(&vtable, kind, true);
+    var injected = io;
+    injected.vtable = &vtable;
+    try std.testing.expectError(error.InputOutput, prepareTarget(
+        allocator,
+        injected,
+        &environment,
+        options,
+        true,
+    ));
+    try std.testing.expect(PendingSyncFault.reached);
+    var associations = try workspace.resolve(allocator, io, &environment, root);
+    defer associations.deinit();
+    const controls = try controlsPath(owned, root, null, home);
+    const path = try std.fs.path.join(owned, &.{ controls, "registration.json" });
+    const registration = try readPendingRegistration(owned, io, &associations, home, path);
+    const before = try catalog.readJson(std.json.Value, owned, io, path, 4096);
+    try std.testing.expectEqual(@as(usize, 5), before.value.object.count());
+    PendingSyncFault.install(&vtable, kind, false);
+    if (prepareTarget(allocator, injected, &environment, options, false)) |value| {
+        var observed = value;
+        observed.deinit();
+        try std.testing.expectEqual(PendingSyncFault.Kind.marker, kind);
+    } else |err| {
+        try std.testing.expectEqual(error.PendingInitializationRequiresPreparation, err);
+        try std.testing.expectEqual(PendingSyncFault.Kind.registration, kind);
+    }
+    try std.testing.expectEqual(@as(usize, 0), PendingSyncFault.calls);
+    PendingSyncFault.root = registration.store_root;
+    PendingSyncFault.controls = controls;
+    PendingSyncFault.install(&vtable, kind, false);
+    var retry = try prepareTarget(allocator, injected, &environment, options, true);
+    defer retry.deinit();
+    try std.testing.expectEqualStrings(registration.store_id, retry.context.value.store_id);
+    try std.testing.expectEqualStrings(registration.store_root, retry.context.value.store_root);
+    try std.testing.expectEqual(@as(u8, 127), PendingSyncFault.mask);
+    var selected = try catalog.read(allocator, io, home);
+    defer selected.deinit();
+    try std.testing.expectEqual(@as(usize, 0), selected.value.stores.map.count());
+    PendingSyncFault.root = "";
 }

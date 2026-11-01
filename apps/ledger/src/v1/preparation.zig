@@ -815,6 +815,11 @@ pub const File = struct {
     }
 };
 
+pub const HistoryBounds = struct {
+    max_bytes: usize,
+    max_files: usize,
+};
+
 pub const History = struct {
     files: std.ArrayList(File) = .empty,
     epochs: []const replay.HistoryEpoch = &.{},
@@ -838,7 +843,7 @@ pub const History = struct {
         allocator: std.mem.Allocator,
         path: []const u8,
         bytes: []const u8,
-        limits: Limits,
+        limits: HistoryBounds,
     ) !void {
         if (self.files.items.len == limits.max_files) return error.PreparationFileBoundExceeded;
         if (bytes.len > limits.max_bytes - self.bytes) return error.PreparationSpaceBoundExceeded;
@@ -911,6 +916,31 @@ pub fn captureHistory(
     require_coordination: bool,
 ) !History {
     try limits.validate();
+    return captureHistoryBounded(
+        scope,
+        allocator,
+        repo_root,
+        plan,
+        slot,
+        parameters,
+        protocol_required,
+        .{ .max_bytes = limits.max_bytes, .max_files = limits.max_files },
+        require_coordination,
+    );
+}
+
+pub fn captureHistoryBounded(
+    scope: *storage_root.Scope,
+    allocator: std.mem.Allocator,
+    repo_root: []const u8,
+    plan: *const definition.Plan,
+    slot: storage.ResolvedSlot,
+    parameters: *const definition_core.parameters.Bindings,
+    protocol_required: bool,
+    limits: HistoryBounds,
+    require_coordination: bool,
+) !History {
+    if (limits.max_bytes == 0 or limits.max_files < 2) return error.InvalidPreparationBound;
     var bounded_slot = slot;
     bounded_slot.max_bytes = @min(slot.max_bytes, limits.max_bytes);
     var snapshot = try custody.readSlotOrMissing(
@@ -974,7 +1004,7 @@ fn captureSnapshotFiles(
     repo_root: []const u8,
     slot: storage.ResolvedSlot,
     snapshot: *const custody.SlotSnapshot,
-    limits: Limits,
+    limits: HistoryBounds,
     result: *History,
 ) !void {
     try result.append(allocator, slot.relative_path, snapshot.content, limits);
@@ -995,7 +1025,7 @@ fn captureMetadata(
     definition_id: []const u8,
     slot: storage.ResolvedSlot,
     snapshot: *const custody.SlotSnapshot,
-    limits: Limits,
+    limits: HistoryBounds,
     result: *History,
 ) !void {
     var dependencies = try replay.collectHistoryDependencies(
@@ -1061,16 +1091,17 @@ fn completePrefix(prefix: []const u8, full: []const u8) bool {
 
 test "preparation prefix requires complete records and compatible native metadata" {
     const allocator = std.testing.allocator;
+    const limits: HistoryBounds = .{ .max_bytes = 4096, .max_files = 4 };
     var short: History = .{ .exists = true };
     defer short.deinit(allocator);
     var long: History = .{ .exists = true };
     defer long.deinit(allocator);
-    try short.append(allocator, "events.jsonl", "{\"id\":1}\n", .{});
-    try short.append(allocator, ".bindings/history.jsonl", "binding-one\n", .{});
-    try short.append(allocator, ".definitions/one.json", "definition-one", .{});
-    try long.append(allocator, "events.jsonl", "{\"id\":1}\n{\"id\":2}\n", .{});
-    try long.append(allocator, ".bindings/history.jsonl", "binding-one\nbinding-two\n", .{});
-    try long.append(allocator, ".definitions/one.json", "definition-one", .{});
+    try short.append(allocator, "events.jsonl", "{\"id\":1}\n", limits);
+    try short.append(allocator, ".bindings/history.jsonl", "binding-one\n", limits);
+    try short.append(allocator, ".definitions/one.json", "definition-one", limits);
+    try long.append(allocator, "events.jsonl", "{\"id\":1}\n{\"id\":2}\n", limits);
+    try long.append(allocator, ".bindings/history.jsonl", "binding-one\nbinding-two\n", limits);
+    try long.append(allocator, ".definitions/one.json", "definition-one", limits);
     try std.testing.expect(long.covers(&short));
     try std.testing.expect(!short.covers(&long));
     long.files.items[2].bytes[0] = 'X';

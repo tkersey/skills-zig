@@ -5,8 +5,6 @@ pub const directory_name = ".migration-copy";
 pub const payload_name = "payload";
 pub const bytes_max: u64 = 2 * 1024 * 1024 * 1024;
 
-/// Only pending registration may admit this directory. Its declaration survives
-/// retries; the caller holds the existing repository guard for this lifetime.
 pub const Scratch = struct {
     dir: std.Io.Dir,
 
@@ -42,8 +40,6 @@ pub const Scratch = struct {
         try catalog.sync(io, self.dir);
     }
 
-    /// A failed rename may have published. Never roll back the destination.
-    /// Retrying validates canonical bytes before attempting another publication.
     pub fn copy(
         self: Scratch,
         io: std.Io,
@@ -59,8 +55,6 @@ pub const Scratch = struct {
             .exclusive = true,
             .permissions = .fromMode(0o600),
         });
-        // Retain incomplete scratch on failure. The persisted declaration and
-        // next guarded invocation authorize its bounded disposal, not a defer.
         defer output.close(io);
         try stream(io, input, output, expected, digest);
         try output.sync(io);
@@ -96,8 +90,6 @@ pub fn stream(
     if (size != expected or !std.mem.eql(u8, &actual, digest)) return error.SourceChanged;
 }
 
-/// Faults target only the private copy leaf, including through the migration
-/// command. Other archive, journal and metadata I/O uses the real backend.
 pub const TestFault = struct {
     pub const Kind = enum { write, before_rename, after_rename, directory_sync };
     pub var kind: Kind = .write;

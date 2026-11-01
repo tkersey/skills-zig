@@ -2,6 +2,7 @@ const std = @import("std");
 const canonical_json = @import("definition_core").canonical_json;
 const catalog = @import("host_catalog.zig");
 const migration_copy = @import("host_migration_copy.zig");
+const migration_archive = @import("host_migration_archive.zig");
 
 pub const Limits = struct {
     max_files: usize = 100000,
@@ -322,23 +323,65 @@ pub fn archive(
     io: std.Io,
     snapshot: *const Inventory,
     destination: []const u8,
+    scratch: migration_archive.Scratch,
 ) !void {
-    if (try catalog.exists(io, destination))
-        return verifyArchive(allocator, io, snapshot, destination);
     const parent_path = std.fs.path.dirname(destination) orelse return error.InvalidPath;
     const parent = try catalog.openDirectory(io, parent_path, true);
     defer parent.close(io);
-    var random: [16]u8 = undefined;
-    try io.randomSecure(&random);
-    const temporary = try std.fmt.allocPrint(
+    const manifest = try canonicalAlloc(
         allocator,
-        ".archiving-{s}",
-        .{std.fmt.bytesToHex(random, .lower)},
+        .{ .schema = "ledger-legacy-archive/v1", .sources = snapshot.sources },
     );
-    defer allocator.free(temporary);
-    try parent.createDir(io, temporary, .fromMode(0o700));
-    const stage = try std.fs.path.join(allocator, &.{ parent_path, temporary });
+    defer allocator.free(manifest);
+    if (manifest.len >= migration_archive.manifest_bytes_max)
+        return error.MigrationInventoryBoundExceeded;
+    if (try catalog.exists(io, destination)) {
+        try verifyArchive(allocator, io, snapshot, destination);
+        try catalog.sync(io, parent);
+        try catalog.sync(io, scratch.root);
+        return scratch.clear(allocator, io, snapshot);
+    }
+    try scratch.restart(allocator, io, snapshot);
+    const stage = try scratch.root.realPathFileAlloc(
+        io,
+        migration_archive.directory_name,
+        allocator,
+    );
     defer allocator.free(stage);
+    const dir = try scratch.root.openDir(io, migration_archive.directory_name, .{
+        .follow_symlinks = false,
+    });
+    defer dir.close(io);
+    const file = try dir.createFile(
+        io,
+        "manifest.json",
+        .{ .exclusive = true, .permissions = .fromMode(0o600) },
+    );
+    defer file.close(io);
+    try file.writeStreamingAll(io, manifest);
+    try file.writeStreamingAll(io, "\n");
+    try file.sync(io);
+    try catalog.sync(io, dir);
+    try copyArchive(allocator, io, snapshot, stage);
+
+    try catalog.sync(io, dir);
+    try scratch.root.renamePreserve(
+        migration_archive.directory_name,
+        parent,
+        std.fs.path.basename(destination),
+        io,
+    );
+    try catalog.sync(io, parent);
+    try catalog.sync(io, scratch.root);
+    try verifyArchive(allocator, io, snapshot, destination);
+}
+
+fn copyArchive(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    snapshot: *const Inventory,
+    stage: []const u8,
+) !void {
     for (snapshot.sources.map.keys(), snapshot.sources.map.values()) |index, source| {
         for (source.entries.map.keys(), source.entries.map.values()) |name, entry| {
             const target = try std.fmt.allocPrint(allocator, "worktree-{s}/{s}", .{ index, name });
@@ -354,27 +397,6 @@ pub fn archive(
             }
         }
     }
-    const dir = try catalog.openDirectory(io, stage, false);
-    defer dir.close(io);
-    const manifest = try canonicalAlloc(
-        allocator,
-        .{ .schema = "ledger-legacy-archive/v1", .sources = snapshot.sources },
-    );
-    defer allocator.free(manifest);
-    const file = try dir.createFile(
-        io,
-        "manifest.json",
-        .{ .exclusive = true, .permissions = .fromMode(0o600) },
-    );
-    defer file.close(io);
-    try file.writeStreamingAll(io, manifest);
-    try file.writeStreamingAll(io, "\n");
-    try file.sync(io);
-    try catalog.sync(io, dir);
-    if (try catalog.exists(io, destination)) return error.ArchiveAlreadyExists;
-    try parent.rename(temporary, parent, std.fs.path.basename(destination), io);
-    try catalog.sync(io, parent);
-    try verifyArchive(allocator, io, snapshot, destination);
 }
 
 pub fn verifyArchive(
@@ -707,9 +729,10 @@ test "legacy transport archives unselected bytes and inert links and FIFO metada
     );
     const target = try std.fs.path.join(allocator, &.{ root, "archive" });
     defer allocator.free(target);
-    try archive(allocator, io, &snapshot, target);
+    const scratch: migration_archive.Scratch = .{ .root = tmp.dir };
+    try archive(allocator, io, &snapshot, target, scratch);
     try verifyArchive(allocator, io, &snapshot, target);
-    try archive(allocator, io, &snapshot, target);
+    try archive(allocator, io, &snapshot, target, scratch);
     try std.testing.expect(!try catalog.existsAt(
         io,
         tmp.dir,

@@ -595,7 +595,11 @@ fn archiveGenerations(
 ) ![]const []const u8 {
     var generations: std.ArrayList([]const u8) = .empty;
     var iterator = archive_dir.iterate();
+    var observed: usize = 0;
     while (try iterator.next(io)) |entry| {
+        observed += 1;
+        if (observed > 100000) return error.ArchiveManifestBoundExceeded;
+        if (unpublishedArchive(entry.name)) continue;
         if (generations.items.len == max_sources) return error.ArchiveManifestBoundExceeded;
         const generation = try archive_dir.openDir(io, entry.name, .{ .follow_symlinks = false });
         generation.close(io);
@@ -603,4 +607,61 @@ fn archiveGenerations(
     }
     std.mem.sort([]const u8, generations.items, {}, lessString);
     return generations.toOwnedSlice(allocator);
+}
+
+fn unpublishedArchive(name: []const u8) bool {
+    const prefix = ".archiving-";
+    if (!std.mem.startsWith(u8, name, prefix)) return false;
+    if (name.len == prefix.len + 8) {
+        for (name[prefix.len..]) |byte| {
+            if (!std.ascii.isDigit(byte) and !(byte >= 'a' and byte <= 'z') and byte != '_')
+                return false;
+        }
+        return true;
+    }
+    if (name.len != prefix.len + 32) return false;
+    for (name[prefix.len..]) |byte| {
+        if (!std.ascii.isDigit(byte) and !(byte >= 'a' and byte <= 'f')) return false;
+    }
+    return true;
+}
+
+test "host archive discovery retains old stages beside valid generations" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(root);
+    var environment = std.process.Environ.Map.init(allocator);
+    defer environment.deinit();
+    var target = try host.context(
+        allocator,
+        root,
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        null,
+        null,
+        false,
+    );
+    defer target.deinit();
+    const slot = "owner/events.jsonl";
+    try testArchiveManifest(root, slot);
+    const native = "legacy-archive/.archiving-0123456789abcdef0123456789abcdef/partial";
+    const python_stage = "legacy-archive/.archiving-a1b2c3d_/partial";
+    try testWrite(root, native, "retain native stage");
+    try testWrite(root, python_stage, "retain Python stage");
+    var found = try discover(allocator, io, &environment, null, target.value, slot, &.{}, true);
+    defer found.deinit();
+    try std.testing.expectEqual(@as(usize, 2), found.sources.len);
+    try std.testing.expect(found.sources[0].archive and found.sources[1].archive);
+    for (&[_][]const u8{ native, python_stage }) |path| {
+        const bytes = try catalog.readBytes(allocator, io, tmp.dir, path, 128);
+        defer allocator.free(bytes);
+        try std.testing.expect(std.mem.startsWith(u8, bytes, "retain "));
+    }
+    try testWrite(root, "legacy-archive/.archiving-unknown/partial", "unclassified");
+    try std.testing.expectError(
+        error.FileNotFound,
+        discover(allocator, io, &environment, null, target.value, slot, &.{}, true),
+    );
 }

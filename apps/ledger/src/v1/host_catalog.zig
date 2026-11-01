@@ -337,7 +337,6 @@ pub fn openDirectory(io: std.Io, path: []const u8, create: bool) !std.Io.Dir {
                     error.PathAlreadyExists => {},
                     else => return create_error,
                 };
-                try sync(io, current);
                 break :blk try current.openDir(
                     io,
                     component.name,
@@ -346,6 +345,8 @@ pub fn openDirectory(io: std.Io, path: []const u8, create: bool) !std.Io.Dir {
             },
             else => return err,
         };
+        errdefer next.close(io);
+        if (create) try sync(io, current);
         current.close(io);
         current = next;
     }
@@ -615,4 +616,90 @@ test "catalog contention has a bounded wait and preserves the active lock" {
     defer acquired.deinit();
     try std.testing.expectEqual(inode, (try acquired.file.stat(io)).inode);
     try std.testing.expectEqual(@as(i96, 30 * std.time.ns_per_s), ContendedLockWait.slept_ns);
+}
+
+const DirectorySyncFault = struct {
+    var selected: []const u8 = "";
+    var parent_inode: ?std.Io.File.INode = null;
+    var fail = true;
+    var calls: usize = 0;
+    var matched: usize = 0;
+
+    fn create(
+        userdata: ?*anyopaque,
+        parent: std.Io.Dir,
+        name: []const u8,
+        permissions: std.Io.Dir.Permissions,
+    ) std.Io.Dir.CreateDirError!void {
+        try std.testing.io.vtable.dirCreateDir(userdata, parent, name, permissions);
+        if (std.mem.eql(u8, name, selected)) {
+            parent_inode = (parent.stat(std.testing.io) catch |err| {
+                std.debug.panic("directory sync probe: {s}", .{@errorName(err)});
+            }).inode;
+        }
+    }
+
+    fn sync(userdata: ?*anyopaque, file: std.Io.File) std.Io.File.SyncError!void {
+        calls += 1;
+        const stat = file.stat(std.testing.io) catch return error.InputOutput;
+        if (parent_inode != null and stat.kind == .directory and stat.inode == parent_inode.?) {
+            matched += 1;
+            if (fail) return error.InputOutput;
+        }
+        return std.testing.io.vtable.fileSync(userdata, file);
+    }
+};
+
+test "catalog path admission retries each nested parent sync without read only effects" {
+    for ([_][]const u8{ "outer", "inner", "home" }) |part| try testDirectorySyncRetry(part);
+}
+
+fn testDirectorySyncRetry(part: []const u8) !void {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(root);
+    const home = try std.fs.path.join(allocator, &.{ root, "outer/inner/home" });
+    defer allocator.free(home);
+    DirectorySyncFault.selected = part;
+    DirectorySyncFault.parent_inode = null;
+    DirectorySyncFault.fail = true;
+    DirectorySyncFault.calls = 0;
+    DirectorySyncFault.matched = 0;
+    var vtable = io.vtable.*;
+    vtable.dirCreateDir = DirectorySyncFault.create;
+    vtable.fileSync = DirectorySyncFault.sync;
+    var injected = io;
+    injected.vtable = &vtable;
+    try std.testing.expectError(error.InputOutput, Lock.acquire(injected, home));
+    try std.testing.expectEqual(@as(usize, 1), DirectorySyncFault.matched);
+    const suffix = if (std.mem.eql(u8, part, "outer"))
+        "outer"
+    else if (std.mem.eql(u8, part, "inner"))
+        "outer/inner"
+    else
+        "outer/inner/home";
+    const created = try std.fs.path.join(allocator, &.{ root, suffix });
+    defer allocator.free(created);
+    const before = try std.Io.Dir.cwd().statFile(io, created, .{ .follow_symlinks = false });
+    DirectorySyncFault.calls = 0;
+    const observed = try openDirectory(injected, created, false);
+    observed.close(injected);
+    try std.testing.expectEqual(@as(usize, 0), DirectorySyncFault.calls);
+    DirectorySyncFault.matched = 0;
+    try std.testing.expectError(error.InputOutput, Lock.acquire(injected, home));
+    try std.testing.expectEqual(@as(usize, 1), DirectorySyncFault.matched);
+    DirectorySyncFault.fail = false;
+    DirectorySyncFault.matched = 0;
+    var retry = try Lock.acquire(injected, home);
+    defer retry.deinit();
+    try std.testing.expect(DirectorySyncFault.matched > 0);
+    try retry.publish(allocator, empty());
+    const after = try std.Io.Dir.cwd().statFile(io, created, .{ .follow_symlinks = false });
+    try std.testing.expectEqual(before.inode, after.inode);
+    var catalog = try read(allocator, io, home);
+    defer catalog.deinit();
+    try std.testing.expectEqual(@as(usize, 0), catalog.value.stores.map.count());
 }

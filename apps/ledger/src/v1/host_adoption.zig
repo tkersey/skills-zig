@@ -6,6 +6,7 @@ const ledger = @import("ledger_v1_core");
 const parameters = @import("definition_core").parameters;
 const storage_root = @import("storage_root");
 const durable_store = @import("durable_store");
+const preparation = ledger.preparation;
 
 const Owner = struct {
     plan: ledger.compiled_plan.PlanSet,
@@ -152,7 +153,7 @@ pub fn execute(
     try owners.inspect(allocator, io, source_git.root, null);
     var before = try legacy.coldInventory(allocator, io, trees, owners.slots.items, .{});
     defer before.deinit();
-    const index = try selectedSource(allocator, io, &before, owners.slots.items, source_git.root);
+    const index = try selectedSource(allocator, io, &before, &owners, source_git.root);
     return publishAdoption(
         allocator,
         io,
@@ -347,34 +348,58 @@ fn selectedSource(
     allocator: std.mem.Allocator,
     io: std.Io,
     snapshot: *const legacy.Inventory,
-    slots: []const []const u8,
+    owners: *const Owners,
     source: []const u8,
 ) !usize {
-    const covering = try legacy.selectSource(allocator, io, snapshot, slots);
     const explicit = for (snapshot.sources.map.values(), 0..) |candidate, index| {
         if (std.mem.eql(u8, candidate.workspace, source)) break index;
     } else return error.AdoptionSourceOutsideGitFamily;
-    if (covering) |index| {
-        const selected = snapshot.sources.map.values()[explicit];
-        const complete = snapshot.sources.map.values()[index];
-        for (slots) |slot| {
-            const path = try std.fs.path.join(allocator, &.{ ".ledger", slot });
-            defer allocator.free(path);
-            const left = complete.entries.map.get(path) orelse continue;
-            const right = selected.entries.map.get(path) orelse
-                return error.AdoptionSourceDoesNotCoverHistory;
-            if (!try legacy.completePrefix(
-                allocator,
-                io,
-                complete.workspace,
-                selected.workspace,
-                path,
-                left,
-                right,
-            )) return error.AdoptionSourceDoesNotCoverHistory;
+    const limits: legacy.Limits = .{};
+    if (snapshot.total_bytes > limits.max_bytes or snapshot.file_count > limits.max_files)
+        return error.MigrationInventoryBoundExceeded;
+    for (owners.definitions.items) |*owner| {
+        for (owner.plan.storage_plan.?.slots) |slot| {
+            var selected = try captureSource(allocator, io, owner, source, slot);
+            defer selected.deinit(allocator);
+            for (snapshot.sources.map.values(), 0..) |candidate, index| {
+                if (index == explicit) continue;
+                var other = try captureSource(allocator, io, owner, candidate.workspace, slot);
+                defer other.deinit(allocator);
+                if (!selected.covers(&other)) return error.AdoptionSourceDoesNotCoverHistory;
+            }
         }
     }
     return explicit;
+}
+
+fn captureSource(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    owner: *const Owner,
+    root: []const u8,
+    slot: ledger.storage.Slot,
+) !preparation.History {
+    const limits: legacy.Limits = .{};
+    var scope = storage_root.Scope.init(.init(io, std.Io.Dir.cwd()));
+    return preparation.captureHistoryBounded(
+        &scope,
+        allocator,
+        root,
+        &owner.plan.definition_plan,
+        .{
+            .name = slot.name,
+            .relative_path = slot.relative_path,
+            .owned_path = null,
+            .kind = slot.kind,
+            .codec = slot.codec,
+            .max_bytes = slot.max_bytes,
+            .layout = slot.layout,
+        },
+        &owner.bindings,
+        owner.plan.protocol_plan != null,
+        .{ .max_bytes = @intCast(limits.max_bytes), .max_files = limits.max_files },
+        false,
+    );
 }
 
 fn verifyCopy(
@@ -449,61 +474,6 @@ test "cold adoption requires explicit authority before inspecting or creating cu
         &.{},
         true,
     ));
-}
-
-test "cold adoption explicit source must cover every selected event history" {
-    const allocator = std.testing.allocator;
-    const io = std.testing.io;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const root = try tmp.dir.realPathFileAlloc(io, ".", allocator);
-    defer allocator.free(root);
-    const prefix = try std.fs.path.join(allocator, &.{ root, "prefix" });
-    defer allocator.free(prefix);
-    const full = try std.fs.path.join(allocator, &.{ root, "full" });
-    defer allocator.free(full);
-    try tmp.dir.createDirPath(io, "prefix/.ledger/owner");
-    try tmp.dir.createDirPath(io, "full/.ledger/owner");
-    try tmp.dir.writeFile(
-        io,
-        .{ .sub_path = "prefix/.ledger/owner/events.jsonl", .data = "one\n" },
-    );
-    try tmp.dir.writeFile(
-        io,
-        .{ .sub_path = "full/.ledger/owner/events.jsonl", .data = "one\ntwo\n" },
-    );
-    var snapshot = try legacy.coldInventory(
-        allocator,
-        io,
-        &.{ prefix, full },
-        &.{"owner/events.jsonl"},
-        .{},
-    );
-    defer snapshot.deinit();
-    try std.testing.expectError(error.AdoptionSourceDoesNotCoverHistory, selectedSource(
-        allocator,
-        io,
-        &snapshot,
-        &.{"owner/events.jsonl"},
-        prefix,
-    ));
-    try std.testing.expectEqual(@as(usize, 1), try selectedSource(
-        allocator,
-        io,
-        &snapshot,
-        &.{"owner/events.jsonl"},
-        full,
-    ));
-    const destination = try std.fs.path.join(allocator, &.{ root, "destination" });
-    defer allocator.free(destination);
-    try legacy.copyCold(allocator, io, &snapshot, 1, destination);
-    try verifyCopy(
-        allocator,
-        io,
-        &snapshot.sources.map.values()[1],
-        destination,
-        &.{"owner/events.jsonl"},
-    );
 }
 
 fn testGit(

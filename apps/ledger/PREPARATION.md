@@ -1,24 +1,49 @@
 # Preparation working-file lifetimes
 
-Explicit broad migration also owns `<store-root>/.migration-copy/payload`, outside
-canonical `.ledger` and preserved archives. Under the existing repository guard,
-the host durably declares the fixed `v1` scratch layout in `migration-copy.json`
-beside the existing pending registration before creating its private directory.
-The immutable declaration binds the exact store ID and root; the registration
-retains its original five-field format. An undeclared occupied path,
-unknown contents, links, and unsupported declarations stop migration without
-deletion. This declaration retains lifetime ownership; it records no commit state.
-The one regular scratch file is bounded by the admitted inventory file length
-(at most 2 GiB), using a 64 KiB streaming buffer. Failed attempts retain at most
-that file, independently of retry count. The next guarded attempt may remove it
-because no native transaction depends on it. Verified and synced bytes become
-canonical only through atomic nonreplacing rename; retries validate existing
-canonical bytes and finish directory sync. Source files, completed archives and
-ambiguous preexisting canonical files are never removed or overwritten. Archive
-and cold-adoption construction retain their existing outer directory publication.
+Explicit broad migration owns fixed private work outside canonical `.ledger` and
+completed archives. The existing repository guard coordinates each lifetime.
+Immutable declarations beside the pending registration bind the exact store ID,
+root and permitted layout; they record no commit state. Archive admission also
+accepts an existing checked catalog selection or legacy Git registration, without
+requiring a pending locator. The original pending registration keeps its five-field
+format. Mutating retries validate and finish locator, marker and directory syncs
+before custody can be associated; inspection never performs those syncs.
+Mutating directory opens replay parent-link syncs for existing and newly created
+components, so a failed directory-creation sync cannot be bypassed on retry.
+
+| Path | Creator | Required lifetime | Coordination | Release witness |
+| --- | --- | --- | --- | --- |
+| `<store>/.migration-copy/payload` | Explicit native migration, after `migration-copy.json` declaration | One bounded regular canonical-copy stage, at most 2 GiB | Existing repository guard | Declared layout, regular single-link file, bounded length; no native transaction depends on it |
+| `<store>/.migration-archive` | Explicit native migration, after separate `migration-archive.json` declaration | One unpublished broad archive stage | Existing repository guard | Empty/manifest-only owned stage, or complete bounded validation against its persisted archive manifest before any deletion |
+| `<store>/legacy-archive/<fingerprint>` | Existing explicit broad migration | Preserved historical evidence | Existing repository guard for publication | Never reclaimed by preparation or migration retry |
+| Existing `.archiving-*` stages | Historical native/Python migration | Retained unpublished evidence | Outside new cleanup authority | Never deleted; exact historical generated names are excluded from completed-generation discovery |
+| `registration.json`, `migration-copy.json`, `migration-archive.json` | Native host integration | Stable identity and immutable working-layout ownership | Existing repository guard and catalog coordination | Retained; no new metadata sweeper |
+
+Archive capture writes and syncs the existing `ledger-legacy-archive/v1` manifest
+before copying payload. Retry validates every staged path, kind, link count and
+maximum length against that prior manifest before deleting anything; implicit
+parent directories are derived from its admitted paths. This permits restart when
+the current source inventory changes. A malformed manifest with payload, unknown
+entries, links, special files or undeclared occupied paths remain untouched and
+block that operation. A partial manifest without payload may restart. Working
+payload is bounded by the existing 2 GiB inventory limit and 100,000 inventory
+entries; the prior manifest read has a separate 2 GiB ceiling. Directory inspection
+is bounded by the finite allowed-path set, including implicit parents.
+
+Canonical-copy publication and completed archive publication use nonreplacing
+rename. Existing destinations are verified, and retries finish directory syncs
+before returning success. Source files, completed archives and ambiguous canonical
+files are never overwritten or removed. Identical failed captures retain one bulk
+stage, independently of retry count. The existing archive schema, fingerprint and
+receipt contracts remain unchanged. Cold adoption retains its outer directory
+publication and reuses native `History.covers` per static slot under its existing
+aggregate 2 GiB/100,000-entry inventory bounds; routine preparation keeps the
+defaults and ceilings below.
+
 Ownership assumes participating callers obey the repository guard and private
-scratch is not modified by an uncoordinated writer. Existing catalog metadata
-temporary files retain their existing cleanup rules; this adds no metadata sweeper.
+scratch is not modified by an uncoordinated writer. Deterministic write, rename
+and sync fault tests establish retry behavior; they do not simulate power loss.
+Existing catalog metadata temporary files retain their existing cleanup rules.
 
 Paths below are relative to the admitted managed `.ledger` directory. Preparation and maintenance use the existing persistent CAS advisory lock for `.preparation`. Inspect opens an existing shared lock and never creates one. Native transaction recovery remains the only publication authority.
 
