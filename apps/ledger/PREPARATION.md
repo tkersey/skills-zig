@@ -40,6 +40,20 @@ publication and reuses native `History.covers` per static slot under its existin
 aggregate 2 GiB/100,000-entry inventory bounds; routine preparation keeps the
 defaults and ceilings below.
 
+Native host context distinguishes verified Git identity from a plain workspace;
+failed Git discovery with Git metadata present cannot allocate replacement custody.
+Existing catalog lookup does not require sibling availability. Owner coverage does:
+healthy selected history is compared against bounded live Git-family candidates,
+using native bindings and one aggregate read allowance, without inspecting archives
+or inferring conversion from retained retired files. A longer live history requires
+reconciliation and cannot advance a healthy target through preparation.
+
+Cold adoption uses the same fresh-identity admission as initialization: selected
+pending registration or unregistered custody blocks another allocation even when
+an unrelated catalog exists. Publication failures retain the original root and ID;
+explicit `context --register-root` can associate a verified published orphan. No
+automatic orphan recovery or additional publication journal is introduced.
+
 Ownership assumes participating callers obey the repository guard and private
 scratch is not modified by an uncoordinated writer. Deterministic write, rename
 and sync fault tests establish retry behavior; they do not simulate power loss.

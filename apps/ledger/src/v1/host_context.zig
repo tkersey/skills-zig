@@ -392,6 +392,16 @@ fn admitInitialization(
     lock: *const catalog.Lock,
 ) !void {
     try rejectKnownHistory(allocator, io, environment, associations, options.legacy_paths);
+    try admitAllocation(allocator, io, options, associations, lock);
+}
+
+pub fn admitAllocation(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    options: Options,
+    associations: *const workspace.Associations,
+    lock: *const catalog.Lock,
+) !void {
     const pending = @import("host_pending.zig");
     if (associations.workspace_root) |root| {
         const controls = try pending.controlsPath(
@@ -845,7 +855,7 @@ test "context initialization checks late history before publishing the family as
     const allocator = std.testing.allocator;
     const io = std.testing.io;
     for ([_]bool{ false, true }) |after_final_rename| {
-        var tmp = std.testing.tmpDir(.{});
+        var tmp = try workspace.testPlainDirectory();
         defer tmp.cleanup();
         const root = try tmp.dir.realPathFileAlloc(io, ".", allocator);
         defer allocator.free(root);
@@ -853,7 +863,6 @@ test "context initialization checks late history before publishing the family as
         defer allocator.free(home);
         var environment = std.process.Environ.Map.init(allocator);
         defer environment.deinit();
-        try environment.put("GIT_CEILING_DIRECTORIES", std.fs.path.dirname(root).?);
         var interleaving: InitializationInterleaving = .{
             .io = io,
             .workspace_dir = tmp.dir,

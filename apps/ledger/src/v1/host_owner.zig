@@ -279,7 +279,7 @@ fn existingCoverage(
     const slot = plan.storage_plan.?.slots[0];
     const present = health.slots[0].state != .missing;
     const covered = if (present)
-        try localCovered(allocator, io, selected, plan, bindings)
+        try localCovered(allocator, io, environment, selected, plan, bindings)
     else
         try missingCovered(
             allocator,
@@ -443,26 +443,45 @@ fn inspect(
 fn localCovered(
     allocator: std.mem.Allocator,
     io: std.Io,
+    environment: *const std.process.Environ.Map,
     selected: host.ContextValue,
     plan: *const compiled.PlanSet,
     bindings: *const parameters.Bindings,
 ) !bool {
     const root = selected.workspace_root orelse return true;
     if (std.mem.eql(u8, root, selected.store_root)) return true;
-    const local = try std.fs.path.join(allocator, &.{ root, ".ledger" });
-    if (!try host.catalog.exists(io, local)) return true;
-    try host.catalog.noSymlinks(io, local);
+    var sources = try discovery.discover(
+        allocator,
+        io,
+        environment,
+        root,
+        selected,
+        plan.storage_plan.?.slots[0].relative_path,
+        &.{},
+        false,
+    );
+    defer sources.deinit();
     if (plan.storage_plan.?.slots[0].layout == .segmented) {
         if (!try anyHistory(
             allocator,
             io,
-            &.{.{ .root = root }},
+            sources.sources,
             plan.storage_plan.?.slots[0].relative_path,
         )) return true;
         return error.SegmentedLocalCoverageRequiresMigration;
     }
-    const source_dir = try host.catalog.openDirectory(io, local, false);
-    defer source_dir.close(io);
+    return coverLiveSources(allocator, io, environment, selected, plan, bindings, &sources);
+}
+
+fn coverLiveSources(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    environment: *const std.process.Environ.Map,
+    selected: host.ContextValue,
+    plan: *const compiled.PlanSet,
+    bindings: *const parameters.Bindings,
+    sources: *const discovery.Sources,
+) !bool {
     const target_dir = try storage_root.checkedRoot(
         allocator,
         io,
@@ -474,15 +493,98 @@ fn localCovered(
         .max_bytes = history_limits.max_read_bytes,
         .max_files = history_limits.max_files * 16,
     };
-    var source_scope = storage_root.Scope.init(.anchored(io, source_dir));
-    source_scope.fs.read_budget = &budget;
     var target_scope = storage_root.Scope.init(.anchored(io, target_dir));
     target_scope.fs.read_budget = &budget;
-    var source_history = try captureCoverageHistory(&source_scope, allocator, plan, bindings);
-    defer source_history.deinit(allocator);
     var target_history = try captureCoverageHistory(&target_scope, allocator, plan, bindings);
     defer target_history.deinit(allocator);
-    return target_history.covers(&source_history);
+    const controls = try allocator.alloc(?std.Io.Dir, sources.sources.len);
+    defer allocator.free(controls);
+    @memset(controls, null);
+    defer for (controls) |control| if (control) |dir| dir.close(io);
+    const histories = try allocator.alloc(preparation.History, sources.sources.len);
+    defer allocator.free(histories);
+    @memset(histories, .{});
+    defer for (histories) |*history| history.deinit(allocator);
+    var covered = true;
+    for (sources.sources, controls, histories) |source, *control, *history| {
+        control.* = try openCoverageSource(allocator, io, source);
+        const dir = control.* orelse continue;
+        var source_scope = storage_root.Scope.init(.anchored(io, dir));
+        source_scope.fs.read_budget = &budget;
+        history.* = try captureCoverageHistory(&source_scope, allocator, plan, bindings);
+        if (!target_history.covers(history)) covered = false;
+    }
+    try recheckCoverage(allocator, io, environment, selected, plan, sources, controls);
+    const current = try storage_root.checkedRoot(
+        allocator,
+        io,
+        selected.store_root,
+        selected.store_id,
+    );
+    defer current.close(io);
+    if (!try @import("durable_store").sameDirectoryObject(io, target_dir, current))
+        return error.StorageRootChanged;
+    return covered;
+}
+
+fn openCoverageSource(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    source: preparation.Source,
+) !?std.Io.Dir {
+    if (source.store_id) |id| return try storage_root.checkedRoot(allocator, io, source.root, id);
+    const path = try std.fs.path.join(allocator, &.{ source.root, ".ledger" });
+    defer allocator.free(path);
+    return host.catalog.openDirectory(io, path, false) catch |err| switch (err) {
+        error.FileNotFound => null,
+        else => return err,
+    };
+}
+
+fn recheckCoverage(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    environment: *const std.process.Environ.Map,
+    selected: host.ContextValue,
+    plan: *const compiled.PlanSet,
+    sources: *const discovery.Sources,
+    controls: []const ?std.Io.Dir,
+) !void {
+    var associations = try host.workspace.resolve(
+        allocator,
+        io,
+        environment,
+        selected.workspace_root,
+    );
+    defer associations.deinit();
+    if (!host.catalog.optionalEqual(associations.workspace_root, selected.workspace_root) or
+        !host.catalog.optionalEqual(associations.git_common_dir, selected.git_common_dir))
+        return error.WorkspaceCoverageChangedAfterPreparation;
+    var current = try discovery.discover(
+        allocator,
+        io,
+        environment,
+        selected.workspace_root,
+        selected,
+        plan.storage_plan.?.slots[0].relative_path,
+        &.{},
+        false,
+    );
+    defer current.deinit();
+    if (current.sources.len != sources.sources.len)
+        return error.WorkspaceCoverageChangedAfterPreparation;
+    for (current.sources, sources.sources, controls) |now, before, previous| {
+        if (!std.mem.eql(u8, now.root, before.root) or
+            !host.catalog.optionalEqual(now.store_id, before.store_id))
+            return error.WorkspaceCoverageChangedAfterPreparation;
+        const control = try openCoverageSource(allocator, io, now);
+        defer if (control) |dir| dir.close(io);
+        if ((control == null) != (previous == null)) return error.SourceChangedDuringPreparation;
+        if (control) |dir| {
+            if (!try @import("durable_store").sameDirectoryObject(io, previous.?, dir))
+                return error.SourceChangedDuringPreparation;
+        }
+    }
 }
 
 fn captureCoverageHistory(
@@ -573,7 +675,7 @@ fn prepare(
         plan,
         bindings,
         selected,
-        retired,
+        if (discover_archives) retired else &.{},
         discover_archives,
     );
 }

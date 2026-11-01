@@ -395,6 +395,9 @@ fn inspectSources(
             const path = try std.fs.path.join(allocator, &.{ source.workspace, name });
             defer allocator.free(path);
             try host.catalog.noSymlinks(io, path);
+            if (source.entries.map.get(name)) |entry| {
+                if (!std.mem.eql(u8, entry.kind, "file")) return error.UnsupportedRetiredSource;
+            }
         }
         for (source.entries.map.keys(), source.entries.map.values()) |name, entry| {
             if (std.mem.endsWith(u8, name, ".cas.lock")) return error.LegacyLeaseRequiresRecovery;
@@ -409,13 +412,6 @@ fn inspectSources(
                 std.mem.eql(u8, first, ".revisions")) return error.SymlinkInSelectedCustody;
         }
         for (owners.entries) |*owner| {
-            var present = false;
-            for (owner.descriptor.slots) |slot| {
-                const name = try std.fmt.allocPrint(allocator, ".ledger/{s}", .{slot});
-                defer allocator.free(name);
-                present = present or source.entries.map.contains(name);
-            }
-            if (!present) continue;
             var health = try inspectOwner(allocator, io, owner, source.workspace, null);
             defer health.deinit(allocator);
             if (health.pending_transactions != 0 or health.preparation_pending or
@@ -619,6 +615,7 @@ const Migration = struct {
             selected,
             self.digest,
             self.owners,
+            self.snapshot,
         );
     }
 
@@ -1160,7 +1157,7 @@ fn retiredSources(
     for (snapshot.sources.map.keys(), snapshot.sources.map.values()) |index, tree| {
         for (paths) |path| {
             const entry = tree.entries.map.get(path) orelse continue;
-            if (!std.mem.eql(u8, entry.kind, "file")) continue;
+            std.debug.assert(std.mem.eql(u8, entry.kind, "file"));
             try sources.append(allocator, .{
                 .source = try std.fmt.allocPrint(
                     allocator,
@@ -1328,6 +1325,7 @@ fn reusableReceipt(
     selected: host.ContextValue,
     digest: []const u8,
     owners: Owners,
+    snapshot: *const legacy.Inventory,
 ) !?std.json.Value {
     const path = try std.fs.path.join(
         allocator,
@@ -1352,6 +1350,12 @@ fn reusableReceipt(
             return error.OwnerCustodyRequiresMaintenance;
         }
     }
+    const archive = try std.fs.path.join(
+        scratch,
+        &.{ selected.store_root, "legacy-archive", digest },
+    );
+    defer scratch.free(archive);
+    try legacy.verifyArchive(scratch, io, snapshot, archive);
     return saved;
 }
 

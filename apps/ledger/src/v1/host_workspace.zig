@@ -37,10 +37,7 @@ pub fn resolve(
     var root = try canonicalPath(owned, io, selected);
     var common: ?[]const u8 = null;
     if (try isDirectory(io, root)) {
-        const paths = verifiedGit(owned, io, environment, root) catch |err| switch (err) {
-            error.GitContextUnavailable, error.FileNotFound, error.NotDir => null,
-            else => return err,
-        };
+        const paths = try gitOrPlain(owned, io, environment, root);
         if (paths) |found| {
             root = found.root;
             common = found.common;
@@ -54,6 +51,40 @@ pub fn resolve(
         .workspace_root = root,
         .git_common_dir = common,
         .aliases = aliases,
+    };
+}
+
+pub fn gitOrPlain(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    environment: *const std.process.Environ.Map,
+    root: []const u8,
+) !?GitPaths {
+    return verifiedGit(allocator, io, environment, root) catch |err| switch (err) {
+        error.GitContextUnavailable, error.FileNotFound, error.NotDir => blk: {
+            var ancestor: ?[]const u8 = root;
+            while (ancestor) |path| {
+                const dir = try catalog.openDirectory(io, path, false);
+                defer dir.close(io);
+                const bare = try catalog.existsAt(io, dir, "objects") and
+                    (try catalog.existsAt(io, dir, "HEAD") or
+                        (try catalog.existsAt(io, dir, "config") and
+                            try catalog.existsAt(io, dir, "refs")));
+                if (try catalog.existsAt(io, dir, ".git") or bare)
+                    return error.UnverifiableGitFamily;
+                ancestor = std.fs.path.dirname(path);
+                if (ancestor != null and std.mem.eql(u8, ancestor.?, path)) break;
+            }
+            if (git(allocator, io, environment, root, &.{ "rev-parse", "--git-dir" })) |bytes| {
+                allocator.free(bytes);
+                return error.UnverifiableGitFamily;
+            } else |probe_error| switch (probe_error) {
+                error.GitContextUnavailable, error.FileNotFound, error.NotDir => {},
+                else => return probe_error,
+            }
+            break :blk null;
+        },
+        else => return err,
     };
 }
 
@@ -251,4 +282,52 @@ test "plain and missing workspace resolution do not create custody" {
     try std.testing.expectEqualStrings(missing, selected.workspace_root.?);
     try std.testing.expect(selected.git_common_dir == null);
     try std.testing.expect(!try catalog.exists(io, missing));
+}
+
+pub fn testPlainDirectory() !std.testing.TmpDir {
+    const io = std.testing.io;
+    const parent = try std.Io.Dir.openDirAbsolute(io, "/tmp", .{});
+    errdefer parent.close(io);
+    var random: [12]u8 = undefined;
+    io.random(&random);
+    var name: @FieldType(std.testing.TmpDir, "sub_path") = undefined;
+    _ = std.base64.url_safe.Encoder.encode(&name, &random);
+    try parent.createDir(io, &name, .fromMode(0o700));
+    errdefer parent.deleteTree(io, &name) catch |err| @panic(@errorName(err));
+    const dir = try parent.openDir(io, &name, .{});
+    return .{ .dir = dir, .parent_dir = parent, .sub_path = name };
+}
+
+test "plain admission with missing Git rejects broken nested and bare Git evidence" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = try testPlainDirectory();
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(root);
+    var environment = std.process.Environ.Map.init(allocator);
+    defer environment.deinit();
+    try environment.put("PATH", "/nonexistent-ledger-git");
+    var plain = try resolve(allocator, io, &environment, root);
+    defer plain.deinit();
+    try std.testing.expect(plain.git_common_dir == null);
+    try tmp.dir.createDir(io, "nested", .default_dir);
+    const nested = try std.fs.path.join(allocator, &.{ root, "nested" });
+    defer allocator.free(nested);
+    try tmp.dir.writeFile(io, .{ .sub_path = ".git", .data = "gitdir: /missing\n" });
+    try std.testing.expectError(error.UnverifiableGitFamily, resolve(
+        allocator,
+        io,
+        &environment,
+        nested,
+    ));
+    try tmp.dir.deleteFile(io, ".git");
+    try tmp.dir.createDir(io, "objects", .default_dir);
+    try tmp.dir.writeFile(io, .{ .sub_path = "HEAD", .data = "ref: refs/heads/main\n" });
+    try std.testing.expectError(error.UnverifiableGitFamily, resolve(
+        allocator,
+        io,
+        &environment,
+        root,
+    ));
 }

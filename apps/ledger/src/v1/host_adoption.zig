@@ -187,7 +187,7 @@ fn publishAdoption(
         return error.ConcurrentCatalogRegistration;
     }
     try rejectRegistration(allocator, io, common);
-    try rejectUncatalogedRoots(io, &lock);
+    try host.admitAllocation(allocator, io, options, associations, &lock);
     lock.dir.createDir(io, "repos", .fromMode(0o700)) catch |err| switch (err) {
         error.PathAlreadyExists => {},
         else => return err,
@@ -333,15 +333,6 @@ fn rejectRegistration(allocator: std.mem.Allocator, io: std.Io, common: []const 
     const path = try std.fs.path.join(allocator, &.{ common, host.catalog.registration_name });
     defer allocator.free(path);
     if (try host.catalog.exists(io, path)) return error.ExistingRegistrationRequiresImport;
-}
-
-fn rejectUncatalogedRoots(io: std.Io, lock: *const host.catalog.Lock) !void {
-    if (try host.catalog.existsAt(io, lock.dir, host.catalog.filename)) return;
-    if (!try host.catalog.existsAt(io, lock.dir, "repos")) return;
-    const repos = try lock.dir.openDir(io, "repos", .{ .follow_symlinks = false, .iterate = true });
-    defer repos.close(io);
-    var entries = repos.iterate();
-    if (try entries.next(io) != null) return error.ExistingCustodyWithoutCatalog;
 }
 
 fn selectedSource(
@@ -738,4 +729,223 @@ fn testBuildFamily(
     defer prefix.deinit();
     try legacy.copyCold(allocator, io, &prefix, 0, other);
     try testAppend(environment, definition, repo, "{\"kind\":\"second\",\"value\":2}");
+}
+
+const AdoptionPublicationFault = struct {
+    var active: ?*AdoptionPublicationFault = null;
+    io: std.Io,
+    catalog_sync: bool,
+    published_id: ?[32]u8 = null,
+    fired: bool = false,
+
+    fn renamePreserve(
+        userdata: ?*anyopaque,
+        old_dir: std.Io.Dir,
+        old_name: []const u8,
+        new_dir: std.Io.Dir,
+        new_name: []const u8,
+    ) std.Io.Dir.RenamePreserveError!void {
+        const self = active.?;
+        try self.io.vtable.dirRenamePreserve(userdata, old_dir, old_name, new_dir, new_name);
+        if (std.mem.startsWith(u8, old_name, ".initializing-")) {
+            std.debug.assert(new_name.len == 32);
+            self.published_id = new_name[0..32].*;
+        }
+    }
+
+    fn sync(userdata: ?*anyopaque, file: std.Io.File) std.Io.File.SyncError!void {
+        const self = active.?;
+        if (self.published_id != null) {
+            const stat = file.stat(self.io) catch return error.InputOutput;
+            if (!self.catalog_sync or stat.kind == .file) {
+                self.fired = true;
+                return error.InputOutput;
+            }
+        }
+        return self.io.vtable.fileSync(userdata, file);
+    }
+};
+
+test "cold adoption retains one published identity across sync failures and manual registration" {
+    for ([_]bool{ false, true }) |catalog_sync| try testAdoptionPublicationRetry(catalog_sync);
+}
+
+fn testAdoptionPublicationRetry(catalog_sync: bool) !void {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = try host.workspace.testPlainDirectory();
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const owned = arena.allocator();
+    const root = try tmp.dir.realPathFileAlloc(io, ".", owned);
+    const repo = try std.fs.path.join(owned, &.{ root, "repo" });
+    const other = try std.fs.path.join(owned, &.{ root, "other" });
+    const home = try std.fs.path.join(owned, &.{ root, "catalog" });
+    const definition = try std.fs.path.join(owned, &.{ root, "definition.json" });
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "definition.json",
+        .data = @embedFile("fixtures/event-definition.json"),
+    });
+    var environment = std.process.Environ.Map.init(allocator);
+    defer environment.deinit();
+    try testBuildFamily(tmp.dir, &environment, root, repo, other, definition);
+    if (!catalog_sync) try testSelectedPending(&environment, root, repo, other, definition);
+    var unrelated = try host.initialize(allocator, io, &environment, .{ .catalog_root = home });
+    defer unrelated.deinit();
+    try tmp.dir.createDir(io, "plain", .default_dir);
+    const pending = @import("host_pending.zig");
+    var unrelated_pending = try pending.prepareTarget(allocator, io, &environment, .{
+        .catalog_root = home,
+        .workspace = try std.fs.path.join(owned, &.{ root, "plain" }),
+    }, true);
+    defer unrelated_pending.deinit();
+    const options: host.Options = .{ .catalog_root = home, .workspace = other };
+    var fault: AdoptionPublicationFault = .{ .io = io, .catalog_sync = catalog_sync };
+    AdoptionPublicationFault.active = &fault;
+    defer AdoptionPublicationFault.active = null;
+    var vtable = io.vtable.*;
+    vtable.dirRenamePreserve = AdoptionPublicationFault.renamePreserve;
+    vtable.fileSync = AdoptionPublicationFault.sync;
+    var injected = io;
+    injected.vtable = &vtable;
+    try std.testing.expectError(error.InputOutput, execute(
+        allocator,
+        injected,
+        &environment,
+        options,
+        repo,
+        &.{definition},
+        true,
+    ));
+    try std.testing.expect(fault.fired and fault.published_id != null);
+    const orphan = try std.fs.path.join(owned, &.{ home, "repos", &fault.published_id.? });
+    try testRetainedAdoption(
+        &environment,
+        options,
+        repo,
+        definition,
+        orphan,
+        &fault.published_id.?,
+    );
+}
+
+fn testRetainedAdoption(
+    environment: *const std.process.Environ.Map,
+    options: host.Options,
+    source: []const u8,
+    definition: []const u8,
+    orphan: []const u8,
+    id: []const u8,
+) !void {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var before = try legacy.coldInventory(
+        allocator,
+        io,
+        &.{orphan},
+        &.{"example/events.jsonl"},
+        .{},
+    );
+    defer before.deinit();
+    for (0..100) |_| try std.testing.expectError(error.UnregisteredCustodyExists, execute(
+        allocator,
+        io,
+        environment,
+        options,
+        source,
+        &.{definition},
+        true,
+    ));
+    var after = try legacy.coldInventory(
+        allocator,
+        io,
+        &.{orphan},
+        &.{"example/events.jsonl"},
+        .{},
+    );
+    defer after.deinit();
+    const expected = try before.json(allocator);
+    defer allocator.free(expected);
+    const actual = try after.json(allocator);
+    defer allocator.free(actual);
+    try std.testing.expectEqualStrings(expected, actual);
+    {
+        var lock = try host.catalog.Lock.acquire(io, options.catalog_root);
+        defer lock.deinit();
+        const repos = try lock.dir.openDir(io, "repos", .{ .iterate = true });
+        defer repos.close(io);
+        var entries = repos.iterate();
+        var count: usize = 0;
+        while (try entries.next(io)) |_| count += 1;
+        try std.testing.expectEqual(@as(usize, 3), count);
+    }
+    try testRegisterRetained(environment, options, orphan, id);
+}
+
+fn testRegisterRetained(
+    environment: *const std.process.Environ.Map,
+    options: host.Options,
+    root: []const u8,
+    id: []const u8,
+) !void {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var registered = try host.registerRoot(allocator, io, environment, options, root, id);
+    defer registered.deinit();
+    var selected = try host.resolve(allocator, io, environment, options);
+    defer selected.deinit();
+    try std.testing.expectEqualStrings(id, selected.value.store_id);
+    try std.testing.expectEqualStrings(root, selected.value.store_root);
+}
+
+fn testSelectedPending(
+    environment: *const std.process.Environ.Map,
+    root: []const u8,
+    repo: []const u8,
+    other: []const u8,
+    definition: []const u8,
+) !void {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const owned = arena.allocator();
+    const home = try std.fs.path.join(owned, &.{ root, "pending-catalog" });
+    var associations = try host.workspace.resolve(allocator, io, environment, other);
+    defer associations.deinit();
+    const pending = @import("host_pending.zig");
+    const controls_path = try pending.controlsPath(
+        owned,
+        other,
+        associations.git_common_dir,
+        home,
+    );
+    const controls = try host.catalog.openDirectory(io, controls_path, true);
+    defer controls.close(io);
+    const id = "0123456789abcdef0123456789abcdef";
+    const target = try std.fs.path.join(owned, &.{ home, "repos", id });
+    try host.catalog.writeJson(allocator, io, controls, "registration.json", pending.Registration{
+        .schema = host.catalog.registration_schema,
+        .store_id = id,
+        .store_root = target,
+        .workspace_root = associations.workspace_root.?,
+        .git_common_dir = associations.git_common_dir,
+    }, 4096);
+    const before = try host.catalog.readBytes(owned, io, controls, "registration.json", 4096);
+    for (0..3) |_| try std.testing.expectError(
+        error.PendingInitializationRequiresPreparation,
+        execute(
+            allocator,
+            io,
+            environment,
+            .{ .catalog_root = home, .workspace = repo },
+            repo,
+            &.{definition},
+            true,
+        ),
+    );
+    const after = try host.catalog.readBytes(owned, io, controls, "registration.json", 4096);
+    try std.testing.expectEqualStrings(before, after);
+    try std.testing.expect(!try host.catalog.exists(io, target));
 }

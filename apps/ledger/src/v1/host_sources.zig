@@ -45,15 +45,12 @@ pub fn trees(
     if (try catalog.existsAt(io, selected_dir, ".ledger-root.json"))
         return error.ManagedRootRequiresRegistration;
     const canonical = try selected_dir.realPathFileAlloc(io, ".", owned);
-    const paths = workspace.verifiedGit(
+    const paths = try workspace.gitOrPlain(
         owned,
         io,
         environment,
         canonical,
-    ) catch |err| switch (err) {
-        error.GitContextUnavailable => null,
-        else => return err,
-    };
+    );
     var result: Trees = .{
         .arena = arena,
         .roots = undefined,
@@ -68,28 +65,8 @@ pub fn trees(
         defer root_dir.close(io);
         if (try catalog.existsAt(io, root_dir, ".ledger-root.json"))
             return error.ManagedRootRequiresRegistration;
-        const output = try workspace.git(
-            owned,
-            io,
-            environment,
-            git.root,
-            &.{ "worktree", "list", "--porcelain", "-z" },
-        );
-        var fields = std.mem.splitScalar(u8, output, 0);
-        while (fields.next()) |field| {
-            if (!std.mem.startsWith(u8, field, "worktree ")) continue;
-            if (found.items.len == max_sources) return error.WorkspaceDiscoveryBoundExceeded;
-            const path = field["worktree ".len..];
-            const dir = catalog.openDirectory(io, path, false) catch |err| switch (err) {
-                error.FileNotFound => return error.UnavailableWorktree,
-                else => return err,
-            };
-            defer dir.close(io);
-            try found.append(owned, try dir.realPathFileAlloc(io, ".", owned));
-        }
-        if (found.items.len == 0) return error.IncompleteWorkspaceDiscovery;
+        try appendGitTrees(owned, io, environment, git, &found);
     } else {
-        try verifyPlainWorkspace(owned, io, environment, canonical);
         try found.append(owned, canonical);
     }
     for (found.items) |root| {
@@ -102,30 +79,38 @@ pub fn trees(
     return result;
 }
 
-fn verifyPlainWorkspace(
+fn appendGitTrees(
     owned: std.mem.Allocator,
     io: std.Io,
     environment: *const std.process.Environ.Map,
-    canonical: []const u8,
+    git: workspace.GitPaths,
+    found: *std.ArrayList([]const u8),
 ) !void {
-    var ancestor: ?[]const u8 = canonical;
-    while (ancestor) |path| {
-        const dir = try catalog.openDirectory(io, path, false);
+    const output = try workspace.git(
+        owned,
+        io,
+        environment,
+        git.root,
+        &.{ "worktree", "list", "--porcelain", "-z" },
+    );
+    var fields = std.mem.splitScalar(u8, output, 0);
+    while (fields.next()) |field| {
+        if (!std.mem.startsWith(u8, field, "worktree ")) continue;
+        if (found.items.len == max_sources) return error.WorkspaceDiscoveryBoundExceeded;
+        const path = field["worktree ".len..];
+        const dir = catalog.openDirectory(io, path, false) catch |err| switch (err) {
+            error.FileNotFound => return error.UnavailableWorktree,
+            else => return err,
+        };
         defer dir.close(io);
-        if (try catalog.existsAt(io, dir, ".git") or
-            (try catalog.existsAt(io, dir, "config") and
-                try catalog.existsAt(io, dir, "objects") and
-                try catalog.existsAt(io, dir, "refs")))
-            return error.UnverifiableGitFamily;
-        ancestor = std.fs.path.dirname(path);
-        if (ancestor != null and std.mem.eql(u8, ancestor.?, path)) break;
+        const canonical = try dir.realPathFileAlloc(io, ".", owned);
+        const verified = try workspace.verifiedGit(owned, io, environment, canonical);
+        if (!std.mem.eql(u8, verified.root, canonical) or
+            !std.mem.eql(u8, verified.common, git.common))
+            return error.WorktreeGitIdentityChanged;
+        try found.append(owned, canonical);
     }
-    if (workspace.git(owned, io, environment, canonical, &.{ "rev-parse", "--git-dir" })) |_| {
-        return error.UnverifiableGitFamily;
-    } else |err| switch (err) {
-        error.GitContextUnavailable => {},
-        else => return err,
-    }
+    if (found.items.len == 0) return error.IncompleteWorkspaceDiscovery;
 }
 
 pub fn discover(

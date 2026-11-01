@@ -732,7 +732,7 @@ const MigrationScratchTest = struct {
 test "pending migration scratch owns only its declared fixed layout across retries" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = try workspace.testPlainDirectory();
     defer tmp.cleanup();
     var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();
@@ -741,7 +741,6 @@ test "pending migration scratch owns only its declared fixed layout across retri
     const home = try std.fs.path.join(owned, &.{ root, "home" });
     var environment = std.process.Environ.Map.init(allocator);
     defer environment.deinit();
-    try environment.put("GIT_CEILING_DIRECTORIES", std.fs.path.dirname(root).?);
     const options: host.Options = .{ .catalog_root = home, .workspace = root };
     var target = try prepareTarget(allocator, io, &environment, options, true);
     defer target.deinit();
@@ -777,7 +776,7 @@ test "pending migration scratch owns only its declared fixed layout across retri
 test "pending migration scratch declaration rejects other versions and identities" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = try workspace.testPlainDirectory();
     defer tmp.cleanup();
     const registration: Registration = .{
         .schema = catalog.registration_schema,
@@ -803,7 +802,7 @@ test "pending migration scratch declaration rejects other versions and identitie
 test "pending migration declaration failure creates no scratch and retry reuses identity" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = try workspace.testPlainDirectory();
     defer tmp.cleanup();
     var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();
@@ -812,7 +811,6 @@ test "pending migration declaration failure creates no scratch and retry reuses 
     const home = try std.fs.path.join(owned, &.{ root, "home" });
     var environment = std.process.Environ.Map.init(allocator);
     defer environment.deinit();
-    try environment.put("GIT_CEILING_DIRECTORIES", std.fs.path.dirname(root).?);
     var target = try prepareTarget(
         allocator,
         io,
@@ -859,7 +857,7 @@ test "pending migration declaration failure creates no scratch and retry reuses 
 test "pending target persists identity across preparation retries and does not publish catalog" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = try workspace.testPlainDirectory();
     defer tmp.cleanup();
     const root = try tmp.dir.realPathFileAlloc(io, ".", allocator);
     defer allocator.free(root);
@@ -867,7 +865,6 @@ test "pending target persists identity across preparation retries and does not p
     defer allocator.free(home);
     var environment = std.process.Environ.Map.init(allocator);
     defer environment.deinit();
-    try environment.put("GIT_CEILING_DIRECTORIES", std.fs.path.dirname(root).?);
     const options: host.Options = .{ .catalog_root = home, .workspace = root };
     var first = try prepareTarget(allocator, io, &environment, options, true);
     const id = try allocator.dupe(u8, first.context.value.store_id);
@@ -896,7 +893,7 @@ test "pending target persists identity across preparation retries and does not p
 test "pending target refuses foreign skeleton data and retains locator identity" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = try workspace.testPlainDirectory();
     defer tmp.cleanup();
     const root = try tmp.dir.realPathFileAlloc(io, ".", allocator);
     defer allocator.free(root);
@@ -904,7 +901,6 @@ test "pending target refuses foreign skeleton data and retains locator identity"
     defer allocator.free(home);
     var environment = std.process.Environ.Map.init(allocator);
     defer environment.deinit();
-    try environment.put("GIT_CEILING_DIRECTORIES", std.fs.path.dirname(root).?);
     const options: host.Options = .{ .catalog_root = home, .workspace = root };
     var first = try prepareTarget(allocator, io, &environment, options, true);
     const custody = try allocator.dupe(u8, first.context.value.store_root);
@@ -925,7 +921,7 @@ test "pending bootstrap resumes durable locator root and control boundaries with
     const allocator = std.testing.allocator;
     const io = std.testing.io;
     for (0..3) |boundary| {
-        var tmp = std.testing.tmpDir(.{});
+        var tmp = try workspace.testPlainDirectory();
         defer tmp.cleanup();
         const root = try tmp.dir.realPathFileAlloc(io, ".", allocator);
         defer allocator.free(root);
@@ -952,7 +948,6 @@ test "pending bootstrap resumes durable locator root and control boundaries with
         }
         var environment = std.process.Environ.Map.init(allocator);
         defer environment.deinit();
-        try environment.put("GIT_CEILING_DIRECTORIES", std.fs.path.dirname(root).?);
         const options: host.Options = .{ .catalog_root = home, .workspace = root };
         const before = try catalog.readBytes(allocator, io, controls, "registration.json", 4096);
         defer allocator.free(before);
@@ -975,7 +970,7 @@ test "pending bootstrap resumes durable locator root and control boundaries with
 test "pending matching marker candidate keeps its inode and malformed candidate survives failure" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = try workspace.testPlainDirectory();
     defer tmp.cleanup();
     const id = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
     try tmp.dir.writeFile(io, .{ .sub_path = candidate_name, .data = "{partial" });
@@ -998,7 +993,7 @@ test "pending matching marker candidate keeps its inode and malformed candidate 
 test "pending identity prevents replacement initialization without holding catalog custody" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = try workspace.testPlainDirectory();
     defer tmp.cleanup();
     const root = try tmp.dir.realPathFileAlloc(io, ".", allocator);
     defer allocator.free(root);
@@ -1009,7 +1004,6 @@ test "pending identity prevents replacement initialization without holding catal
     try tmp.dir.createDir(io, "other", .fromMode(0o700));
     var environment = std.process.Environ.Map.init(allocator);
     defer environment.deinit();
-    try environment.put("GIT_CEILING_DIRECTORIES", std.fs.path.dirname(root).?);
     const options: host.Options = .{ .catalog_root = home, .workspace = root };
     var pending = try prepareTarget(allocator, io, &environment, options, true);
     defer pending.deinit();
@@ -1110,7 +1104,7 @@ const CatalogPublicationInterleaving = struct {
 test "pending target waits for catalog publication and reuses its initialized identity" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = try workspace.testPlainDirectory();
     defer tmp.cleanup();
     const root = try tmp.dir.realPathFileAlloc(io, ".", allocator);
     defer allocator.free(root);
@@ -1118,7 +1112,6 @@ test "pending target waits for catalog publication and reuses its initialized id
     defer allocator.free(home);
     var environment = std.process.Environ.Map.init(allocator);
     defer environment.deinit();
-    try environment.put("GIT_CEILING_DIRECTORIES", std.fs.path.dirname(root).?);
     const options: host.Options = .{ .catalog_root = home, .workspace = root };
     var interleaving: CatalogPublicationInterleaving = .{
         .io = io,
@@ -1238,7 +1231,7 @@ test "pending apply retries durability after locator and marker rename while ins
 fn testPendingSyncRetry(kind: PendingSyncFault.Kind) !void {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = try workspace.testPlainDirectory();
     defer tmp.cleanup();
     var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();
@@ -1247,7 +1240,6 @@ fn testPendingSyncRetry(kind: PendingSyncFault.Kind) !void {
     const home = try std.fs.path.join(owned, &.{ root, "home" });
     var environment = std.process.Environ.Map.init(allocator);
     defer environment.deinit();
-    try environment.put("GIT_CEILING_DIRECTORIES", std.fs.path.dirname(root).?);
     const options: host.Options = .{ .catalog_root = home, .workspace = root };
     var vtable = io.vtable.*;
     PendingSyncFault.root = "";
