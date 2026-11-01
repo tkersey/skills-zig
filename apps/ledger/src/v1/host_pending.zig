@@ -30,12 +30,11 @@ pub const Guard = struct {
         errdefer file.close(io);
         const stat = try file.stat(io);
         if (stat.kind != .file or stat.nlink != 1) return error.InvalidRegistrationLock;
-        for (0..301) |attempt| {
-            if (try file.tryLock(io, .exclusive)) return .{ .dir = dir, .file = file, .io = io };
-            if (attempt == 300) return error.RegistrationLockBusy;
-            try std.Io.sleep(io, .fromMilliseconds(100), .awake);
-        }
-        unreachable;
+        catalog.lockExclusive(io, file) catch |err| switch (err) {
+            error.LockBusy => return error.RegistrationLockBusy,
+            else => return err,
+        };
+        return .{ .dir = dir, .file = file, .io = io };
     }
 
     pub fn deinit(self: *Guard) void {
@@ -716,7 +715,7 @@ const CatalogPublicationInterleaving = struct {
     fn prepare(self: *CatalogPublicationInterleaving) void {
         defer self.ready.set(self.io);
         var vtable = self.io.vtable.*;
-        vtable.fileLock = waitForCatalog;
+        vtable.fileTryLock = waitForCatalog;
         var injected = self.io;
         injected.vtable = &vtable;
         var target = prepareTarget(
@@ -737,11 +736,14 @@ const CatalogPublicationInterleaving = struct {
         userdata: ?*anyopaque,
         file: std.Io.File,
         mode: std.Io.File.Lock,
-    ) std.Io.File.LockError!void {
+    ) std.Io.File.LockError!bool {
         const self = active.?;
-        self.waited_for_catalog = true;
-        self.ready.set(self.io);
-        return self.io.vtable.fileLock(userdata, file, mode);
+        const acquired = try self.io.vtable.fileTryLock(userdata, file, mode);
+        if (!acquired) {
+            self.waited_for_catalog = true;
+            self.ready.set(self.io);
+        }
+        return acquired;
     }
 
     fn rename(

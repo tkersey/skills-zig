@@ -61,6 +61,8 @@ creates new custody only after checking known history; it never replaces a
 missing cataloged root. `--register-root`, `--import-registration`, and
 `--attach-workspace` retain existing IDs, roots, layouts, and records. Existing
 `ledger-personal-catalog/v1` catalogs and Git registration files remain readable.
+Catalog and pending-initialization locks allow 300 retries at 100 ms intervals
+before returning a busy error. Timeout never removes a lock or transfers ownership.
 
 An owner call supplies `--definition` and its explicit `--owner-manifest`.
 `--ensure-owner` prepares compatible selected history; `--read-only` refuses

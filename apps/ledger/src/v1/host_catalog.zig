@@ -248,7 +248,10 @@ pub const Lock = struct {
         const file = try openLock(io, dir, "catalog.lock");
         errdefer file.close(io);
         if ((try file.stat(io)).kind != .file) return error.InvalidCatalogLock;
-        try file.lock(io, .exclusive);
+        lockExclusive(io, file) catch |err| switch (err) {
+            error.LockBusy => return error.CatalogLockBusy,
+            else => return err,
+        };
         return .{ .dir = dir, .file = file, .io = io };
     }
 
@@ -295,6 +298,15 @@ pub fn openLock(io: std.Io, dir: std.Io.Dir, name: []const u8) !std.Io.File {
         };
     }
     return error.LockFileDisappeared;
+}
+
+pub fn lockExclusive(io: std.Io, file: std.Io.File) !void {
+    for (0..301) |attempt| {
+        if (try file.tryLock(io, .exclusive)) return;
+        if (attempt == 300) return error.LockBusy;
+        try std.Io.sleep(io, .fromMilliseconds(100), .awake);
+    }
+    unreachable;
 }
 
 pub fn openDirectory(io: std.Io, path: []const u8, create: bool) !std.Io.Dir {
@@ -556,4 +568,51 @@ test "catalog oversized publication leaves prior readable metadata intact" {
     const after = try readBytes(allocator, io, tmp.dir, filename, max_catalog_bytes);
     defer allocator.free(after);
     try std.testing.expectEqualStrings(before, after);
+}
+
+const ContendedLockWait = struct {
+    var slept_ns: i96 = 0;
+
+    fn sleep(_: ?*anyopaque, timeout: std.Io.Timeout) std.Io.Cancelable!void {
+        std.debug.assert(timeout == .duration);
+        std.debug.assert(timeout.duration.clock == .awake);
+        slept_ns += timeout.duration.raw.nanoseconds;
+    }
+
+    fn blockingLock(
+        _: ?*anyopaque,
+        _: std.Io.File,
+        _: std.Io.File.Lock,
+    ) std.Io.File.LockError!void {
+        return error.Unexpected;
+    }
+};
+
+test "catalog contention has a bounded wait and preserves the active lock" {
+    const io = std.testing.io;
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const home = try tmp.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(home);
+    var vtable = io.vtable.*;
+    vtable.sleep = ContendedLockWait.sleep;
+    vtable.fileLock = ContendedLockWait.blockingLock;
+    var bounded = io;
+    bounded.vtable = &vtable;
+    ContendedLockWait.slept_ns = 0;
+    var inode: std.Io.File.INode = undefined;
+    {
+        var active = try Lock.acquire(io, home);
+        defer active.deinit();
+        inode = (try active.file.stat(io)).inode;
+        try std.testing.expectError(error.CatalogLockBusy, Lock.acquire(bounded, home));
+        try std.testing.expectEqual(@as(i96, 30 * std.time.ns_per_s), ContendedLockWait.slept_ns);
+        try std.testing.expectEqual(inode, (try active.file.stat(io)).inode);
+        try std.testing.expect(!try existsAt(io, tmp.dir, filename));
+    }
+    var acquired = try Lock.acquire(bounded, home);
+    defer acquired.deinit();
+    try std.testing.expectEqual(inode, (try acquired.file.stat(io)).inode);
+    try std.testing.expectEqual(@as(i96, 30 * std.time.ns_per_s), ContendedLockWait.slept_ns);
 }
