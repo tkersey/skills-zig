@@ -34,7 +34,6 @@ jobs:
     outputs:
       seq: ${{ steps.classify.outputs.seq }}
       lift: ${{ steps.classify.outputs.lift }}
-      cas: ${{ steps.classify.outputs.cas }}
       ledger: ${{ steps.classify.outputs.ledger }}
       memory_note: ${{ steps.classify.outputs.memory_note }}
       siwc: ${{ steps.classify.outputs.siwc }}
@@ -59,17 +58,15 @@ jobs:
           if grep -Fxq ".github/scripts/linux_fuzz_gate.sh" <<<"$changed_paths"; then
             selected[seq]=true
             selected[lift]=true
-            selected[cas]=true
           fi
 
-          for app in seq lift cas ledger memory-note siwc; do
+          for app in seq lift ledger memory-note siwc; do
             output_name="${app//-/_}"
             echo "${output_name}=${selected[$app]:-false}" >> "$GITHUB_OUTPUT"
           done
 
           perf=${selected[seq]:-false}
-          if [[ "${selected[cas]:-false}" == true ]] ||
-             grep -Fxq 'build.zig' <<<"$changed_paths" ||
+          if grep -Fxq 'build.zig' <<<"$changed_paths" ||
              grep -Fxq 'tools/perf_hub.zig' <<<"$changed_paths" ||
              grep -Fxq 'tools/perf_contract.zig' <<<"$changed_paths" ||
              grep -Fxq 'tools/seq_replay_driver.zig' <<<"$changed_paths" ||
@@ -105,8 +102,6 @@ jobs:
         run: .github/scripts/test_seq_release_transaction.sh
       - name: Test Lift archive verifier
         run: .github/scripts/test_verify_lift_archive.sh
-      - name: Test CAS archive verifier
-        run: .github/scripts/test_verify_cas_archive.sh
       - name: Require VERSION bumps for release-relevant CLI changes
         run: |
           set -euo pipefail
@@ -214,220 +209,9 @@ jobs:
           .github/scripts/linux_fuzz_gate.sh -- zig build test-lift-bench-stats
           -Doptimize=safe --fuzz=100K --summary all
 
-  cas:
+  full-suite-linux:
     needs: changes
-    if: needs.changes.outputs.cas == 'true'
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - os: ubuntu-latest
-            platform: linux-x86_64
-            zig_target: x86_64-linux-musl
-            cas_static: true
-            runner_arch: X64
-            codex_asset: codex-package-x86_64-unknown-linux-musl.tar.gz
-            codex_archive_sha256: 042f851ea3fc1083c45157520520944fc790632b53ebc580fc98eaca55862a25
-          - os: macos-15
-            platform: macos-aarch64
-            zig_target: aarch64-macos.15.0
-            cas_static: false
-            runner_arch: ARM64
-            codex_asset: codex-package-aarch64-apple-darwin.tar.gz
-            codex_archive_sha256: 97809f91cb355e55480cd7a126f9ad24bb7b162222515e30286bcac6fba94acd
-    runs-on: ${{ matrix.os }}
-    steps:
-      - uses: actions/checkout@v4
-      - uses: mlugg/setup-zig@v2
-        with:
-          version: 0.17.0
-      # This exact release is a reproducible compatibility fixture, not a
-      # minimum supported Codex version or an admission rule.
-      - name: Install reproducible Codex compatibility fixture
-        shell: bash
-        env:
-          CODEX_ASSET: ${{ matrix.codex_asset }}
-          CODEX_ARCHIVE_SHA256: ${{ matrix.codex_archive_sha256 }}
-          CODEX_PLATFORM: ${{ matrix.platform }}
-          EXPECTED_RUNNER_ARCH: ${{ matrix.runner_arch }}
-        run: |
-          set -euo pipefail
-
-          if [[ "${RUNNER_ARCH}" != "${EXPECTED_RUNNER_ARCH}" ]]; then
-            echo "Expected ${CODEX_PLATFORM} runner architecture ${EXPECTED_RUNNER_ARCH}, got ${RUNNER_ARCH}" >&2
-            exit 1
-          fi
-
-          qualification_version="0.157.0"
-          release_url="https://github.com/openai/codex/releases/download/rust-v${qualification_version}/${CODEX_ASSET}"
-          archive="${RUNNER_TEMP}/${CODEX_ASSET}"
-          extract_dir="${RUNNER_TEMP}/codex-${qualification_version}"
-          bin_dir="${RUNNER_TEMP}/codex-bin"
-          stable_schema_dir="${RUNNER_TEMP}/codex-schema/stable"
-          experimental_schema_dir="${RUNNER_TEMP}/codex-schema/experimental"
-          evidence="${RUNNER_TEMP}/cas-codex-${qualification_version}-${CODEX_PLATFORM}.txt"
-
-          curl --fail --location --retry 3 --output "${archive}" "${release_url}"
-          archive_sha256="$(shasum -a 256 "${archive}" | awk '{print $1}')"
-          if [[ "${archive_sha256}" != "${CODEX_ARCHIVE_SHA256}" ]]; then
-            echo "Codex archive digest mismatch: expected ${CODEX_ARCHIVE_SHA256}, got ${archive_sha256}" >&2
-            exit 1
-          fi
-
-          mkdir -p "${extract_dir}" "${bin_dir}" "${stable_schema_dir}" "${experimental_schema_dir}"
-          tar -xzf "${archive}" -C "${extract_dir}"
-          package_bin="${extract_dir}/bin"
-          if [[ -z "${package_bin}" || ! -x "${package_bin}/codex" || ! -x "${package_bin}/codex-code-mode-host" ]]; then
-            echo "Expected Codex app-server package binaries in ${CODEX_ASSET}" >&2
-            exit 1
-          fi
-          cp "${package_bin}/codex" "${package_bin}/codex-code-mode-host" "${bin_dir}/"
-          chmod +x "${bin_dir}/codex" "${bin_dir}/codex-code-mode-host"
-
-          codex_version="$("${bin_dir}/codex" --version)"
-          if [[ "${codex_version}" != "codex-cli ${qualification_version}" ]]; then
-            echo "Expected qualification baseline codex-cli ${qualification_version}, got ${codex_version}" >&2
-            exit 1
-          fi
-          binary_sha256="$(shasum -a 256 "${bin_dir}/codex" | awk '{print $1}')"
-
-          "${bin_dir}/codex" app-server generate-json-schema --out "${stable_schema_dir}"
-          "${bin_dir}/codex" app-server generate-json-schema --experimental --out "${experimental_schema_dir}"
-
-          digest_directory() {
-            local directory="$1"
-            (
-              cd "${directory}"
-              find . -type f -print | LC_ALL=C sort | while IFS= read -r schema_path; do
-                file_sha256="$(shasum -a 256 "${schema_path}" | awk '{print $1}')"
-                printf '%s  %s\n' "${file_sha256}" "${schema_path}"
-              done
-            ) | shasum -a 256 | awk '{print $1}'
-          }
-
-          stable_schema_sha256="$(digest_directory "${stable_schema_dir}")"
-          experimental_schema_sha256="$(digest_directory "${experimental_schema_dir}")"
-          {
-            echo "platform=${CODEX_PLATFORM}"
-            echo "runner_os=${RUNNER_OS}"
-            echo "runner_arch=${RUNNER_ARCH}"
-            echo "uname=$(uname -a)"
-            echo "release=rust-v${qualification_version}"
-            echo "archive=${CODEX_ASSET}"
-            echo "archive_sha256=${archive_sha256}"
-            echo "codex_version=${codex_version}"
-            echo "binary_sha256=${binary_sha256}"
-            echo "stable_schema_sha256=${stable_schema_sha256}"
-            echo "experimental_schema_sha256=${experimental_schema_sha256}"
-          } | tee "${evidence}"
-
-          {
-            echo "### CAS reproducible Codex compatibility fixture (${CODEX_PLATFORM})"
-            echo '```text'
-            cat "${evidence}"
-            echo '```'
-          } >> "${GITHUB_STEP_SUMMARY}"
-
-          echo "CODEX_BIN=${bin_dir}/codex" >> "${GITHUB_ENV}"
-          echo "${bin_dir}" >> "${GITHUB_PATH}"
-      - name: Fetch pinned SQLite amalgamation
-        shell: bash
-        run: |
-          set -euo pipefail
-          sqlite_version=3450100
-          sqlite_sha256=5592243caf28b2cdef41e6ab58d25d653dfc53deded8450eb66072c929f030c4
-          sqlite_archive="${RUNNER_TEMP}/sqlite-amalgamation-${sqlite_version}.zip"
-          sqlite_root="${RUNNER_TEMP}/sqlite-amalgamation-${sqlite_version}"
-          curl --fail --location --retry 3 \
-            --output "${sqlite_archive}" \
-            "https://www.sqlite.org/2024/sqlite-amalgamation-${sqlite_version}.zip"
-          actual_sha256="$(shasum -a 256 "${sqlite_archive}" | awk '{print $1}')"
-          if [[ "${actual_sha256}" != "${sqlite_sha256}" ]]; then
-            echo "SQLite archive digest mismatch: ${actual_sha256}" >&2
-            exit 1
-          fi
-          unzip -q "${sqlite_archive}" -d "${RUNNER_TEMP}"
-          test -f "${sqlite_root}/sqlite3.c"
-          echo "CAS_SQLITE_AMALGAMATION=${sqlite_root}/sqlite3.c" >> "${GITHUB_ENV}"
-      - name: Build cas binaries
-        run: >-
-          zig build build-cas
-          -Dtarget=${{ matrix.zig_target }}
-          -Dcpu=baseline
-          -Doptimize=fast
-          -Dcas-static=${{ matrix.cas_static }}
-          -Dcas-sqlite-amalgamation="${CAS_SQLITE_AMALGAMATION}"
-      - name: Verify pinned SQLite release boundary
-        shell: bash
-        run: |
-          set -euo pipefail
-          case "${RUNNER_OS}" in
-            Linux)
-              for binary in \
-                cas cas_account cas_app_server_preflight cas_automation \
-                cas_smoke_check cas_instance_runner cas_review_session \
-                cas_session_inquiry cas_conformance_suite cas_goal; do
-                if objdump -p "zig-out/bin/${binary}" | grep -Fq NEEDED; then
-                  echo "CAS release binary is dynamically linked: ${binary}" >&2
-                  exit 1
-                fi
-              done
-              ;;
-            macOS)
-              if otool -L zig-out/bin/cas_automation | grep -Fq libsqlite3; then
-                echo "CAS Automation unexpectedly depends on system SQLite" >&2
-                exit 1
-              fi
-              ;;
-          esac
-          apps/cas/testdata/automation/cron-0.2.13/verify.sh \
-            ./zig-out/bin/cas automation
-      - name: Verify Codex app-server capability contract
-        run: .github/scripts/test_cas_app_server_preflight.sh "${CODEX_BIN}"
-      - name: Verify packaged Linux CAS dispatcher layout
-        if: matrix.platform == 'linux-x86_64'
-        run: |
-          set -euo pipefail
-          package_dir="$(mktemp -d "${RUNNER_TEMP}/cas-release.XXXXXX")"
-          trap 'rm -rf "$package_dir"' EXIT
-          archive="${RUNNER_TEMP}/cas-pr-linux-x86_64.tar.gz"
-          cp zig-out/bin/cas "${package_dir}/cas"
-          cp zig-out/bin/cas_account "${package_dir}/cas_account"
-          cp zig-out/bin/cas_app_server_preflight "${package_dir}/cas_app_server_preflight"
-          cp zig-out/bin/cas_automation "${package_dir}/cas_automation"
-          cp zig-out/bin/cas_smoke_check "${package_dir}/cas_smoke_check"
-          cp zig-out/bin/cas_smoke_check "${package_dir}/cas-smoke-check"
-          cp zig-out/bin/cas_instance_runner "${package_dir}/cas_instance_runner"
-          cp zig-out/bin/cas_instance_runner "${package_dir}/cas-instance-runner"
-          cp zig-out/bin/cas_review_session "${package_dir}/cas_review_session"
-          cp zig-out/bin/cas_review_session "${package_dir}/cas-review-session"
-          cp zig-out/bin/cas_session_inquiry "${package_dir}/cas_session_inquiry"
-          cp zig-out/bin/cas_session_inquiry "${package_dir}/cas-session-inquiry"
-          cp zig-out/bin/cas_conformance_suite "${package_dir}/cas_conformance_suite"
-          cp zig-out/bin/cas_conformance_suite "${package_dir}/cas-conformance-suite"
-          cp zig-out/bin/cas_goal "${package_dir}/cas_goal"
-          cp zig-out/bin/cas_goal "${package_dir}/cas-goal"
-          tar -czf "${archive}" -C "${package_dir}" .
-          .github/scripts/verify_cas_archive.sh linux-x86_64 "${archive}"
-      - name: Test generic CAS surfaces
-        if: runner.os != 'Linux'
-        run: zig build test-cas
-      - name: Install full-suite guard dependency
-        if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install --yes ripgrep
-      - name: Qualify full suite on native Linux
-        if: runner.os == 'Linux'
-        run: zig build test-full -Doptimize=debug -j2 --summary all
-      - name: Upload exact Codex evidence
-        uses: actions/upload-artifact@v4
-        with:
-          name: cas-codex-0.157.0-${{ matrix.platform }}
-          path: ${{ runner.temp }}/cas-codex-0.157.0-${{ matrix.platform }}.txt
-          if-no-files-found: error
-
-  cas-fuzz-linux:
-    needs: changes
-    if: needs.changes.outputs.cas == 'true'
+    if: contains(needs.changes.outputs.*, 'true')
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
@@ -435,10 +219,27 @@ jobs:
       - uses: mlugg/setup-zig@v2
         with:
           version: 0.17.0
-      - name: Fuzz CAS budget governor (Linux)
-        run: >-
-          .github/scripts/linux_fuzz_gate.sh -- zig build test-cas-budget-governor
-          -Doptimize=safe --fuzz=100K --summary all
+      - name: Install full-suite guard dependency
+        run: sudo apt-get update && sudo apt-get install --yes ripgrep
+      - name: Qualify full suite on native Linux
+        run: zig build test-full -Doptimize=debug -j2 --summary all
+
+  build-all-linux:
+    needs: changes
+    if: contains(needs.changes.outputs.*, 'true')
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.17.0
+      - name: Build and verify the surviving executable inventory
+        run: |
+          zig build -Doptimize=fast -j2 --summary all
+          printf '%s\n' bench_stats ledger memory-note perf_hub seq siwc > expected-binaries.txt
+          find zig-out/bin -maxdepth 1 -type f -printf '%f\n' | LC_ALL=C sort > actual-binaries.txt
+          diff -u expected-binaries.txt actual-binaries.txt
 
   perf-hub:
     needs: changes

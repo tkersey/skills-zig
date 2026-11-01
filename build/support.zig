@@ -123,7 +123,6 @@ pub const AppSurface = struct {
 
 pub const TestStepOptions = struct {
     link_libc: bool = false,
-    sqlite: bool = false,
     cwd: ?std.Build.LazyPath = null,
     filters: []const []const u8 = &.{},
 };
@@ -230,7 +229,6 @@ pub fn addTestStepWithOptions(
     const tests = b.addTest(.{ .root_module = root_module, .filters = options.filters });
     if (options.link_libc) {
         tests.root_module.linkSystemLibrary("c", .{});
-        if (options.sqlite) tests.root_module.linkSystemLibrary("sqlite3", .{});
     }
     const run_tests = b.addRunArtifact(tests);
     if (options.cwd) |cwd| run_tests.setCwd(cwd);

@@ -1,5 +1,11 @@
 # CLI optimization measurements
 
+Historical record: CAS has since been retired. CAS-specific commands and source
+paths below apply to the recorded pre-retirement revisions, not the current
+build. The last source baseline before this removal is
+`d92e5e3cf10c203c4515af534aa489195ff7c5db`; retain the original measured revisions
+and hashes when reproducing a reported comparison.
+
 Baseline: `8e470a24b533dba479f39f7ae3cc7f07b5fc5aeb`. Candidate: the implementation
 and source hashes published with this report. Zig 0.17.0, ReleaseFast, native
 Apple M2 Pro ARM64, macOS 27.2. Build work for this task was stopped during timing;

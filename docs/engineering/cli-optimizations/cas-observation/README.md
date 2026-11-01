@@ -1,5 +1,11 @@
 # CAS observation allocation benchmark
 
+Historical record: CAS has since been retired. CAS-specific commands and source
+paths below apply to the recorded pre-retirement revisions, not the current
+build. The last source baseline before this removal is
+`d92e5e3cf10c203c4515af534aa489195ff7c5db`; retain the original measured revisions
+and hashes when reproducing a reported comparison.
+
 This benchmark isolates request construction and notification-buffer ownership for
 1,000 inquiry polling cycles. It uses synthetic data and performs no RPC, account,
 model, filesystem-log, or sleep operations. It does not measure end-to-end inquiry

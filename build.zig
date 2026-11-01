@@ -23,11 +23,9 @@ pub fn build(b: *std.Build) void {
     const shared = SharedModules.init(ctx);
     const seq = @import("build/apps/seq.zig").build(ctx, shared);
     const ledger = @import("build/apps/ledger.zig").build(ctx, shared);
-    const cas = @import("build/apps/cas.zig").build(ctx, shared);
     const surfaces = [_]AppSurface{
         seq.surface,
         @import("build/apps/lift.zig").build(ctx, shared),
-        cas.surface,
         ledger.surface,
         @import("build/apps/memory-note.zig").build(ctx, shared),
         @import("build/apps/siwc.zig").build(ctx, shared),
@@ -56,7 +54,7 @@ pub fn build(b: *std.Build) void {
     );
     routine.dependOn(&install_guard_tests.step);
     addSlowTests(ctx, shared, full);
-    addPerformance(ctx, shared, seq.core, ledger.core, cas.automation, routine);
+    addPerformance(ctx, shared, seq.core, ledger.core, routine);
     addLint(ctx, &surfaces);
 }
 
@@ -212,7 +210,6 @@ fn addPerformance(
     shared: SharedModules,
     seq_v1_core: *std.Build.Module,
     ledger_v1_core: *std.Build.Module,
-    cas_automation_root: *std.Build.Module,
     routine: *std.Build.Step,
 ) void {
     const b = ctx.b;
@@ -222,7 +219,6 @@ fn addPerformance(
         .{ .name = "definition_core", .module = shared.definitions },
         .{ .name = "durable_store", .module = shared.durable },
         .{ .name = "perf_contract", .module = shared.perf_contract },
-        .{ .name = "cas_automation_cli", .module = cas_automation_root },
         .{ .name = "seq_v1_core", .module = seq_v1_core },
     });
     const perf_hub = support.addInstalledExecutable(b, "perf_hub", perf_hub_root);

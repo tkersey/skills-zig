@@ -4,20 +4,18 @@ This monorepo uses independent GitHub Actions release workflows per CLI:
 
 - `seq`: `.github/workflows/release-seq.yml` on tag `seq-v*`
 - `lift`: `.github/workflows/release-lift.yml` on tag `lift-v*`
-- `cas`: `.github/workflows/release-cas.yml` on tag `cas-v*`
 - `ledger`: `.github/workflows/release-ledger.yml` on tag `ledger-v*`
 - `memory-note`: `.github/workflows/release-memory-note.yml` on tag `memory-note-v*`
 - `siwc`: `.github/workflows/release-siwc.yml` on tag `siwc-v*`
 
-Codex automation is part of CAS 0.4 and is invoked through `cas automation`.
-It uses the CAS build, version, tag, release archives, and tap formula; there is
-no standalone release identity or compatibility alias.
+CAS is retired; it has no current build, VERSION, tag dispatcher, or release
+workflow. Existing releases and local automation data are not deleted. See
+[retirement migration](#cli-retirement-migration) for existing installations.
 
 Per-app VERSION files:
 
 - `apps/seq/VERSION`
 - `apps/lift/VERSION`
-- `apps/cas/VERSION`
 - `apps/ledger/VERSION`
 - `apps/memory-note/VERSION`
 - `apps/siwc/VERSION`
@@ -31,10 +29,9 @@ Release contract:
    - Root `build.zig`, `build.zig.zon`, shared `build/support.zig`, and unknown `build/**` or `libs/**` paths count for every shipped CLI. Classification uses both sides of renamed or moved paths; root-build diff text is never interpreted as ownership.
    - broad shared shipped surfaces (`libs/core/**`) count for every shipped CLI.
    - shared install admission (`apps/seq/build_support.zig` and `tools/install_guard.zig`) counts for every shipped CLI, regardless of its source directory.
-   - `libs/definition_core/**` and `libs/definition_compat/**` count for their shipped consumers: `seq`, `cas`, and `ledger`.
-   - `libs/durable_store/**` and `libs/jsonl_core/**` count for their shipped consumers: `seq`, `cas`, `ledger`, `memory-note`, and `siwc`.
-   - `libs/trace_core/**` counts for its shipped consumers: `seq` and `cas`.
-   - `libs/cas_runtime/**` counts for CAS, its sole shipped consumer.
+   - `libs/definition_core/**` and `libs/definition_compat/**` count for their shipped consumers: `seq` and `ledger`.
+   - `libs/durable_store/**` and `libs/jsonl_core/**` count for their shipped consumers: `seq`, `ledger`, `memory-note`, and `siwc`.
+   - `libs/trace_core/**` counts for its shipped consumers: `seq`.
    - `libs/siwc/**` counts for SIWC, its sole shipped consumer.
    - `.github/workflows/release-<cli>.yml` counts for that CLI's packaged artifact contract.
    Durable-store changes that alter lease locks, fencing counters, CAS writes, transaction recovery, or semantic concurrency errors must be treated as release-relevant for every shipped consumer whose command behavior depends on those paths.
@@ -43,11 +40,11 @@ Release contract:
 5. Generic release builds must declare their target architecture and use Zig's baseline CPU. Build-time dependencies carried by a release binary must be content-addressed rather than inherited from the build runner. Direct Zig downloads must match the pinned archive checksum; setup-zig verifies the upstream signature. Clean runners prepare the package-cache directory before fetching dependencies. macOS artifacts require macOS 15 and use the explicit `aarch64-macos.15.0` target; tap formulas must declare the same minimum.
 
 Root build assembly creates the shared modules once through `build/support.zig` and
-passes them to the six `build/apps/<cli>.zig` owners. The root package includes the
+passes them to the five `build/apps/<cli>.zig` owners. The root package includes the
 whole `build/` directory; PR CI, Auto Release, cache inputs, and lint cover it.
 The install guard remains in `apps/seq/build_support.zig` so both root and standalone
 Seq builds share the same make-time admission. Releases build the repository checkout
-and package the same executable names and CAS sibling layout.
+and package the surviving executable names without a CAS sibling layout.
 
 `affected` selects release-relevant applications, `ci-affected` additionally selects
 all applications for CI/classifier changes, and `version-changed` selects only edited
@@ -59,12 +56,11 @@ Release tags must match file versions:
 
 - `seq-v<version>` where `<version>` equals `apps/seq/VERSION`
 - `lift-v<version>` where `<version>` equals `apps/lift/VERSION`
-- `cas-v<version>` where `<version>` equals `apps/cas/VERSION`
 - `ledger-v<version>` where `<version>` equals `apps/ledger/VERSION`
 - `memory-note-v<version>` where `<version>` equals `apps/memory-note/VERSION`
 - `siwc-v<version>` where `<version>` equals `apps/siwc/VERSION`
 
-Each workflow publishes two release archives for its independently versioned CLI. CAS neither bundles nor executes Ledger; caller workflows validate inquiry carriers before handing them to CAS.
+Each workflow publishes two release archives for its independently versioned CLI.
 
 - `<tag>-linux-x86_64.tar.gz`
 - `<tag>-darwin-arm64.tar.gz`
@@ -75,8 +71,6 @@ Examples:
 - `seq-v1.2.3-darwin-arm64.tar.gz`
 - `lift-v1.2.3-linux-x86_64.tar.gz`
 - `lift-v1.2.3-darwin-arm64.tar.gz`
-- `cas-v1.2.3-linux-x86_64.tar.gz`
-- `cas-v1.2.3-darwin-arm64.tar.gz`
 - `ledger-v1.2.3-linux-x86_64.tar.gz`
 - `ledger-v1.2.3-darwin-arm64.tar.gz`
 - `memory-note-v1.2.3-linux-x86_64.tar.gz`
@@ -144,34 +138,63 @@ propagation is not blocked:
 
 ## CLI retirement migration
 
-TypeSafe is retired. Lift now ships only `bench_stats`; `perf_report` is removed.
-The Lift parser and CAS budget-governor benchmarks remain available through
-`zig build bench-lift-bench-stats` and `zig build bench-cas-budget-governor`, with
-no installed or packaged benchmark executable. Existing data and evidence need
-no migration. Historical releases and evidence remain unchanged.
+### CAS
 
-After all five release families are published, update the tap's five surviving
-formulas together using the actual two-platform archive hashes, and remove its
-TypeSafe formula. Lift archives contain only the executable `lift-bench-stats`,
-renamed to `bench_stats` by the formula. CAS archives contain the ten functional
-executables and six existing hyphenated compatibility copies (16 members); its
-formula exposes ten names. Always stage explicit filenames in a fresh directory
-and run the respective archive verifier before publication.
+CAS is retired after the native-Codex skill migration in
+[dotfiles #387](https://github.com/tkersey/dotfiles/pull/387). This source removal
+eliminates its executables, runtime library, benchmarks, packaging, and release
+selection. It does not install a compatibility shim, mutate Codex data, stop a
+scheduler, uninstall a package, or remove historical releases and evidence.
+The root-build change follows the existing conservative release rule: all five
+surviving CLIs receive VERSION bumps and normal release qualification.
 
-For an existing installation, check `brew list --versions` and `brew list --pinned`
-first. Upgrade only installed formulas, without automatically unpinning anything:
+Before uninstalling an existing CAS package, inspect the actual local scheduler
+and external callers. In particular, the old launchd job can invoke
+`cas automation run-due` or the `cas_automation` sibling. The default label was
+`com.openai.codex.automation-runner`; custom labels and independent installations
+are possible. A repository scan does not establish absence of host dependencies.
+Migrate needed schedules or deliberately retire them with the owner's authority
+before removing their executable. Native Codex execution is not an automatic
+replacement for the old automation store/scheduler semantics.
+
+Preserve `~/.codex/sqlite/codex-dev.db`, `~/.codex/automations/`, run history,
+memories, logs, and historical review evidence. Do not rewrite these into a new
+store or delete them during package cleanup. Unresolved scheduler inventory is
+a blocker to local uninstallation, not permission to assume no jobs exist.
+
+The linked Homebrew tap change removes `Formula/cas.rb` and its installation
+listing. It does not uninstall existing kegs. Once dependencies are resolved,
+use Homebrew's supported uninstall operation for the verified owned package;
+check `brew list --versions`, `brew list --pinned`, and command resolution first.
+Do not unpin automatically, delete same-name files manually, or remove an
+independently installed tool. No local uninstallation is implied by merging
+these repository PRs.
+
+Historical CAS performance capsules keep their original bytes. Their removed
+cases are not active performance workloads; use the recorded original revision
+and toolchain for historical readback/reproduction. Compare-and-swap operations
+in the surviving generic storage libraries are unrelated to the retired CLI.
+
+### Earlier TypeSafe and Lift retirements
+
+TypeSafe is retired. Lift ships only `bench_stats`; `perf_report` is removed.
+The Lift parser benchmark remains `zig build bench-lift-bench-stats`, with no
+installed or packaged benchmark executable. Existing data and historical
+release evidence remain unchanged. Lift archives contain only
+`lift-bench-stats`, renamed to `bench_stats` by the formula; use the Lift archive
+verifier before publication.
+
+Upgrade only installed surviving formulas, without automatically unpinning any:
 
 ```bash
 brew update
-brew upgrade --formula tkersey/tap/seq tkersey/tap/lift tkersey/tap/cas tkersey/tap/ledger tkersey/tap/memory-note
+brew upgrade --formula tkersey/tap/seq tkersey/tap/lift tkersey/tap/ledger tkersey/tap/memory-note tkersey/tap/siwc
 # Only if the owned TypeSafe package is installed:
 brew uninstall --formula tkersey/tap/typesafe
 ```
 
-If the deleted formula name cannot be resolved, inspect the existing keg's recorded
+If a removed formula name cannot be resolved, inspect the existing keg's recorded
 identity and use Homebrew's supported uninstall path for that installation.
-Do not delete same-name files manually. Verify actual formula prefixes and versions,
-Lift's one-name bin inventory, CAS's ten-name bin inventory, and the active prefix's
-absence of `typesafe`, `perf_report`, `lift-perf-bench-stats`, and
-`cas-perf-budget-governor`. Check command resolution for independent copies and
-alternate prefixes; report them separately. Old unlinked kegs are not active commands.
+Verify actual prefixes, versions, and executable inventories; old unlinked kegs
+are not active commands. Independent copies and alternate prefixes remain
+separate observations.

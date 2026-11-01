@@ -1,5 +1,11 @@
 # CAS stdio framing reproduction
 
+Historical record: CAS has since been retired. CAS-specific commands and source
+paths below apply to the recorded pre-retirement revisions, not the current
+build. The last source baseline before this removal is
+`d92e5e3cf10c203c4515af534aa489195ff7c5db`; retain the original measured revisions
+and hashes when reproducing a reported comparison.
+
 This synthetic benchmark calls the actual `Client.readLineAlloc` implementation
 with an in-memory unseekable input. It compares the byte-at-a-time reader and
 repeated prefix scan with the persistent 4 KiB reader and incremental line cursor.
