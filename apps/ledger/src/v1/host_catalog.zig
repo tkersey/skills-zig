@@ -428,7 +428,12 @@ pub fn noSymlinks(io: std.Io, path: []const u8) !void {
 }
 
 pub fn sync(io: std.Io, dir: std.Io.Dir) !void {
-    const file: std.Io.File = .{ .handle = dir.handle, .flags = .{ .nonblocking = false } };
+    const file = try dir.openFile(io, ".", .{
+        .allow_directory = true,
+        .follow_symlinks = false,
+        .path_only = false,
+    });
+    defer file.close(io);
     try file.sync(io);
 }
 
