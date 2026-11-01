@@ -40,6 +40,21 @@ publication and reuses native `History.covers` per static slot under its existin
 aggregate 2 GiB/100,000-entry inventory bounds; routine preparation keeps the
 defaults and ceilings below.
 
+Explicit broad migration selects one source covering every selected slot's native
+binding history and required definitions/revisions. Equal event bytes alone do
+not establish coverage. Selection retains the observed before-state of supported
+unbound or stale histories; it cannot use an unbound history to hide conflicting
+bindings. Only the owner's existing `bind-existing` or `rebind-existing` operation
+can repair that state. A read-only preview reuses native maintenance preparation
+to derive its exact binding result, without another store or persistent format.
+Registered coverage, partial-copy retry, final verification and receipt reuse
+require the same selected native history or that exact repair result, followed by
+valid native continuation. This preserves retired imports and registered recovery
+after receipt deletion. Incomplete copying resumes only when existing selected
+members match the admitted original exactly; unrelated bindings are not a repair
+fallback. Source comparison retains one slot's bounded source observations at a
+time under the broad 2 GiB/100,000-entry limits, releasing them before the next slot.
+
 Native host context distinguishes verified Git identity from a plain workspace;
 failed Git discovery with Git metadata present cannot allocate replacement custody.
 Existing catalog lookup does not require sibling availability. Owner coverage does:

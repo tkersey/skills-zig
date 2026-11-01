@@ -3,6 +3,7 @@ const host = @import("host_context.zig");
 const pending = @import("host_pending.zig");
 const discovery = @import("host_sources.zig");
 const legacy = @import("host_legacy.zig");
+const migration_history = @import("host_migration_history.zig");
 const owner_host = @import("host_owner.zig");
 const cli = @import("cli.zig");
 const engine = @import("ledger_v1_core");
@@ -52,12 +53,29 @@ const Owner = struct {
     plan: engine.compiled_plan.PlanSet,
     bindings: definition_core.parameters.Bindings,
     description: std.json.Value,
+
+    fn history(self: *const Owner) migration_history.Owner {
+        return .{
+            .plan = &self.plan,
+            .parameters = &self.bindings,
+            .definition = self.descriptor.definition,
+        };
+    }
 };
 
 const Owners = struct {
     entries: []Owner,
     slots: []const []const u8,
     retired: []const []const u8,
+
+    fn histories(
+        self: Owners,
+        buffer: *[128]migration_history.Owner,
+    ) []const migration_history.Owner {
+        std.debug.assert(self.entries.len <= buffer.len);
+        for (self.entries, 0..) |*owner, index| buffer[index] = owner.history();
+        return buffer[0..self.entries.len];
+    }
 
     fn deinit(self: *Owners, allocator: std.mem.Allocator) void {
         for (self.entries) |*owner| {
@@ -535,8 +553,15 @@ fn run(
         .{},
     );
     defer snapshot.deinit();
-    const source = try legacy.selectSource(scratch, io, &snapshot, owners.slots);
     try inspectSources(scratch, io, &snapshot, owners);
+    var owner_histories: [128]migration_history.Owner = undefined;
+    const source = try migration_history.selectSource(
+        scratch,
+        io,
+        environment,
+        &snapshot,
+        owners.histories(&owner_histories),
+    );
     var associations = try host.workspace.resolve(scratch, io, environment, workspace_path);
     defer associations.deinit();
     var initial = try currentContext(scratch, io, environment, options.context, &associations);
@@ -612,10 +637,12 @@ const Migration = struct {
             self.allocator,
             self.scratch,
             self.io,
+            self.environment,
             selected,
             self.digest,
             self.owners,
             self.snapshot,
+            self.source,
         );
     }
 
@@ -714,13 +741,7 @@ const Migration = struct {
         registered: bool,
         guard: *const pending.Guard,
     ) ![]const u8 {
-        if (registered) try requireCovered(
-            self.scratch,
-            self.io,
-            self.snapshot,
-            self.owners.slots,
-            selected.store_root,
-        );
+        try self.requireCoverage(selected, !registered, true);
         const path = try std.fs.path.join(
             self.allocator,
             &.{ selected.store_root, "legacy-archive", self.digest },
@@ -760,7 +781,28 @@ const Migration = struct {
         for (self.owners.entries) |*owner| {
             try healthy(self.scratch, self.io, self.environment, owner, selected, true);
         }
+        try self.requireCoverage(selected, false, false);
         return path;
+    }
+
+    fn requireCoverage(
+        self: Migration,
+        selected: host.ContextValue,
+        partial: bool,
+        repair: bool,
+    ) !void {
+        var owner_histories: [128]migration_history.Owner = undefined;
+        try migration_history.requireCovered(
+            self.scratch,
+            self.io,
+            self.environment,
+            self.owners.histories(&owner_histories),
+            if (self.source) |index| self.snapshot.sources.map.values()[index].workspace else null,
+            selected.store_root,
+            selected.store_id,
+            partial,
+            repair,
+        );
     }
 
     fn importOwners(self: Migration, selected: host.ContextValue, archive_path: []const u8) !bool {
@@ -822,6 +864,7 @@ const Migration = struct {
         for (self.owners.entries) |*owner| {
             try healthy(self.scratch, self.io, self.environment, owner, selected, false);
         }
+        try self.requireCoverage(selected, false, false);
         const result = self.result;
         try result.put("status", "verified");
         try result.put("store_id", selected.store_id);
@@ -880,51 +923,10 @@ fn healthy(
             return error.OwnerCustodyRequiresMaintenance;
         }
         const failure = health.slots[0].error_code orelse return error.UnknownBindingFailure;
-        const operation = try maintenanceName(failure);
+        const operation = try migration_history.maintenanceName(failure);
         try repairBinding(allocator, io, environment, owner, selected, operation);
     }
     unreachable;
-}
-
-fn maintenanceName(failure: []const u8) ![]const u8 {
-    if (std.mem.eql(u8, failure, "InvalidStoreBinding") or
-        std.mem.eql(u8, failure, "StoreSlotWithoutBinding")) return "bind-existing";
-    if (std.mem.eql(u8, failure, "StoreBindingRecordCountMismatch") or
-        std.mem.eql(u8, failure, "StoreBindingRevisionMismatch")) return "rebind-existing";
-    return error.UnknownBindingFailure;
-}
-
-fn checkMaintenanceOperation(
-    plan: *const engine.compiled_plan.PlanSet,
-    owner: *const Owner,
-    operation: []const u8,
-) !void {
-    if (!std.mem.eql(
-        u8,
-        &plan.definition_plan.closure_digest,
-        &owner.plan.definition_plan.closure_digest,
-    )) {
-        return error.OwnerDefinitionChanged;
-    }
-    const store = &(plan.storage_plan orelse return error.UnsupportedBindingMaintenance);
-    const declared = store.findOperation(operation) orelse
-        return error.UnsupportedBindingMaintenance;
-    const expected: engine.storage.EffectKind = if (std.mem.eql(u8, operation, "bind-existing"))
-        .bind_existing
-    else
-        .rebind_existing;
-    if (declared.effects.len != 1 or declared.effects[0].kind != expected or
-        declared.effects[0].slot_index >= store.slots.len)
-    {
-        return error.UnsupportedBindingMaintenance;
-    }
-    if (!std.mem.eql(
-        u8,
-        store.slots[declared.effects[0].slot_index].relative_path,
-        owner.descriptor.slots[0],
-    )) {
-        return error.UnsupportedBindingMaintenance;
-    }
 }
 
 fn repairBinding(
@@ -952,7 +954,7 @@ fn repairBinding(
         false,
     );
     defer plan.deinit(allocator);
-    try checkMaintenanceOperation(&plan, owner, operation);
+    try migration_history.checkMaintenanceOperation(&plan, owner.history(), operation);
     const control = try storage_root.checkedRoot(
         allocator,
         io,
@@ -1044,38 +1046,6 @@ fn targetEntry(
     };
 }
 
-fn requireCovered(
-    allocator: std.mem.Allocator,
-    io: std.Io,
-    snapshot: *const legacy.Inventory,
-    slots: []const []const u8,
-    root: []const u8,
-) !void {
-    for (snapshot.sources.map.values()) |source| {
-        for (slots) |slot| {
-            const name = try std.fmt.allocPrint(allocator, ".ledger/{s}", .{slot});
-            defer allocator.free(name);
-            const old = source.entries.map.get(name) orelse continue;
-            const active = try targetEntry(
-                allocator,
-                io,
-                root,
-                slot,
-            ) orelse return error.AdditionalOrDivergentHistory;
-            defer allocator.free(active.sha256.?);
-            if (!try legacy.completePrefix(
-                allocator,
-                io,
-                source.workspace,
-                root,
-                name,
-                old,
-                active,
-            )) return error.AdditionalOrDivergentHistory;
-        }
-    }
-}
-
 fn copyMissing(
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -1117,32 +1087,44 @@ fn copyMissing(
         const path = try std.fs.path.join(owned, &.{ root, name });
         try host.catalog.noSymlinks(io, path);
         if (try host.catalog.exists(io, path)) {
-            if ((try std.Io.Dir.cwd().statFile(
-                io,
-                path,
-                .{ .follow_symlinks = false },
-            )).kind != .file) return error.UnsupportedSelectedSlot;
-            if (selected_slot) {
-                const active = (try targetEntry(owned, io, root, local)).?;
-                if (!try legacy.completePrefix(
-                    owned,
-                    io,
-                    selected.workspace,
-                    root,
-                    name,
-                    entry,
-                    active,
-                )) return error.AdditionalOrDivergentHistory;
-            }
-            const parent = try host.catalog.openDirectory(io, std.fs.path.dirname(path).?, false);
-            defer parent.close(io);
-            try host.catalog.sync(io, parent);
+            try verifyExistingCopy(owned, io, selected.workspace, root, name, entry, selected_slot);
             continue;
         }
         try source.entries.map.put(owned, name, entry);
     }
     try missing.sources.map.put(owned, snapshot.sources.map.keys()[index], source);
     try legacy.copySelected(allocator, io, &missing, 0, slots, archive, root, scratch);
+}
+
+fn verifyExistingCopy(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    source: []const u8,
+    root: []const u8,
+    name: []const u8,
+    entry: legacy.Entry,
+    selected_slot: bool,
+) !void {
+    const path = try std.fs.path.join(allocator, &.{ root, name });
+    defer allocator.free(path);
+    if ((try std.Io.Dir.cwd().statFile(io, path, .{ .follow_symlinks = false })).kind != .file) {
+        return error.UnsupportedSelectedSlot;
+    }
+    const parent = try host.catalog.openDirectory(io, std.fs.path.dirname(path).?, false);
+    defer parent.close(io);
+    if (selected_slot) {
+        const active = (try targetEntry(allocator, io, root, name[8..])).?;
+        defer allocator.free(active.sha256.?);
+        if (!try legacy.completePrefix(allocator, io, source, root, name, entry, active)) {
+            return error.AdditionalOrDivergentHistory;
+        }
+    } else if (!std.mem.startsWith(u8, name, ".ledger/.bindings/")) {
+        const active = try legacy.hashFile(io, parent, std.fs.path.basename(path), entry.size.?);
+        if (active.bytes != entry.size.? or !std.mem.eql(u8, &active.sha256, entry.sha256.?)) {
+            return error.AdditionalOrDivergentHistory;
+        }
+    }
+    try host.catalog.sync(io, parent);
 }
 
 const ImportSource = struct { source: []const u8, source_sha256: []const u8 };
@@ -1322,10 +1304,12 @@ fn reusableReceipt(
     allocator: std.mem.Allocator,
     scratch: std.mem.Allocator,
     io: std.Io,
+    environment: *const std.process.Environ.Map,
     selected: host.ContextValue,
     digest: []const u8,
     owners: Owners,
     snapshot: *const legacy.Inventory,
+    source: ?usize,
 ) !?std.json.Value {
     const path = try std.fs.path.join(
         allocator,
@@ -1350,6 +1334,18 @@ fn reusableReceipt(
             return error.OwnerCustodyRequiresMaintenance;
         }
     }
+    var owner_histories: [128]migration_history.Owner = undefined;
+    try migration_history.requireCovered(
+        scratch,
+        io,
+        environment,
+        owners.histories(&owner_histories),
+        if (source) |index| snapshot.sources.map.values()[index].workspace else null,
+        selected.store_root,
+        selected.store_id,
+        false,
+        false,
+    );
     const archive = try std.fs.path.join(
         scratch,
         &.{ selected.store_root, "legacy-archive", digest },
