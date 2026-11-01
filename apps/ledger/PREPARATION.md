@@ -13,15 +13,18 @@ components, so a failed directory-creation sync cannot be bypassed on retry.
 
 | Path | Creator | Required lifetime | Coordination | Release witness |
 | --- | --- | --- | --- | --- |
-| `<store>/.migration-copy/payload` | Explicit native migration, after `migration-copy.json` declaration | One bounded regular canonical-copy stage, at most 2 GiB | Existing repository guard | Declared layout, regular single-link file, bounded length; no native transaction depends on it |
+| `<store>/.migration-copy/payload` | Explicit native migration, after `migration-copy.json` declaration | One bounded regular canonical-copy stage, at most 2 GiB | Existing repository guard | Declared layout, regular single-link file, bounded length; no native transaction depends on it. The empty directory is retired after verified completion |
 | `<store>/.migration-archive` | Explicit native migration, after separate `migration-archive.json` declaration | One unpublished broad archive stage | Existing repository guard | Empty/manifest-only owned stage, or complete bounded validation against its persisted archive manifest before any deletion |
 | `<store>/legacy-archive/<fingerprint>` | Existing explicit broad migration | Preserved historical evidence | Existing repository guard for publication | Never reclaimed by preparation or migration retry |
 | Existing `.archiving-*` stages | Historical native/Python migration | Retained unpublished evidence | Outside new cleanup authority | Never deleted; exact historical generated names are excluded from completed-generation discovery |
-| `registration.json`, `migration-copy.json`, `migration-archive.json` | Native host integration | Stable identity and immutable working-layout ownership | Existing repository guard and catalog coordination | Retained; no new metadata sweeper |
+| `registration.json`, `migration-archive.json` | Native host integration | Stable identity and immutable working-layout ownership | Existing repository guard and catalog coordination | Retained; no new metadata sweeper |
+| `migration-copy.json` | Explicit native migration before archive capture | Copy ownership and exact selected input through interrupted capture/publication and external owner import | Existing repository guard and catalog coordination | Verified migration receipt and catalog association; clear owned scratch, durably remove its directory, then retire this declaration |
 
 Archive capture writes and syncs the existing `ledger-legacy-archive/v1` manifest
 before copying payload. Retry validates every staged path, kind, link count and
-maximum length against that prior manifest before deleting anything; implicit
+maximum length against that prior manifest before deleting anything. Each file
+witness requires its size and a valid SHA-256 digest; interrupted payload may be
+shorter than that witness. Implicit
 parent directories are derived from its admitted paths. This permits restart when
 the current source inventory changes. A malformed manifest with payload, unknown
 entries, links, special files or undeclared occupied paths remain untouched and
@@ -54,6 +57,18 @@ after receipt deletion. Incomplete copying resumes only when existing selected
 members match the admitted original exactly; unrelated bindings are not a repair
 fallback. Source comparison retains one slot's bounded source observations at a
 time under the broad 2 GiB/100,000-entry limits, releasing them before the next slot.
+The copy declaration binds selected paths, lengths and digests, excluding unrelated
+inventory and source location. A matching pending identity retains this exact-copy
+permission across explicit registration, without treating registration as completed
+migration. A changed selected input cannot reuse it. Successful completion consumes
+the permission; deleting a later receipt or canonical history cannot revive it.
+Receipt retries finish interrupted declaration retirement without another copy.
+
+External retired-import receipts retain scalar `revision` for one-slot owners.
+For multiple static event slots, `revisions` maps every declared relative slot path
+to its current native revision (or null for a missing slot), with no extra keys.
+Identity, definition closure, archived-source hashes and independent full-record
+parity remain required for both forms.
 
 Native host context distinguishes verified Git identity from a plain workspace;
 failed Git discovery with Git metadata present cannot allocate replacement custody.
@@ -62,6 +77,13 @@ healthy selected history is compared against bounded live Git-family candidates,
 using native bindings and one aggregate read allowance, without inspecting archives
 or inferring conversion from retained retired files. A longer live history requires
 reconciliation and cannot advance a healthy target through preparation.
+An empty local family retains existing new-owner access. Otherwise live history
+comparison requires the existing native guards or explicit writer quiescence,
+and unresolved source publication blocks admission while the guards are retained.
+Catalog selection during initialization still enters the same owner admission.
+Manifest-selected archive evidence cannot become empty history when its payload
+is missing. Explicit archive repair requires the surviving original binding and
+selected archive evidence; that binding remains required through native publication.
 
 Cold adoption uses the same fresh-identity admission as initialization: selected
 pending registration or unregistered custody blocks another allocation even when

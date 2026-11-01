@@ -156,7 +156,7 @@ fn expectedMembers(
                 .directory
             else
                 continue;
-            const size = entry.size orelse 0;
+            const size = if (kind == .file) try fileSize(entry) else 0;
             if (size > bytes_max - total) return error.UnknownMigrationArchive;
             total += size;
             const path = try std.fmt.allocPrint(allocator, "worktree-{s}/{s}", .{ index, name });
@@ -169,6 +169,17 @@ fn expectedMembers(
         }
     }
     return expected;
+}
+
+fn fileSize(entry: anytype) !u64 {
+    const size = entry.size orelse return error.UnknownMigrationArchive;
+    const digest = entry.sha256 orelse return error.UnknownMigrationArchive;
+    if (digest.len != 64) return error.UnknownMigrationArchive;
+    for (digest) |byte| {
+        if (!std.ascii.isDigit(byte) and (byte < 'a' or byte > 'f'))
+            return error.UnknownMigrationArchive;
+    }
+    return size;
 }
 
 fn inspect(
@@ -353,4 +364,57 @@ test "archive declaration rejects occupied unowned paths and survives publicatio
     ));
     const unchanged = try controls.statFile(io, declaration_name, .{});
     try std.testing.expectEqual(before.inode, unchanged.inode);
+}
+
+test "archive cleanup retains payload until its persisted file witness is valid" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const legacy = @import("host_legacy.zig");
+    const snapshot = .{ .sources = legacy.Sources{} };
+    const scratch: Scratch = .{ .root = tmp.dir };
+    try tmp.dir.createDirPath(io, directory_name ++ "/worktree-0/.ledger");
+    const payload = directory_name ++ "/worktree-0/.ledger/events.jsonl";
+    try tmp.dir.writeFile(io, .{ .sub_path = payload, .data = "part" });
+    const valid_digest = "0000000000000000000000000000000000000000000000000000000000000000";
+    const entries = [_][]const u8{
+        "{\"kind\":\"file\",\"size\":8}",
+        "{\"kind\":\"file\",\"sha256\":\"" ++ valid_digest ++ "\"}",
+        "{\"kind\":\"file\",\"size\":8,\"sha256\":\"bad\"}",
+        "{\"kind\":\"file\",\"size\":8,\"sha256\":\"g" ++ valid_digest[1..] ++ "\"}",
+    };
+    for (entries) |entry| {
+        const manifest = try std.fmt.allocPrint(
+            allocator,
+            "{{\"schema\":\"ledger-legacy-archive/v1\",\"sources\":{{\"0\":" ++
+                "{{\"workspace\":\"/source\",\"entries\":{{\".ledger/events.jsonl\":{s}}}}}}}}}",
+            .{entry},
+        );
+        defer allocator.free(manifest);
+        try tmp.dir.writeFile(io, .{
+            .sub_path = directory_name ++ "/manifest.json",
+            .data = manifest,
+        });
+        try std.testing.expectError(
+            error.UnknownMigrationArchive,
+            scratch.clear(allocator, io, &snapshot),
+        );
+        const retained = try catalog.readBytes(allocator, io, tmp.dir, payload, 8);
+        defer allocator.free(retained);
+        try std.testing.expectEqualStrings("part", retained);
+        try std.testing.expect(try catalog.existsAt(
+            io,
+            tmp.dir,
+            directory_name ++ "/manifest.json",
+        ));
+    }
+    try tmp.dir.writeFile(io, .{
+        .sub_path = directory_name ++ "/manifest.json",
+        .data = "{\"schema\":\"ledger-legacy-archive/v1\",\"sources\":{\"0\":" ++
+            "{\"workspace\":\"/source\",\"entries\":{\".ledger/events.jsonl\":" ++
+            "{\"kind\":\"file\",\"size\":8,\"sha256\":\"" ++ valid_digest ++ "\"}}}}}",
+    });
+    try scratch.clear(allocator, io, &snapshot);
+    try std.testing.expect(!try catalog.existsAt(io, tmp.dir, directory_name));
 }

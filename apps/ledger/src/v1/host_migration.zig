@@ -722,17 +722,46 @@ const Migration = struct {
         );
         try self.result.put("context", selected);
         if (try self.savedReceipt(selected)) |saved| {
-            try self.inspectAgain();
-            try self.checkOwners();
-            const changed = try publish(self.scratch, self.io, &lock, self.associations, selected);
-            self.result.value = saved;
-            try self.result.put("context", selected);
-            try self.result.put("storage_mutated", changed);
-            return;
+            return self.reuseCompleted(selected, saved, &lock, &guard);
         }
         const archive_path = try self.archive(selected, current != null, &guard);
         if (!try self.importOwners(selected, archive_path)) return;
         try self.finish(selected, &lock);
+        _ = try self.retireCopy(selected, &guard);
+    }
+
+    fn reuseCompleted(
+        self: Migration,
+        selected: host.ContextValue,
+        saved: std.json.Value,
+        lock: *const host.catalog.Lock,
+        guard: *const pending.Guard,
+    ) !void {
+        try self.inspectAgain();
+        try self.checkOwners();
+        const changed = try publish(
+            self.scratch,
+            self.io,
+            lock,
+            self.associations,
+            self.options.context.catalog_root,
+            selected,
+        );
+        const retired = try self.retireCopy(selected, guard);
+        self.result.value = saved;
+        try self.result.put("context", selected);
+        try self.result.put("storage_mutated", changed or retired);
+    }
+
+    fn retireCopy(self: Migration, selected: host.ContextValue, guard: *const pending.Guard) !bool {
+        return pending.retireMigrationCopy(
+            self.scratch,
+            self.io,
+            self.associations,
+            self.options.context.catalog_root,
+            selected,
+            guard,
+        );
     }
 
     fn archive(
@@ -741,7 +770,33 @@ const Migration = struct {
         registered: bool,
         guard: *const pending.Guard,
     ) ![]const u8 {
-        try self.requireCoverage(selected, !registered, true);
+        const source_sha256 = if (self.source) |index|
+            try copyInputDigest(self.allocator, self.snapshot, index, self.owners.slots)
+        else
+            null;
+        const copy_owned = if (!registered) true else if (source_sha256) |digest|
+            try pending.migrationCopyMatches(
+                self.scratch,
+                self.io,
+                self.associations,
+                self.options.context.catalog_root,
+                selected,
+                digest,
+            )
+        else
+            false;
+        try self.requireCoverage(selected, copy_owned, true);
+        var copy_scratch: ?@import("host_migration_copy.zig").Scratch = null;
+        defer if (copy_scratch) |scratch| scratch.deinit(self.io);
+        if (copy_owned and source_sha256 != null) copy_scratch = try pending.migrationScratch(
+            self.scratch,
+            self.io,
+            self.associations,
+            self.options.context.catalog_root,
+            selected,
+            guard,
+            source_sha256.?,
+        );
         const path = try std.fs.path.join(
             self.allocator,
             &.{ selected.store_root, "legacy-archive", self.digest },
@@ -756,27 +811,18 @@ const Migration = struct {
         );
         defer archive_scratch.deinit(self.io);
         try legacy.archive(self.scratch, self.io, self.snapshot, path, archive_scratch);
-        if (!registered) if (self.source) |index| {
-            const scratch = try pending.migrationScratch(
-                self.scratch,
-                self.io,
-                self.associations,
-                self.options.context.catalog_root,
-                selected,
-                guard,
-            );
-            defer scratch.deinit(self.io);
+        if (copy_scratch) |scratch| {
             try copyMissing(
                 self.scratch,
                 self.io,
                 self.snapshot,
-                index,
+                self.source.?,
                 self.owners.slots,
                 path,
                 selected.store_root,
                 scratch,
             );
-        };
+        }
         try self.result.put("storage_mutated", true);
         for (self.owners.entries) |*owner| {
             try healthy(self.scratch, self.io, self.environment, owner, selected, true);
@@ -898,7 +944,14 @@ const Migration = struct {
             64 * 1024 * 1024,
         );
         try self.inspectAgain();
-        _ = try publish(self.scratch, self.io, lock, self.associations, selected);
+        _ = try publish(
+            self.scratch,
+            self.io,
+            lock,
+            self.associations,
+            self.options.context.catalog_root,
+            selected,
+        );
     }
 };
 
@@ -1067,23 +1120,7 @@ fn copyMissing(
     const selected = snapshot.sources.map.values()[index];
     var source: legacy.Source = .{ .workspace = selected.workspace };
     for (selected.entries.map.keys(), selected.entries.map.values()) |name, entry| {
-        if (!std.mem.startsWith(u8, name, ".ledger/")) continue;
-        const local = name[8..];
-        var selected_slot = false;
-        for (slots) |slot| selected_slot = selected_slot or std.mem.eql(u8, local, slot);
-        const first = if (std.mem.indexOfScalar(u8, local, '/')) |end| local[0..end] else local;
-        const control = std.mem.eql(
-            u8,
-            first,
-            ".bindings",
-        ) or std.mem.eql(u8, first, ".definitions") or std.mem.eql(u8, first, ".revisions");
-        if (!selected_slot and !control) continue;
-        if (std.mem.eql(u8, entry.kind, "symlink")) return error.SymlinkInSelectedCustody;
-        if (!std.mem.eql(
-            u8,
-            entry.kind,
-            "file",
-        ) or std.mem.endsWith(u8, name, ".cas.lock.advisory")) continue;
+        const selected_slot = (try selectedCopyEntry(name, entry, slots)) orelse continue;
         const path = try std.fs.path.join(owned, &.{ root, name });
         try host.catalog.noSymlinks(io, path);
         if (try host.catalog.exists(io, path)) {
@@ -1094,6 +1131,43 @@ fn copyMissing(
     }
     try missing.sources.map.put(owned, snapshot.sources.map.keys()[index], source);
     try legacy.copySelected(allocator, io, &missing, 0, slots, archive, root, scratch);
+}
+
+fn selectedCopyEntry(name: []const u8, entry: legacy.Entry, slots: []const []const u8) !?bool {
+    if (!std.mem.startsWith(u8, name, ".ledger/")) return null;
+    const local = name[8..];
+    var selected_slot = false;
+    for (slots) |slot| selected_slot = selected_slot or std.mem.eql(u8, local, slot);
+    const first = if (std.mem.indexOfScalar(u8, local, '/')) |end| local[0..end] else local;
+    const control = std.mem.eql(u8, first, ".bindings") or
+        std.mem.eql(u8, first, ".definitions") or std.mem.eql(u8, first, ".revisions");
+    if (!selected_slot and !control) return null;
+    if (std.mem.eql(u8, entry.kind, "symlink")) return error.SymlinkInSelectedCustody;
+    if (!std.mem.eql(u8, entry.kind, "file") or
+        std.mem.endsWith(u8, name, ".cas.lock.advisory")) return null;
+    return selected_slot;
+}
+
+fn copyInputDigest(
+    allocator: std.mem.Allocator,
+    snapshot: *const legacy.Inventory,
+    index: usize,
+    slots: []const []const u8,
+) ![]const u8 {
+    const Entry = struct { size: u64, sha256: []const u8 };
+    var selected: std.json.ArrayHashMap(Entry) = .{};
+    defer selected.deinit(allocator);
+    const source = snapshot.sources.map.values()[index];
+    for (source.entries.map.keys(), source.entries.map.values()) |name, entry| {
+        if (try selectedCopyEntry(name, entry, slots) == null) continue;
+        try selected.map.put(allocator, name, .{
+            .size = entry.size orelse return error.InvalidLegacyManifest,
+            .sha256 = entry.sha256 orelse return error.InvalidLegacyManifest,
+        });
+    }
+    const bytes = try legacy.canonicalAlloc(allocator, selected);
+    defer allocator.free(bytes);
+    return @import("definition_core").canonical_json.digestBytesAlloc(allocator, bytes);
 }
 
 fn verifyExistingCopy(
@@ -1204,12 +1278,28 @@ fn validateImportReceipt(
     var health = try inspectOwner(allocator, io, owner, selected.store_root, selected.store_id);
     defer health.deinit(allocator);
     if (!health.healthy or health.pending_transactions != 0 or health.preparation_pending or
-        health.slots.len != 1)
+        health.slots.len != owner.plan.storage_plan.?.slots.len)
     {
         return error.OwnerImportRevisionMismatch;
     }
-    const revision = receipt.object.get("revision") orelse return error.OwnerImportRevisionMismatch;
-    if (health.slots[0].revision) |current| {
+    if (health.slots.len == 1) {
+        return validateImportRevision(
+            health.slots[0].revision,
+            receipt.object.get("revision") orelse return error.OwnerImportRevisionMismatch,
+        );
+    }
+    const revisions = receipt.object.get("revisions") orelse
+        return error.OwnerImportRevisionMismatch;
+    if (revisions != .object or revisions.object.count() != health.slots.len)
+        return error.OwnerImportRevisionMismatch;
+    for (health.slots) |slot| try validateImportRevision(
+        slot.revision,
+        revisions.object.get(slot.logical_ref) orelse return error.OwnerImportRevisionMismatch,
+    );
+}
+
+fn validateImportRevision(current_revision: ?[]const u8, revision: std.json.Value) !void {
+    if (current_revision) |current| {
         if (revision != .string or !std.mem.eql(
             u8,
             revision.string,
@@ -1401,6 +1491,7 @@ fn publish(
     io: std.Io,
     lock: *const host.catalog.Lock,
     associations: *const host.workspace.Associations,
+    home: []const u8,
     selected: host.ContextValue,
 ) !bool {
     const control = try host.catalog.checkedRoot(
@@ -1410,25 +1501,16 @@ fn publish(
         selected.store_id,
     );
     defer control.close(io);
-    var catalog = try lock.read(allocator);
-    defer catalog.deinit();
-    _ = try catalog.select(associations.aliases, null, true);
-    var changed = try catalog.register(selected.store_id, selected.store_root);
-    changed = (try catalog.associate(associations.aliases, selected.store_id)) or changed;
-    const current = try host.catalog.checkedRoot(
+    return host.associateRootLocked(
         allocator,
         io,
+        lock,
+        associations,
+        home,
         selected.store_root,
         selected.store_id,
-    );
-    defer current.close(io);
-    if (!try @import("durable_store").sameDirectoryObject(
-        io,
         control,
-        current,
-    )) return error.StorageRootChanged;
-    if (changed) try lock.publish(allocator, catalog.value);
-    return changed;
+    );
 }
 
 fn lessString(_: void, left: []const u8, right: []const u8) bool {
@@ -1547,10 +1629,16 @@ fn expectStatus(result: Result, expected: []const u8) !void {
 
 test "host migration retries interrupted copy in the same pending identity" {
     const copy = @import("host_migration_copy.zig");
-    for (std.enums.values(copy.TestFault.Kind)) |fault| try testCopyInterruption(fault);
+    for ([_]bool{ false, true }) |registered| {
+        for (std.enums.values(copy.TestFault.Kind)) |fault|
+            try testCopyInterruption(fault, registered);
+    }
 }
 
-fn testCopyInterruption(fault: @import("host_migration_copy.zig").TestFault.Kind) !void {
+fn testCopyInterruption(
+    fault: @import("host_migration_copy.zig").TestFault.Kind,
+    registered: bool,
+) !void {
     const copy = @import("host_migration_copy.zig");
     const allocator = std.testing.allocator;
     const io = std.testing.io;
@@ -1576,6 +1664,17 @@ fn testCopyInterruption(fault: @import("host_migration_copy.zig").TestFault.Kind
     const source = try host.catalog.openDirectory(io, fixture.source, false);
     defer source.close(io);
     const before = try testHash(source, ".ledger/example/plain.jsonl");
+    if (registered) {
+        var associated = try host.registerRoot(
+            allocator,
+            io,
+            &fixture.environment,
+            fixture.options(true).context,
+            root,
+            try string(selected, "store_id"),
+        );
+        defer associated.deinit();
+    }
     var retry = try execute(allocator, io, &fixture.environment, fixture.options(true));
     defer retry.deinit();
     try expectStatus(retry, "verified");
@@ -1597,6 +1696,7 @@ fn testCopyInterruption(fault: @import("host_migration_copy.zig").TestFault.Kind
     defer allocator.free(archive_name);
     try std.testing.expectEqualDeep(before, try testHash(dir, archive_name));
     try std.testing.expect(!try host.catalog.existsAt(io, dir, ".migration-copy/payload"));
+    try std.testing.expect(!try host.catalog.existsAt(io, dir, ".migration-copy"));
 }
 
 fn testHash(root: std.Io.Dir, path: []const u8) !legacy.Witness {
@@ -1914,7 +2014,168 @@ fn testArchiveInterruption(fault: @import("host_migration_archive.zig").TestFaul
             retained_bytes = bytes;
         }
     }
+    var associated = try host.registerRoot(
+        allocator,
+        io,
+        &fixture.environment,
+        fixture.options(true).context,
+        root,
+        identity.?,
+    );
+    defer associated.deinit();
     try testArchiveRetry(&fixture, identity.?, root);
+}
+
+test "completed migration cannot revive consumed copy authority after receipt and custody loss" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var fixture = try Fixture.init(false);
+    defer fixture.deinit();
+    var completed = try execute(allocator, io, &fixture.environment, fixture.options(true));
+    defer completed.deinit();
+    try expectStatus(completed, "verified");
+    const selected = completed.value.object.get("context").?;
+    const root = try string(selected, "store_root");
+    const dir = try host.catalog.openDirectory(io, root, false);
+    defer dir.close(io);
+    try dir.deleteFile(io, "migration-receipt.json");
+    try dir.deleteTree(io, ".ledger");
+    try dir.createDir(io, ".ledger", .fromMode(0o700));
+    var retry = try execute(allocator, io, &fixture.environment, fixture.options(true));
+    defer retry.deinit();
+    try expectStatus(retry, "blocked");
+    try std.testing.expectEqualStrings(
+        "AdditionalOrDivergentHistory",
+        try string(retry.value, "error_code"),
+    );
+    try std.testing.expect(!try host.catalog.existsAt(io, dir, ".ledger/example/plain.jsonl"));
+    var context = try host.resolve(
+        allocator,
+        io,
+        &fixture.environment,
+        fixture.options(true).context,
+    );
+    defer context.deinit();
+    try std.testing.expectEqualStrings(try string(selected, "store_id"), context.value.store_id);
+}
+
+test "registered interrupted migration cannot exchange its admitted copy input" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const copy = @import("host_migration_copy.zig");
+    var fixture = try Fixture.init(false);
+    defer fixture.deinit();
+    var vtable = io.vtable.*;
+    copy.TestFault.install(&vtable, .before_rename);
+    var injected = io;
+    injected.vtable = &vtable;
+    var interrupted = try execute(allocator, injected, &fixture.environment, fixture.options(true));
+    defer interrupted.deinit();
+    try expectStatus(interrupted, "blocked");
+    try std.testing.expect(copy.TestFault.reached);
+    const selected = interrupted.value.object.get("context").?;
+    const root = try string(selected, "store_root");
+    var associated = try host.registerRoot(
+        allocator,
+        io,
+        &fixture.environment,
+        fixture.options(true).context,
+        root,
+        try string(selected, "store_id"),
+    );
+    defer associated.deinit();
+    try fixtureWrite(
+        fixture.source,
+        ".ledger/example/plain.jsonl",
+        "{\"kind\":\"created\",\"value\":{\"id\":\"other\",\"revision\":\"r2\"}}\n",
+    );
+    var retry = try execute(allocator, io, &fixture.environment, fixture.options(true));
+    defer retry.deinit();
+    try expectStatus(retry, "blocked");
+    try std.testing.expectEqualStrings(
+        "AdditionalOrDivergentHistory",
+        try string(retry.value, "error_code"),
+    );
+    const dir = try host.catalog.openDirectory(io, root, false);
+    defer dir.close(io);
+    try std.testing.expect(!try host.catalog.existsAt(io, dir, ".ledger/example/plain.jsonl"));
+}
+
+const CopyRetirementFault = struct {
+    var after_declaration = false;
+    var armed = false;
+    var reached = false;
+
+    fn deleteDir(
+        userdata: ?*anyopaque,
+        dir: std.Io.Dir,
+        name: []const u8,
+    ) std.Io.Dir.DeleteDirError!void {
+        try std.testing.io.vtable.dirDeleteDir(userdata, dir, name);
+        if (!after_declaration and std.mem.eql(u8, name, ".migration-copy")) armed = true;
+    }
+
+    fn deleteFile(
+        userdata: ?*anyopaque,
+        dir: std.Io.Dir,
+        name: []const u8,
+    ) std.Io.Dir.DeleteFileError!void {
+        try std.testing.io.vtable.dirDeleteFile(userdata, dir, name);
+        if (after_declaration and std.mem.eql(u8, name, "migration-copy.json")) armed = true;
+    }
+
+    fn sync(userdata: ?*anyopaque, file: std.Io.File) std.Io.File.SyncError!void {
+        if (armed) {
+            reached = true;
+            return error.InputOutput;
+        }
+        return std.testing.io.vtable.fileSync(userdata, file);
+    }
+};
+
+test "completed migration retries copy retirement without repeating publication" {
+    for ([_]bool{ false, true }) |after_declaration| try testCopyRetirement(after_declaration);
+}
+
+fn testCopyRetirement(after_declaration: bool) !void {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var fixture = try Fixture.init(false);
+    defer fixture.deinit();
+    CopyRetirementFault.after_declaration = after_declaration;
+    CopyRetirementFault.armed = false;
+    CopyRetirementFault.reached = false;
+    var vtable = io.vtable.*;
+    vtable.dirDeleteDir = CopyRetirementFault.deleteDir;
+    vtable.dirDeleteFile = CopyRetirementFault.deleteFile;
+    vtable.fileSync = CopyRetirementFault.sync;
+    var injected = io;
+    injected.vtable = &vtable;
+    var interrupted = try execute(allocator, injected, &fixture.environment, fixture.options(true));
+    defer interrupted.deinit();
+    try expectStatus(interrupted, "blocked");
+    try std.testing.expect(CopyRetirementFault.reached);
+    const selected = interrupted.value.object.get("context").?;
+    const root = try string(selected, "store_root");
+    const dir = try host.catalog.openDirectory(io, root, false);
+    defer dir.close(io);
+    const before = try testTreeBytes(dir);
+    const history = try testHash(dir, ".ledger/example/plain.jsonl");
+    const receipt = try legacy.hashFile(io, dir, "migration-receipt.json", 64 * 1024 * 1024);
+    var retry = try execute(allocator, io, &fixture.environment, fixture.options(true));
+    defer retry.deinit();
+    try expectStatus(retry, "verified");
+    try std.testing.expectEqualStrings(
+        try string(selected, "store_id"),
+        try string(retry.value.object.get("context").?, "store_id"),
+    );
+    try std.testing.expectEqualDeep(history, try testHash(dir, ".ledger/example/plain.jsonl"));
+    try std.testing.expectEqualDeep(
+        receipt,
+        try legacy.hashFile(io, dir, "migration-receipt.json", 64 * 1024 * 1024),
+    );
+    try std.testing.expectEqual(before, try testTreeBytes(dir));
+    try std.testing.expect(!try host.catalog.existsAt(io, dir, ".migration-copy"));
 }
 
 fn testArchiveRetry(fixture: *Fixture, identity: []const u8, root: []const u8) !void {

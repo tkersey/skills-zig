@@ -339,6 +339,16 @@ test -f "$owner/repo/.ledger/unrelated/sparse.bin"
 project --store-root "$owner_root" --store-id "$owner_id" >"$scratch/owner-projection.json"
 assert_json 'length == 2' "$scratch/owner-projection.json"
 snapshot "$owner" >"$scratch/before.snapshot"
+blocked PreparationRequiresQuiescence context --catalog-root "$owner/home" \
+  --workspace "$owner/prefix" --definition "$definition" --owner-manifest "$manifest" --read-only
+snapshot "$owner" >"$scratch/after.snapshot"
+cmp "$scratch/before.snapshot" "$scratch/after.snapshot"
+while IFS= read -r advisory; do
+  relative=${advisory#"$owner/repo/.ledger/"}
+  mkdir -p "$(dirname "$owner/prefix/.ledger/$relative")"
+  cp "$advisory" "$owner/prefix/.ledger/$relative"
+done < <(find "$owner/repo/.ledger" -type f -name '*.cas.lock.advisory')
+snapshot "$owner" >"$scratch/before.snapshot"
 context --catalog-root "$owner/home" --workspace "$owner/prefix" --definition "$definition" \
   --owner-manifest "$manifest" --read-only
 assert_json '.storage_mutated == false'

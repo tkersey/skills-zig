@@ -11,7 +11,12 @@ const candidate_name = ".root-marker.json";
 const Marker = struct { schema: []const u8, store_id: []const u8 };
 const migration_copy_name = "migration-copy.json";
 const migration_copy_schema = "ledger-migration-copy/v1";
-const MigrationCopy = struct { schema: []const u8, store_id: []const u8, store_root: []const u8 };
+const MigrationCopy = struct {
+    schema: []const u8,
+    store_id: []const u8,
+    store_root: []const u8,
+    source_sha256: ?[]const u8 = null,
+};
 
 pub const Registration = struct {
     schema: []const u8,
@@ -28,6 +33,7 @@ pub fn migrationScratch(
     home: []const u8,
     selected: host.ContextValue,
     guard: *const Guard,
+    source_sha256: ?[]const u8,
 ) !migration_copy.Scratch {
     _ = guard;
     const controls_path = try controlsPath(
@@ -61,8 +67,98 @@ pub fn migrationScratch(
     defer root.close(io);
     const controls = try catalog.openDirectory(io, controls_path, false);
     defer controls.close(io);
-    try declareMigrationCopy(allocator, io, controls, root, value);
+    try declareMigrationCopy(allocator, io, controls, root, value, source_sha256);
     return migration_copy.Scratch.open(io, root);
+}
+
+pub fn migrationCopyMatches(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    associations: *const workspace.Associations,
+    home: []const u8,
+    selected: host.ContextValue,
+    source_sha256: []const u8,
+) !bool {
+    const controls = try controlsPath(
+        allocator,
+        associations.workspace_root.?,
+        associations.git_common_dir,
+        home,
+    );
+    defer allocator.free(controls);
+    const path = try std.fs.path.join(allocator, &.{ controls, migration_copy_name });
+    defer allocator.free(path);
+    if (!try catalog.exists(io, path)) return false;
+    var parsed = try catalog.readJson(MigrationCopy, allocator, io, path, 4096);
+    defer parsed.deinit();
+    const value = parsed.value;
+    if (!std.mem.eql(u8, value.schema, migration_copy_schema) or
+        !std.mem.eql(u8, value.store_id, selected.store_id) or
+        !std.mem.eql(u8, value.store_root, selected.store_root))
+        return error.InvalidMigrationCopy;
+    const admitted = value.source_sha256 orelse return false;
+    return std.mem.eql(u8, admitted, source_sha256);
+}
+
+pub fn retireMigrationCopy(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    associations: *const workspace.Associations,
+    home: []const u8,
+    selected: host.ContextValue,
+    guard: *const Guard,
+) !bool {
+    _ = guard;
+    const controls_path = try controlsPath(
+        allocator,
+        associations.workspace_root.?,
+        associations.git_common_dir,
+        home,
+    );
+    defer allocator.free(controls_path);
+    const controls = catalog.openDirectory(io, controls_path, false) catch |err| switch (err) {
+        error.FileNotFound => return false,
+        else => return err,
+    };
+    defer controls.close(io);
+    if (!try catalog.existsAt(io, controls, migration_copy_name)) {
+        try catalog.sync(io, controls);
+        return false;
+    }
+    const bytes = try catalog.readBytes(allocator, io, controls, migration_copy_name, 4096);
+    defer allocator.free(bytes);
+    var parsed = try std.json.parseFromSlice(MigrationCopy, allocator, bytes, .{
+        .duplicate_field_behavior = .@"error",
+    });
+    defer parsed.deinit();
+    const value = parsed.value;
+    if (!std.mem.eql(u8, value.schema, migration_copy_schema) or
+        !std.mem.eql(u8, value.store_id, selected.store_id) or
+        !std.mem.eql(u8, value.store_root, selected.store_root))
+        return error.InvalidMigrationCopy;
+    const control = try catalog.checkedRoot(allocator, io, selected.store_root, selected.store_id);
+    defer control.close(io);
+    const root = try catalog.openDirectory(io, selected.store_root, false);
+    defer root.close(io);
+    const anchored = try root.openDir(io, ".ledger", .{ .follow_symlinks = false });
+    defer anchored.close(io);
+    if (!try @import("durable_store").sameDirectoryObject(io, control, anchored))
+        return error.StorageRootChanged;
+    if (try catalog.existsAt(io, root, migration_copy.directory_name)) {
+        const dir = try root.openDir(io, migration_copy.directory_name, .{
+            .follow_symlinks = false,
+            .iterate = true,
+        });
+        defer dir.close(io);
+        const scratch: migration_copy.Scratch = .{ .dir = dir };
+        try scratch.clear(io);
+        try catalog.sync(io, dir);
+        try root.deleteDir(io, migration_copy.directory_name);
+    }
+    try catalog.sync(io, root);
+    try controls.deleteFile(io, migration_copy_name);
+    try catalog.sync(io, controls);
+    return true;
 }
 
 pub fn archiveScratch(
@@ -146,11 +242,13 @@ fn declareMigrationCopy(
     controls: std.Io.Dir,
     root: std.Io.Dir,
     registration: Registration,
+    source_sha256: ?[]const u8,
 ) !void {
     const expected: MigrationCopy = .{
         .schema = migration_copy_schema,
         .store_id = registration.store_id,
         .store_root = registration.store_root,
+        .source_sha256 = source_sha256,
     };
     if (try catalog.existsAt(io, controls, migration_copy_name)) {
         const bytes = try catalog.readBytes(allocator, io, controls, migration_copy_name, 4096);
@@ -162,7 +260,8 @@ fn declareMigrationCopy(
         const value = parsed.value;
         if (!std.mem.eql(u8, value.schema, expected.schema) or
             !std.mem.eql(u8, value.store_id, expected.store_id) or
-            !std.mem.eql(u8, value.store_root, expected.store_root))
+            !std.mem.eql(u8, value.store_root, expected.store_root) or
+            !catalog.optionalEqual(value.source_sha256, expected.source_sha256))
             return error.InvalidMigrationCopy;
     } else {
         if (try catalog.existsAt(io, root, migration_copy.directory_name))
@@ -311,19 +410,45 @@ pub fn checkPendingContext(
     home: []const u8,
     selected: host.ContextValue,
 ) !void {
+    return admitPendingContext(allocator, io, associations, home, selected, null);
+}
+
+pub fn syncPendingContext(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    associations: *const workspace.Associations,
+    home: []const u8,
+    selected: host.ContextValue,
+    lock: *const catalog.Lock,
+) !void {
+    return admitPendingContext(allocator, io, associations, home, selected, lock);
+}
+
+fn admitPendingContext(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    associations: *const workspace.Associations,
+    home: []const u8,
+    selected: host.ContextValue,
+    lock: ?*const catalog.Lock,
+) !void {
     const root = associations.workspace_root orelse return;
     const controls = try controlsPath(allocator, root, associations.git_common_dir, home);
     defer allocator.free(controls);
     const locator = try std.fs.path.join(allocator, &.{ controls, "registration.json" });
     defer allocator.free(locator);
     if (!try catalog.exists(io, locator)) return;
-    var pending = try pendingTarget(allocator, io, associations, home, controls, false);
-    defer pending.deinit();
-    if (!std.mem.eql(u8, pending.value.store_id, selected.store_id) or
-        !std.mem.eql(u8, pending.value.store_root, selected.store_root))
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const value = try readPendingRegistration(arena.allocator(), io, associations, home, locator);
+    if (!std.mem.eql(u8, value.store_id, selected.store_id) or
+        !std.mem.eql(u8, value.store_root, selected.store_root))
     {
         return error.PendingCustodyConflictsWithCatalog;
     }
+    if (lock != null) try syncRegistration(io, controls);
+    var pending = try materializePending(allocator, io, associations, value, controls, lock);
+    defer pending.deinit();
 }
 
 fn validRegistration(allocator: std.mem.Allocator, value: Registration, home: []const u8) !void {
@@ -490,20 +615,7 @@ fn pendingRegistration(
     const locator_path = try std.fs.path.join(allocator, &.{ controls_path, "registration.json" });
     if (try catalog.exists(io, locator_path)) {
         const value = try readPendingRegistration(allocator, io, associations, home, locator_path);
-        if (publication_lock != null) {
-            const controls = try catalog.openDirectory(io, controls_path, true);
-            defer controls.close(io);
-            const locator = try controls.openFile(
-                io,
-                "registration.json",
-                .{ .follow_symlinks = false },
-            );
-            defer locator.close(io);
-            const stat = try locator.stat(io);
-            if (stat.kind != .file or stat.nlink != 1) return error.InvalidPendingRegistration;
-            try locator.sync(io);
-            try catalog.sync(io, controls);
-        }
+        if (publication_lock != null) try syncRegistration(io, controls_path);
         return value;
     }
     const lock = publication_lock orelse return error.PendingInitializationRequiresPreparation;
@@ -521,6 +633,17 @@ fn pendingRegistration(
     defer controls.close(io);
     try catalog.writeJson(allocator, io, controls, "registration.json", value, 4096);
     return value;
+}
+
+fn syncRegistration(io: std.Io, controls_path: []const u8) !void {
+    const controls = try catalog.openDirectory(io, controls_path, true);
+    defer controls.close(io);
+    const locator = try controls.openFile(io, "registration.json", .{ .follow_symlinks = false });
+    defer locator.close(io);
+    const stat = try locator.stat(io);
+    if (stat.kind != .file or stat.nlink != 1) return error.InvalidPendingRegistration;
+    try locator.sync(io);
+    try catalog.sync(io, controls);
 }
 
 fn readPendingRegistration(
@@ -725,6 +848,7 @@ const MigrationScratchTest = struct {
             self.home,
             self.context,
             self.guard,
+            null,
         );
     }
 };
@@ -793,7 +917,7 @@ test "pending migration scratch declaration rejects other versions and identitie
         }, 4096);
         try std.testing.expectError(
             error.InvalidMigrationCopy,
-            declareMigrationCopy(allocator, io, tmp.dir, tmp.dir, registration),
+            declareMigrationCopy(allocator, io, tmp.dir, tmp.dir, registration, null),
         );
         try std.testing.expect(!try catalog.existsAt(io, tmp.dir, migration_copy.directory_name));
     }
@@ -1150,6 +1274,7 @@ const PendingSyncFault = struct {
     var last_bit: u8 = 0;
     var root: []const u8 = "";
     var controls: []const u8 = "";
+    var fail_bit: u8 = 0;
 
     fn install(vtable: *std.Io.VTable, selected: Kind, failing: bool) void {
         kind = selected;
@@ -1158,6 +1283,7 @@ const PendingSyncFault = struct {
         reached = false;
         calls = 0;
         mask = 0;
+        fail_bit = 0;
         last_file = null;
         last_bit = 0;
         vtable.dirRename = rename;
@@ -1215,7 +1341,7 @@ const PendingSyncFault = struct {
 
     fn sync(userdata: ?*anyopaque, file: std.Io.File) std.Io.File.SyncError!void {
         calls += 1;
-        if (fail and renamed) {
+        if (fail and renamed and (fail_bit == 0 or last_bit == fail_bit)) {
             reached = true;
             return error.InputOutput;
         }
@@ -1283,4 +1409,68 @@ fn testPendingSyncRetry(kind: PendingSyncFault.Kind) !void {
     defer selected.deinit();
     try std.testing.expectEqual(@as(usize, 0), selected.value.stores.map.count());
     PendingSyncFault.root = "";
+}
+
+test "registration preserves pending identity and completes marker durability before association" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = try workspace.testPlainDirectory();
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const owned = arena.allocator();
+    const root = try tmp.dir.realPathFileAlloc(io, ".", owned);
+    const home = try std.fs.path.join(owned, &.{ root, "home" });
+    var environment = std.process.Environ.Map.init(allocator);
+    defer environment.deinit();
+    const options: host.Options = .{ .catalog_root = home, .workspace = root };
+    var target = try prepareTarget(allocator, io, &environment, options, true);
+    defer target.deinit();
+    const selected = target.context.value;
+    var other = try host.initialize(allocator, io, &environment, .{ .catalog_root = home });
+    defer other.deinit();
+    try std.testing.expectError(error.PendingCustodyConflictsWithCatalog, host.registerRoot(
+        allocator,
+        io,
+        &environment,
+        options,
+        other.value.store_root,
+        other.value.store_id,
+    ));
+    const before = try catalog.readBytes(owned, io, tmp.dir, "home/catalog.json", 65536);
+    var vtable = io.vtable.*;
+    PendingSyncFault.root = selected.store_root;
+    PendingSyncFault.controls = try controlsPath(owned, root, null, home);
+    defer PendingSyncFault.root = "";
+    PendingSyncFault.install(&vtable, .marker, true);
+    PendingSyncFault.renamed = true;
+    PendingSyncFault.fail_bit = 2;
+    var injected = io;
+    injected.vtable = &vtable;
+    try std.testing.expectError(error.InputOutput, host.registerRoot(
+        allocator,
+        injected,
+        &environment,
+        options,
+        selected.store_root,
+        selected.store_id,
+    ));
+    try std.testing.expect(PendingSyncFault.reached);
+    const after = try catalog.readBytes(owned, io, tmp.dir, "home/catalog.json", 65536);
+    try std.testing.expectEqualStrings(before, after);
+    PendingSyncFault.install(&vtable, .marker, false);
+    var registered = try host.registerRoot(
+        allocator,
+        injected,
+        &environment,
+        options,
+        selected.store_root,
+        selected.store_id,
+    );
+    defer registered.deinit();
+    try std.testing.expectEqual(@as(u8, 127), PendingSyncFault.mask);
+    try std.testing.expectEqualStrings(selected.store_id, registered.value.store_id);
+    var resolved = try host.resolve(allocator, io, &environment, options);
+    defer resolved.deinit();
+    try std.testing.expectEqualStrings(selected.store_id, resolved.value.store_id);
 }

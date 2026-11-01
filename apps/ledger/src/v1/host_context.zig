@@ -166,20 +166,16 @@ pub fn registerRoot(
     defer allocator.free(canonical);
     var lock = try catalog.Lock.acquire(io, options.catalog_root);
     defer lock.deinit();
-    try checkLegacyRegistration(allocator, io, associations.git_common_dir, canonical, id);
-    var selected = try lock.read(allocator);
-    defer selected.deinit();
-    _ = try selected.select(associations.aliases, null, true);
-    var changed = try selected.register(id, canonical);
-    changed = (try selected.associate(associations.aliases, id)) or changed;
-    const current = try catalog.checkedRoot(allocator, io, canonical, id);
-    defer current.close(io);
-    if (!try @import("durable_store").sameDirectoryObject(
+    const changed = try associateRootLocked(
+        allocator,
         io,
+        &lock,
+        &associations,
+        options.catalog_root,
+        canonical,
+        id,
         control,
-        current,
-    )) return error.StorageRootChanged;
-    if (changed) try lock.publish(allocator, selected.value);
+    );
     return context(
         allocator,
         canonical,
@@ -188,6 +184,50 @@ pub fn registerRoot(
         associations.git_common_dir,
         changed,
     );
+}
+
+pub fn associateRootLocked(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    lock: *const catalog.Lock,
+    associations: *const workspace.Associations,
+    home: []const u8,
+    root: []const u8,
+    id: []const u8,
+    control: std.Io.Dir,
+) !bool {
+    try checkLegacyRegistration(allocator, io, associations.git_common_dir, root, id);
+    var candidate = try context(
+        allocator,
+        root,
+        id,
+        associations.workspace_root,
+        associations.git_common_dir,
+        false,
+    );
+    defer candidate.deinit();
+    try @import("host_pending.zig").syncPendingContext(
+        allocator,
+        io,
+        associations,
+        home,
+        candidate.value,
+        lock,
+    );
+    var selected = try lock.read(allocator);
+    defer selected.deinit();
+    _ = try selected.select(associations.aliases, null, true);
+    var changed = try selected.register(id, root);
+    changed = (try selected.associate(associations.aliases, id)) or changed;
+    const current = try catalog.checkedRoot(allocator, io, root, id);
+    defer current.close(io);
+    if (!try @import("durable_store").sameDirectoryObject(
+        io,
+        control,
+        current,
+    )) return error.StorageRootChanged;
+    if (changed) try lock.publish(allocator, selected.value);
+    return changed;
 }
 
 pub fn attach(

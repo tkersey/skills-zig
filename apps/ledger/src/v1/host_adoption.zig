@@ -372,7 +372,7 @@ fn captureSource(
 ) !preparation.History {
     const limits: legacy.Limits = .{};
     var scope = storage_root.Scope.init(.init(io, std.Io.Dir.cwd()));
-    return preparation.captureHistoryBounded(
+    return preparation.captureSourceHistoryBounded(
         &scope,
         allocator,
         root,

@@ -37,14 +37,23 @@ pub fn trees(
     environment: *const std.process.Environ.Map,
     selected: []const u8,
 ) !Trees {
+    return treesForTarget(allocator, io, environment, selected, null);
+}
+
+pub fn treesForTarget(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    environment: *const std.process.Environ.Map,
+    selected: []const u8,
+    target: ?host.ContextValue,
+) !Trees {
     var arena = std.heap.ArenaAllocator.init(allocator);
     errdefer arena.deinit();
     const owned = arena.allocator();
     const selected_dir = try catalog.openDirectory(io, selected, false);
     defer selected_dir.close(io);
-    if (try catalog.existsAt(io, selected_dir, ".ledger-root.json"))
-        return error.ManagedRootRequiresRegistration;
     const canonical = try selected_dir.realPathFileAlloc(io, ".", owned);
+    try admitSelectedRoot(allocator, io, selected_dir, canonical, target);
     const paths = try workspace.gitOrPlain(
         owned,
         io,
@@ -63,8 +72,7 @@ pub fn trees(
         result.git_common_dir = git.common;
         const root_dir = try catalog.openDirectory(io, git.root, false);
         defer root_dir.close(io);
-        if (try catalog.existsAt(io, root_dir, ".ledger-root.json"))
-            return error.ManagedRootRequiresRegistration;
+        try admitSelectedRoot(allocator, io, root_dir, git.root, target);
         try appendGitTrees(owned, io, environment, git, &found);
     } else {
         try found.append(owned, canonical);
@@ -77,6 +85,20 @@ pub fn trees(
     result.roots = try found.toOwnedSlice(owned);
     result.arena = arena;
     return result;
+}
+
+fn admitSelectedRoot(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    directory: std.Io.Dir,
+    path: []const u8,
+    target: ?host.ContextValue,
+) !void {
+    if (!try catalog.existsAt(io, directory, ".ledger-root.json")) return;
+    const current = target orelse return error.ManagedRootRequiresRegistration;
+    if (!std.mem.eql(u8, path, current.store_root)) return error.ManagedRootRequiresRegistration;
+    const control = try catalog.checkedRoot(allocator, io, path, current.store_id);
+    control.close(io);
 }
 
 fn appendGitTrees(
@@ -130,7 +152,7 @@ pub fn discover(
     const owned = arena.allocator();
     var roots: []const []const u8 = &.{};
     if (selected) |path| {
-        var discovered = try trees(allocator, io, environment, path);
+        var discovered = try treesForTarget(allocator, io, environment, path, target);
         defer discovered.deinit();
         const copied = try owned.alloc([]const u8, discovered.roots.len);
         for (discovered.roots, copied) |root, *copy| copy.* = try owned.dupe(u8, root);

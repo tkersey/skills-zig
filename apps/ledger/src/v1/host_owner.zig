@@ -228,6 +228,8 @@ fn runPlan(
         io,
         environment,
         options,
+        plan,
+        bindings,
         &associations,
         slot.relative_path,
         retired,
@@ -275,11 +277,27 @@ fn existingCoverage(
     if (options.repair_archive and health.pending_transactions != 0) {
         return error.ArchiveRepairRequiresResolvedTransactions;
     }
+    if (options.repair_archive and (!health.healthy or health.slots[0].state == .missing)) {
+        const failure = health.slots[0].error_code orelse
+            return error.ArchiveRepairRequiresBoundMissingSlot;
+        if (std.mem.eql(u8, failure, "EventStoreBusy") or
+            std.mem.eql(u8, failure, "LockBusy")) return .{};
+        if (!std.mem.eql(u8, failure, "StoreBindingWithoutSlot"))
+            return error.ArchiveRepairRequiresBoundMissingSlot;
+        return .{};
+    }
     if (!health.healthy or health.pending_transactions != 0) return .{};
-    const slot = plan.storage_plan.?.slots[0];
     const present = health.slots[0].state != .missing;
     const covered = if (present)
-        try localCovered(allocator, io, environment, selected, plan, bindings)
+        try localCovered(
+            allocator,
+            io,
+            environment,
+            selected,
+            plan,
+            bindings,
+            options.confirm_no_writers,
+        )
     else
         try missingCovered(
             allocator,
@@ -287,7 +305,8 @@ fn existingCoverage(
             environment,
             options,
             selected,
-            slot.relative_path,
+            plan,
+            bindings,
             retired,
         );
     return .{
@@ -302,7 +321,8 @@ fn missingCovered(
     environment: *const std.process.Environ.Map,
     options: Options,
     selected: host.ContextValue,
-    slot: []const u8,
+    plan: *const compiled.PlanSet,
+    bindings: *const parameters.Bindings,
     retired: []const []const u8,
 ) !bool {
     var sources = try discovery.discover(
@@ -311,12 +331,36 @@ fn missingCovered(
         environment,
         options.context.workspace,
         selected,
-        slot,
+        plan.storage_plan.?.slots[0].relative_path,
         retired,
         true,
     );
     defer sources.deinit();
-    return !try anyHistory(allocator, io, sources.sources, slot);
+    if (try emptyFamily(allocator, io, sources.sources)) return true;
+    return coverSources(
+        allocator,
+        io,
+        environment,
+        selected,
+        plan,
+        bindings,
+        &sources,
+        options.confirm_no_writers,
+        false,
+        true,
+    );
+}
+
+fn emptyFamily(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    sources: []const preparation.Source,
+) !bool {
+    for (sources) |source| {
+        if (source.archive or try host.workspace.hasLegacyHistory(allocator, io, source.root, &.{}))
+            return false;
+    }
+    return true;
 }
 
 fn initializeNewOwner(
@@ -324,6 +368,8 @@ fn initializeNewOwner(
     io: std.Io,
     environment: *const std.process.Environ.Map,
     options: Options,
+    plan: *const compiled.PlanSet,
+    bindings: *const parameters.Bindings,
     associations: *const host.workspace.Associations,
     slot: []const u8,
     retired: []const []const u8,
@@ -357,7 +403,28 @@ fn initializeNewOwner(
             else => return err,
         };
     defer initialized.deinit();
-    try result.setContext(initialized.value);
+    const coverage = try existingCoverage(
+        result,
+        io,
+        environment,
+        options,
+        plan,
+        bindings,
+        associations,
+        initialized.value,
+        retired,
+    );
+    if (!coverage.covered) try prepareSelected(
+        result,
+        io,
+        environment,
+        options,
+        plan,
+        bindings,
+        initialized.value,
+        if (coverage.discover_archives) retired else &.{},
+        coverage.discover_archives,
+    );
     return true;
 }
 
@@ -447,9 +514,9 @@ fn localCovered(
     selected: host.ContextValue,
     plan: *const compiled.PlanSet,
     bindings: *const parameters.Bindings,
+    confirm_no_writers: bool,
 ) !bool {
     const root = selected.workspace_root orelse return true;
-    if (std.mem.eql(u8, root, selected.store_root)) return true;
     var sources = try discovery.discover(
         allocator,
         io,
@@ -461,6 +528,7 @@ fn localCovered(
         false,
     );
     defer sources.deinit();
+    if (try emptyFamily(allocator, io, sources.sources)) return true;
     if (plan.storage_plan.?.slots[0].layout == .segmented) {
         if (!try anyHistory(
             allocator,
@@ -470,10 +538,21 @@ fn localCovered(
         )) return true;
         return error.SegmentedLocalCoverageRequiresMigration;
     }
-    return coverLiveSources(allocator, io, environment, selected, plan, bindings, &sources);
+    return coverSources(
+        allocator,
+        io,
+        environment,
+        selected,
+        plan,
+        bindings,
+        &sources,
+        confirm_no_writers,
+        true,
+        false,
+    );
 }
 
-fn coverLiveSources(
+fn coverSources(
     allocator: std.mem.Allocator,
     io: std.Io,
     environment: *const std.process.Environ.Map,
@@ -481,6 +560,9 @@ fn coverLiveSources(
     plan: *const compiled.PlanSet,
     bindings: *const parameters.Bindings,
     sources: *const discovery.Sources,
+    confirm_no_writers: bool,
+    target_present: bool,
+    discover_archives: bool,
 ) !bool {
     const target_dir = try storage_root.checkedRoot(
         allocator,
@@ -495,7 +577,13 @@ fn coverLiveSources(
     };
     var target_scope = storage_root.Scope.init(.anchored(io, target_dir));
     target_scope.fs.read_budget = &budget;
-    var target_history = try captureCoverageHistory(&target_scope, allocator, plan, bindings);
+    var target_history = try captureCoverageHistory(
+        &target_scope,
+        allocator,
+        plan,
+        bindings,
+        target_present and !confirm_no_writers,
+    );
     defer target_history.deinit(allocator);
     const controls = try allocator.alloc(?std.Io.Dir, sources.sources.len);
     defer allocator.free(controls);
@@ -505,16 +593,41 @@ fn coverLiveSources(
     defer allocator.free(histories);
     @memset(histories, .{});
     defer for (histories) |*history| history.deinit(allocator);
+    try captureCoverageSources(
+        allocator,
+        io,
+        plan,
+        bindings,
+        sources.sources,
+        controls,
+        histories,
+        &budget,
+        confirm_no_writers,
+    );
     var covered = true;
-    for (sources.sources, controls, histories) |source, *control, *history| {
-        control.* = try openCoverageSource(allocator, io, source);
-        const dir = control.* orelse continue;
-        var source_scope = storage_root.Scope.init(.anchored(io, dir));
-        source_scope.fs.read_budget = &budget;
-        history.* = try captureCoverageHistory(&source_scope, allocator, plan, bindings);
-        if (!target_history.covers(history)) covered = false;
-    }
-    try recheckCoverage(allocator, io, environment, selected, plan, sources, controls);
+    for (histories) |*history| if (!target_history.covers(history)) {
+        covered = false;
+    };
+    try recheckCoverage(
+        allocator,
+        io,
+        environment,
+        selected,
+        plan,
+        sources,
+        controls,
+        discover_archives,
+    );
+    try recheckTarget(allocator, io, selected, target_dir);
+    return covered;
+}
+
+fn recheckTarget(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    selected: host.ContextValue,
+    previous: std.Io.Dir,
+) !void {
     const current = try storage_root.checkedRoot(
         allocator,
         io,
@@ -522,9 +635,60 @@ fn coverLiveSources(
         selected.store_id,
     );
     defer current.close(io);
-    if (!try @import("durable_store").sameDirectoryObject(io, target_dir, current))
+    if (!try @import("durable_store").sameDirectoryObject(io, previous, current))
         return error.StorageRootChanged;
-    return covered;
+}
+
+fn captureCoverageSources(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    plan: *const compiled.PlanSet,
+    bindings: *const parameters.Bindings,
+    sources: []const preparation.Source,
+    controls: []?std.Io.Dir,
+    histories: []preparation.History,
+    budget: *storage_root.ReadBudget,
+    confirm_no_writers: bool,
+) !void {
+    for ([_]bool{ true, false }) |archive| {
+        for (sources, controls, histories) |source, *control, *history| {
+            if (source.archive != archive) continue;
+            control.* = try openCoverageSource(allocator, io, source);
+            if (control.*) |dir| {
+                var source_scope = storage_root.Scope.init(.anchored(io, dir));
+                source_scope.fs.read_budget = budget;
+                history.* = if (source.archive)
+                    try preparation.captureHistory(
+                        &source_scope,
+                        allocator,
+                        ".",
+                        &plan.definition_plan,
+                        try preparation.selectedSlot(&plan.storage_plan.?),
+                        bindings,
+                        plan.protocol_plan != null,
+                        history_limits,
+                        false,
+                    )
+                else
+                    try captureCoverageHistory(
+                        &source_scope,
+                        allocator,
+                        plan,
+                        bindings,
+                        !confirm_no_writers,
+                    );
+            } else if (!source.archive and !confirm_no_writers) {
+                return error.PreparationRequiresQuiescence;
+            }
+            if (source.archive) try preparation.validateArchive(
+                io,
+                allocator,
+                source,
+                history,
+                budget,
+            );
+        }
+    }
 }
 
 fn openCoverageSource(
@@ -549,6 +713,7 @@ fn recheckCoverage(
     plan: *const compiled.PlanSet,
     sources: *const discovery.Sources,
     controls: []const ?std.Io.Dir,
+    discover_archives: bool,
 ) !void {
     var associations = try host.workspace.resolve(
         allocator,
@@ -568,7 +733,7 @@ fn recheckCoverage(
         selected,
         plan.storage_plan.?.slots[0].relative_path,
         &.{},
-        false,
+        discover_archives,
     );
     defer current.deinit();
     if (current.sources.len != sources.sources.len)
@@ -592,8 +757,9 @@ fn captureCoverageHistory(
     allocator: std.mem.Allocator,
     plan: *const compiled.PlanSet,
     bindings: *const parameters.Bindings,
+    require_coordination: bool,
 ) !preparation.History {
-    return preparation.captureHistory(
+    return preparation.captureSourceHistory(
         scope,
         allocator,
         ".",
@@ -602,7 +768,7 @@ fn captureCoverageHistory(
         bindings,
         plan.protocol_plan != null,
         history_limits,
-        false,
+        require_coordination,
     );
 }
 
@@ -616,12 +782,24 @@ fn anyHistory(
     std.crypto.hash.sha2.Sha256.hash(slot, &hash, .{});
     const hex = std.fmt.bytesToHex(hash, .lower);
     for (sources) |source| {
+        if (source.archive) return true;
+        const control = try openCoverageSource(allocator, io, source);
+        if (control) |directory| {
+            defer directory.close(io);
+            try @import("durable_store").ensureNoPendingTransactions(
+                .anchored(io, directory),
+                allocator,
+                ".transactions",
+            );
+        }
         const path = try std.fs.path.join(allocator, &.{ source.root, ".ledger", slot });
+        defer allocator.free(path);
         const binding = try std.fmt.allocPrint(
             allocator,
             "{s}/.ledger/.bindings/{s}.jsonl",
             .{ source.root, hex },
         );
+        defer allocator.free(binding);
         if (try host.catalog.exists(io, path) or try host.catalog.exists(io, binding)) return true;
     }
     return false;
@@ -704,6 +882,12 @@ fn prepareSelected(
         discover_archives,
     );
     defer sources.deinit();
+    if (options.repair_archive) {
+        const archived = for (sources.sources) |source| {
+            if (source.archive) break true;
+        } else false;
+        if (!archived) return error.ArchiveRepairRequiresArchiveEvidence;
+    }
     const control = try storage_root.checkedRoot(
         allocator,
         io,
@@ -720,9 +904,10 @@ fn prepareSelected(
         selected,
         sources.sources,
         options.confirm_no_writers,
+        options.repair_archive,
     );
     if (options.context.workspace) |workspace| {
-        try recheckPreparedTrees(allocator, io, environment, workspace, sources.trees);
+        try recheckPreparedTrees(allocator, io, environment, workspace, selected, sources.trees);
     }
     try registerContext(result, io, environment, options, selected);
 }
@@ -736,6 +921,7 @@ fn prepareNative(
     selected: host.ContextValue,
     sources: []const preparation.Source,
     confirm_no_writers: bool,
+    restore_bound_history: bool,
 ) !void {
     const allocator = result.arena.allocator();
     const selection: storage_root.Selection = .{
@@ -759,6 +945,7 @@ fn prepareNative(
         bindings,
         sources,
         confirm_no_writers,
+        restore_bound_history,
     ) catch |err| {
         if (!selected.storage_mutated) try result.put("storage_mutated", scope.mutation_state);
         return err;
@@ -781,9 +968,10 @@ fn recheckPreparedTrees(
     io: std.Io,
     environment: *const std.process.Environ.Map,
     workspace: []const u8,
+    selected: host.ContextValue,
     expected: []const []const u8,
 ) !void {
-    var current = try discovery.trees(allocator, io, environment, workspace);
+    var current = try discovery.treesForTarget(allocator, io, environment, workspace, selected);
     defer current.deinit();
     if (current.roots.len != expected.len) return error.WorkspaceCoverageChangedAfterPreparation;
     for (current.roots, expected) |left, right| {
@@ -799,6 +987,7 @@ fn prepareWaiting(
     bindings: *const parameters.Bindings,
     sources: []const preparation.Source,
     confirm_no_writers: bool,
+    restore_bound_history: bool,
 ) !preparation.Result {
     for (0..301) |attempt| {
         var result = try preparation.execute(
@@ -813,6 +1002,7 @@ fn prepareWaiting(
             .{
                 .apply = true,
                 .confirm_no_legacy_writers = confirm_no_writers,
+                .restore_bound_history = restore_bound_history,
                 .limits = history_limits,
             },
         );
@@ -830,4 +1020,228 @@ fn prepareWaiting(
         try std.Io.sleep(scope.fs.io, .fromMilliseconds(100), .awake);
     }
     unreachable;
+}
+
+const OwnerAssociationInterleaving = struct {
+    var active: ?*OwnerAssociationInterleaving = null;
+
+    io: std.Io,
+    environment: *const std.process.Environ.Map,
+    options: host.Options,
+    selected: host.ContextValue,
+    seed: std.Io.Dir,
+    workspace: std.Io.Dir,
+    catalog: std.Io.Dir,
+    catalog_reads: usize = 0,
+    fired: bool = false,
+
+    fn verify(self: *const OwnerAssociationInterleaving, result: Result) !void {
+        if (!self.fired or result.exit_code != 0) {
+            const diagnostic = try std.json.Stringify.valueAlloc(
+                std.testing.allocator,
+                result.value,
+                .{},
+            );
+            defer std.testing.allocator.free(diagnostic);
+            std.debug.print("catalog reads={d}, fired={}, result={s}\n", .{
+                self.catalog_reads, self.fired, diagnostic,
+            });
+        }
+        try std.testing.expect(self.fired);
+        try std.testing.expectEqual(@as(u8, 0), result.exit_code);
+        try std.testing.expectEqualStrings(
+            self.selected.store_id,
+            result.value.object.get("store_id").?.string,
+        );
+    }
+
+    fn stat(
+        userdata: ?*anyopaque,
+        directory: std.Io.Dir,
+        path: []const u8,
+        options: std.Io.Dir.StatFileOptions,
+    ) std.Io.Dir.StatFileError!std.Io.File.Stat {
+        const self = active.?;
+        if (std.mem.eql(u8, path, host.catalog.filename) and
+            (@import("durable_store").sameDirectoryObject(self.io, directory, self.catalog) catch
+                return error.Unexpected))
+        {
+            self.catalog_reads += 1;
+            if (self.catalog_reads == 2) {
+                var registered = host.registerRoot(
+                    std.testing.allocator,
+                    self.io,
+                    self.environment,
+                    self.options,
+                    self.selected.store_root,
+                    self.selected.store_id,
+                ) catch return error.Unexpected;
+                registered.deinit();
+                self.seed.renamePreserve(".ledger", self.workspace, ".ledger", self.io) catch
+                    return error.Unexpected;
+                self.fired = true;
+            }
+        }
+        return self.io.vtable.dirStatFile(userdata, directory, path, options);
+    }
+};
+
+test "segmented owner source absence rejects unresolved native publication" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var temporary = try host.workspace.testPlainDirectory();
+    defer temporary.cleanup();
+    const root = try temporary.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(root);
+    const sources = [_]preparation.Source{.{ .root = root }};
+    try std.testing.expect(!try anyHistory(allocator, io, &sources, "example/events.jsonl"));
+    try temporary.dir.createDirPath(io, ".ledger/.transactions/dtx-first");
+    try std.testing.expectError(error.TransactionRecoveryRequired, anyHistory(
+        allocator,
+        io,
+        &sources,
+        "example/events.jsonl",
+    ));
+    try std.testing.expect(try host.catalog.existsAt(
+        io,
+        temporary.dir,
+        ".ledger/.transactions/dtx-first",
+    ));
+    try std.testing.expect(!try host.catalog.existsAt(
+        io,
+        temporary.dir,
+        ".ledger/example/events.jsonl",
+    ));
+}
+
+test "owner initialization admits history after concurrent existing catalog selection" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var temporary = try host.workspace.testPlainDirectory();
+    defer temporary.cleanup();
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const owned = arena.allocator();
+    const root = try temporary.dir.realPathFileAlloc(io, ".", owned);
+    const home = try std.fs.path.join(owned, &.{ root, "home" });
+    const workspace = try std.fs.path.join(owned, &.{ root, "workspace" });
+    const seed = try std.fs.path.join(owned, &.{ root, "seed" });
+    const definition_path = try std.fs.path.join(owned, &.{ root, "definition.json" });
+    const manifest_path = try std.fs.path.join(owned, &.{ root, "migration.json" });
+    try testOwnerInputs(temporary.dir);
+    var environment = std.process.Environ.Map.init(allocator);
+    defer environment.deinit();
+    var selected = try host.initialize(allocator, io, &environment, .{ .catalog_root = home });
+    defer selected.deinit();
+    try testAppendOwner(&environment, definition_path, seed);
+    const seed_dir = try temporary.dir.openDir(io, "seed", .{});
+    defer seed_dir.close(io);
+    const workspace_dir = try temporary.dir.openDir(io, "workspace", .{});
+    defer workspace_dir.close(io);
+    const catalog_dir = try temporary.dir.openDir(io, "home", .{});
+    defer catalog_dir.close(io);
+    const original = try host.catalog.readBytes(
+        owned,
+        io,
+        seed_dir,
+        ".ledger/example/events.jsonl",
+        4096,
+    );
+    const options: host.Options = .{ .catalog_root = home, .workspace = workspace };
+    var interleaving: OwnerAssociationInterleaving = .{
+        .io = io,
+        .environment = &environment,
+        .options = options,
+        .selected = selected.value,
+        .seed = seed_dir,
+        .workspace = workspace_dir,
+        .catalog = catalog_dir,
+    };
+    OwnerAssociationInterleaving.active = &interleaving;
+    defer OwnerAssociationInterleaving.active = null;
+    var vtable = io.vtable.*;
+    vtable.dirStatFile = OwnerAssociationInterleaving.stat;
+    var injected = io;
+    injected.vtable = &vtable;
+    var result = try execute(allocator, injected, &environment, .{
+        .context = options,
+        .definition = definition_path,
+        .manifest = manifest_path,
+        .ensure = true,
+    });
+    defer result.deinit();
+    try interleaving.verify(result);
+    const target = try host.catalog.openDirectory(io, selected.value.store_root, false);
+    defer target.close(io);
+    try expectOwnerBytes(target, original);
+    try expectOwnerBytes(workspace_dir, original);
+}
+
+fn testOwnerInputs(directory: std.Io.Dir) !void {
+    const io = std.testing.io;
+    try directory.createDir(io, "workspace", .default_dir);
+    try directory.createDir(io, "seed", .default_dir);
+    try directory.writeFile(io, .{
+        .sub_path = "definition.json",
+        .data = @embedFile("fixtures/event-definition.json"),
+    });
+    try host.catalog.writeJson(std.testing.allocator, io, directory, "migration.json", Manifest{
+        .schema = "ledger-owner-migration/v1",
+        .definition = "definition.json",
+        .retired_sources = &.{},
+        .importer = null,
+    }, 16384);
+}
+
+fn expectOwnerBytes(directory: std.Io.Dir, expected: []const u8) !void {
+    const allocator = std.testing.allocator;
+    const actual = try host.catalog.readBytes(
+        allocator,
+        std.testing.io,
+        directory,
+        ".ledger/example/events.jsonl",
+        4096,
+    );
+    defer allocator.free(actual);
+    try std.testing.expectEqualStrings(expected, actual);
+}
+
+fn testAppendOwner(
+    environment: *const std.process.Environ.Map,
+    definition_path: []const u8,
+    root: []const u8,
+) !void {
+    const allocator = std.testing.allocator;
+    var scope = storage_root.Scope.init(.init(std.testing.io, std.Io.Dir.cwd()));
+    var plans = try cli.loadDefinitionWithCache(
+        &scope,
+        allocator,
+        environment,
+        definition_path,
+        .{ .kind = .transact, .name = "append" },
+        false,
+    );
+    defer plans.deinit(allocator);
+    var bindings = try cli.bindParameters(
+        allocator,
+        &plans.definition_plan.parameter_declarations,
+        &.{"request=first"},
+    );
+    defer bindings.deinit(allocator);
+    var result = try @import("ledger_v1_core").transaction.transact(
+        &scope,
+        allocator,
+        &plans.definition_plan,
+        &plans.closure,
+        plans.entry_path,
+        &plans.validation_plan.?,
+        &plans.storage_plan.?,
+        if (plans.protocol_plan) |*protocol| protocol else null,
+        "append",
+        root,
+        &.{.{ .name = "event", .bytes = "{\"kind\":\"one\",\"value\":1}" }},
+        &bindings,
+    );
+    defer result.deinit(allocator);
+    try std.testing.expect(result.validation_result.valid and result.storage_mutated);
 }

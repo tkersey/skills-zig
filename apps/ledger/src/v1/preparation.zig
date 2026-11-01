@@ -36,6 +36,7 @@ pub const Source = struct {
 pub const Options = struct {
     apply: bool = false,
     confirm_no_legacy_writers: bool = false,
+    restore_bound_history: bool = false,
     limits: Limits = .{},
 };
 
@@ -213,6 +214,11 @@ const Execution = struct {
         try self.selection.revalidateBudgeted(self.allocator, self.budget);
         if (try self.resolvePriorWork()) {
             self.target = try self.readTarget();
+            if (self.options.restore_bound_history and
+                !self.target.exists and self.missing_binding == null)
+            {
+                return error.PreparationRequiresBoundHistory;
+            }
             try self.admitSources(sources);
             try self.decide();
         }
@@ -431,14 +437,17 @@ const Execution = struct {
             var scope: storage_root.Scope = .{
                 .fs = self.scope.fs.reanchor(control),
             };
-            if (!source.source.archive) try durable_store.ensureNoPendingTransactions(
-                scope.fs,
-                self.allocator,
-                ".transactions",
-            );
-            return self.capture(
+            if (source.source.archive) return self.capture(&scope, false);
+            return captureSourceHistory(
                 &scope,
-                !self.options.confirm_no_legacy_writers and !source.source.archive,
+                self.allocator,
+                ".",
+                self.plan,
+                self.slot,
+                self.parameters,
+                self.protocol_required,
+                self.options.limits,
+                !self.options.confirm_no_legacy_writers,
             );
         }
         if (!self.options.confirm_no_legacy_writers and !source.source.archive) {
@@ -529,6 +538,15 @@ const Execution = struct {
                 "reconciliation-required";
             return;
         }
+        if (self.missing_binding) |binding| {
+            const current = try self.scope.readFile(
+                self.allocator,
+                chosen.files.items[1].path,
+                binding.bytes.len,
+            );
+            defer self.allocator.free(current);
+            if (!std.mem.eql(u8, current, binding.bytes)) return error.PreparationTargetChanged;
+        }
         releaseHistoryLocks(&refreshed);
         const provenance = try std.json.Stringify.valueAlloc(
             self.allocator,
@@ -547,6 +565,7 @@ const Execution = struct {
             chosen,
             &self.workspace.?,
             &self.result,
+            self.missing_binding != null,
         );
         self.result.outcome = "prepared";
         self.result.phase = "committed";
@@ -651,6 +670,7 @@ fn publish(
     history: *const History,
     workspace: *const work.Workspace,
     result: *Result,
+    require_binding: bool,
 ) ![]u8 {
     const control_root = try std.fs.path.join(
         allocator,
@@ -678,7 +698,13 @@ fn publish(
     for (history.files.items, 0..) |file, index| {
         const path = try std.fs.path.join(allocator, &.{ control_root, file.path });
         paths.appendAssumeCapacity(path);
-        mutations[index] = try selectedMutation(scope, allocator, path, file);
+        mutations[index] = try selectedMutation(
+            scope,
+            allocator,
+            path,
+            file,
+            require_binding and index == 1,
+        );
         if (mutations[index].action == .write) staged += file.bytes.len;
     }
     mutations[mutations.len - 1] = try workspace.publicationMutation();
@@ -713,12 +739,14 @@ fn selectedMutation(
     allocator: std.mem.Allocator,
     path: []const u8,
     file: File,
+    require_existing: bool,
 ) !durable_store.TransactionMutation {
     const existing = scope.readFile(allocator, file.path, file.bytes.len) catch |err| switch (err) {
         error.FileNotFound => null,
         else => return err,
     };
     defer if (existing) |bytes| allocator.free(bytes);
+    if (require_existing and existing == null) return error.PreparationTargetChanged;
     if (existing) |bytes| {
         if (!std.mem.eql(u8, bytes, file.bytes)) return error.PreparationTargetConflict;
     }
@@ -735,7 +763,7 @@ fn selectedMutation(
     };
 }
 
-fn validateArchive(
+pub fn validateArchive(
     io: std.Io,
     allocator: std.mem.Allocator,
     source: Source,
@@ -929,6 +957,64 @@ pub fn captureHistory(
     );
 }
 
+pub fn captureSourceHistory(
+    scope: *storage_root.Scope,
+    allocator: std.mem.Allocator,
+    repo_root: []const u8,
+    plan: *const definition.Plan,
+    slot: storage.ResolvedSlot,
+    parameters: *const definition_core.parameters.Bindings,
+    protocol_required: bool,
+    limits: Limits,
+    require_coordination: bool,
+) !History {
+    try limits.validate();
+    return captureSourceHistoryBounded(
+        scope,
+        allocator,
+        repo_root,
+        plan,
+        slot,
+        parameters,
+        protocol_required,
+        .{ .max_bytes = limits.max_bytes, .max_files = limits.max_files },
+        require_coordination,
+    );
+}
+
+pub fn captureSourceHistoryBounded(
+    scope: *storage_root.Scope,
+    allocator: std.mem.Allocator,
+    repo_root: []const u8,
+    plan: *const definition.Plan,
+    slot: storage.ResolvedSlot,
+    parameters: *const definition_core.parameters.Bindings,
+    protocol_required: bool,
+    limits: HistoryBounds,
+    require_coordination: bool,
+) !History {
+    const transactions = try std.fs.path.join(
+        allocator,
+        &.{ repo_root, storage_root.controlComponent(scope), ".transactions" },
+    );
+    defer allocator.free(transactions);
+    try durable_store.ensureNoPendingTransactions(scope.fs, allocator, transactions);
+    var history = try captureHistoryBounded(
+        scope,
+        allocator,
+        repo_root,
+        plan,
+        slot,
+        parameters,
+        protocol_required,
+        limits,
+        require_coordination,
+    );
+    errdefer history.deinit(allocator);
+    try durable_store.ensureNoPendingTransactions(scope.fs, allocator, transactions);
+    return history;
+}
+
 pub fn captureHistoryBounded(
     scope: *storage_root.Scope,
     allocator: std.mem.Allocator,
@@ -1107,6 +1193,154 @@ test "preparation prefix requires complete records and compatible native metadat
     long.files.items[2].bytes[0] = 'X';
     try std.testing.expect(!long.covers(&short));
     try std.testing.expect(!completePrefix("{\"id\":1}", "{\"id\":1}\n"));
+}
+
+test "bound restoration retains the binding existence expectation through publication" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    var scope = storage_root.Scope.init(.anchored(io, temporary.dir));
+    const binding: File = .{
+        .path = try allocator.dupe(u8, "binding.jsonl"),
+        .bytes = try allocator.dupe(u8, "original binding\n"),
+        .digest = try definition_core.canonical_json.digestBytesAlloc(
+            allocator,
+            "original binding\n",
+        ),
+    };
+    var owned = binding;
+    defer owned.deinit(allocator);
+    try temporary.dir.writeFile(io, .{ .sub_path = binding.path, .data = binding.bytes });
+    const mutation = try selectedMutation(&scope, allocator, "./binding.jsonl", binding, true);
+    try temporary.dir.deleteFile(io, binding.path);
+    try std.testing.expectError(error.PreparationTargetChanged, selectedMutation(
+        &scope,
+        allocator,
+        binding.path,
+        binding,
+        true,
+    ));
+    try std.testing.expectError(error.ExpectationMismatch, durable_store.commitTextTransaction(
+        scope.fs,
+        allocator,
+        "./.transactions",
+        &.{mutation},
+        .{
+            .owner = .{ .process_id = 0, .session_id = "restore-test", .executor = "ledger" },
+            .fencing_counter_path = ".fencing.counter",
+            .reject_symlinks = true,
+        },
+    ));
+    try std.testing.expectError(error.FileNotFound, temporary.dir.statFile(io, binding.path, .{}));
+    try durable_store.ensureNoPendingTransactions(scope.fs, allocator, ".transactions");
+}
+
+const SourcePublicationInterleaving = struct {
+    var active: ?*SourcePublicationInterleaving = null;
+
+    io: std.Io,
+    control: std.Io.Dir,
+    fired: bool = false,
+
+    fn open(
+        userdata: ?*anyopaque,
+        directory: std.Io.Dir,
+        path: []const u8,
+        options: std.Io.Dir.OpenFileOptions,
+    ) std.Io.File.OpenError!std.Io.File {
+        const self = active.?;
+        if (!self.fired and options.lock == .shared) {
+            self.fired = true;
+            self.control.createDirPath(self.io, ".transactions/dtx-interleaving") catch
+                return error.Unexpected;
+        }
+        return self.io.vtable.dirOpenFile(userdata, directory, path, options);
+    }
+};
+
+test "source admission checks pending publication after acquiring history guards" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    const root = try temporary.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(root);
+    var plans = try testSourcePlan(temporary.dir, root);
+    defer plans.deinit(allocator);
+    const slot = try selectedSlot(&plans.storage_plan.?);
+    try temporary.dir.createDirPath(io, ".ledger/example");
+    try temporary.dir.createDirPath(io, ".ledger/.bindings");
+    const control = try temporary.dir.openDir(io, ".ledger", .{});
+    defer control.close(io);
+    var scope = storage_root.Scope.init(.anchored(io, control));
+    const binding_path = try custody.bindingPathAlloc(&scope, allocator, ".", slot.relative_path);
+    defer allocator.free(binding_path);
+    for ([_][]const u8{ slot.relative_path, binding_path }) |path| {
+        const writer = try durable_store.acquireCasAdvisoryLock(scope.fs, allocator, path);
+        writer.close(io);
+    }
+    var parameters = try definition_core.parameters.bind(
+        allocator,
+        &plans.definition_plan.parameter_declarations,
+        &.{},
+    );
+    defer parameters.deinit(allocator);
+    var empty = try captureSourceHistory(
+        &scope,
+        allocator,
+        ".",
+        &plans.definition_plan,
+        slot,
+        &parameters,
+        false,
+        .{},
+        true,
+    );
+    try std.testing.expect(!empty.exists);
+    empty.deinit(allocator);
+    var interleaving: SourcePublicationInterleaving = .{ .io = io, .control = control };
+    SourcePublicationInterleaving.active = &interleaving;
+    defer SourcePublicationInterleaving.active = null;
+    var vtable = io.vtable.*;
+    vtable.dirOpenFile = SourcePublicationInterleaving.open;
+    var injected = io;
+    injected.vtable = &vtable;
+    scope.fs.io = injected;
+    try std.testing.expectError(error.TransactionRecoveryRequired, captureSourceHistory(
+        &scope,
+        allocator,
+        ".",
+        &plans.definition_plan,
+        slot,
+        &parameters,
+        false,
+        .{},
+        true,
+    ));
+    try std.testing.expect(interleaving.fired);
+    for ([_][]const u8{ slot.relative_path, binding_path }) |path| {
+        const writer = try durable_store.acquireCasAdvisoryLock(scope.fs, allocator, path);
+        writer.close(io);
+    }
+}
+
+fn testSourcePlan(directory: std.Io.Dir, root: []const u8) !@import("compiled_plan.zig").PlanSet {
+    const io = std.testing.io;
+    try directory.writeFile(io, .{
+        .sub_path = "definition.json",
+        .data = @embedFile("fixtures/event-definition.json"),
+    });
+    var scope = storage_root.Scope.init(.init(io, std.Io.Dir.cwd()));
+    return @import("compiled_plan.zig").load(
+        &scope,
+        std.testing.allocator,
+        root,
+        "definition.json",
+        .{ .kind = .doctor },
+        "test",
+        .{},
+    );
 }
 
 test "preparation target handoff preserves independent empty source custody" {
