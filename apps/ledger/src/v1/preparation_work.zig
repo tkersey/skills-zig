@@ -183,7 +183,9 @@ fn reconcileLocked(
 ) !void {
     try limits.validate();
     try rejectLegacyWorkspace(scope);
-    try durable_store.ensureNoPendingTransactions(scope.fs, allocator, ".transactions");
+    if (try durable_store.hasPendingTransactions(scope.fs, allocator, ".transactions")) {
+        return error.TransactionRecoveryRequired;
+    }
     const bytes = scope.readFile(allocator, record_path, record_max_bytes) catch |err|
         switch (err) {
             error.FileNotFound => {

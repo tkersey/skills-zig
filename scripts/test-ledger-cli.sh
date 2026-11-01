@@ -750,6 +750,54 @@ done
   --format json >"$preparation_dir/source-two.json"
 printf '%s\n' '{"kind":"one","value":1}' '{"kind":"two","value":2}' >"$preparation_dir/expected.jsonl"
 cmp -s "$preparation_dir/expected.jsonl" "$preparation_source/.ledger/example/events.jsonl"
+preparation_budget_root="$preparation_dir/prejournal-budget"
+preparation_budget_reset() {
+  rm -rf "$preparation_budget_root"
+  preparation_init "$preparation_budget_root"
+  for metadata in .definitions .revisions; do
+    if test -d "$preparation_source/.ledger/$metadata"; then
+      cp -R "$preparation_source/.ledger/$metadata" "$preparation_budget_root/.ledger/"
+    fi
+  done
+}
+preparation_budget_run() {
+  preparation_budget_status=0
+  "$binary" prepare --definition "$event_definition" \
+    --store-root "$preparation_budget_root" --store-id preparation-smoke \
+    --source-root "$preparation_source" --apply "$@" --format json \
+    >"$preparation_dir/prejournal-budget.json" || preparation_budget_status=$?
+  test "$preparation_budget_status" -eq 0 || test "$preparation_budget_status" -eq 2
+}
+preparation_budget_reset
+preparation_budget_run
+test "$preparation_budget_status" -eq 0
+preparation_budget_low=1
+preparation_budget_high=$("$json_cli" -r '.bytes_read' "$preparation_dir/prejournal-budget.json")
+while test "$preparation_budget_low" -lt "$preparation_budget_high"; do
+  preparation_budget_mid=$(( (preparation_budget_low + preparation_budget_high) / 2 ))
+  preparation_budget_reset
+  preparation_budget_run --max-read-bytes "$preparation_budget_mid"
+  case $("$json_cli" -r '.phase' "$preparation_dir/prejournal-budget.json") in
+    publication|verification|cleanup|committed) preparation_budget_high=$preparation_budget_mid ;;
+    *) preparation_budget_low=$(( preparation_budget_mid + 1 )) ;;
+  esac
+done
+preparation_budget_reset
+preparation_budget_run --max-read-bytes "$preparation_budget_low"
+test "$preparation_budget_status" -eq 2
+"$json_cli" -e '
+  .phase == "publication" and .error_code == "ReadBudgetExceeded" and
+  .outcome == "incomplete" and .transaction_id == null and .storage_mutated == true and
+  .bytes_read <= .limits.max_read_bytes and .file_reads > 0 and .records == 2
+' "$preparation_dir/prejournal-budget.json" >/dev/null
+test -z "$(find "$preparation_budget_root/.ledger/.transactions" -name transaction.json -print)"
+test ! -e "$preparation_budget_root/.ledger/example/events.jsonl"
+cmp -s "$preparation_dir/expected.jsonl" "$preparation_source/.ledger/example/events.jsonl"
+preparation_budget_run
+test "$preparation_budget_status" -eq 0
+"$json_cli" -e '.outcome == "prepared" and .store_id == "preparation-smoke" and .records == 2' \
+  "$preparation_dir/prejournal-budget.json" >/dev/null
+cmp -s "$preparation_dir/expected.jsonl" "$preparation_budget_root/.ledger/example/events.jsonl"
 preparation_alias_target="$preparation_dir/alias-target"
 preparation_init "$preparation_alias_target"
 cp "$preparation_alias_target/.ledger-root.json" "$preparation_dir/alias-marker-before.json"
@@ -1041,6 +1089,63 @@ for ((preparation_retry=0; preparation_retry<=100; preparation_retry++)); do
 done
 test ! -e "$preparation_bootstrap_root/.ledger/.preparation.json"
 test ! -e "$preparation_bootstrap_root/.ledger/example/events.jsonl"
+
+for preparation_fault in journal_failure journal_cleanup_failure committed_sync publication_busy; do
+  preparation_fault_root="$preparation_dir/observed-$preparation_fault"
+  preparation_init "$preparation_fault_root"
+  preparation_fault_status=0
+  LEDGER_PREPARATION_MEASURE="$preparation_dir/observed-$preparation_fault-measurement.json" \
+    LEDGER_PREPARATION_FAULT="$preparation_fault" "$preparation_probe" prepare \
+    --definition "$event_definition" --store-root "$preparation_fault_root" \
+    --store-id preparation-smoke --source-root "$preparation_source" --apply --format json \
+    >"$preparation_dir/observed-$preparation_fault.json" || preparation_fault_status=$?
+  test "$preparation_fault_status" -eq 2
+  preparation_measurement_check "$preparation_dir/observed-$preparation_fault-measurement.json"
+  "$json_cli" -e '.phase == "publication" and .storage_mutated == true and .records == 2' \
+    "$preparation_dir/observed-$preparation_fault.json" >/dev/null
+  case "$preparation_fault" in
+    journal_failure)
+      "$json_cli" -e '.outcome == "failure" and .error_code == "InputOutput" and .transaction_id == null' \
+        "$preparation_dir/observed-$preparation_fault.json" >/dev/null
+      test -z "$(find "$preparation_fault_root/.ledger/.transactions" -name transaction.json -print)"
+      test ! -e "$preparation_fault_root/.ledger/example/events.jsonl"
+      ;;
+    journal_cleanup_failure)
+      "$json_cli" -e '.outcome == "unknown" and .error_code == "InputOutput" and .transaction_id != null' \
+        "$preparation_dir/observed-$preparation_fault.json" >/dev/null
+      preparation_fault_id=$("$json_cli" -r '.transaction_id' "$preparation_dir/observed-$preparation_fault.json")
+      test -d "$preparation_fault_root/.ledger/.transactions/$preparation_fault_id"
+      test ! -e "$preparation_fault_root/.ledger/example/events.jsonl"
+      ;;
+    committed_sync)
+      "$json_cli" -e '.outcome == "committed-with-later-failure" and .error_code == "InputOutput" and .transaction_id != null' \
+        "$preparation_dir/observed-$preparation_fault.json" >/dev/null
+      preparation_fault_id=$("$json_cli" -r '.transaction_id' "$preparation_dir/observed-$preparation_fault.json")
+      "$json_cli" -e '.state == "committed"' \
+        "$preparation_fault_root/.ledger/.transactions/$preparation_fault_id/transaction.json" >/dev/null
+      test -f "$preparation_fault_root/.ledger/.transactions/$preparation_fault_id/commit.json"
+      cmp -s "$preparation_dir/expected.jsonl" "$preparation_fault_root/.ledger/example/events.jsonl"
+      ;;
+    publication_busy)
+      "$json_cli" -e '.outcome == "recovery-required" and .error_code == "LockBusy" and .transaction_id != null' \
+        "$preparation_dir/observed-$preparation_fault.json" >/dev/null
+      preparation_fault_id=$("$json_cli" -r '.transaction_id' "$preparation_dir/observed-$preparation_fault.json")
+      "$json_cli" -e '.state == "preparing"' \
+        "$preparation_fault_root/.ledger/.transactions/$preparation_fault_id/transaction.json" >/dev/null
+      test ! -e "$preparation_fault_root/.ledger/example/events.jsonl"
+      ;;
+  esac
+  if test "$preparation_fault" != journal_cleanup_failure; then
+    "$binary" prepare --definition "$event_definition" \
+      --store-root "$preparation_fault_root" --store-id preparation-smoke \
+      --source-root "$preparation_source" --apply --format json \
+      >"$preparation_dir/observed-$preparation_fault-retry.json"
+    "$json_cli" -e '.outcome == "prepared" or .outcome == "covered"' \
+      "$preparation_dir/observed-$preparation_fault-retry.json" >/dev/null
+    cmp -s "$preparation_dir/expected.jsonl" "$preparation_fault_root/.ledger/example/events.jsonl"
+    preparation_stable_covered "$preparation_fault_root"
+  fi
+done
 
 for preparation_fault in publication verification; do
   preparation_fault_root="$preparation_dir/fault-$preparation_fault"

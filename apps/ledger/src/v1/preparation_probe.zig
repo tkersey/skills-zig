@@ -14,6 +14,10 @@ const Fault = enum {
     inspection,
     recovery,
     catalog_association,
+    journal_failure,
+    journal_cleanup_failure,
+    committed_sync,
+    publication_busy,
 };
 var original: *const std.Io.VTable = undefined;
 var fault: Fault = .none;
@@ -23,6 +27,8 @@ var recovery_deleted: std.atomic.Value(bool) = .init(false);
 const no_handle = std.math.maxInt(usize);
 var stage_handle: std.atomic.Value(usize) = .init(no_handle);
 var marker_handle: std.atomic.Value(usize) = .init(no_handle);
+var journal_handle: std.atomic.Value(usize) = .init(no_handle);
+var journal_ready: std.atomic.Value(bool) = .init(false);
 
 var measurement_io: std.Io = undefined;
 var measurement_allocator: std.mem.Allocator = undefined;
@@ -128,6 +134,12 @@ fn createFile(
     path: []const u8,
     options: std.Io.Dir.CreateFileOptions,
 ) std.Io.File.OpenError!std.Io.File {
+    if (fault == .publication_busy and journal_ready.load(.monotonic) and
+        std.mem.endsWith(u8, path, ".cas.lock"))
+    {
+        triggered.store(true, .monotonic);
+        return error.PathAlreadyExists;
+    }
     const file = try original.dirCreateFile(userdata, directory, path, options);
     const native_stage = std.mem.startsWith(u8, std.fs.path.basename(path), ".ledger-dtx-stage-");
     if (native_stage) {
@@ -136,6 +148,11 @@ fn createFile(
     }
     if (std.mem.eql(u8, std.fs.path.basename(path), "commit.json")) {
         marker_handle.store(@intCast(file.handle), .monotonic);
+    }
+    if ((fault == .journal_failure or fault == .journal_cleanup_failure) and
+        std.mem.eql(u8, std.fs.path.basename(path), "transaction.json") and journalDirectory(directory))
+    {
+        journal_handle.store(@intCast(file.handle), .monotonic);
     }
     sample();
     if ((fault == .creation and native_stage) or
@@ -165,7 +182,22 @@ fn writePositional(
 }
 
 fn syncFile(userdata: ?*anyopaque, file: std.Io.File) std.Io.File.SyncError!void {
+    if ((fault == .journal_failure or fault == .journal_cleanup_failure) and
+        journal_handle.load(.monotonic) == @as(usize, @intCast(file.handle)) and
+        !triggered.swap(true, .monotonic)) return error.InputOutput;
+    var journal_directory = false;
+    if (fault == .committed_sync or fault == .publication_busy) {
+        var path_buffer: [4096]u8 = undefined;
+        const path_length = original.fileRealPath(userdata, file, &path_buffer) catch
+            @panic("probe cannot identify synced file");
+        journal_directory = std.mem.startsWith(u8, std.fs.path.basename(path_buffer[0..path_length]), "dtx-");
+    }
+    if (fault == .committed_sync and committed.load(.monotonic) and journal_directory and
+        !triggered.swap(true, .monotonic)) return error.InputOutput;
     try original.fileSync(userdata, file);
+    if (journal_directory) {
+        journal_ready.store(true, .monotonic);
+    }
     if (marker_handle.load(.monotonic) == @as(usize, @intCast(file.handle))) {
         committed.store(true, .monotonic);
     }
@@ -176,6 +208,7 @@ fn closeFiles(userdata: ?*anyopaque, files: []const std.Io.File) void {
         const handle: usize = @intCast(file.handle);
         if (stage_handle.load(.monotonic) == handle) stage_handle.store(no_handle, .monotonic);
         if (marker_handle.load(.monotonic) == handle) marker_handle.store(no_handle, .monotonic);
+        if (journal_handle.load(.monotonic) == handle) journal_handle.store(no_handle, .monotonic);
     }
     original.fileClose(userdata, files);
 }
@@ -205,6 +238,8 @@ fn deleteFile(
     directory: std.Io.Dir,
     path: []const u8,
 ) std.Io.Dir.DeleteFileError!void {
+    if (fault == .journal_cleanup_failure and triggered.load(.monotonic) and
+        journalDirectory(directory)) return error.AccessDenied;
     const stat = if ((measurement_path != null or fault == .recovery) and
         journalDirectory(directory))
         directory.statFile(measurement_io, path, .{ .follow_symlinks = false }) catch null

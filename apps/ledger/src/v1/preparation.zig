@@ -209,6 +209,8 @@ const Execution = struct {
     best: ?usize = null,
     target_covers: bool = true,
     recovery_required: bool = false,
+    prior_work_uncertain: bool = false,
+    publication: durable_store.CommitTransactionObservation.Publication = .unpublished,
 
     fn run(self: *Execution, sources: []const Source) !void {
         try self.selection.revalidateBudgeted(self.allocator, self.budget);
@@ -231,19 +233,22 @@ const Execution = struct {
     fn recordFailure(self: *Execution, err: anyerror) void {
         self.result.error_code = @errorName(err);
         const outcome = failureOutcome(err);
-        self.result.outcome = if (self.result.transaction_id != null)
+        self.result.outcome = if (self.publication == .committed)
             "committed-with-later-failure"
+        else if (self.publication == .unknown)
+            "unknown"
+        else if (self.recovery_required or self.publication == .pending or self.prior_work_uncertain)
+            "recovery-required"
         else if (err == error.LockBusy or err == error.EventStoreBusy)
             "busy"
-        else if (self.recovery_required or
-            std.mem.eql(u8, self.result.phase, "publication"))
-            "recovery-required"
-        else if (std.mem.eql(u8, outcome, "incomplete"))
-            outcome
-        else if (std.mem.startsWith(u8, self.result.phase, "prior-"))
-            "recovery-required"
         else
             outcome;
+    }
+
+    fn retainPriorFailure(self: *Execution, err: anyerror) void {
+        const outcome = failureOutcome(err);
+        self.prior_work_uncertain = !std.mem.eql(u8, outcome, "incomplete") and
+            !std.mem.eql(u8, outcome, "busy");
     }
 
     fn deinit(self: *Execution) void {
@@ -272,15 +277,21 @@ const Execution = struct {
 
     fn resolvePriorWork(self: *Execution) !bool {
         self.result.phase = "prior-inspection";
-        var needed = try durable_store.countPendingTransactions(
+        var needed = durable_store.hasPendingTransactions(
             self.scope.fs,
             self.allocator,
             ".transactions",
-        ) != 0;
+        ) catch |err| {
+            self.retainPriorFailure(err);
+            return err;
+        };
         if (!needed) {
             var observation: ?work.Report = null;
             defer self.retainPriorObservation(observation);
-            try work.inspectObserved(self.scope, self.allocator, self.options.limits, &observation);
+            work.inspectObserved(self.scope, self.allocator, self.options.limits, &observation) catch |err| {
+                self.retainPriorFailure(err);
+                return err;
+            };
             const existing = observation.?;
             needed = existing.phase != .absent and existing.phase != .finalized;
         }
@@ -300,11 +311,11 @@ const Execution = struct {
     fn acquireWorkspace(self: *Execution) !void {
         if (self.workspace != null) return;
         self.workspace = try work.Workspace.acquire(self.scope, self.allocator);
-        if (try durable_store.countPendingTransactions(
+        if (try durable_store.hasPendingTransactions(
             self.scope.fs,
             self.allocator,
             ".transactions",
-        ) != 0) {
+        )) {
             self.recovery_required = true;
             self.result.phase = "recovery";
             const previous_reclaimed = self.result.reclaimed_bytes;
@@ -316,8 +327,12 @@ const Execution = struct {
         self.result.phase = "prior-reconciliation";
         var observation: ?work.Report = null;
         defer self.retainPriorObservation(observation);
-        try self.workspace.?.reconcileObserved(self.options.limits, true, &observation);
+        self.workspace.?.reconcileObserved(self.options.limits, true, &observation) catch |err| {
+            self.retainPriorFailure(err);
+            return err;
+        };
         self.recovery_required = false;
+        self.prior_work_uncertain = false;
         self.result.phase = "preparation";
     }
 
@@ -565,6 +580,7 @@ const Execution = struct {
             chosen,
             &self.workspace.?,
             &self.result,
+            &self.publication,
             self.missing_binding != null,
         );
         self.result.outcome = "prepared";
@@ -670,6 +686,7 @@ fn publish(
     history: *const History,
     workspace: *const work.Workspace,
     result: *Result,
+    publication: *durable_store.CommitTransactionObservation.Publication,
     require_binding: bool,
 ) ![]u8 {
     const control_root = try std.fs.path.join(
@@ -711,7 +728,20 @@ fn publish(
     mutations[mutations.len - 1].path = operation_path;
     result.phase = "publication";
     transaction.markStorageMutationUnknown(scope);
-    var receipt = try durable_store.commitTextTransaction(
+    var observation: durable_store.CommitTransactionObservation = .{};
+    defer observation.deinit(allocator);
+    defer {
+        publication.* = observation.publication;
+        if (observation.publication == .pending or observation.publication == .committed) {
+            transaction.markStorageMutated(scope);
+        }
+        if (observation.publication == .committed) result.staged_bytes = staged;
+        if (observation.transaction_id) |id| {
+            result.transaction_id = @constCast(id);
+            observation.transaction_id = null;
+        }
+    }
+    var receipt = try durable_store.commitTextTransactionObserved(
         scope.fs,
         allocator,
         transactions,
@@ -725,10 +755,9 @@ fn publish(
             .fencing_counter_path = counter,
             .reject_symlinks = true,
         },
+        &observation,
     );
     defer receipt.deinit(allocator);
-    transaction.markStorageMutated(scope);
-    result.staged_bytes = staged;
     const transaction_id = @constCast(receipt.transaction_id);
     receipt.transaction_id = &.{};
     return transaction_id;

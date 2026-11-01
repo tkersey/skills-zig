@@ -1235,6 +1235,37 @@ pub fn commitTextTransaction(
     mutations: []const TransactionMutation,
     options: AcquireOptions,
 ) !CommitTransactionReceipt {
+    var observation: CommitTransactionObservation = .{};
+    defer observation.deinit(allocator);
+    return commitTextTransactionObserved(fs, allocator, transactions_dir, mutations, options, &observation);
+}
+
+pub const CommitTransactionObservation = struct {
+    pub const Publication = enum {
+        unpublished,
+        pending,
+        unknown,
+        committed,
+    };
+    publication: Publication = .unpublished,
+    transaction_id: ?[]const u8 = null,
+
+    pub fn deinit(self: *CommitTransactionObservation, allocator: std.mem.Allocator) void {
+        if (self.transaction_id) |id| allocator.free(id);
+        self.* = .{};
+    }
+};
+
+pub fn commitTextTransactionObserved(
+    fs: Fs,
+    allocator: std.mem.Allocator,
+    transactions_dir: []const u8,
+    mutations: []const TransactionMutation,
+    options: AcquireOptions,
+    observation: *CommitTransactionObservation,
+) !CommitTransactionReceipt {
+    std.debug.assert(observation.transaction_id == null);
+    observation.* = .{};
     try admitTransactionTargets(fs, allocator, transactions_dir, mutations);
     var commit: TransactionCommit = .{
         .fs = fs,
@@ -1243,6 +1274,11 @@ pub fn commitTextTransaction(
         .options = options,
     };
     defer commit.deinit();
+    defer observation.publication = commit.publication;
+    errdefer if (commit.publication != .unpublished) {
+        observation.transaction_id = commit.transaction_id;
+        commit.transaction_id = &.{};
+    };
     try commit.prepare(mutations);
     try commit.prepareRows();
     try commit.persistPreparingRecord();
@@ -1252,6 +1288,7 @@ pub fn commitTextTransaction(
     try commit.publishWrites();
     try commit.writeRecord(.committed);
     try writeCommittedTransactionMarker(fs, allocator, commit.commit_marker_path);
+    commit.publication = .committed;
     try syncDirectoryPath(fs, commit.transaction_dir);
     return commit.takeReceipt();
 }
@@ -1300,6 +1337,7 @@ const TransactionCommit = struct {
     recovery_hash_admission: usize = 0,
     recovery_hash_check_only: usize = 0,
     record_persisted: bool = false,
+    publication: CommitTransactionObservation.Publication = .unpublished,
     stage_dir: ?std.Io.Dir = null,
     cas_locks: []LockFile = &.{},
     cas_lock_count: usize = 0,
@@ -1482,12 +1520,15 @@ const TransactionCommit = struct {
         );
         defer journal_lock.close(fs.io);
         errdefer if (!self.record_persisted) {
+            var cleaned = true;
             fs.directory().deleteTree(fs.io, self.transaction_dir) catch |err| {
+                cleaned = false;
                 fs_authority.warn(fs.io, "journal rollback failed for {s}: {s}; run recovery", .{
                     self.transaction_dir, @errorName(err),
                 });
             };
             syncDirectoryPath(fs, self.transactions_dir) catch |err| {
+                cleaned = false;
                 fs_authority.warn(
                     fs.io,
                     "journal rollback sync failed for {s}: {s}; run recovery",
@@ -1496,7 +1537,9 @@ const TransactionCommit = struct {
                     },
                 );
             };
+            self.publication = if (cleaned) .unpublished else .unknown;
         };
+        self.publication = .unknown;
         try ensureDirectoryPathNoSymlinks(fs, self.transaction_dir);
         try writeCurrentTransactionRecord(
             fs,
@@ -1515,6 +1558,7 @@ const TransactionCommit = struct {
         try syncDirectoryPath(fs, self.transaction_dir);
         try syncDirectoryPath(fs, self.transactions_dir);
         self.record_persisted = true;
+        self.publication = .pending;
     }
 
     fn acquireCompatibilityLocks(self: *TransactionCommit) !void {
@@ -4984,12 +5028,31 @@ pub fn countPendingTransactions(
     );
 }
 
+pub fn hasPendingTransactions(
+    fs: Fs,
+    allocator: std.mem.Allocator,
+    transactions_dir: []const u8,
+) !bool {
+    return try scanPendingTransactions(fs, allocator, transactions_dir, 4096, 8192, true) != 0;
+}
+
 fn countPendingTransactionsBounded(
     fs: Fs,
     allocator: std.mem.Allocator,
     transactions_dir: []const u8,
     max_pending: usize,
     max_entries: usize,
+) !usize {
+    return scanPendingTransactions(fs, allocator, transactions_dir, max_pending, max_entries, false);
+}
+
+fn scanPendingTransactions(
+    fs: Fs,
+    allocator: std.mem.Allocator,
+    transactions_dir: []const u8,
+    max_pending: usize,
+    max_entries: usize,
+    stop_at_first: bool,
 ) !usize {
     const dir_stat = fs.directory().statFile(
         fs.io,
@@ -5025,6 +5088,7 @@ fn countPendingTransactionsBounded(
         if (entries > max_entries) return error.TooManyFiles;
         if (try transactionEntryPending(fs, allocator, transactions_dir, entry)) {
             try incrementPending(&pending, max_pending);
+            if (stop_at_first) return pending;
         }
     }
     return pending;
@@ -10861,6 +10925,78 @@ test "native publication rejects a 64 byte target under one shared read byte" {
     try std.testing.expectEqual(NativeReadCounter.bytes, budget.bytes);
     try std.testing.expectEqual(@as(usize, 0), budget.bytes);
     try std.testing.expect(budget.files > 0);
+}
+
+test "native publication observation distinguishes the same budget failure across journal custody" {
+    const allocator = std.testing.allocator;
+    for ([_]usize{ 0, 4 }) |allowance| {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "operation.json", .data = "1234" });
+        var vtable: std.Io.VTable = undefined;
+        var fs = Fs.anchored(NativeReadCounter.io(&vtable), tmp.dir);
+        var budget: fs_authority.ReadBudget = .{ .max_bytes = allowance, .max_files = 128 };
+        fs.read_budget = &budget;
+        var observation: CommitTransactionObservation = .{};
+        defer observation.deinit(allocator);
+        try std.testing.expectError(error.ReadBudgetExceeded, commitTextTransactionObserved(
+            fs,
+            allocator,
+            "./.transactions",
+            &.{.{
+                .path = "./operation.json",
+                .text = "5678",
+                .expectation = .{ .expected_exists = true },
+                .content_mode = .raw,
+                .max_bytes = 64,
+            }},
+            .{ .owner = .{
+                .process_id = 0,
+                .session_id = "publication-observation",
+                .executor = "test",
+            } },
+            &observation,
+        ));
+        try std.testing.expectEqual(allowance, budget.bytes);
+        try std.testing.expectEqual(NativeReadCounter.bytes, budget.bytes);
+        const unbudgeted = Fs.anchored(std.testing.io, tmp.dir);
+        const unchanged = try readFileAlloc(unbudgeted, allocator, "operation.json", 64);
+        defer allocator.free(unchanged);
+        try std.testing.expectEqualStrings("1234", unchanged);
+        if (allowance == 0) {
+            try std.testing.expectEqual(.unpublished, observation.publication);
+            try std.testing.expect(observation.transaction_id == null);
+            try std.testing.expect(!try hasPendingTransactions(unbudgeted, allocator, ".transactions"));
+        } else {
+            try std.testing.expectEqual(.pending, observation.publication);
+            const id = observation.transaction_id orelse return error.MissingTransactionIdentity;
+            const journal = try std.fs.path.join(allocator, &.{ "./.transactions", id });
+            defer allocator.free(journal);
+            try std.testing.expect(try hasPendingTransactions(unbudgeted, allocator, ".transactions"));
+            var recovered = try recoverTransaction(unbudgeted, allocator, journal);
+            defer recovered.deinit(allocator);
+            try std.testing.expectEqualStrings(id, recovered.transaction_id);
+            try std.testing.expect(!try hasPendingTransactions(unbudgeted, allocator, ".transactions"));
+        }
+    }
+}
+
+test "native pending existence retains a positive witness without reading later journals" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    try tmp.dir.createDir(std.testing.io, "one", .default_dir);
+    try tmp.dir.createDir(std.testing.io, "two", .default_dir);
+    var iter = tmp.dir.iterate();
+    const first = (try iter.next(std.testing.io)).?;
+    const other = if (std.mem.eql(u8, first.name, "one")) "two/transaction.json" else "one/transaction.json";
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = other, .data = "unreadable-under-zero-budget" });
+    var fs = Fs.anchored(std.testing.io, tmp.dir);
+    var budget: fs_authority.ReadBudget = .{ .max_bytes = 0, .max_files = 128 };
+    fs.read_budget = &budget;
+    try std.testing.expect(try hasPendingTransactions(fs, allocator, "."));
+    try std.testing.expectEqual(@as(usize, 0), budget.bytes);
+    try std.testing.expectError(error.ReadBudgetExceeded, countPendingTransactions(fs, allocator, "."));
 }
 
 test "native append publication inspection and recovery charge actual repeated reads" {

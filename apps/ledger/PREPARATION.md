@@ -181,7 +181,7 @@ any transaction identity. `covered`, `empty`, `ready` and `prepared` return exit
 `empty` means no admitted history, not permission to initialize or replace an
 established owner. `ready` is inspection evidence, not an execution token.
 `reconciliation-required`, `recovery-required`, `busy`, `incomplete`, `unsupported`,
-`failure` and `committed-with-later-failure` return exit 2. The latter preserves the committed installation and names the
+`failure`, `unknown` and `committed-with-later-failure` return exit 2. The latter preserves the committed installation and names the
 failed later phase; retry reuses it. Operation failures preserve measured counters,
 the specific `error_code`, phase and mutation observation in the preparation
 result. Argument/definition/layout admission errors before operation entry retain
@@ -195,9 +195,16 @@ not certification of that recovery. `activity` identifies the observation,
 and `complete: false` marks partial observations. Unresolved or malformed native work reports `recovery-required` and is retained;
 a receipt never overrides the native publication outcome.
 `committed-with-later-failure` identifies this invocation's committed transaction.
+Native transaction observations distinguish no retained journal, pending publication,
+uncertain initial-journal cleanup, and the native committed record/marker witness.
+A known transaction ID may therefore accompany pending or unknown outcomes; its
+presence alone does not mean committed. Failure after marker publication but before
+the final directory sync is reported as committed with a later failure. This does
+not certify that sync or add a durable-retry guarantee to the existing native protocol.
 Budget exhaustion before unresolved work is established reports `incomplete`;
 known pending publication retains `recovery-required` even if further reads cannot
-finish. A phase label alone does not establish pending work.
+finish or a subsequent lock acquisition is busy. Prior inspection stops on a positive
+native pending-work witness. A phase label alone does not establish pending work.
 Known observations survive later failures; native recovery reports
 `reclaimed_bytes: null` when its deletion count is unavailable. New capture uses its own observations and cannot inherit an older
 installation's success.
