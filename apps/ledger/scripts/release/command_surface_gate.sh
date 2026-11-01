@@ -9,7 +9,7 @@ if [[ ! -x "$bin_path" ]]; then
   exit 1
 fi
 
-expected=$'definition check\ndefinition describe\nvalidate\nmaterialize\ntransact\nproject\ndoctor\nmigrate-segmented\nprepare\nmaintain\nrecovery inspect\nrecovery reclaim\ncapabilities\nversion'
+expected=$'context\ndefinition check\ndefinition describe\nvalidate\nmaterialize\ntransact\nproject\ndoctor\nmigrate-segmented\nprepare\nmaintain\nrecovery inspect\nrecovery reclaim\ncapabilities\nversion'
 help_output=$("$bin_path" --help)
 actual=$(
   awk '
@@ -51,6 +51,9 @@ jq -e --arg version "$version" \
     .features.segmented_migration_v1 == true and
     .features.bounded_preparation_v1 == true and
     .features.preparation_maintenance_v1 == true and
+    .features.explicit_host_context_v1 == true and
+    .features.owner_preparation_v1 == true and
+    .features.historical_custody_migration_v2 == true and
     .cache_format != null and
     (.result_schemas | type == "array" and length > 0) and
     (.result_schemas | index("ledger-storage-root-error/v1")) != null

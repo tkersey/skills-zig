@@ -750,6 +750,40 @@ done
   --format json >"$preparation_dir/source-two.json"
 printf '%s\n' '{"kind":"one","value":1}' '{"kind":"two","value":2}' >"$preparation_dir/expected.jsonl"
 cmp -s "$preparation_dir/expected.jsonl" "$preparation_source/.ledger/example/events.jsonl"
+preparation_alias_target="$preparation_dir/alias-target"
+preparation_init "$preparation_alias_target"
+cp "$preparation_alias_target/.ledger-root.json" "$preparation_dir/alias-marker-before.json"
+while IFS= read -r preparation_advisory; do
+  preparation_relative=${preparation_advisory#"$preparation_source/.ledger/"}
+  mkdir -p "$preparation_alias_target/.ledger/$(dirname "$preparation_relative")"
+  cp "$preparation_advisory" "$preparation_alias_target/.ledger/$preparation_relative"
+done < <(find "$preparation_source/.ledger/example" "$preparation_source/.ledger/.bindings" \
+  -type f -name '*.cas.lock.advisory' -print)
+preparation_fingerprint "$preparation_source" >"$preparation_dir/alias-source-before"
+"$binary" prepare --definition "$event_definition" \
+  --store-root "$preparation_alias_target" --store-id preparation-smoke \
+  --source-store "preparation-smoke=$preparation_alias_target" \
+  --source-store "preparation-smoke=$preparation_alias_target" \
+  --source-store "preparation-smoke=$preparation_alias_target//" \
+  --source-root "$preparation_source" --apply --format json >"$preparation_dir/alias-applied.json"
+"$json_cli" -e --arg target "$preparation_alias_target" --arg source "$preparation_source" '
+  .outcome == "prepared" and .records == 2 and .store_id == "preparation-smoke" and
+  (.observations | length) == 4 and
+  .observations[0].root == $target and .observations[1].root == $target and
+  .observations[2].root == ($target + "//") and
+  all(.observations[0:3][]; .revision == null and .records == 0 and .store_id == "preparation-smoke") and
+  .observations[3].root == $source and .observations[3].records == 2
+' "$preparation_dir/alias-applied.json" >/dev/null
+"$json_cli" -e --slurpfile result "$preparation_dir/alias-applied.json" \
+  '.provenance == $result[0].observations' "$preparation_alias_target/.ledger/.preparation.json" >/dev/null
+cmp -s "$preparation_dir/alias-marker-before.json" "$preparation_alias_target/.ledger-root.json"
+cmp -s "$preparation_dir/expected.jsonl" "$preparation_alias_target/.ledger/example/events.jsonl"
+preparation_fingerprint "$preparation_source" >"$preparation_dir/alias-source-after"
+cmp -s "$preparation_dir/alias-source-before" "$preparation_dir/alias-source-after"
+"$binary" project --definition "$event_definition" --projection all \
+  --store-root "$preparation_alias_target" --store-id preparation-smoke \
+  --format jsonl >"$preparation_dir/alias-projection.jsonl"
+cmp -s "$preparation_dir/expected.jsonl" "$preparation_dir/alias-projection.jsonl"
 mkdir -p "$preparation_source/.ledger/unrelated-cas"
 dd if=/dev/zero of="$preparation_source/.ledger/unrelated-cas/oversized.bin" bs=1 count=0 seek=2147483649 2>/dev/null
 test "$(wc -c <"$preparation_source/.ledger/unrelated-cas/oversized.bin")" -gt 2147483648

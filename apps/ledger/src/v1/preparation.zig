@@ -155,12 +155,15 @@ pub fn execute(
     const slot = try selectedSlot(store);
     try options.limits.validate();
     if (sources.len > 32) return error.PreparationSourceBoundExceeded;
-    var budget: storage_root.ReadBudget = .{
+    var local_budget: storage_root.ReadBudget = .{
         .max_bytes = options.limits.max_read_bytes,
         .max_files = options.limits.max_files * 16,
     };
     const previous_budget = scope.fs.read_budget;
-    scope.fs.read_budget = &budget;
+    const budget = previous_budget orelse &local_budget;
+    if (budget.max_bytes > options.limits.max_read_bytes or
+        budget.max_files > options.limits.max_files * 16) return error.InvalidPreparationBound;
+    scope.fs.read_budget = budget;
     defer scope.fs.read_budget = previous_budget;
     var execution: Execution = .{
         .scope = scope,
@@ -171,7 +174,7 @@ pub fn execute(
         .parameters = parameters,
         .protocol_required = protocol_required,
         .options = options,
-        .budget = &budget,
+        .budget = budget,
         .result = .{
             .owner = plan.id,
             .outcome = "empty",
@@ -506,7 +509,13 @@ const Execution = struct {
                 return error.InsufficientPreparationSpace;
             }
         }
-        releaseHistoryLocks(&self.target);
+        try releaseTargetLocks(
+            self.scope.fs.io,
+            self.scope.fs.directory(),
+            &self.target,
+            self.opened.items,
+            self.histories.items,
+        );
         try self.acquireWorkspace();
         var refreshed = self.capture(self.scope, false) catch |err| switch (err) {
             error.StoreBindingWithoutSlot => History{},
@@ -585,6 +594,22 @@ fn releaseHistoryLocks(history: *History) void {
     if (history.read_custody) |*locks| {
         locks.deinit();
         history.read_custody = null;
+    }
+}
+
+fn releaseTargetLocks(
+    io: std.Io,
+    target_directory: std.Io.Dir,
+    target: *History,
+    sources: []const OpenedSource,
+    histories: []History,
+) !void {
+    releaseHistoryLocks(target);
+    for (sources, histories) |source, *history| {
+        const control = source.control orelse continue;
+        if (try durable_store.sameDirectoryObject(io, target_directory, control)) {
+            releaseHistoryLocks(history);
+        }
     }
 }
 
@@ -1051,4 +1076,148 @@ test "preparation prefix requires complete records and compatible native metadat
     long.files.items[2].bytes[0] = 'X';
     try std.testing.expect(!long.covers(&short));
     try std.testing.expect(!completePrefix("{\"id\":1}", "{\"id\":1}\n"));
+}
+
+test "preparation target handoff preserves independent empty source custody" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    try temporary.dir.createDirPath(io, "target/.bindings");
+    try temporary.dir.createDirPath(io, "independent/.bindings");
+    const target_directory = try temporary.dir.openDir(io, "target", .{});
+    defer target_directory.close(io);
+    const alias_directory = try temporary.dir.openDir(io, "target/", .{});
+    defer alias_directory.close(io);
+    const independent_directory = try temporary.dir.openDir(io, "independent", .{});
+    defer independent_directory.close(io);
+    var scope = storage_root.Scope.init(durable_store.Fs.init(
+        io,
+        temporary.dir,
+    ).reanchor(target_directory));
+    const independent_fs = scope.fs.reanchor(independent_directory);
+    const slot: storage.ResolvedSlot = .{
+        .name = "events",
+        .relative_path = "events.jsonl",
+        .owned_path = null,
+        .kind = .event_log,
+        .codec = .jsonl,
+        .max_bytes = 4096,
+    };
+    const binding_path = try custody.bindingPathAlloc(&scope, allocator, ".", slot.relative_path);
+    defer allocator.free(binding_path);
+    for ([_]durable_store.Fs{ scope.fs, independent_fs }) |fs| {
+        for ([_][]const u8{ slot.relative_path, binding_path }) |path| {
+            const writer = try durable_store.acquireCasAdvisoryLock(fs, allocator, path);
+            writer.close(io);
+        }
+    }
+    var target: History = .{
+        .read_custody = try durable_store.acquireCasReadLockPair(
+            scope.fs,
+            allocator,
+            slot.relative_path,
+            binding_path,
+        ),
+    };
+    defer target.deinit(allocator);
+    const sources = handoffSources(target_directory, alias_directory, independent_directory);
+    var histories = [_]History{ .{}, .{}, .{} };
+    defer for (&histories) |*history| history.deinit(allocator);
+    for (sources, &histories) |source, *history| {
+        history.read_custody = try durable_store.acquireCasReadLockPair(
+            scope.fs.reanchor(source.control.?),
+            allocator,
+            slot.relative_path,
+            binding_path,
+        );
+    }
+    try releaseTargetLocks(io, target_directory, &target, &sources, &histories);
+    try expectIndependentSourceProtected(independent_fs, slot, binding_path);
+    try expectCompetingTargetRejected(&scope, slot, &histories[0]);
+}
+
+fn handoffSources(target: std.Io.Dir, alias: std.Io.Dir, independent: std.Io.Dir) [3]OpenedSource {
+    return .{
+        .{
+            .source = .{ .root = "target", .store_id = "same-id" },
+            .root = target,
+            .control = target,
+        },
+        .{
+            .source = .{ .root = "target/", .store_id = "same-id" },
+            .root = alias,
+            .control = alias,
+        },
+        .{
+            .source = .{ .root = "independent", .store_id = "same-id" },
+            .root = independent,
+            .control = independent,
+        },
+    };
+}
+
+fn expectIndependentSourceProtected(
+    independent_fs: durable_store.Fs,
+    slot: storage.ResolvedSlot,
+    binding_path: []const u8,
+) !void {
+    const allocator = std.testing.allocator;
+    for ([_][]const u8{ slot.relative_path, binding_path }) |path| {
+        try std.testing.expectError(error.LockBusy, durable_store.writeTextAtomicCas(
+            independent_fs,
+            allocator,
+            path,
+            "{\"id\":1}\n",
+            .{ .expected_exists = false },
+        ));
+        try std.testing.expectError(
+            error.FileNotFound,
+            independent_fs.directory().statFile(independent_fs.io, path, .{}),
+        );
+    }
+}
+
+fn expectCompetingTargetRejected(
+    scope: *storage_root.Scope,
+    slot: storage.ResolvedSlot,
+    history: *const History,
+) !void {
+    const allocator = std.testing.allocator;
+    try recheckHistory(scope, allocator, slot, history);
+    const competing_history = "{\"id\":1}\n";
+    var writer = try durable_store.writeTextAtomicCas(
+        scope.fs,
+        allocator,
+        "./events.jsonl",
+        competing_history,
+        .{ .expected_exists = false },
+    );
+    defer writer.deinit(allocator);
+    try std.testing.expectError(error.PreparationSourceChanged, recheckHistory(
+        scope,
+        allocator,
+        slot,
+        history,
+    ));
+    try std.testing.expectError(error.ExpectationMismatch, durable_store.commitTextTransaction(
+        scope.fs,
+        allocator,
+        "./.transactions",
+        &.{.{
+            .path = "./events.jsonl",
+            .text = "{\"id\":2}\n",
+            .expectation = .{ .expected_exists = false },
+            .content_mode = .raw,
+            .max_bytes = 4096,
+        }},
+        .{
+            .owner = .{ .process_id = 0, .session_id = "alias-handoff-test", .executor = "ledger" },
+            .fencing_counter_path = ".fencing.counter",
+            .reject_symlinks = true,
+        },
+    ));
+    const actual = try scope.readFile(allocator, slot.relative_path, 4096);
+    defer allocator.free(actual);
+    try std.testing.expectEqualStrings(competing_history, actual);
 }

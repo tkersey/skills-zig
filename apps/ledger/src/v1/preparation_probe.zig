@@ -13,6 +13,7 @@ const Fault = enum {
     verification,
     inspection,
     recovery,
+    catalog_association,
 };
 var original: *const std.Io.VTable = undefined;
 var fault: Fault = .none;
@@ -70,7 +71,7 @@ pub fn main(init: std.process.Init) !void {
     defer if (observed_path) |path| init.gpa.free(path);
     const argv = try init.minimal.args.toSlice(init.arena.allocator());
     if (argv.len > 1 and (std.mem.eql(u8, argv[1], "prepare") or
-        std.mem.eql(u8, argv[1], "maintain")))
+        std.mem.eql(u8, argv[1], "maintain") or std.mem.eql(u8, argv[1], "context")))
     {
         if (init.environ_map.get("LEDGER_PREPARATION_FAULT")) |name| {
             fault = std.meta.stringToEnum(Fault, name) orelse
@@ -227,6 +228,10 @@ fn rename(
     new_dir: std.Io.Dir,
     new_sub_path: []const u8,
 ) std.Io.Dir.RenameError!void {
+    if (fault == .catalog_association and std.mem.eql(u8, new_sub_path, "catalog.json")) {
+        triggered.store(true, .monotonic);
+        return error.AccessDenied;
+    }
     try original.dirRename(userdata, old_dir, old_sub_path, new_dir, new_sub_path);
     sample();
     if (fault == .publication and

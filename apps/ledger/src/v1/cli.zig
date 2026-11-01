@@ -28,6 +28,11 @@ const Help =
     \\
     \\usage: ledger <command> [options]
     \\
+    \\host context commands:
+    \\  ledger context --catalog-root <absolute-path>
+    \\    [--workspace <absolute-path>] [--store-id <id>]
+    \\    Run ledger context --help for registration and preparation modes.
+    \\
     \\definition commands:
     \\  ledger definition check --definition <file> [--format json|text]
     \\  ledger definition describe --definition <file> [--format json|text]
@@ -72,7 +77,8 @@ const Help =
     \\  Durable commands also accept --store-root <absolute-directory> --store-id <id>
     \\  instead of --repo. The caller selects and initializes the root; Ledger verifies
     \\  its identity marker and keeps all logical slots beneath its .ledger directory.
-    \\  No Git discovery, default location, registration, migration, or fallback occurs.
+    \\  Engine commands do not discover Git or select a default location.
+    \\  Use the separate context command for explicit catalog lookup and registration.
     \\  Prepare and maintain inspect by default. Apply requires existing custody authority.
     \\  Preparation supports static monolithic histories; maintenance releases only owned work.
     \\  Default bounds: 67108864 staged bytes, 512 files, 1073741824 read bytes.
@@ -1550,7 +1556,7 @@ fn loadDefinition(
     return loadDefinitionWithCache(scope, allocator, environment, path, route, true);
 }
 
-fn loadDefinitionWithCache(
+pub fn loadDefinitionWithCache(
     scope: *storage_root.Scope,
     allocator: std.mem.Allocator,
     environment: *const std.process.Environ.Map,
@@ -1723,7 +1729,7 @@ fn deinitDocuments(
     allocator.free(documents);
 }
 
-fn bindParameters(
+pub fn bindParameters(
     allocator: std.mem.Allocator,
     declarations: *const definition_core.parameters.Declarations,
     specs: []const []const u8,
@@ -2583,7 +2589,9 @@ fn writeCapabilityTail(writer: *std.Io.Writer) !void {
             "\"full_history_doctor_v1\":true," ++
             "\"segmented_event_log_v1\":true," ++
             "\"segmented_migration_v1\":true," ++
-            "\"bounded_preparation_v1\":true,\"preparation_maintenance_v1\":true}," ++
+            "\"bounded_preparation_v1\":true,\"preparation_maintenance_v1\":true," ++
+            "\"explicit_host_context_v1\":true,\"owner_preparation_v1\":true," ++
+            "\"historical_custody_migration_v2\":true}," ++
             "\"cache_format\":",
     );
     try writer.print(
@@ -2601,6 +2609,8 @@ fn writeCapabilityTail(writer: *std.Io.Writer) !void {
             "\"result_schemas\":[\"ledger-capabilities/v1\"," ++
             "\"ledger-command-error/v1\"," ++
             "\"ledger-storage-root-error/v1\"," ++
+            "\"ledger-workspace-context/v1\",\"ledger-workspace-context-error/v1\"," ++
+            "\"ledger-personal-store-list/v1\",\"ledger-custody-migration/v2\"," ++
             "\"ledger-definition-check-result/v1\"," ++
             "\"ledger-definition-description/v1\"," ++
             "\"ledger-doctor-result/v1\"," ++

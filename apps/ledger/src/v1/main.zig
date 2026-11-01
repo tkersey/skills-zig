@@ -1,12 +1,21 @@
 const std = @import("std");
 const cli = @import("cli.zig");
 const storage_root = @import("storage_root");
+const host_cli = @import("host_cli.zig");
 
 pub const panic = cli.panic;
 pub const std_options = cli.std_options;
 
 pub fn main(init: std.process.Init) !void {
     const argv = try init.minimal.args.toSlice(init.arena.allocator());
+    if (argv.len > 1 and std.mem.eql(u8, argv[1], "context")) {
+        const code = host_cli.run(init.gpa, init.io, init.environ_map, argv[2..]) catch |err| {
+            if (cli.isClosedPipe(err)) return;
+            return err;
+        };
+        if (code != 0) std.process.exit(code);
+        return;
+    }
     var selection = storage_root.prepare(init.gpa, init.io, argv) catch |err| {
         emitRootError(init.io, err) catch |write_err| {
             if (cli.isClosedPipe(write_err)) return;
@@ -49,6 +58,7 @@ fn emitRootError(io: std.Io, err: anyerror) !void {
 test {
     _ = cli;
     _ = storage_root;
+    _ = host_cli;
 }
 
 test "managed projection failure is not a clear route gate" {

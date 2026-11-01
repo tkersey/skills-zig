@@ -28,21 +28,55 @@ Renaming or replacing the external root or `.ledger/` pathname after admission
 does not redirect that command to a replacement history. Definitions and input
 files retain their own explicit path semantics.
 
-No Git discovery, home-directory default, repository registration, fallback,
-automatic binding, or migration occurs in the native CLI. The caller owns those
-policies. In the Codex skills integration, the Ledger skill is the single owner
-of location policy and repository/worktree-family resolution. Other owners
-consume that context rather than deriving their own paths.
+The storage engine does not discover Git, choose a home directory, or register
+a repository. Ledger 1.6 adds a separate native host interface, `ledger context`,
+for explicit catalog lookup, identity validation, workspace/worktree association,
+and authorized registration. The caller supplies `--catalog-root` and either
+`--workspace` or a known `--store-id`. No Codex-specific location default is
+compiled into Ledger. In the Codex integration, the Ledger skill body selects
+the location and other owners consume its returned context.
 
 `--repo` remains the explicit legacy/unmanaged filesystem-root interface. It
 retains its existing behavior, including pure initial missing-slot semantics.
 Never use it as a fallback after managed-root failure. Neither selector grants
 permission to initialize, migrate, repair, or publish history.
 
-The entry point now separates managed argument admission (`main.zig` and
-`storage_root.zig`) from the unchanged native command implementation (`cli.zig`,
-renamed byte-for-byte from the previous entry point). The existing CLI test suite
-is retained; managed-root admission adds focused unit tests.
+The entry point routes host-context commands to `host_cli.zig`; `host_context.zig`,
+`host_catalog.zig`, and `host_workspace.zig` implement that host layer. Engine
+argument admission remains in `storage_root.zig`, with native commands in
+`cli.zig`. Definitions cannot call host discovery or select catalog paths.
+
+## Native host context
+
+```sh
+ledger context --catalog-root /selected/home --workspace /selected/workspace
+ledger context --catalog-root /selected/home --store-id <existing-id>
+ledger context --catalog-root /selected/home --list-stores
+ledger context --help
+```
+
+Default lookup and listing are read-only, including when the catalog is absent.
+`--ensure` may import a valid existing Git registration. `--initialize` explicitly
+creates new custody only after checking known history; it never replaces a
+missing cataloged root. `--register-root`, `--import-registration`, and
+`--attach-workspace` retain existing IDs, roots, layouts, and records. Existing
+`ledger-personal-catalog/v1` catalogs and Git registration files remain readable.
+
+An owner call supplies `--definition` and its explicit `--owner-manifest`.
+`--ensure-owner` prepares compatible selected history; `--read-only` refuses
+necessary preparation without changing storage; `--repair-archive` selects exact
+restoration. Successful preparation returns the context with the native
+`preparation` result. Later catalog failure retains that result and reports
+`status: blocked`; callers must not infer that a committed operation did not run.
+No status worker or additional post-write health check runs.
+
+`--migrate` separately inspects broad historical sources. Apply requires
+`--apply --confirm-no-writers` and explicit owner manifests. Retired semantic
+conversion remains with the owner: native `owner-import-required` identifies
+the archived source inputs; the caller invokes the trusted owner constructor
+and resumes with scoped `--owner-import-receipt` results. Ledger does not execute
+owner code. Errors return structured JSON and exit 3, preserving known target
+identity and mutation/preparation results. `authority_granted` remains false.
 
 ## Qualification
 

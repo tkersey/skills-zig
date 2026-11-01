@@ -172,6 +172,14 @@ fn addLedgerCliSmoke(
         "Run Ledger 1.1 definition, validation, and materialization smoke tests",
     );
     step.dependOn(&smoke_cmd.step);
+    const host_cmd = b.addSystemCommand(&.{ "bash", "scripts/test-ledger-host.sh" });
+    host_cmd.addArtifactArg(ledger);
+    const host_step = b.step(
+        "test-ledger-host",
+        "Run native Ledger context and custody integration tests",
+    );
+    host_step.dependOn(&host_cmd.step);
+    step.dependOn(host_step);
     return step;
 }
 
