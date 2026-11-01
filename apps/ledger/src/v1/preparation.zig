@@ -706,10 +706,8 @@ fn publish(
     defer allocator.free(counter);
     const operation_path = try std.fs.path.join(allocator, &.{ control_root, work.record_path });
     defer allocator.free(operation_path);
-    const mutations = try allocator.alloc(
-        durable_store.TransactionMutation,
-        history.files.items.len + 1,
-    );
+    const mutation_count = history.files.items.len + 1;
+    const mutations = try allocator.alloc(durable_store.TransactionMutation, mutation_count);
     defer allocator.free(mutations);
     var paths: std.ArrayList([]u8) = .empty;
     defer {
