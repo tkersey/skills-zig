@@ -336,7 +336,19 @@ fn missingCovered(
         true,
     );
     defer sources.deinit();
-    if (try emptyFamily(allocator, io, sources.sources)) return true;
+    if (plan.storage_plan.?.slots[0].layout == .segmented) {
+        try requireSegmentedSourcesAbsent(
+            allocator,
+            io,
+            environment,
+            selected,
+            plan,
+            &sources,
+            options.confirm_no_writers,
+            true,
+        );
+        return true;
+    }
     return coverSources(
         allocator,
         io,
@@ -349,18 +361,6 @@ fn missingCovered(
         false,
         true,
     );
-}
-
-fn emptyFamily(
-    allocator: std.mem.Allocator,
-    io: std.Io,
-    sources: []const preparation.Source,
-) !bool {
-    for (sources) |source| {
-        if (source.archive or try host.workspace.hasLegacyHistory(allocator, io, source.root, &.{}))
-            return false;
-    }
-    return true;
 }
 
 fn initializeNewOwner(
@@ -394,6 +394,8 @@ fn initializeNewOwner(
         sources.trees,
         retired,
     )) return false;
+    if (sources.sources.len != 0 and !options.confirm_no_writers)
+        return error.PreparationRequiresQuiescence;
     var initialize_options = options.context;
     initialize_options.legacy_paths = retired;
     try result.put("storage_mutated", @as(?bool, null));
@@ -528,15 +530,18 @@ fn localCovered(
         false,
     );
     defer sources.deinit();
-    if (try emptyFamily(allocator, io, sources.sources)) return true;
     if (plan.storage_plan.?.slots[0].layout == .segmented) {
-        if (!try anyHistory(
+        try requireSegmentedSourcesAbsent(
             allocator,
             io,
-            sources.sources,
-            plan.storage_plan.?.slots[0].relative_path,
-        )) return true;
-        return error.SegmentedLocalCoverageRequiresMigration;
+            environment,
+            selected,
+            plan,
+            &sources,
+            confirm_no_writers,
+            false,
+        );
+        return true;
     }
     return coverSources(
         allocator,
@@ -772,37 +777,72 @@ fn captureCoverageHistory(
     );
 }
 
-fn anyHistory(
+fn requireSegmentedSourcesAbsent(
     allocator: std.mem.Allocator,
     io: std.Io,
-    sources: []const preparation.Source,
-    slot: []const u8,
-) !bool {
-    var hash: [32]u8 = undefined;
-    std.crypto.hash.sha2.Sha256.hash(slot, &hash, .{});
-    const hex = std.fmt.bytesToHex(hash, .lower);
-    for (sources) |source| {
-        if (source.archive) return true;
-        const control = try openCoverageSource(allocator, io, source);
-        if (control) |directory| {
-            defer directory.close(io);
-            try @import("durable_store").ensureNoPendingTransactions(
-                .anchored(io, directory),
-                allocator,
-                ".transactions",
-            );
-        }
-        const path = try std.fs.path.join(allocator, &.{ source.root, ".ledger", slot });
-        defer allocator.free(path);
-        const binding = try std.fmt.allocPrint(
+    environment: *const std.process.Environ.Map,
+    selected: host.ContextValue,
+    plan: *const compiled.PlanSet,
+    sources: *const discovery.Sources,
+    confirm_no_writers: bool,
+    discover_archives: bool,
+) !void {
+    const durable = @import("durable_store");
+    const controls = try allocator.alloc(?std.Io.Dir, sources.sources.len);
+    defer allocator.free(controls);
+    @memset(controls, null);
+    defer for (controls) |control| if (control) |dir| dir.close(io);
+    const guards = try allocator.alloc([2]?durable.CasReadLockPair, sources.sources.len);
+    defer allocator.free(guards);
+    @memset(guards, .{ null, null });
+    defer for (guards) |*pair| for (pair) |*guard| if (guard.*) |*held| held.deinit();
+    for (sources.sources, controls, guards) |source, *control, *pair| {
+        if (source.archive) return error.SegmentedLocalCoverageRequiresMigration;
+        control.* = try openCoverageSource(allocator, io, source);
+        const directory = control.* orelse {
+            if (!confirm_no_writers) return error.PreparationRequiresQuiescence;
+            continue;
+        };
+        var scope = storage_root.Scope.init(.anchored(io, directory));
+        var paths = try @import("ledger_v1_core").segmented_event_log.Paths.init(
+            &scope,
             allocator,
-            "{s}/.ledger/.bindings/{s}.jsonl",
-            .{ source.root, hex },
+            ".",
+            plan.storage_plan.?.slots[0].relative_path,
         );
-        defer allocator.free(binding);
-        if (try host.catalog.exists(io, path) or try host.catalog.exists(io, binding)) return true;
+        defer paths.deinit(allocator);
+        try durable.ensureNoPendingTransactions(scope.fs, allocator, ".transactions");
+        pair[0] = try durable.acquireCasReadLockPair(
+            scope.fs,
+            allocator,
+            paths.legacy_event,
+            paths.legacy_binding,
+        );
+        pair[1] = try durable.acquireCasReadLockPair(
+            scope.fs,
+            allocator,
+            paths.manifest,
+            paths.manifest,
+        );
+        try durable.ensureNoPendingTransactions(scope.fs, allocator, ".transactions");
+        for ([_][]const u8{ paths.legacy_event, paths.legacy_binding, paths.manifest }) |path| {
+            try durable.rejectSymlinkComponents(scope.fs, path);
+            if (try host.catalog.existsAt(io, directory, path))
+                return error.SegmentedLocalCoverageRequiresMigration;
+        }
+        if (!confirm_no_writers and (pair[0].?.count != 2 or pair[1].?.count != 1))
+            return error.PreparationRequiresQuiescence;
     }
-    return false;
+    try recheckCoverage(
+        allocator,
+        io,
+        environment,
+        selected,
+        plan,
+        sources,
+        controls,
+        discover_archives,
+    );
 }
 
 fn genuinelyNew(
@@ -1086,32 +1126,133 @@ const OwnerAssociationInterleaving = struct {
     }
 };
 
-test "segmented owner source absence rejects unresolved native publication" {
+test "owner empty source requires quiescence before allocation and on repeated coverage" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
     var temporary = try host.workspace.testPlainDirectory();
     defer temporary.cleanup();
-    const root = try temporary.dir.realPathFileAlloc(io, ".", allocator);
-    defer allocator.free(root);
-    const sources = [_]preparation.Source{.{ .root = root }};
-    try std.testing.expect(!try anyHistory(allocator, io, &sources, "example/events.jsonl"));
-    try temporary.dir.createDirPath(io, ".ledger/.transactions/dtx-first");
-    try std.testing.expectError(error.TransactionRecoveryRequired, anyHistory(
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const owned = arena.allocator();
+    const root = try temporary.dir.realPathFileAlloc(io, ".", owned);
+    try testOwnerInputs(temporary.dir);
+    var environment = std.process.Environ.Map.init(allocator);
+    defer environment.deinit();
+    var options: Options = .{
+        .context = .{
+            .catalog_root = try std.fs.path.join(owned, &.{ root, "home" }),
+            .workspace = try std.fs.path.join(owned, &.{ root, "workspace" }),
+        },
+        .definition = try std.fs.path.join(owned, &.{ root, "definition.json" }),
+        .manifest = try std.fs.path.join(owned, &.{ root, "migration.json" }),
+        .ensure = true,
+    };
+    try expectOwnerError(io, &environment, options, "PreparationRequiresQuiescence");
+    try std.testing.expect(!try host.catalog.existsAt(io, temporary.dir, "home"));
+    try std.testing.expect(!try host.catalog.existsAt(io, temporary.dir, "workspace/.ledger"));
+    options.confirm_no_writers = true;
+    var initialized = try execute(allocator, io, &environment, options);
+    defer initialized.deinit();
+    try std.testing.expectEqual(@as(u8, 0), initialized.exit_code);
+    const id = initialized.value.object.get("store_id").?.string;
+    const target = initialized.value.object.get("store_root").?.string;
+    for ([_]bool{ false, true }) |present| {
+        if (present) try testAppendOwner(&environment, options.definition, target);
+        options.confirm_no_writers = false;
+        try expectOwnerError(io, &environment, options, "PreparationRequiresQuiescence");
+        options.confirm_no_writers = true;
+        var repeated = try execute(allocator, io, &environment, options);
+        defer repeated.deinit();
+        try std.testing.expectEqual(@as(u8, 0), repeated.exit_code);
+        try std.testing.expectEqualStrings(id, repeated.value.object.get("store_id").?.string);
+        try std.testing.expect(!repeated.value.object.get("storage_mutated").?.bool);
+    }
+    options.ensure = false;
+    options.confirm_no_writers = false;
+    try expectOwnerError(io, &environment, options, "PreparationRequiresQuiescence");
+    try std.testing.expect(!try host.catalog.existsAt(io, temporary.dir, "workspace/.ledger"));
+}
+
+test "segmented owner absence needs quiescence or all existing publication guards" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var temporary = try host.workspace.testPlainDirectory();
+    defer temporary.cleanup();
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const owned = arena.allocator();
+    const root = try temporary.dir.realPathFileAlloc(io, ".", owned);
+    try testOwnerInputs(temporary.dir);
+    try testSegmentedDefinition(owned, temporary.dir);
+    var environment = std.process.Environ.Map.init(allocator);
+    defer environment.deinit();
+    var options: Options = .{
+        .context = .{
+            .catalog_root = try std.fs.path.join(owned, &.{ root, "home" }),
+            .workspace = try std.fs.path.join(owned, &.{ root, "workspace" }),
+        },
+        .definition = try std.fs.path.join(owned, &.{ root, "definition.json" }),
+        .manifest = try std.fs.path.join(owned, &.{ root, "migration.json" }),
+        .ensure = true,
+    };
+    var initialized = try host.initialize(allocator, io, &environment, options.context);
+    defer initialized.deinit();
+    try expectOwnerError(io, &environment, options, "PreparationRequiresQuiescence");
+    options.confirm_no_writers = true;
+    var quiescent = try execute(allocator, io, &environment, options);
+    defer quiescent.deinit();
+    try std.testing.expectEqual(@as(u8, 0), quiescent.exit_code);
+    try temporary.dir.createDirPath(io, "workspace/.ledger/.transactions/dtx-first");
+    try expectOwnerError(io, &environment, options, "TransactionRecoveryRequired");
+    try temporary.dir.deleteDir(io, "workspace/.ledger/.transactions/dtx-first");
+    options.confirm_no_writers = false;
+    const control = try temporary.dir.openDir(io, "workspace/.ledger", .{});
+    defer control.close(io);
+    var scope = storage_root.Scope.init(.anchored(io, control));
+    var paths = try @import("ledger_v1_core").segmented_event_log.Paths.init(
+        &scope,
         allocator,
-        io,
-        &sources,
-        "example/events.jsonl",
-    ));
-    try std.testing.expect(try host.catalog.existsAt(
-        io,
-        temporary.dir,
-        ".ledger/.transactions/dtx-first",
-    ));
-    try std.testing.expect(!try host.catalog.existsAt(
-        io,
-        temporary.dir,
-        ".ledger/example/events.jsonl",
-    ));
+        ".",
+        "example/chained-events.jsonl",
+    );
+    defer paths.deinit(allocator);
+    for ([_][]const u8{ paths.legacy_event, paths.legacy_binding, paths.manifest }) |path| {
+        try expectOwnerError(io, &environment, options, "PreparationRequiresQuiescence");
+        try control.createDirPath(io, std.fs.path.dirname(path).?);
+        const guard = try @import("durable_store").acquireCasAdvisoryLock(
+            scope.fs,
+            allocator,
+            path,
+        );
+        guard.close(io);
+    }
+    options.ensure = false;
+    var protected = try execute(allocator, io, &environment, options);
+    defer protected.deinit();
+    try std.testing.expectEqual(@as(u8, 0), protected.exit_code);
+    try std.testing.expect(!protected.value.object.get("storage_mutated").?.bool);
+    try control.writeFile(io, .{ .sub_path = paths.manifest, .data = "present" });
+    try expectOwnerError(io, &environment, options, "SegmentedLocalCoverageRequiresMigration");
+}
+
+fn testSegmentedDefinition(allocator: std.mem.Allocator, directory: std.Io.Dir) !void {
+    const segmented = try std.mem.replaceOwned(
+        u8,
+        allocator,
+        @embedFile("fixtures/chained-event-definition.json"),
+        "\"codec\":\"jsonl\",\"max_bytes\":65536",
+        "\"codec\":\"jsonl\",\"layout\":\"segmented\",\"max_bytes\":67108864",
+    );
+    defer allocator.free(segmented);
+    const definition = try std.mem.replaceOwned(
+        u8,
+        allocator,
+        segmented,
+        ",\"idempotency_param\":\"request\"",
+        "",
+    );
+    defer allocator.free(definition);
+    try directory.writeFile(std.testing.io, .{ .sub_path = "definition.json", .data = definition });
 }
 
 test "owner initialization admits history after concurrent existing catalog selection" {
@@ -1168,6 +1309,7 @@ test "owner initialization admits history after concurrent existing catalog sele
         .definition = definition_path,
         .manifest = manifest_path,
         .ensure = true,
+        .confirm_no_writers = true,
     });
     defer result.deinit();
     try interleaving.verify(result);
@@ -1175,6 +1317,19 @@ test "owner initialization admits history after concurrent existing catalog sele
     defer target.close(io);
     try expectOwnerBytes(target, original);
     try expectOwnerBytes(workspace_dir, original);
+}
+
+fn expectOwnerError(
+    io: std.Io,
+    environment: *const std.process.Environ.Map,
+    options: Options,
+    expected: []const u8,
+) !void {
+    var result = try execute(std.testing.allocator, io, environment, options);
+    defer result.deinit();
+    try std.testing.expectEqual(@as(u8, 3), result.exit_code);
+    try std.testing.expectEqualStrings(expected, result.value.object.get("error_code").?.string);
+    try std.testing.expect(!result.value.object.get("storage_mutated").?.bool);
 }
 
 fn testOwnerInputs(directory: std.Io.Dir) !void {

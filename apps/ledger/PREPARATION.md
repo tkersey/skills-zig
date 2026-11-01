@@ -77,9 +77,11 @@ healthy selected history is compared against bounded live Git-family candidates,
 using native bindings and one aggregate read allowance, without inspecting archives
 or inferring conversion from retained retired files. A longer live history requires
 reconciliation and cannot advance a healthy target through preparation.
-An empty local family retains existing new-owner access. Otherwise live history
-comparison requires the existing native guards or explicit writer quiescence,
-and unresolved source publication blocks admission while the guards are retained.
+Live history comparison, including an empty local family, requires the existing
+native guards or explicit writer quiescence. The genuinely new-owner route checks
+this before allocating custody. Unresolved source publication blocks admission while
+the guards are retained. Ordinary context lookup and direct managed reads retain
+their separate routes without asserting source-family coverage.
 Catalog selection during initialization still enters the same owner admission.
 Manifest-selected archive evidence cannot become empty history when its payload
 is missing. Explicit archive repair requires the surviving original binding and

@@ -392,6 +392,20 @@ mkdir -p "$segmented_root/legacy-archive/broken"
 printf '%s\n' 'malformed archive must not be read' >"$segmented_root/legacy-archive/broken/manifest.json"
 snapshot "$segmented/home" >"$scratch/before.snapshot"
 for mode in --ensure-owner --read-only; do
+  blocked PreparationRequiresQuiescence context --catalog-root "$segmented/home" \
+    --workspace "$segmented/work" "$mode" --definition "$segmented/owner/definition.json" \
+    --owner-manifest "$segmented/owner/migration.json"
+done
+test ! -e "$segmented/work/.ledger"
+context --catalog-root "$segmented/home" --workspace "$segmented/work" --ensure-owner \
+  --confirm-no-legacy-writers --definition "$segmented/owner/definition.json" \
+  --owner-manifest "$segmented/owner/migration.json"
+while IFS= read -r guard; do
+  relative="${guard#"$segmented_root/.ledger/"}"
+  mkdir -p "$(dirname "$segmented/work/.ledger/$relative")"
+  cp "$guard" "$segmented/work/.ledger/$relative"
+done < <(find "$segmented_root/.ledger" -type f -name '*.cas.lock.advisory')
+for mode in --ensure-owner --read-only; do
   context --catalog-root "$segmented/home" --workspace "$segmented/work" "$mode" \
     --definition "$segmented/owner/definition.json" --owner-manifest "$segmented/owner/migration.json"
   test "$("$json" -r '.store_id' "$scratch/result.json")" = "$segmented_id"
