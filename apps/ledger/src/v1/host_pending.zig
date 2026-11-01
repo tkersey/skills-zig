@@ -2,11 +2,15 @@ const std = @import("std");
 const host = @import("host_context.zig");
 const catalog = host.catalog;
 const workspace = host.workspace;
+const migration_copy = @import("host_migration_copy.zig");
 
 const max_sources = 128;
 const marker_name = ".ledger-root.json";
 const candidate_name = ".root-marker.json";
 const Marker = struct { schema: []const u8, store_id: []const u8 };
+const migration_copy_name = "migration-copy.json";
+const migration_copy_schema = "ledger-migration-copy/v1";
+const MigrationCopy = struct { schema: []const u8, store_id: []const u8, store_root: []const u8 };
 
 pub const Registration = struct {
     schema: []const u8,
@@ -15,6 +19,91 @@ pub const Registration = struct {
     workspace_root: []const u8,
     git_common_dir: ?[]const u8,
 };
+
+/// The declaration owns only a fixed scratch layout, never publication state.
+/// The caller retains this guard until copying and scratch cleanup finish.
+pub fn migrationScratch(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    associations: *const workspace.Associations,
+    home: []const u8,
+    selected: host.ContextValue,
+    guard: *const Guard,
+) !migration_copy.Scratch {
+    _ = guard;
+    const controls_path = try controlsPath(
+        allocator,
+        associations.workspace_root.?,
+        associations.git_common_dir,
+        home,
+    );
+    defer allocator.free(controls_path);
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const locator = try std.fs.path.join(
+        arena.allocator(),
+        &.{ controls_path, "registration.json" },
+    );
+    const value = try readPendingRegistration(arena.allocator(), io, associations, home, locator);
+    if (!std.mem.eql(u8, value.store_id, selected.store_id) or
+        !std.mem.eql(u8, value.store_root, selected.store_root))
+        return error.PendingCustodyConflictsWithCatalog;
+    var checked = try host.checkedRoot(
+        allocator,
+        io,
+        value.store_root,
+        value.store_id,
+        associations.workspace_root,
+        associations.git_common_dir,
+        false,
+    );
+    defer checked.deinit();
+    const root = try catalog.openDirectory(io, checked.value.store_root, false);
+    defer root.close(io);
+    const controls = try catalog.openDirectory(io, controls_path, false);
+    defer controls.close(io);
+    try declareMigrationCopy(allocator, io, controls, root, value);
+    return migration_copy.Scratch.open(io, root);
+}
+
+fn declareMigrationCopy(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    controls: std.Io.Dir,
+    root: std.Io.Dir,
+    registration: Registration,
+) !void {
+    const expected: MigrationCopy = .{
+        .schema = migration_copy_schema,
+        .store_id = registration.store_id,
+        .store_root = registration.store_root,
+    };
+    if (try catalog.existsAt(io, controls, migration_copy_name)) {
+        const bytes = try catalog.readBytes(allocator, io, controls, migration_copy_name, 4096);
+        defer allocator.free(bytes);
+        var parsed = try std.json.parseFromSlice(MigrationCopy, allocator, bytes, .{
+            .duplicate_field_behavior = .@"error",
+        });
+        defer parsed.deinit();
+        const value = parsed.value;
+        if (!std.mem.eql(u8, value.schema, expected.schema) or
+            !std.mem.eql(u8, value.store_id, expected.store_id) or
+            !std.mem.eql(u8, value.store_root, expected.store_root))
+            return error.InvalidMigrationCopy;
+    } else {
+        if (try catalog.existsAt(io, root, migration_copy.directory_name))
+            return error.UndeclaredMigrationScratch;
+        try catalog.writeJson(allocator, io, controls, migration_copy_name, expected, 4096);
+    }
+    // A previous declaration rename may have succeeded before directory sync
+    // failed. Make the observed ownership durable before creating any payload.
+    const declaration = try controls.openFile(io, migration_copy_name, .{
+        .follow_symlinks = false,
+    });
+    defer declaration.close(io);
+    try declaration.sync(io);
+    try catalog.sync(io, controls);
+}
 
 pub const Guard = struct {
     dir: std.Io.Dir,
@@ -511,6 +600,151 @@ fn discardMarkerCandidate(io: std.Io, controls: std.Io.Dir, inode: std.Io.File.I
     catalog.sync(io, controls) catch |err| {
         std.log.warn("pending marker cleanup sync failed: {s}", .{@errorName(err)});
     };
+}
+
+const MigrationScratchTest = struct {
+    associations: *const workspace.Associations,
+    home: []const u8,
+    context: host.ContextValue,
+    guard: *const Guard,
+
+    fn acquire(self: MigrationScratchTest, io: std.Io) !migration_copy.Scratch {
+        return migrationScratch(
+            std.testing.allocator,
+            io,
+            self.associations,
+            self.home,
+            self.context,
+            self.guard,
+        );
+    }
+};
+
+test "pending migration scratch owns only its declared fixed layout across retries" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const owned = arena.allocator();
+    const root = try tmp.dir.realPathFileAlloc(io, ".", owned);
+    const home = try std.fs.path.join(owned, &.{ root, "home" });
+    var environment = std.process.Environ.Map.init(allocator);
+    defer environment.deinit();
+    try environment.put("GIT_CEILING_DIRECTORIES", std.fs.path.dirname(root).?);
+    const options: host.Options = .{ .catalog_root = home, .workspace = root };
+    var target = try prepareTarget(allocator, io, &environment, options, true);
+    defer target.deinit();
+    var associations = try workspace.resolve(allocator, io, &environment, root);
+    defer associations.deinit();
+    const context = target.context.value;
+    const fixture: MigrationScratchTest = .{
+        .associations = &associations,
+        .home = home,
+        .context = context,
+        .guard = &target.guard.?,
+    };
+    const custody = try catalog.openDirectory(io, context.store_root, false);
+    defer custody.close(io);
+    try custody.createDir(io, migration_copy.directory_name, .fromMode(0o700));
+    try std.testing.expectError(error.UndeclaredMigrationScratch, fixture.acquire(io));
+    try custody.deleteDir(io, migration_copy.directory_name);
+    const scratch = try fixture.acquire(io);
+    defer scratch.deinit(io);
+    const controls = try controlsPath(owned, root, null, home);
+    const locator = try std.fs.path.join(owned, &.{ controls, "registration.json" });
+    const value = try readPendingRegistration(owned, io, &associations, home, locator);
+    try std.testing.expectEqualStrings(context.store_id, value.store_id);
+    try scratch.dir.writeFile(io, .{ .sub_path = "payload", .data = "partial" });
+    const retry = try fixture.acquire(io);
+    defer retry.deinit(io);
+    try std.testing.expect(!try catalog.existsAt(io, retry.dir, "payload"));
+    try scratch.dir.writeFile(io, .{ .sub_path = "foreign", .data = "retain" });
+    try std.testing.expectError(error.UnknownMigrationScratch, fixture.acquire(io));
+    try std.testing.expect(try catalog.existsAt(io, scratch.dir, "foreign"));
+}
+
+test "pending migration scratch declaration rejects other versions and identities" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const registration: Registration = .{
+        .schema = catalog.registration_schema,
+        .store_id = "id",
+        .store_root = "/root",
+        .workspace_root = "/workspace",
+        .git_common_dir = null,
+    };
+    for (0..3) |field| {
+        try catalog.writeJson(allocator, io, tmp.dir, migration_copy_name, MigrationCopy{
+            .schema = if (field == 0) "ledger-migration-copy/v2" else migration_copy_schema,
+            .store_id = if (field == 1) "foreign" else registration.store_id,
+            .store_root = if (field == 2) "/foreign" else registration.store_root,
+        }, 4096);
+        try std.testing.expectError(
+            error.InvalidMigrationCopy,
+            declareMigrationCopy(allocator, io, tmp.dir, tmp.dir, registration),
+        );
+        try std.testing.expect(!try catalog.existsAt(io, tmp.dir, migration_copy.directory_name));
+    }
+}
+
+test "pending migration declaration failure creates no scratch and retry reuses identity" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const owned = arena.allocator();
+    const root = try tmp.dir.realPathFileAlloc(io, ".", owned);
+    const home = try std.fs.path.join(owned, &.{ root, "home" });
+    var environment = std.process.Environ.Map.init(allocator);
+    defer environment.deinit();
+    try environment.put("GIT_CEILING_DIRECTORIES", std.fs.path.dirname(root).?);
+    var target = try prepareTarget(
+        allocator,
+        io,
+        &environment,
+        .{ .catalog_root = home, .workspace = root },
+        true,
+    );
+    defer target.deinit();
+    var associations = try workspace.resolve(allocator, io, &environment, root);
+    defer associations.deinit();
+    const fixture: MigrationScratchTest = .{
+        .associations = &associations,
+        .home = home,
+        .context = target.context.value,
+        .guard = &target.guard.?,
+    };
+    const custody = try catalog.openDirectory(io, target.context.value.store_root, false);
+    defer custody.close(io);
+    var vtable = io.vtable.*;
+    vtable.dirRename = struct {
+        fn rename(
+            userdata: ?*anyopaque,
+            from: std.Io.Dir,
+            name: []const u8,
+            to: std.Io.Dir,
+            leaf: []const u8,
+        ) std.Io.Dir.RenameError!void {
+            try std.testing.io.vtable.dirRename(userdata, from, name, to, leaf);
+            if (std.mem.eql(u8, leaf, migration_copy_name)) return error.HardwareFailure;
+        }
+    }.rename;
+    var injected = io;
+    injected.vtable = &vtable;
+    try std.testing.expectError(error.HardwareFailure, fixture.acquire(injected));
+    try std.testing.expect(!try catalog.existsAt(io, custody, migration_copy.directory_name));
+    const scratch = try fixture.acquire(io);
+    defer scratch.deinit(io);
+    const controls = try controlsPath(owned, root, null, home);
+    const locator = try std.fs.path.join(owned, &.{ controls, "registration.json" });
+    const registration = try readPendingRegistration(owned, io, &associations, home, locator);
+    try std.testing.expectEqualStrings(target.context.value.store_id, registration.store_id);
 }
 
 test "pending target persists identity across preparation retries and does not publish catalog" {

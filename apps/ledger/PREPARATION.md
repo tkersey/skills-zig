@@ -1,5 +1,25 @@
 # Preparation working-file lifetimes
 
+Explicit broad migration also owns `<store-root>/.migration-copy/payload`, outside
+canonical `.ledger` and preserved archives. Under the existing repository guard,
+the host durably declares the fixed `v1` scratch layout in `migration-copy.json`
+beside the existing pending registration before creating its private directory.
+The immutable declaration binds the exact store ID and root; the registration
+retains its original five-field format. An undeclared occupied path,
+unknown contents, links, and unsupported declarations stop migration without
+deletion. This declaration retains lifetime ownership; it records no commit state.
+The one regular scratch file is bounded by the admitted inventory file length
+(at most 2 GiB), using a 64 KiB streaming buffer. Failed attempts retain at most
+that file, independently of retry count. The next guarded attempt may remove it
+because no native transaction depends on it. Verified and synced bytes become
+canonical only through atomic nonreplacing rename; retries validate existing
+canonical bytes and finish directory sync. Source files, completed archives and
+ambiguous preexisting canonical files are never removed or overwritten. Archive
+and cold-adoption construction retain their existing outer directory publication.
+Ownership assumes participating callers obey the repository guard and private
+scratch is not modified by an uncoordinated writer. Existing catalog metadata
+temporary files retain their existing cleanup rules; this adds no metadata sweeper.
+
 Paths below are relative to the admitted managed `.ledger` directory. Preparation and maintenance use the existing persistent CAS advisory lock for `.preparation`. Inspect opens an existing shared lock and never creates one. Native transaction recovery remains the only publication authority.
 
 | Path | Creator | Required lifetime | Coordination | Release witness |

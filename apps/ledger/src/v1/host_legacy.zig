@@ -1,6 +1,7 @@
 const std = @import("std");
 const canonical_json = @import("definition_core").canonical_json;
 const catalog = @import("host_catalog.zig");
+const migration_copy = @import("host_migration_copy.zig");
 
 pub const Limits = struct {
     max_files: usize = 100000,
@@ -309,26 +310,9 @@ fn copyFile(
         .{ .exclusive = true, .permissions = .fromMode(0o600) },
     );
     defer output.close(io);
-    var hash = std.crypto.hash.sha2.Sha256.init(.{});
-    var buffer: [65536]u8 = undefined;
-    var size: u64 = 0;
     const expected = entry.size orelse return error.InvalidLegacyManifest;
-    while (size <= expected) {
-        const count = input.readStreaming(io, &.{&buffer}) catch |err| switch (err) {
-            error.EndOfStream => break,
-            else => return err,
-        };
-        if (count == 0) break;
-        if (count > expected - size) return error.SourceChanged;
-        size += count;
-        hash.update(buffer[0..count]);
-        try output.writeStreamingAll(io, buffer[0..count]);
-    }
-    const digest = std.fmt.bytesToHex(hash.finalResult(), .lower);
-    if (size != expected or
-        !std.mem.eql(u8, &digest, entry.sha256 orelse
-            return error.InvalidLegacyManifest))
-        return error.SourceChanged;
+    const digest = entry.sha256 orelse return error.InvalidLegacyManifest;
+    try migration_copy.stream(io, input, output, expected, digest);
     try output.sync(io);
     try catalog.sync(io, to);
 }
@@ -589,6 +573,7 @@ pub fn copySelected(
     slots: []const []const u8,
     archive_root: []const u8,
     destination: []const u8,
+    scratch: migration_copy.Scratch,
 ) !void {
     if (index >= snapshot.sources.map.count()) return error.InvalidSourceIndex;
     const source = snapshot.sources.map.values()[index];
@@ -608,7 +593,20 @@ pub fn copySelected(
             .{ snapshot.sources.map.keys()[index], name },
         );
         defer allocator.free(archived);
-        try copyFile(allocator, io, archive_root, archived, destination, name, entry);
+        const from = try openParent(allocator, io, archive_root, archived, false);
+        defer from.close(io);
+        const input = try openRegular(io, from, std.fs.path.basename(archived));
+        defer input.close(io);
+        const to = try openParent(allocator, io, destination, name, true);
+        defer to.close(io);
+        try scratch.copy(
+            io,
+            input,
+            to,
+            std.fs.path.basename(name),
+            entry.size orelse return error.InvalidLegacyManifest,
+            entry.sha256 orelse return error.InvalidLegacyManifest,
+        );
     }
 }
 
@@ -724,7 +722,7 @@ test "legacy transport archives unselected bytes and inert links and FIFO metada
     ));
     const destination = try std.fs.path.join(allocator, &.{ root, "custody" });
     defer allocator.free(destination);
-    try copySelected(allocator, io, &snapshot, 0, &.{"owner/events.jsonl"}, target, destination);
+    try testCopySelected(&snapshot, target, destination, tmp.dir);
     try std.testing.expect(try catalog.existsAt(io, tmp.dir, "custody/.ledger/owner/events.jsonl"));
     try std.testing.expect(!try catalog.existsAt(io, tmp.dir, "custody/.ledger/unselected"));
     try tmp.dir.symLink(io, "/absent/external", "archive/worktree-0/.ledger/unselected/link", .{});
@@ -741,6 +739,26 @@ test "legacy transport archives unselected bytes and inert links and FIFO metada
     const serialized = try snapshot.json(allocator);
     defer allocator.free(serialized);
     try std.testing.expect(std.mem.indexOf(u8, serialized, "\"target\":null") == null);
+}
+
+fn testCopySelected(
+    snapshot: *const Inventory,
+    source: []const u8,
+    target: []const u8,
+    root: std.Io.Dir,
+) !void {
+    const scratch = try migration_copy.Scratch.open(std.testing.io, root);
+    defer scratch.deinit(std.testing.io);
+    try copySelected(
+        std.testing.allocator,
+        std.testing.io,
+        snapshot,
+        0,
+        &.{"owner/events.jsonl"},
+        source,
+        target,
+        scratch,
+    );
 }
 
 test "legacy transport selects complete prefixes and rejects divergent and partial rows" {

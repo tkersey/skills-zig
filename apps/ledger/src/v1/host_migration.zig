@@ -706,12 +706,17 @@ const Migration = struct {
             try self.result.put("storage_mutated", changed);
             return;
         }
-        const archive_path = try self.archive(selected, current != null);
+        const archive_path = try self.archive(selected, current != null, &guard);
         if (!try self.importOwners(selected, archive_path)) return;
         try self.finish(selected, &lock);
     }
 
-    fn archive(self: Migration, selected: host.ContextValue, registered: bool) ![]const u8 {
+    fn archive(
+        self: Migration,
+        selected: host.ContextValue,
+        registered: bool,
+        guard: *const pending.Guard,
+    ) ![]const u8 {
         if (registered) try requireCovered(
             self.scratch,
             self.io,
@@ -724,15 +729,27 @@ const Migration = struct {
             &.{ selected.store_root, "legacy-archive", self.digest },
         );
         try legacy.archive(self.scratch, self.io, self.snapshot, path);
-        if (!registered) if (self.source) |index| try copyMissing(
-            self.scratch,
-            self.io,
-            self.snapshot,
-            index,
-            self.owners.slots,
-            path,
-            selected.store_root,
-        );
+        if (!registered) if (self.source) |index| {
+            const scratch = try pending.migrationScratch(
+                self.scratch,
+                self.io,
+                self.associations,
+                self.options.context.catalog_root,
+                selected,
+                guard,
+            );
+            defer scratch.deinit(self.io);
+            try copyMissing(
+                self.scratch,
+                self.io,
+                self.snapshot,
+                index,
+                self.owners.slots,
+                path,
+                selected.store_root,
+                scratch,
+            );
+        };
         try self.result.put("storage_mutated", true);
         for (self.owners.entries) |*owner| {
             try healthy(self.scratch, self.io, self.environment, owner, selected, true);
@@ -1061,6 +1078,7 @@ fn copyMissing(
     slots: []const []const u8,
     archive: []const u8,
     root: []const u8,
+    scratch: @import("host_migration_copy.zig").Scratch,
 ) !void {
     var missing: legacy.Inventory = .{
         .arena = std.heap.ArenaAllocator.init(allocator),
@@ -1110,12 +1128,17 @@ fn copyMissing(
                     active,
                 )) return error.AdditionalOrDivergentHistory;
             }
+            // An earlier create-new rename may have returned after publication
+            // but before parent sync. Validate first, then finish durability.
+            const parent = try host.catalog.openDirectory(io, std.fs.path.dirname(path).?, false);
+            defer parent.close(io);
+            try host.catalog.sync(io, parent);
             continue;
         }
         try source.entries.map.put(owned, name, entry);
     }
     try missing.sources.map.put(owned, snapshot.sources.map.keys()[index], source);
-    try legacy.copySelected(allocator, io, &missing, 0, slots, archive, root);
+    try legacy.copySelected(allocator, io, &missing, 0, slots, archive, root, scratch);
 }
 
 const ImportSource = struct { source: []const u8, source_sha256: []const u8 };
@@ -1513,6 +1536,66 @@ fn expectStatus(result: Result, expected: []const u8) !void {
         std.debug.print("unexpected migration result: {s}\n", .{rendered});
     }
     try std.testing.expectEqualStrings(expected, try string(result.value, "status"));
+}
+
+test "host migration retries interrupted copy in the same pending identity" {
+    const copy = @import("host_migration_copy.zig");
+    for (std.enums.values(copy.TestFault.Kind)) |fault| try testCopyInterruption(fault);
+}
+
+fn testCopyInterruption(fault: @import("host_migration_copy.zig").TestFault.Kind) !void {
+    const copy = @import("host_migration_copy.zig");
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var fixture = try Fixture.init(false);
+    defer fixture.deinit();
+    var vtable = io.vtable.*;
+    copy.TestFault.install(&vtable, fault);
+    var injected = io;
+    injected.vtable = &vtable;
+    var failed = try execute(allocator, injected, &fixture.environment, fixture.options(true));
+    defer failed.deinit();
+    try expectStatus(failed, "blocked");
+    try std.testing.expect(copy.TestFault.reached);
+    const selected = failed.value.object.get("context").?;
+    const root = try string(selected, "store_root");
+    const dir = try host.catalog.openDirectory(io, root, false);
+    defer dir.close(io);
+    const published = fault == .after_rename or fault == .directory_sync;
+    try std.testing.expectEqual(
+        published,
+        try host.catalog.existsAt(io, dir, ".ledger/example/plain.jsonl"),
+    );
+    const source = try host.catalog.openDirectory(io, fixture.source, false);
+    defer source.close(io);
+    const before = try testHash(source, ".ledger/example/plain.jsonl");
+    var retry = try execute(allocator, io, &fixture.environment, fixture.options(true));
+    defer retry.deinit();
+    try expectStatus(retry, "verified");
+    const resumed = retry.value.object.get("context").?;
+    try std.testing.expectEqualStrings(
+        try string(selected, "store_id"),
+        try string(resumed, "store_id"),
+    );
+    try std.testing.expectEqualStrings(root, try string(resumed, "store_root"));
+    const after = try testHash(dir, ".ledger/example/plain.jsonl");
+    try std.testing.expectEqualDeep(before, after);
+    const unchanged = try testHash(source, ".ledger/example/plain.jsonl");
+    try std.testing.expectEqualDeep(before, unchanged);
+    const archive_name = try std.fmt.allocPrint(
+        allocator,
+        "legacy-archive/{s}/worktree-0/.ledger/example/plain.jsonl",
+        .{try string(retry.value, "fingerprint")},
+    );
+    defer allocator.free(archive_name);
+    try std.testing.expectEqualDeep(before, try testHash(dir, archive_name));
+    try std.testing.expect(!try host.catalog.existsAt(io, dir, ".migration-copy/payload"));
+}
+
+fn testHash(root: std.Io.Dir, path: []const u8) !legacy.Witness {
+    const dir = try root.openDir(std.testing.io, std.fs.path.dirname(path).?, .{});
+    defer dir.close(std.testing.io);
+    return legacy.hashFile(std.testing.io, dir, std.fs.path.basename(path), 4096);
 }
 
 test "host migration current history archives broad material repairs bindings and reuses receipt" {

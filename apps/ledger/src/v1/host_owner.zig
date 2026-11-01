@@ -10,6 +10,12 @@ const preparation = @import("ledger_v1_core").preparation;
 const compiled = @import("ledger_v1_core").compiled_plan;
 const parameters = @import("definition_core").parameters;
 
+const history_limits: preparation.Limits = .{
+    .max_bytes = 256 * 1024 * 1024,
+    .max_files = 512,
+    .max_read_bytes = 2 * 1024 * 1024 * 1024,
+};
+
 pub const Options = struct {
     context: host.Options,
     definition: []const u8,
@@ -205,6 +211,7 @@ fn runPlan(
             bindings,
             &associations,
             current.value,
+            retired,
         );
         discover_archives = coverage.discover_archives;
         if (coverage.covered) {
@@ -252,6 +259,7 @@ fn existingCoverage(
     bindings: *const parameters.Bindings,
     associations: *const host.workspace.Associations,
     selected: host.ContextValue,
+    retired: []const []const u8,
 ) !Coverage {
     const allocator = result.arena.allocator();
     try result.setContext(selected);
@@ -271,9 +279,17 @@ fn existingCoverage(
     const slot = plan.storage_plan.?.slots[0];
     const present = health.slots[0].state != .missing;
     const covered = if (present)
-        try localCovered(allocator, io, selected, slot.relative_path, slot.layout == .segmented)
+        try localCovered(allocator, io, selected, plan, bindings)
     else
-        try missingCovered(allocator, io, environment, options, selected, slot.relative_path);
+        try missingCovered(
+            allocator,
+            io,
+            environment,
+            options,
+            selected,
+            slot.relative_path,
+            retired,
+        );
     return .{
         .covered = covered and !health.preparation_pending,
         .discover_archives = !present,
@@ -287,6 +303,7 @@ fn missingCovered(
     options: Options,
     selected: host.ContextValue,
     slot: []const u8,
+    retired: []const []const u8,
 ) !bool {
     var sources = try discovery.discover(
         allocator,
@@ -295,7 +312,7 @@ fn missingCovered(
         options.context.workspace,
         selected,
         slot,
-        &.{},
+        retired,
         true,
     );
     defer sources.deinit();
@@ -427,40 +444,63 @@ fn localCovered(
     allocator: std.mem.Allocator,
     io: std.Io,
     selected: host.ContextValue,
-    slot: []const u8,
-    segmented: bool,
+    plan: *const compiled.PlanSet,
+    bindings: *const parameters.Bindings,
 ) !bool {
     const root = selected.workspace_root orelse return true;
-    const name = try std.fs.path.join(allocator, &.{ ".ledger", slot });
-    const local = try std.fs.path.join(allocator, &.{ root, name });
-    if (!try host.catalog.exists(io, local)) return true;
     if (std.mem.eql(u8, root, selected.store_root)) return true;
-    if (segmented) return error.SegmentedLocalCoverageRequiresMigration;
+    const local = try std.fs.path.join(allocator, &.{ root, ".ledger" });
+    if (!try host.catalog.exists(io, local)) return true;
     try host.catalog.noSymlinks(io, local);
-    const active = try std.fs.path.join(allocator, &.{ selected.store_root, name });
-    try host.catalog.noSymlinks(io, active);
-    const source_dir = try host.catalog.openDirectory(io, std.fs.path.dirname(local).?, false);
+    if (plan.storage_plan.?.slots[0].layout == .segmented) {
+        if (!try anyHistory(
+            allocator,
+            io,
+            &.{.{ .root = root }},
+            plan.storage_plan.?.slots[0].relative_path,
+        )) return true;
+        return error.SegmentedLocalCoverageRequiresMigration;
+    }
+    const source_dir = try host.catalog.openDirectory(io, local, false);
     defer source_dir.close(io);
-    const target_dir = try host.catalog.openDirectory(io, std.fs.path.dirname(active).?, false);
-    defer target_dir.close(io);
-    const left = try legacy.hashFile(io, source_dir, std.fs.path.basename(name), 256 * 1024 * 1024);
-    const right = legacy.hashFile(
-        io,
-        target_dir,
-        std.fs.path.basename(name),
-        256 * 1024 * 1024,
-    ) catch |err| switch (err) {
-        error.FileNotFound => return false,
-        else => return err,
-    };
-    return legacy.completePrefix(
+    const target_dir = try storage_root.checkedRoot(
         allocator,
         io,
-        root,
         selected.store_root,
-        name,
-        .{ .kind = "file", .size = left.bytes, .sha256 = &left.sha256 },
-        .{ .kind = "file", .size = right.bytes, .sha256 = &right.sha256 },
+        selected.store_id,
+    );
+    defer target_dir.close(io);
+    var budget: storage_root.ReadBudget = .{
+        .max_bytes = history_limits.max_read_bytes,
+        .max_files = history_limits.max_files * 16,
+    };
+    var source_scope = storage_root.Scope.init(.anchored(io, source_dir));
+    source_scope.fs.read_budget = &budget;
+    var target_scope = storage_root.Scope.init(.anchored(io, target_dir));
+    target_scope.fs.read_budget = &budget;
+    var source_history = try captureCoverageHistory(&source_scope, allocator, plan, bindings);
+    defer source_history.deinit(allocator);
+    var target_history = try captureCoverageHistory(&target_scope, allocator, plan, bindings);
+    defer target_history.deinit(allocator);
+    return target_history.covers(&source_history);
+}
+
+fn captureCoverageHistory(
+    scope: *storage_root.Scope,
+    allocator: std.mem.Allocator,
+    plan: *const compiled.PlanSet,
+    bindings: *const parameters.Bindings,
+) !preparation.History {
+    return preparation.captureHistory(
+        scope,
+        allocator,
+        ".",
+        &plan.definition_plan,
+        try preparation.selectedSlot(&plan.storage_plan.?),
+        bindings,
+        plan.protocol_plan != null,
+        history_limits,
+        false,
     );
 }
 
@@ -605,8 +645,8 @@ fn prepareNative(
     };
     var scope = storage_root.Scope.init(.anchored(io, control));
     var budget: storage_root.ReadBudget = .{
-        .max_bytes = 2 * 1024 * 1024 * 1024,
-        .max_files = 512 * 16,
+        .max_bytes = history_limits.max_read_bytes,
+        .max_files = history_limits.max_files * 16,
     };
     scope.fs.read_budget = &budget;
     var prepared = prepareWaiting(
@@ -671,11 +711,7 @@ fn prepareWaiting(
             .{
                 .apply = true,
                 .confirm_no_legacy_writers = confirm_no_writers,
-                .limits = .{
-                    .max_bytes = 256 * 1024 * 1024,
-                    .max_files = 512,
-                    .max_read_bytes = 2 * 1024 * 1024 * 1024,
-                },
+                .limits = history_limits,
             },
         );
         if (!std.mem.eql(
