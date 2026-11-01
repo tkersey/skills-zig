@@ -99,7 +99,6 @@ for token in \
   '"build/**"' \
   '"tools/perf_contract.zig"' \
   'perf=${selected[seq]:-false}' \
-  '${selected[cas]:-false}' \
   "grep -Fxq 'build.zig'" \
   "grep -Fxq 'tools/perf_contract.zig'" \
   "if: needs.changes.outputs.perf == 'true'" \
@@ -111,10 +110,12 @@ for token in \
 done
 
 
-if grep -Fq -- '${selected[cron]:-false}' "$workflow"; then
-  echo "Performance CI still routes through retired Cron release identity" >&2
-  exit 1
-fi
+for retired in cas cron; do
+  if grep -Fq -- "\${selected[$retired]:-false}" "$workflow"; then
+    echo "Performance CI still routes through retired $retired release identity" >&2
+    exit 1
+  fi
+done
 
 perf_selector="$(
   awk '
@@ -155,11 +156,20 @@ for changed_path in build.zig tools/perf_hub.zig tools/perf_contract.zig tools/s
   expect_perf_selection true "$changed_path"
 done
 expect_perf_selection true apps/seq/src/main.zig seq
-expect_perf_selection true apps/cas/src/main.zig cas
+expect_perf_selection false apps/cas/src/main.zig cas
 expect_perf_selection true build/apps/seq.zig seq
-expect_perf_selection true build/apps/cas.zig cas
+expect_perf_selection false build/apps/cas.zig cas
 expect_perf_selection true build/support.zig seq
 expect_perf_selection true build/unknown.zig seq
 expect_perf_selection false README.md
 
-echo "Seq CI proof matrix is valid."
+for token in '  full-suite-linux:' '  build-all-linux:' \
+  'zig build test-full -Doptimize=debug -j2 --summary all' \
+  'zig build -Doptimize=fast -j2 --summary all'; do
+  if ! grep -Fq -- "$token" "$workflow"; then
+    echo "Shared full-suite coverage missing after CAS retirement: $token" >&2
+    exit 1
+  fi
+done
+
+echo "Seq CI proof matrix and shared full-suite coverage are valid."

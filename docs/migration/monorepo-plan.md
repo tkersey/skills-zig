@@ -1,5 +1,11 @@
 # Split-repo to monorepo migration notes
 
+Historical record: CAS has since been retired. CAS-specific commands and source
+paths below apply to the recorded pre-retirement revisions, not the current
+build. The last source baseline before this removal is
+`d92e5e3cf10c203c4515af534aa489195ff7c5db`; retain the original measured revisions
+and hashes when reproducing a reported comparison.
+
 ## Goal
 
 Consolidate `seq`, `lift`, and `cas` into one source monorepo to share Zig internals while preserving independent binary releases.

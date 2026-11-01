@@ -11,8 +11,8 @@ git init -q
 git config user.email test@example.invalid
 git config user.name release-apps-test
 
-apps=(seq lift cas ledger memory-note siwc)
-all_apps=seq,lift,cas,ledger,memory-note,siwc
+apps=(seq lift ledger memory-note siwc)
+all_apps=seq,lift,ledger,memory-note,siwc
 shared_build_paths=(apps/seq/build_support.zig tools/install_guard.zig)
 for path in "${shared_build_paths[@]}"; do
   mkdir -p "$(dirname "$path")"
@@ -142,9 +142,9 @@ move_path() {
 }
 
 write_multiple_owners() {
-  write_path build/apps/cas.zig
+  write_path build/apps/ledger.zig
   write_path build/apps/seq.zig
-  write_path apps/cas/src/release-owner.zig
+  write_path apps/ledger/src/release-owner.zig
   write_path build/apps/memory-note.zig
 }
 
@@ -346,22 +346,22 @@ write_frozen_cas_automation_fixture() {
 
 assert_affected seq write_seq
 for helper_path in "${shared_build_paths[@]}"; do
-  assert_affected seq,lift,cas,ledger,memory-note,siwc write_shared_build_helper "$helper_path"
-  assert_ci_affected seq,lift,cas,ledger,memory-note,siwc write_shared_build_helper "$helper_path"
+  assert_affected seq,lift,ledger,memory-note,siwc write_shared_build_helper "$helper_path"
+  assert_ci_affected seq,lift,ledger,memory-note,siwc write_shared_build_helper "$helper_path"
 done
 assert_affected ledger write_ledger
-assert_affected cas write_frozen_cas_automation_fixture
-assert_affected seq,cas,ledger write_definition_core
-assert_affected seq,cas,ledger write_definition_compat
-assert_affected seq,cas write_trace_core
-assert_affected cas write_cas_runtime
-assert_affected cas write_cas_hook_policy_source
-assert_affected cas write_cas_launch_source
-assert_affected seq,cas,ledger,memory-note,siwc write_store_core
+assert_affected "$all_apps" write_frozen_cas_automation_fixture
+assert_affected seq,ledger write_definition_core
+assert_affected seq,ledger write_definition_compat
+assert_affected seq write_trace_core
+assert_affected "$all_apps" write_cas_runtime
+assert_affected "$all_apps" write_cas_hook_policy_source
+assert_affected "$all_apps" write_cas_launch_source
+assert_affected seq,ledger,memory-note,siwc write_store_core
 assert_affected "$all_apps" write_retired_build
 assert_affected "$all_apps" write_mixed_memory_note_retired_build
-assert_affected seq,cas,ledger,memory-note,siwc write_jsonl_core
-assert_affected seq,lift,cas,ledger,memory-note,siwc change_shared_perf_contract
+assert_affected seq,ledger,memory-note,siwc write_jsonl_core
+assert_affected seq,lift,ledger,memory-note,siwc change_shared_perf_contract
 assert_affected "" move_perf_contract_to_tools
 assert_affected "" write_tool_perf_contract
 assert_affected "$all_apps" write_perf_hub_build
@@ -369,7 +369,7 @@ assert_affected "$all_apps" write_seq_build
 assert_affected "$all_apps" write_cas_control_plane_build
 assert_affected "$all_apps" write_cas_runtime_only_build
 assert_affected "$all_apps" write_cas_hook_policy_only_build
-assert_affected seq,lift,cas,ledger,memory-note,siwc write_unknown_bare_identifier_build
+assert_affected seq,lift,ledger,memory-note,siwc write_unknown_bare_identifier_build
 assert_affected "$all_apps" write_ledger_build
 assert_affected "$all_apps" write_ledger_module_build
 assert_affected "$all_apps" write_ledger_filtered_test_build
@@ -377,22 +377,22 @@ assert_affected "$all_apps" write_mixed_unknown_before_ledger_build
 assert_affected "$all_apps" write_universalist_build
 assert_affected "$all_apps" write_seq_strip_build
 assert_affected "$all_apps" move_build_line
-assert_affected seq,lift,cas,ledger,memory-note,siwc write_mixed_seq_unknown_build
+assert_affected seq,lift,ledger,memory-note,siwc write_mixed_seq_unknown_build
 assert_affected "$all_apps" write_definition_package_path
 assert_affected "$all_apps" write_ledger_package_path
 assert_affected "$all_apps" write_learnings_package_path
 assert_affected "$all_apps" write_synesthesia_package_path
-assert_affected seq,lift,cas,ledger,memory-note,siwc write_unknown_package_change
-assert_affected seq,lift,cas,ledger,memory-note,siwc write_build_only
-assert_affected seq,lift,cas,ledger,memory-note,siwc write_unknown_app
+assert_affected seq,lift,ledger,memory-note,siwc write_unknown_package_change
+assert_affected seq,lift,ledger,memory-note,siwc write_build_only
+assert_affected seq,lift,ledger,memory-note,siwc write_unknown_app
 assert_affected "" write_readme
 assert_affected seq write_durable_store_perf
-assert_ci_affected seq,cas,ledger write_definition_guard
-assert_ci_affected cas write_cas_runtime
+assert_ci_affected seq,ledger write_definition_guard
+assert_ci_affected "$all_apps" write_cas_runtime
 assert_ci_affected seq write_seq_smoke
 assert_ci_affected ledger write_ledger_smoke
 assert_affected "" write_ci_helper
-assert_ci_affected seq,lift,cas,ledger,memory-note,siwc write_ci_helper
+assert_ci_affected seq,lift,ledger,memory-note,siwc write_ci_helper
 assert_affected "" write_path .github/workflows/pr-ci.yml
 assert_ci_affected "$all_apps" write_path .github/workflows/pr-ci.yml
 
@@ -404,7 +404,7 @@ for app in "${apps[@]}"; do
   assert_classification "$app" write_path "apps/$app/src/release-owner.zig"
   assert_classification "$app" rm "apps/$app/src/release-owner.zig"
 done
-assert_classification seq,cas,memory-note write_multiple_owners
+assert_classification seq,ledger,memory-note write_multiple_owners
 for path in "${shared_build_paths[@]}"; do
   assert_classification "$all_apps" rm "$path"
   assert_classification "$all_apps" move_path "$path" tools/moved-helper.zig
@@ -413,11 +413,11 @@ done
 # Every shared group keeps its established conservative consumer set.
 for owner in "${shared_owners[@]}"; do
   case "$owner" in
-    definition_core|definition_compat) expected=seq,cas,ledger ;;
-    trace_core) expected=seq,cas ;;
-    cas_runtime) expected=cas ;;
+    definition_core|definition_compat) expected=seq,ledger ;;
+    trace_core) expected=seq ;;
+    cas_runtime) expected=$all_apps ;;
     siwc) expected=siwc ;;
-    durable_store|jsonl_core) expected=seq,cas,ledger,memory-note,siwc ;;
+    durable_store|jsonl_core) expected=seq,ledger,memory-note,siwc ;;
     *) expected=$all_apps ;;
   esac
   assert_classification "$expected" write_path "libs/$owner/release-owner.zig"
@@ -441,7 +441,7 @@ assert_classification "$all_apps" rm build.zig.zon
 assert_classification seq,ledger move_path build/apps/seq.zig build/apps/ledger.zig
 assert_classification "$all_apps" move_path build/apps/seq.zig build/apps/unknown.zig
 assert_classification seq move_path build/apps/seq.zig tools/seq-build.zig
-assert_classification seq,cas move_path apps/seq/src/release-owner.zig apps/cas/src/moved-owner.zig
+assert_classification "$all_apps" move_path apps/seq/src/release-owner.zig apps/cas/src/moved-owner.zig
 assert_classification seq move_path apps/seq/src/release-owner.zig apps/seq/README.md
 assert_classification "$all_apps" move_path libs/cas_runtime/release-owner.zig libs/new-shared-owner/moved.zig
 assert_classification "" write_path tools/new-test-tool.zig
@@ -496,9 +496,9 @@ mv build.next build.zig
 git add build.zig
 git commit -qm unowned-dotted-dependency-import
 test "$(bash "$classifier" affected "$unowned_dependency_base" HEAD | paste -sd, -)" = \
-  seq,lift,cas,ledger,memory-note,siwc
+  seq,lift,ledger,memory-note,siwc
 test "$(bash "$classifier" ci-affected "$unowned_dependency_base" HEAD | paste -sd, -)" = \
-  seq,lift,cas,ledger,memory-note,siwc
+  seq,lift,ledger,memory-note,siwc
 
 # Adjacent functions and referenced helper names cannot narrow root ownership.
 git reset --hard -q "$base"
@@ -594,24 +594,27 @@ for app in "${apps[@]}"; do
   done
 done
 
-# Exact TypeSafe retirement shape: the removed source/build/workflow/VERSION
-# must never re-enter any active dispatch set. Shared root changes still release
-# every surviving app, with an explicit version bump for each one.
-git reset --hard -q "$base"
-mkdir -p apps/typesafe/src .github/workflows
-printf '0.2.1\n' > apps/typesafe/VERSION
-printf '// retired TypeSafe source\n' > apps/typesafe/src/main.zig
-printf '// retired TypeSafe build owner\n' > build/apps/typesafe.zig
-printf '# retired TypeSafe release\n' > .github/workflows/release-typesafe.yml
-git add -A
-git commit -qm typesafe-retirement-baseline
-typesafe_retirement_base=$(git rev-parse HEAD)
-rm -r apps/typesafe
-rm build/apps/typesafe.zig .github/workflows/release-typesafe.yml
-write_build_only
-for app in "${apps[@]}"; do printf '1.1.0\n' > "apps/$app/VERSION"; done
-git add -A
-git commit -qm retire-typesafe-and-propagate-active-versions
-for mode in affected ci-affected version-changed; do
-  test "$(bash "$classifier" "$mode" "$typesafe_retirement_base" HEAD | paste -sd, -)" = "$all_apps"
+# Removed source/build/workflow/VERSION paths never re-enter dispatch. Shared
+# root changes still release every survivor, with an explicit version bump.
+for retired in typesafe cas; do
+  git reset --hard -q "$base"
+  git clean -fdq
+  mkdir -p "apps/$retired/src" .github/workflows
+  printf '0.2.1\n' >"apps/$retired/VERSION"
+  printf '// retired source\n' >"apps/$retired/src/main.zig"
+  printf '// retired build owner\n' >"build/apps/$retired.zig"
+  printf '# retired release\n' >".github/workflows/release-$retired.yml"
+  git add -A
+  git commit -qm retirement-baseline
+  retirement_base=$(git rev-parse HEAD)
+  rm -r "apps/$retired"
+  rm "build/apps/$retired.zig" ".github/workflows/release-$retired.yml"
+  if [[ "$retired" == cas ]]; then rm -r libs/cas_runtime; fi
+  write_build_only
+  for app in "${apps[@]}"; do printf '1.1.0\n' >"apps/$app/VERSION"; done
+  git add -A
+  git commit -qm retire-and-propagate-active-versions
+  for mode in affected ci-affected version-changed; do
+    test "$(bash "$classifier" "$mode" "$retirement_base" HEAD | paste -sd, -)" = "$all_apps"
+  done
 done

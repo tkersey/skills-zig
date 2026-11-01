@@ -9,7 +9,7 @@ fi
 mode=$1
 base_ref=$2
 head_ref=$3
-apps=(seq lift cas ledger memory-note siwc)
+apps=(seq lift ledger memory-note siwc)
 
 resolve_ref() {
   local ref=$1
@@ -43,22 +43,15 @@ case "$mode" in
 
     mark_definition_consumers() {
       mark_app seq
-      mark_app cas
       mark_app ledger
     }
 
     mark_trace_consumers() {
       mark_app seq
-      mark_app cas
-    }
-
-    mark_cas_runtime_consumers() {
-      mark_app cas
     }
 
     mark_store_consumers() {
       mark_app seq
-      mark_app cas
       mark_app ledger
       mark_app memory-note
       mark_app siwc
@@ -105,12 +98,6 @@ case "$mode" in
         libs/trace_core/*)
           mark_trace_consumers
           ;;
-        libs/cas_runtime/*)
-          mark_cas_runtime_consumers
-          ;;
-        apps/cas/scripts/cas_app_server_launch.zig|apps/cas/scripts/cas_hook_policy.zig)
-          mark_cas_runtime_consumers
-          ;;
         libs/durable_store/*|libs/jsonl_core/*)
           mark_store_consumers
           ;;
@@ -138,9 +125,6 @@ case "$mode" in
           ;;
         .github/workflows/release-lift.yml|.github/scripts/verify_lift_archive.sh|.github/scripts/test_verify_lift_archive.sh)
           mark_app lift
-          ;;
-        .github/workflows/release-cas.yml|.github/scripts/verify_cas_archive.sh|.github/scripts/test_verify_cas_archive.sh)
-          mark_app cas
           ;;
         .github/workflows/release-ledger.yml)
           mark_app ledger

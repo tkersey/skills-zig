@@ -2,7 +2,6 @@ const std = @import("std");
 const builtin = @import("builtin");
 const core_cli = @import("core_cli");
 const core_perf = @import("core_perf");
-const cas_automation_cli = @import("cas_automation_cli");
 const definition_core = @import("definition_core");
 const durable_store = @import("durable_store");
 const perf_contract = @import("perf_contract");
@@ -466,13 +465,6 @@ const CompatSetup = enum {
     ledger_doctor,
     bench_stats_help,
     bench_stats_parse,
-    cas_wrapper_smoke,
-    cas_smoke_check_help,
-    cas_instance_runner_help,
-    cas_review_session_help,
-    cas_review_session_version,
-    cas_automation_help,
-    cas_automation_list,
 };
 
 const CompatCase = struct {
@@ -490,14 +482,6 @@ const CompatCase = struct {
 const DeepSetup = enum {
     optimization,
     seq_observe,
-    cas_automation_show,
-    cas_automation_create,
-    cas_automation_update,
-    cas_automation_enable,
-    cas_automation_disable,
-    cas_automation_run_now,
-    cas_automation_delete,
-    cas_automation_run_due,
 };
 
 const DeepCase = struct {
@@ -664,83 +648,6 @@ const LedgerCoverages = [_]perf_contract.CommandCoverage{
     shallowCoverage("version", "command-surface gate"),
 };
 
-const CasAutomationCases = [_]perf_contract.CaseDescriptor{
-    .{
-        .case_id = "cas-automation-help",
-        .binary = "cas",
-        .family = "help",
-        .case_kind = .subprocess,
-        .measurement_mode = .latency_only,
-        .compat_case = true,
-    },
-    .{
-        .case_id = "cas-automation-list",
-        .binary = "cas",
-        .family = "list",
-        .case_kind = .subprocess,
-        .measurement_mode = .latency_only,
-        .compat_case = true,
-    },
-    .{
-        .case_id = "cas-automation-show-deep",
-        .binary = "cas",
-        .family = "show",
-        .case_kind = .driver,
-        .measurement_mode = .latency_alloc,
-    },
-    .{
-        .case_id = "cas-automation-create-deep",
-        .binary = "cas",
-        .family = "create",
-        .case_kind = .driver,
-        .measurement_mode = .latency_alloc,
-    },
-    .{
-        .case_id = "cas-automation-update-deep",
-        .binary = "cas",
-        .family = "update",
-        .case_kind = .driver,
-        .measurement_mode = .latency_alloc,
-    },
-    .{
-        .case_id = "cas-automation-enable-deep",
-        .binary = "cas",
-        .family = "enable",
-        .case_kind = .driver,
-        .measurement_mode = .latency_alloc,
-    },
-    .{
-        .case_id = "cas-automation-disable-deep",
-        .binary = "cas",
-        .family = "disable",
-        .case_kind = .driver,
-        .measurement_mode = .latency_alloc,
-    },
-    .{
-        .case_id = "cas-automation-run-now-deep",
-        .binary = "cas",
-        .family = "run-now",
-        .case_kind = .driver,
-        .measurement_mode = .latency_alloc,
-    },
-    .{
-        .case_id = "cas-automation-delete-deep",
-        .binary = "cas",
-        .family = "delete",
-        .case_kind = .driver,
-        .measurement_mode = .latency_alloc,
-    },
-    .{
-        .case_id = "cas-automation-run-due-deep",
-        .binary = "cas",
-        .family = "run-due",
-        .case_kind = .driver,
-        .measurement_mode = .latency_alloc,
-    },
-};
-
-const CasAutomationCoverages = buildCasAutomationCoverages();
-
 const MiscCases = [_]perf_contract.CaseDescriptor{
     .{
         .case_id = "bench-stats-help",
@@ -754,46 +661,6 @@ const MiscCases = [_]perf_contract.CaseDescriptor{
         .case_id = "bench-stats-parse",
         .binary = "bench_stats",
         .family = "parse",
-        .case_kind = .subprocess,
-        .measurement_mode = .latency_only,
-        .compat_case = true,
-    },
-    .{
-        .case_id = "cas-wrapper-smoke",
-        .binary = "cas",
-        .family = "wrapper",
-        .case_kind = .subprocess,
-        .measurement_mode = .latency_only,
-        .compat_case = true,
-    },
-    .{
-        .case_id = "cas-smoke-check-help",
-        .binary = "cas_smoke_check",
-        .family = "help",
-        .case_kind = .subprocess,
-        .measurement_mode = .latency_only,
-        .compat_case = true,
-    },
-    .{
-        .case_id = "cas-instance-runner-help",
-        .binary = "cas_instance_runner",
-        .family = "help",
-        .case_kind = .subprocess,
-        .measurement_mode = .latency_only,
-        .compat_case = true,
-    },
-    .{
-        .case_id = "cas-review-session-help",
-        .binary = "cas_review_session",
-        .family = "help",
-        .case_kind = .subprocess,
-        .measurement_mode = .latency_only,
-        .compat_case = true,
-    },
-    .{
-        .case_id = "cas-review-session-version",
-        .binary = "cas_review_session",
-        .family = "version",
         .case_kind = .subprocess,
         .measurement_mode = .latency_only,
         .compat_case = true,
@@ -866,62 +733,6 @@ const CompatCases = [_]CompatCase{
         .setup = .bench_stats_parse,
         .tolerance_pct = 25.0,
     },
-    .{
-        .descriptor = MiscCases[2],
-        .builder = .root,
-        .build_step = "build-cas",
-        .binary_path = "zig-out/bin/cas",
-        .setup = .cas_wrapper_smoke,
-        .tolerance_pct = 120.0,
-    },
-    .{
-        .descriptor = MiscCases[3],
-        .builder = .root,
-        .build_step = "build-cas",
-        .binary_path = "zig-out/bin/cas_smoke_check",
-        .setup = .cas_smoke_check_help,
-        .tolerance_pct = 100.0,
-    },
-    .{
-        .descriptor = MiscCases[4],
-        .builder = .root,
-        .build_step = "build-cas",
-        .binary_path = "zig-out/bin/cas_instance_runner",
-        .setup = .cas_instance_runner_help,
-        .tolerance_pct = 100.0,
-    },
-    .{
-        .descriptor = MiscCases[5],
-        .builder = .root,
-        .build_step = "build-cas",
-        .binary_path = "zig-out/bin/cas_review_session",
-        .setup = .cas_review_session_help,
-        .tolerance_pct = 100.0,
-    },
-    .{
-        .descriptor = MiscCases[6],
-        .builder = .root,
-        .build_step = "build-cas",
-        .binary_path = "zig-out/bin/cas_review_session",
-        .setup = .cas_review_session_version,
-        .tolerance_pct = 100.0,
-    },
-    .{
-        .descriptor = CasAutomationCases[0],
-        .builder = .root,
-        .build_step = "build-cas",
-        .binary_path = "zig-out/bin/cas",
-        .setup = .cas_automation_help,
-        .tolerance_pct = 25.0,
-    },
-    .{
-        .descriptor = CasAutomationCases[1],
-        .builder = .root,
-        .build_step = "build-cas",
-        .binary_path = "zig-out/bin/cas",
-        .setup = .cas_automation_list,
-        .tolerance_pct = 35.0,
-    },
 };
 
 const DeepCases = [_]DeepCase{
@@ -932,46 +743,6 @@ const DeepCases = [_]DeepCase{
         .warmups = 3,
         .samples = 30,
         .batch_iterations = 8,
-    },
-    .{
-        .descriptor = CasAutomationCases[2],
-        .setup = .cas_automation_show,
-        .tolerance_pct = 200.0,
-    },
-    .{
-        .descriptor = CasAutomationCases[3],
-        .setup = .cas_automation_create,
-        .tolerance_pct = 25.0,
-    },
-    .{
-        .descriptor = CasAutomationCases[4],
-        .setup = .cas_automation_update,
-        .tolerance_pct = 25.0,
-    },
-    .{
-        .descriptor = CasAutomationCases[5],
-        .setup = .cas_automation_enable,
-        .tolerance_pct = 250.0,
-    },
-    .{
-        .descriptor = CasAutomationCases[6],
-        .setup = .cas_automation_disable,
-        .tolerance_pct = 100.0,
-    },
-    .{
-        .descriptor = CasAutomationCases[7],
-        .setup = .cas_automation_run_now,
-        .tolerance_pct = 70.0,
-    },
-    .{
-        .descriptor = CasAutomationCases[8],
-        .setup = .cas_automation_delete,
-        .tolerance_pct = 60.0,
-    },
-    .{
-        .descriptor = CasAutomationCases[9],
-        .setup = .cas_automation_run_due,
-        .tolerance_pct = 125.0,
     },
 } ++ OptimizationDeepCases;
 
@@ -1025,23 +796,6 @@ fn deepCaseForId(id: []const u8) ?DeepCase {
     return null;
 }
 
-const CasAutomationCoverageArray =
-    [cas_automation_cli.commandDefinitions().len]perf_contract.CommandCoverage;
-
-fn buildCasAutomationCoverages() CasAutomationCoverageArray {
-    var out: [cas_automation_cli.commandDefinitions().len]perf_contract.CommandCoverage = undefined;
-    for (cas_automation_cli.commandDefinitions(), 0..) |def, idx| {
-        const coverage, const reason = if (def.command == .list)
-            .{ perf_contract.CoverageKind.shallow, "compat subprocess case exists" }
-        else if (def.command == .scheduler)
-            .{ perf_contract.CoverageKind.excluded, "external-like scheduler surfaces deferred" }
-        else
-            .{ perf_contract.CoverageKind.deep, "native deep case landed" };
-        out[idx] = .{ .family = def.name, .coverage = coverage, .reason = reason };
-    }
-    return out;
-}
-
 fn allManifests() []const perf_contract.BinaryManifest {
     return &.{
         .{
@@ -1051,7 +805,6 @@ fn allManifests() []const perf_contract.BinaryManifest {
             .cases = &SeqCases,
         },
         .{ .binary = "ledger", .coverages = &LedgerCoverages, .cases = &LedgerCases },
-        .{ .binary = "cas", .coverages = &CasAutomationCoverages, .cases = &CasAutomationCases },
         .{ .binary = "misc", .coverages = &MiscCoverages, .cases = &MiscCases },
         .{
             .binary = "optimization",
@@ -1791,23 +1544,6 @@ const StatusDetail = struct {
     detail: []const u8,
 };
 
-const Sqlite = struct {
-    pub const sqlite3 = opaque {};
-    pub const SQLITE_OK: c_int = 0;
-
-    extern fn sqlite3_open(filename: [*:0]const u8, ppDb: *?*sqlite3) c_int;
-    extern fn sqlite3_close(db: *sqlite3) c_int;
-    extern fn sqlite3_free(ptr: ?*anyopaque) void;
-    extern fn sqlite3_errmsg(db: *sqlite3) [*:0]const u8;
-    extern fn sqlite3_exec(
-        db: *sqlite3,
-        sql: [*:0]const u8,
-        callback: ?*const fn (?*anyopaque, c_int, [*c][*c]u8, [*c][*c]u8) callconv(.c) c_int,
-        arg: ?*anyopaque,
-        errmsg: ?*?[*:0]u8,
-    ) c_int;
-};
-
 fn matchesDescriptorTarget(descriptor: perf_contract.CaseDescriptor, target: ?[]const u8) bool {
     return matchesTarget(descriptor.case_id, descriptor.binary, target);
 }
@@ -1825,7 +1561,6 @@ fn matchesTarget(case_id: []const u8, binary: []const u8, target: ?[]const u8) b
         return std.mem.eql(u8, binary, "seq") or
             std.mem.eql(u8, binary, "ledger");
     }
-    if (std.mem.eql(u8, needle, "cas")) return std.mem.startsWith(u8, case_id, "cas-");
     if (isKnownBinaryName(needle)) return std.mem.eql(u8, binary, needle);
     if (std.mem.eql(u8, binary, needle)) return true;
     return std.mem.indexOf(u8, case_id, needle) != null;
@@ -2593,7 +2328,6 @@ fn hashObservedCommand(
     var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();
     const run = try renderCompatRun(
-        fs,
         environ,
         arena.allocator(),
         case_cfg,
@@ -4230,7 +3964,6 @@ fn runCompatWarmup(
     var run_arena = std.heap.ArenaAllocator.init(allocator);
     defer run_arena.deinit();
     const run = try renderCompatRun(
-        fs,
         environ,
         run_arena.allocator(),
         case_cfg,
@@ -4255,7 +3988,6 @@ fn appendCompatSample(
     var run_arena = std.heap.ArenaAllocator.init(allocator);
     defer run_arena.deinit();
     const run = try renderCompatRun(
-        fs,
         environ,
         run_arena.allocator(),
         case_cfg,
@@ -4352,7 +4084,6 @@ fn measuredOutputEvidenceOnce(
     var run_arena = std.heap.ArenaAllocator.init(allocator);
     defer run_arena.deinit();
     const run = try renderCompatRun(
-        fs,
         environ,
         run_arena.allocator(),
         case_cfg,
@@ -5248,7 +4979,6 @@ fn prepareLedgerPerfStore(
 }
 
 fn renderCompatRun(
-    fs: durable_store.Fs,
     environ: ?*const std.process.Environ.Map,
     allocator: std.mem.Allocator,
     case_cfg: CompatCase,
@@ -5275,20 +5005,6 @@ fn renderCompatRun(
         .ledger_project,
         .ledger_doctor,
         => try appendLedgerStoreArgs(allocator, &args, case_cfg.setup, binary_path, temp_root),
-        .cas_wrapper_smoke => return renderCasWrapperSmoke(
-            fs,
-            allocator,
-            binary_path,
-            temp_root,
-            cwd,
-        ),
-        .cas_automation_list => try appendCasAutomationListArgs(
-            fs.io,
-            allocator,
-            &args,
-            binary_path,
-            temp_root,
-        ),
         else => try appendMiscCompatArgs(allocator, &args, case_cfg.setup, binary_path),
     }
     return .{ .cwd = cwd, .argv = try args.toOwnedSlice(allocator) };
@@ -5425,19 +5141,7 @@ fn appendMiscCompatArgs(
     binary_path: []const u8,
 ) !void {
     switch (setup) {
-        .bench_stats_help,
-        .cas_smoke_check_help,
-        .cas_instance_runner_help,
-        .cas_review_session_help,
-        => try args.appendSlice(allocator, &.{ binary_path, "--help" }),
-        .cas_automation_help => try args.appendSlice(
-            allocator,
-            &.{ binary_path, "automation", "--help" },
-        ),
-        .cas_review_session_version => try args.appendSlice(
-            allocator,
-            &.{ binary_path, "--version" },
-        ),
+        .bench_stats_help => try args.appendSlice(allocator, &.{ binary_path, "--help" }),
         .bench_stats_parse => {
             const input_path = try std.fs.path.join(
                 allocator,
@@ -5447,47 +5151,6 @@ fn appendMiscCompatArgs(
         },
         else => return error.InvalidCommand,
     }
-}
-
-fn renderCasWrapperSmoke(
-    fs: durable_store.Fs,
-    allocator: std.mem.Allocator,
-    binary_path: []const u8,
-    temp_root: []const u8,
-    cwd: []const u8,
-) !CommandRun {
-    const io = fs.io;
-    const wrapper_dir = try std.fs.path.join(allocator, &.{ temp_root, "cas-wrapper" });
-    try makeRepoAwarePath(fs, allocator, wrapper_dir);
-    const wrapper_binary = try std.fs.path.join(allocator, &.{ wrapper_dir, "cas" });
-    const source_binary = try absolutePathForCwdRelative(fs, allocator, binary_path);
-    defer allocator.free(source_binary);
-    try std.Io.Dir.copyFileAbsolute(source_binary, wrapper_binary, io, .{});
-    try makeExecutable(fs, wrapper_binary);
-    const stub_path = try std.fs.path.join(allocator, &.{ wrapper_dir, "cas_smoke_check" });
-    try fs.directory().writeFile(io, .{
-        .sub_path = stub_path,
-        .data = "#!/usr/bin/env bash\nexit 0\n",
-    });
-    try makeExecutable(fs, stub_path);
-    return .{
-        .cwd = cwd,
-        .argv = try allocator.dupe([]const u8, &.{ wrapper_binary, "smoke_check" }),
-    };
-}
-
-fn appendCasAutomationListArgs(
-    io: std.Io,
-    allocator: std.mem.Allocator,
-    args: *std.ArrayList([]const u8),
-    binary_path: []const u8,
-    temp_root: []const u8,
-) !void {
-    const stamp_ms = @divFloor(std.Io.Clock.awake.now(io).nanoseconds, 1_000_000);
-    const db_name = try allocator.print("codex-dev-{d}.db", .{stamp_ms});
-    const db_path = try std.fs.path.join(allocator, &.{ temp_root, db_name });
-    try seedCasAutomationDb(io, allocator, db_path);
-    try args.appendSlice(allocator, &.{ binary_path, "automation", "--db", db_path, "list" });
 }
 
 const ChildResult = struct {
@@ -5761,19 +5424,6 @@ fn releaseTempRoot(
     allocator.free(path);
 }
 
-fn makeExecutable(fs: durable_store.Fs, path: []const u8) !void {
-    var file = try fs.directory().openFile(
-        fs.io,
-        path,
-        .{ .mode = .read_write },
-    );
-    defer file.close(fs.io);
-    try file.setPermissions(
-        fs.io,
-        @fromBackingInt(@intCast(0o755)),
-    );
-}
-
 fn absolutePathForCwdRelative(
     fs: durable_store.Fs,
     allocator: std.mem.Allocator,
@@ -5783,76 +5433,6 @@ fn absolutePathForCwdRelative(
     const cwd = try fs.directory().realPathFileAlloc(fs.io, ".", allocator);
     defer allocator.free(cwd);
     return std.fs.path.join(allocator, &.{ cwd, path });
-}
-
-fn seedCasAutomationDb(io: std.Io, allocator: std.mem.Allocator, db_path: []const u8) !void {
-    const db_path_z = try allocator.dupeSentinel(u8, db_path, 0);
-    defer allocator.free(db_path_z);
-    var db_opt: ?*Sqlite.sqlite3 = null;
-    const open_rc = Sqlite.sqlite3_open(db_path_z, &db_opt);
-    defer if (db_opt) |db| closeAutomationDb(io, db);
-    if (open_rc != Sqlite.SQLITE_OK or db_opt == null) {
-        return error.InvalidData;
-    }
-
-    const schema =
-        \\create table automations (
-        \\  id text primary key,
-        \\  name text not null,
-        \\  prompt text not null,
-        \\  status text not null,
-        \\  next_run_at integer,
-        \\  last_run_at integer,
-        \\  cwds text not null,
-        \\  rrule text not null,
-        \\  created_at integer not null,
-        \\  updated_at integer not null
-        \\);
-        \\create table automation_runs (
-        \\  thread_id text primary key,
-        \\  automation_id text not null,
-        \\  status text not null,
-        \\  read_at integer,
-        \\  thread_title text,
-        \\  source_cwd text,
-        \\  inbox_title text,
-        \\  inbox_summary text,
-        \\  created_at integer not null,
-        \\  updated_at integer not null,
-        \\  archived_user_message text,
-        \\  archived_assistant_message text,
-        \\  archived_reason text
-        \\);
-        \\insert into automations (id, name, prompt, status, next_run_at, last_run_at, cwds, rrule, created_at, updated_at) values ('cron-001', 'Daily Summary', 'Summarize recent runs', 'ACTIVE', null, null, '[]', 'RRULE:FREQ=DAILY;BYHOUR=9;BYMINUTE=15', 1772469600000, 1772469600000);
-    ;
-    const schema_z = try allocator.dupeSentinel(u8, schema, 0);
-    defer allocator.free(schema_z);
-    var err_msg: ?[*:0]u8 = null;
-    defer if (err_msg) |message| Sqlite.sqlite3_free(@ptrCast(message));
-    if (Sqlite.sqlite3_exec(db_opt.?, schema_z, null, null, &err_msg) != Sqlite.SQLITE_OK) {
-        if (err_msg) |msg| try reportAutomationDbError(io, msg);
-        return error.InvalidData;
-    }
-}
-
-fn reportAutomationDbError(io: std.Io, message: [*:0]const u8) !void {
-    var stderr_writer = std.Io.File.stderr().writer(
-        io,
-        &.{},
-    );
-    try stderr_writer.interface.print(
-        "seedCasAutomationDb sqlite error: {s}\n",
-        .{std.mem.sliceTo(message, 0)},
-    );
-}
-
-fn closeAutomationDb(io: std.Io, db: *Sqlite.sqlite3) void {
-    const rc = Sqlite.sqlite3_close(db);
-    if (rc != Sqlite.SQLITE_OK) warnDiagnostic(
-        io,
-        "automation database cleanup failed code={d}",
-        .{rc},
-    );
 }
 
 fn allowedUpperBoundWithTolerance(base: u64, tolerance_pct: f64) u64 {
@@ -8210,27 +7790,6 @@ test "retained utility cases preserve executable and setup pairing" {
     }{
         .{ .id = "bench-stats-help", .binary = "bench_stats", .setup = .bench_stats_help },
         .{ .id = "bench-stats-parse", .binary = "bench_stats", .setup = .bench_stats_parse },
-        .{ .id = "cas-wrapper-smoke", .binary = "cas", .setup = .cas_wrapper_smoke },
-        .{
-            .id = "cas-smoke-check-help",
-            .binary = "cas_smoke_check",
-            .setup = .cas_smoke_check_help,
-        },
-        .{
-            .id = "cas-instance-runner-help",
-            .binary = "cas_instance_runner",
-            .setup = .cas_instance_runner_help,
-        },
-        .{
-            .id = "cas-review-session-help",
-            .binary = "cas_review_session",
-            .setup = .cas_review_session_help,
-        },
-        .{
-            .id = "cas-review-session-version",
-            .binary = "cas_review_session",
-            .setup = .cas_review_session_version,
-        },
     };
     try std.testing.expectEqual(expected.len, MiscCases.len);
     for (expected) |item| {
@@ -8807,4 +8366,23 @@ fn expectChildCaptureAuthority(
     defer allocator.free(result.stderr);
     try std.testing.expectEqual(@as(u8, 0), result.exit_code);
     try std.testing.expectEqualStrings("supplied", result.stdout);
+}
+
+test "retired CAS has no executable performance surface" {
+    for (allManifests()) |manifest| {
+        try std.testing.expect(!std.mem.eql(u8, manifest.binary, "cas"));
+        for (manifest.cases) |case| {
+            try std.testing.expect(!std.mem.startsWith(u8, case.case_id, "cas-"));
+        }
+    }
+    for (CompatCases) |case| {
+        if (case.build_step) |step| {
+            try std.testing.expect(!std.mem.eql(u8, step, "build-cas"));
+        }
+        const basename = std.fs.path.basename(case.binary_path);
+        try std.testing.expect(!std.mem.startsWith(u8, basename, "cas"));
+    }
+    for (DeepCases) |case| {
+        try std.testing.expect(!std.mem.startsWith(u8, case.descriptor.case_id, "cas-"));
+    }
 }
