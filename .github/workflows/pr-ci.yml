@@ -119,7 +119,7 @@ jobs:
             if git diff --quiet "$base" "$head" -- "apps/$app/VERSION"; then
               missing+=("$app")
             fi
-          done
+n          done
 
           if [ "${#missing[@]}" -ne 0 ]; then
             echo "Missing VERSION bumps for release-relevant CLI changes: ${missing[*]}" >&2
@@ -320,3 +320,27 @@ jobs:
           expected="$(tr -d '[:space:]' < apps/siwc/VERSION)"
           test "$(zig-out/bin/siwc --version)" = "$expected"
           zig-out/bin/siwc --help
+
+  windows:
+    needs: changes
+    if: contains(needs.changes.outputs.*, 'true')
+    strategy:
+      fail-fast: false
+      matrix:
+        app: [seq, lift, ledger, memory-note, siwc]
+    runs-on: windows-2025
+    timeout-minutes: 10
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.17.0
+      - name: Build native Windows release executable
+        run: zig build build-${{ matrix.app }} -Dtarget=x86_64-windows-gnu -Dcpu=baseline -Doptimize=fast -j2 --summary all
+      - name: Test native Windows application in Debug
+        run: zig build test-${{ matrix.app }} -Dtarget=x86_64-windows-gnu -Dcpu=baseline -Doptimize=debug -j2 --summary all
+      - name: Test native Windows application in ReleaseSafe
+        run: zig build test-${{ matrix.app }} -Dtarget=x86_64-windows-gnu -Dcpu=baseline -Doptimize=safe -j2 --summary all
