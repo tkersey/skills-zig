@@ -84,10 +84,16 @@ fn addLedgerPanicProbe(ctx: BuildContext, product: *std.Build.Module) *std.Build
     while (imports.next()) |entry| root.addImport(entry.key_ptr.*, entry.value_ptr.*);
     const executable = support.addExecutable(b, "ledger-panic-probe", root);
     const run = b.addRunArtifact(executable);
-    run.addCheck(.{ .expect_term = .{ .signal = switch (ctx.target.result.cpu.arch) {
-        .aarch64 => .TRAP,
-        else => .ILL,
-    } } });
+    if (comptime @import("builtin").os.tag == .windows) {
+        run.addCheck(.{ .expect_term = .{
+            .exited = @truncate(@as(u32, 0xc000001d)),
+        } });
+    } else {
+        run.addCheck(.{ .expect_term = .{ .signal = switch (ctx.target.result.cpu.arch) {
+            .aarch64 => .TRAP,
+            else => .ILL,
+        } } });
+    }
     run.expectStdErrEqual("ledger panic probe");
     run.expectStdOutEqual("");
     const step = b.step("test-ledger-panic", "Exercise the shipped panic callback");
