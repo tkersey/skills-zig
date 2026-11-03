@@ -119,7 +119,7 @@ jobs:
             if git diff --quiet "$base" "$head" -- "apps/$app/VERSION"; then
               missing+=("$app")
             fi
-n          done
+          done
 
           if [ "${#missing[@]}" -ne 0 ]; then
             echo "Missing VERSION bumps for release-relevant CLI changes: ${missing[*]}" >&2
