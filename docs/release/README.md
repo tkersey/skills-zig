@@ -34,9 +34,10 @@ Release contract:
    - `libs/trace_core/**` counts for its shipped consumers: `seq`.
    - `libs/siwc/**` counts for SIWC, its sole shipped consumer.
    - `.github/workflows/release-<cli>.yml` counts for that CLI's packaged artifact contract.
+   - `.github/scripts/release_artifacts.py` and its archive/ownership regression tests count for all five CLIs.
    Durable-store changes that alter lease locks, fencing counters, CAS writes, transaction recovery, or semantic concurrency errors must be treated as release-relevant for every shipped consumer whose command behavior depends on those paths.
-3. When those `VERSION` bumps land on `main`, `.github/workflows/auto-release.yml` dispatches the matching release workflows. For Seq, Auto Release dispatches `release-seq.yml` from `main` with the exact merged `commit_sha`; the workflow qualifies both release targets before its dependent publish job creates a missing tag. Other CLI workflows retain tag-first dispatch. A manual release dispatch normally selects the existing release tag as its workflow ref and passes the same `tag_name`, for example `gh workflow run release-<cli>.yml --ref <tag> -f tag_name=<tag>`. A deliberate tagless Seq dispatch must also pass the exact commit with `-f commit_sha=<sha>`.
-4. Do not treat a local `./zig-out/bin` binary as release closure for a shipped CLI. Closure requires a tagged release, tap formula update, Homebrew audit/test proof, and installed binary version proof.
+3. When those `VERSION` bumps land on `main`, `.github/workflows/auto-release.yml` dispatches the matching release workflows. For Seq, Auto Release dispatches `release-seq.yml` from `main` with the exact merged `commit_sha`; all three release targets and the exact archive set must qualify before its dependent publish job creates a missing tag. Other CLI workflows retain tag-first dispatch. A manual release dispatch normally selects the existing release tag as its workflow ref and passes the same `tag_name`, for example `gh workflow run release-<cli>.yml --ref <tag> -f tag_name=<tag>`. A deliberate tagless Seq dispatch must also pass the exact commit with `-f commit_sha=<sha>`.
+4. Do not treat a local `./zig-out/bin` binary as release closure for a shipped CLI. Closure requires a tagged release and installed binary version proof. Unix Homebrew distribution additionally requires a tap formula update and Homebrew audit/test proof; Windows distribution requires the qualified ZIP and extracted executable proof described below.
 5. Generic release builds must declare their target architecture and use Zig's baseline CPU. Build-time dependencies carried by a release binary must be content-addressed rather than inherited from the build runner. Direct Zig downloads must match the pinned archive checksum; setup-zig verifies the upstream signature. Clean runners prepare the package-cache directory before fetching dependencies. macOS artifacts require macOS 15 and use the explicit `aarch64-macos.15.0` target; tap formulas must declare the same minimum.
 
 Root build assembly creates the shared modules once through `build/support.zig` and
@@ -60,39 +61,73 @@ Release tags must match file versions:
 - `memory-note-v<version>` where `<version>` equals `apps/memory-note/VERSION`
 - `siwc-v<version>` where `<version>` equals `apps/siwc/VERSION`
 
-Each workflow publishes two release archives for its independently versioned CLI.
+Each workflow requires exactly three release archives for its independently
+versioned CLI before publication:
 
 - `<tag>-linux-x86_64.tar.gz`
 - `<tag>-darwin-arm64.tar.gz`
+- `<tag>-windows-x86_64.zip`
 
-Examples:
+Unix archives contain only the executable named after the CLI, except Lift's
+`lift-bench-stats`. Windows ZIPs contain only the corresponding `.exe`, including
+`lift-bench-stats.exe` for Lift. PDBs, import libraries, companion DLLs, nested
+payload paths, symlinks, and duplicate members are not release payloads.
+The publisher checks exact names and archive contents, not just an archive count.
+Missing Windows qualification cannot silently produce a two-platform release.
 
-- `seq-v1.2.3-linux-x86_64.tar.gz`
-- `seq-v1.2.3-darwin-arm64.tar.gz`
-- `lift-v1.2.3-linux-x86_64.tar.gz`
-- `lift-v1.2.3-darwin-arm64.tar.gz`
-- `ledger-v1.2.3-linux-x86_64.tar.gz`
-- `ledger-v1.2.3-darwin-arm64.tar.gz`
-- `memory-note-v1.2.3-linux-x86_64.tar.gz`
-- `memory-note-v1.2.3-darwin-arm64.tar.gz`
-- `siwc-v1.2.3-linux-x86_64.tar.gz`
-- `siwc-v1.2.3-darwin-arm64.tar.gz`
+## Native Windows Qualification
+
+The Windows target is `x86_64-windows-gnu` with `-Dcpu=baseline`, executed on the
+`windows-2025` runner. Workflow commands select Git Bash explicitly; the shipped
+executable is native Windows, not a WSL or MSYS build. PR CI selects Windows apps
+from the same ownership classifier as the existing lanes. Each app has its own
+setup-zig cache key, so concurrent apps do not compete to save one cache entry.
+
+Both PR CI and the release matrices run the same command:
+
+```bash
+python .github/scripts/release_artifacts.py windows <cli>
+# Releases additionally supply --tag "$RELEASE_TAG".
+```
+
+The helper runs the app tests in Debug and ReleaseSafe, then builds ReleaseFast.
+Seq also runs its core and CLI smoke targets. The built Seq and Ledger binaries
+run their command-surface gates; memory-note runs its CLI layout/migration script.
+Every subprocess failure is fatal.
+Only a successful native run may create the final release ZIP. Cross-compilation
+alone is not qualification.
+
+The helper admits one regular x86_64 PE32+ executable, packages it, verifies the
+ZIP, and executes the extracted payload from a fresh directory containing spaces.
+Its exact `--version` and successful `--help` are checked with `PATH` restricted
+to Windows system directories, excluding Git Bash, Zig, and MinGW tools. This
+prevents a runner-only DLL or executable on `PATH` from masking a broken release.
+The PR uploads successful ZIPs as seven-day workflow artifacts, not GitHub releases.
+
+All five native Windows lanes must succeed before treating Windows support as
+implemented. A matrix row is not evidence that POSIX-specific storage, permission,
+process, or command behavior has been ported. Failed tests must not be skipped or
+credential/durability checks weakened to produce a release archive.
+This contract does not claim Windows ARM64 support, an MSI/winget installer, or
+Authenticode signing. Existing Unix archive names and Homebrew layouts are unchanged.
 
 SIWC qualifies its offline authentication and command tests in Debug and
-ReleaseSafe on both platforms before producing release archives. Its Linux
-target is `x86_64-linux-musl`; macOS uses `aarch64-macos.15.0`. Each archive
-contains only `siwc`, and qualification verifies its version and help surface.
-No release or CI job uses a real ChatGPT account or performs paid inference.
+ReleaseSafe on every release platform before producing archives. Its Linux target
+is `x86_64-linux-musl`; macOS uses `aarch64-macos.15.0`; Windows uses the target above.
+The archives contain only `siwc` or `siwc.exe`, and qualification checks version
+and help. No release or CI job uses a real ChatGPT account or performs paid inference.
 The initial Homebrew formula is a separate tap handoff after the first release.
 
 ## Homebrew Tap Handoff
 
 Homebrew formula updates are intentionally handled in a separate tap repository.
 This repo does not support installing its CLIs into user-global paths from source builds.
-Build artifacts are only allowed under repo-local `zig-out/bin`; shipped installs must flow through a tagged release plus the tap formula update.
+Build artifacts are only allowed under repo-local `zig-out/bin`; Unix shipped installs
+flow through a tagged release plus the tap formula update. Windows users extract the
+qualified release ZIP rather than installing a Homebrew formula.
 After a tagged release in this repo:
 
-1. Copy the release asset URL and SHA256 for the relevant CLI archive.
+1. Copy the release asset URL and SHA256 for the relevant Unix CLI archive.
 2. Open the separate tap repo and update only that CLI formula.
 3. Ship the formula change from the tap repo as a separate PR/release step.
 
@@ -121,20 +156,20 @@ curl -fsSL https://www.githubstatus.com/api/v2/components.json \
 
 ## Outage Fallback (Manual Publish)
 
-If GitHub Actions is degraded/outage and tag runs remain queued, publish manually so tap
-propagation is not blocked:
+An Actions outage does not relax native qualification or the exact asset contract.
+Manual publication requires successful evidence for the same commit on all three
+platforms; otherwise leave the release unpublished.
 
-1. On a clean checkout of the exact release tag, run the affected CLI's build and test lanes and retain the successful command output with the tag commit SHA.
-2. Build and package the exact two release archives for the CLI:
-   `<tag>-darwin-arm64.tar.gz` and `<tag>-linux-x86_64.tar.gz`.
-3. Create the release directly on the existing tag:
-   - `gh release create <tag> <asset1> <asset2> --verify-tag`
-4. Update `homebrew-tap` formula version + SHA256 from the published assets.
-5. Prove end-to-end with:
+1. On clean checkouts of the exact release tag, run the affected CLI's build and test lanes and retain successful command output with the tag commit SHA. Run the shared Windows helper on native Windows; a Unix cross-build does not replace it.
+2. Collect `<tag>-darwin-arm64.tar.gz`, `<tag>-linux-x86_64.tar.gz`, and `<tag>-windows-x86_64.zip` under `release-assets`.
+3. From that checkout, require `python3 .github/scripts/release_artifacts.py verify-set <cli> <tag> release-assets` to succeed before running `gh release create <tag> <asset1> <asset2> <asset3> --verify-tag`.
+4. Update `homebrew-tap` formula version + SHA256 from the published Unix assets.
+5. Prove Unix end-to-end with:
    - `brew audit --strict tkersey/tap/<cli>`
    - `brew upgrade --formula tkersey/tap/<cli>`
    - `brew test tkersey/tap/<cli>`
    - `<cli> --version`
+6. Retain the Windows helper's extracted ZIP version/help proof; verify the installed Windows executable's version on the destination host.
 
 ## CLI retirement migration
 
@@ -180,9 +215,9 @@ in the surviving generic storage libraries are unrelated to the retired CLI.
 TypeSafe is retired. Lift ships only `bench_stats`; `perf_report` is removed.
 The Lift parser benchmark remains `zig build bench-lift-bench-stats`, with no
 installed or packaged benchmark executable. Existing data and historical
-release evidence remain unchanged. Lift archives contain only
+release evidence remain unchanged. Unix Lift archives contain only
 `lift-bench-stats`, renamed to `bench_stats` by the formula; use the Lift archive
-verifier before publication.
+verifier before publication. Windows ZIPs contain `lift-bench-stats.exe`.
 
 Upgrade only installed surviving formulas, without automatically unpinning any:
 

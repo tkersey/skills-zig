@@ -35,8 +35,14 @@ jobs:
           - platform: darwin-arm64
             target: aarch64-macos.15.0
             os: macos-15
+          - platform: windows-x86_64
+            target: x86_64-windows-gnu
+            os: windows-2025
     runs-on: ${{ matrix.os }}
     timeout-minutes: 10
+    defaults:
+      run:
+        shell: bash
     steps:
       - uses: actions/checkout@v5
         with:
@@ -50,13 +56,21 @@ jobs:
       - uses: mlugg/setup-zig@v2
         with:
           version: 0.17.0
+          cache-key: app-siwc
+      - name: Qualify and package native Windows artifact
+        if: runner.os == 'Windows'
+        run: python .github/scripts/release_artifacts.py windows siwc --tag "$RELEASE_TAG"
       - name: Test SIWC in Debug
+        if: runner.os != 'Windows'
         run: zig build test-siwc -Dtarget=${{ matrix.target }} -Dcpu=baseline -Doptimize=debug
       - name: Test SIWC in ReleaseSafe
+        if: runner.os != 'Windows'
         run: zig build test-siwc -Dtarget=${{ matrix.target }} -Dcpu=baseline -Doptimize=safe
       - name: Build SIWC release executable
+        if: runner.os != 'Windows'
         run: zig build build-siwc -Dtarget=${{ matrix.target }} -Dcpu=baseline -Doptimize=fast
       - name: Package and verify SIWC archive
+        if: runner.os != 'Windows'
         shell: bash
         run: |
           set -euo pipefail
@@ -84,6 +98,9 @@ jobs:
     env:
       GH_TOKEN: ${{ github.token }}
     steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: refs/tags/${{ env.RELEASE_TAG }}
       - name: Download qualified archives
         shell: bash
         run: |
@@ -91,21 +108,13 @@ jobs:
           gh run download "${{ github.run_id }}" \
             --repo "$GITHUB_REPOSITORY" \
             --dir release-assets \
-            --pattern "${RELEASE_TAG}-*.tar.gz"
+            --pattern "${RELEASE_TAG}-*"
       - name: Verify exact SIWC artifact set and publish
         shell: bash
         run: |
           set -euo pipefail
-          assets=()
-          for platform in linux-x86_64 darwin-arm64; do
-            name="${RELEASE_TAG}-${platform}.tar.gz"
-            asset="release-assets/$name/$name"
-            test -f "$asset"
-            test "$(tar -tzf "$asset")" = siwc
-            assets+=("$asset")
-          done
-          count="$(find release-assets -type f | wc -l | tr -d '[:space:]')"
-          test "$count" -eq 2
+          qualified_assets="$(python3 .github/scripts/release_artifacts.py verify-set siwc "$RELEASE_TAG" release-assets)"
+          mapfile -t assets <<< "$qualified_assets"
           if gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
             gh release upload "$RELEASE_TAG" "${assets[@]}" --repo "$GITHUB_REPOSITORY" --clobber
           else

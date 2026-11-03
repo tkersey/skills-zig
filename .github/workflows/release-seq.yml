@@ -44,7 +44,14 @@ jobs:
             runs_on: macos-15
             zig_archive: zig-aarch64-macos-0.17.0.tar.xz
             zig_sha256: b607e9b9234790a008116ae5bdb71c6243b84b9fb42a53a9e70fde41c06c536a
+          - target: windows-x86_64
+            zig_target: x86_64-windows-gnu
+            runs_on: windows-2025
     runs-on: ${{ matrix.runs_on }}
+    timeout-minutes: 10
+    defaults:
+      run:
+        shell: bash
     steps:
       - uses: actions/checkout@v6
         with:
@@ -76,8 +83,10 @@ jobs:
             exit 1
           fi
       - name: Set tarball name
+        if: runner.os != 'Windows'
         run: echo "TAR_NAME=${RELEASE_TAG}-${{ matrix.target }}.tar.gz" >> "$GITHUB_ENV"
       - name: Install Zig 0.17.0
+        if: runner.os != 'Windows'
         run: |
           set -euo pipefail
           archive="${{ matrix.zig_archive }}"
@@ -86,23 +95,36 @@ jobs:
           tar -xf "${archive}"
           zig_dir="${archive%.tar.xz}"
           echo "${PWD}/${zig_dir}" >> "$GITHUB_PATH"
+      - uses: mlugg/setup-zig@v2
+        if: runner.os == 'Windows'
+        with:
+          version: 0.17.0
+          cache-key: app-seq
+      - name: Qualify and package native Windows artifact
+        if: runner.os == 'Windows'
+        run: python .github/scripts/release_artifacts.py windows seq --tag "$RELEASE_TAG"
       - name: Prepare Zig package cache
+        if: runner.os != 'Windows'
         run: mkdir -p "${HOME}/.cache/zig/tmp"
       - name: Build seq binary
+        if: runner.os != 'Windows'
         working-directory: apps/seq
         run: zig build -Dtarget=${{ matrix.zig_target }} -Dcpu=baseline -Doptimize=fast
       - name: Verify platform-gated seq command and capability surface
+        if: runner.os != 'Windows'
         run: apps/seq/scripts/release/command_surface_gate.sh apps/seq/zig-out/bin/seq
       - name: Package seq artifact
+        if: runner.os != 'Windows'
         run: |
           mkdir -p dist/seq
           cp apps/seq/zig-out/bin/seq dist/seq/seq
           tar -czf "${TAR_NAME}" -C dist/seq seq
+          echo "RELEASE_ARCHIVE=$TAR_NAME" >> "$GITHUB_ENV"
       - name: Upload seq workflow artifact
         uses: actions/upload-artifact@v7
         with:
-          name: ${{ env.TAR_NAME }}
-          path: ${{ env.TAR_NAME }}
+          name: ${{ env.RELEASE_ARCHIVE }}
+          path: ${{ env.RELEASE_ARCHIVE }}
           if-no-files-found: error
           overwrite: false
 
@@ -112,6 +134,9 @@ jobs:
     env:
       GH_TOKEN: ${{ github.token }}
     steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ env.RELEASE_COMMIT }}
       - name: Download seq release artifacts
         run: |
           set -euo pipefail
@@ -119,15 +144,9 @@ jobs:
           gh run download "${{ github.run_id }}" \
             --repo "$GITHUB_REPOSITORY" \
             --dir release-assets \
-            --pattern "${RELEASE_TAG}-*.tar.gz"
+            --pattern "${RELEASE_TAG}-*"
       - name: Verify seq artifact set
-        run: |
-          set -euo pipefail
-          count="$(find release-assets -type f -name '*.tar.gz' | wc -l | tr -d '[:space:]')"
-          if [ "${count}" -ne 2 ]; then
-            echo "Expected 2 release archives, got ${count}" >&2
-            exit 1
-          fi
+        run: python3 .github/scripts/release_artifacts.py verify-set seq "$RELEASE_TAG" release-assets
       - name: Create or verify qualified Seq release tag
         run: |
           set -euo pipefail
@@ -162,7 +181,8 @@ jobs:
       - name: Publish seq release assets
         run: |
           set -euo pipefail
-          mapfile -d '' assets < <(find release-assets -type f -name '*.tar.gz' -print0 | sort -z)
+          qualified_assets="$(python3 .github/scripts/release_artifacts.py verify-set seq "$RELEASE_TAG" release-assets)"
+          mapfile -t assets <<< "$qualified_assets"
           if gh release view "${RELEASE_TAG}" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
             gh release upload "${RELEASE_TAG}" "${assets[@]}" --repo "$GITHUB_REPOSITORY" --clobber
           else

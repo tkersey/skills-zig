@@ -46,7 +46,7 @@ expect_count "$auto_release" 1 '-f "commit_sha=${GITHUB_SHA}"'
 
 expect_count "$seq_release" 1 "commit_sha:"
 expect_count "$seq_release" 1 "REQUESTED_COMMIT:"
-expect_count "$seq_release" 1 'ref: ${{ env.RELEASE_COMMIT }}'
+expect_count "$seq_release" 2 'ref: ${{ env.RELEASE_COMMIT }}'
 expect_count "$seq_release" 1 '[[ ! "${RELEASE_COMMIT}" =~ ^[0-9a-f]{40}$ ]]'
 expect_count "$seq_release" 1 '"${GITHUB_REF_TYPE}" != "tag"'
 expect_count "$seq_release" 1 '"${checkout_sha}" != "${RELEASE_COMMIT}"'
@@ -54,11 +54,16 @@ expect_count "$seq_release" 1 "needs: release"
 expect_count "$seq_release" 1 "Create or verify qualified Seq release tag"
 expect_count "$seq_release" 1 '-f "sha=${RELEASE_COMMIT}"'
 expect_count "$seq_release" 1 '"${tag_sha}" != "${RELEASE_COMMIT}"'
+expect_count "$seq_release" 1 'runs_on: windows-2025'
+expect_count "$seq_release" 1 'release_artifacts.py windows seq --tag "$RELEASE_TAG"'
+expect_count "$seq_release" 2 'release_artifacts.py verify-set seq "$RELEASE_TAG" release-assets'
 
 publish_line="$(grep -n '^  publish:$' "$seq_release" | cut -d: -f1)"
+verify_line="$(grep -n 'name: Verify seq artifact set' "$seq_release" | cut -d: -f1)"
 tag_line="$(grep -n 'name: Create or verify qualified Seq release tag' "$seq_release" | cut -d: -f1)"
-if [[ -z "$publish_line" || -z "$tag_line" || "$tag_line" -le "$publish_line" ]]; then
-  echo "Seq tag authority must remain inside the post-qualification publish job." >&2
+if [[ -z "$publish_line" || -z "$verify_line" || -z "$tag_line" ||
+      "$verify_line" -le "$publish_line" || "$tag_line" -le "$verify_line" ]]; then
+  echo "Seq tag authority must follow exact archive admission inside the post-qualification publish job." >&2
   exit 1
 fi
 

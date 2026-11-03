@@ -148,6 +148,20 @@ class ReleaseArtifactsTest(unittest.TestCase):
             release.run_checked([sys.executable, "-c", "raise SystemExit(7)"])
         self.assertEqual(failure.exception.returncode, 7)
 
+    def test_smoke_uses_case_insensitive_windows_environment(self):
+        executable = self.root / "extracted payload" / "lift-bench-stats.exe"
+        for key in ("SYSTEMROOT", "SystemRoot"):
+            with self.subTest(key=key), \
+                 mock.patch.dict(os.environ, {key: str(self.root), "Path": "untrusted-tools"}, clear=True), \
+                 mock.patch.object(release, "run_checked", return_value=mock.Mock(stdout="1.2.3\n")) as run:
+                release.smoke_windows(executable, "1.2.3", executable.parent)
+                self.assertEqual(run.call_count, 2)
+                environment = run.call_args_list[0].kwargs["env"]
+                self.assertEqual(environment["SYSTEMROOT"], str(self.root))
+                self.assertEqual(environment["PATH"], os.pathsep.join((str(self.root / "System32"), str(self.root))))
+                self.assertNotIn("Path", environment)
+                self.assertNotIn("untrusted-tools", environment["PATH"])
+
     def test_cross_compilation_is_not_native_qualification(self):
         with mock.patch.object(sys, "platform", "linux"), self.assertRaises(ValueError):
             release.qualify_windows(self.app, self.tag)
@@ -162,6 +176,31 @@ class ReleaseArtifactsTest(unittest.TestCase):
         self.assertEqual(run.call_count, 1)
         self.assertFalse(list(self.root.glob("*.zip")))
 
+    def test_native_command_gates_run_before_packaging(self):
+        gates = {
+            "seq": "apps/seq/scripts/release/command_surface_gate.sh",
+            "ledger": "apps/ledger/scripts/release/command_surface_gate.sh",
+            "memory-note": "apps/memory-note/scripts/test-cli.sh",
+        }
+        for app, script in gates.items():
+            with self.subTest(app=app):
+                version = self.root / "apps" / app / "VERSION"
+                version.parent.mkdir(parents=True)
+                version.write_text("1.2.3\n")
+                source = self.root / "zig-out" / "bin" / (app + ".exe")
+                source.parent.mkdir(parents=True, exist_ok=True)
+                source.write_bytes(pe_image())
+                with mock.patch.object(sys, "platform", "win32"), \
+                     mock.patch.object(release, "ROOT", self.root), \
+                     mock.patch.object(release, "run_checked") as run, \
+                     mock.patch.object(release, "smoke_windows"), \
+                     mock.patch.dict(os.environ, {}, clear=True), \
+                     mock.patch("sys.stdout", new=io.StringIO()):
+                    release.qualify_windows(app, f"{app}-v1.2.3")
+                self.assertEqual(run.call_count, 4)
+                self.assertEqual(run.call_args_list[-1].args[0], ["bash", script, f"zig-out/bin/{app}.exe"])
+                release.verify_archive(self.root / f"{app}-v1.2.3-windows-x86_64.zip", app, "windows-x86_64")
+
     def test_windows_build_follows_both_test_modes(self):
         source = self.root / "zig-out" / "bin" / "bench_stats.exe"
         source.parent.mkdir(parents=True)
@@ -170,7 +209,8 @@ class ReleaseArtifactsTest(unittest.TestCase):
              mock.patch.object(release, "ROOT", self.root), \
              mock.patch.object(release, "run_checked") as run, \
              mock.patch.object(release, "smoke_windows") as smoke, \
-             mock.patch.dict(os.environ, {}, clear=True):
+             mock.patch.dict(os.environ, {}, clear=True), \
+             mock.patch("sys.stdout", new=io.StringIO()):
             release.qualify_windows(self.app, self.tag)
         self.assertEqual(run.call_count, 3)
         self.assertIn("-Doptimize=debug", run.call_args_list[0].args[0])

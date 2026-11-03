@@ -55,6 +55,7 @@ jobs:
       - uses: mlugg/setup-zig@v2
         with:
           version: 0.17.0
+          cache-key: app-lift
       - name: Qualify and package native Windows artifact
         if: runner.os == 'Windows'
         run: python .github/scripts/release_artifacts.py windows lift --tag "$RELEASE_TAG"

@@ -100,8 +100,10 @@ def run_checked(argv, **kwargs):
 
 def smoke_windows(executable, version, cwd):
     # The shipped binary must not accidentally depend on Git Bash, Zig, or MinGW DLLs.
-    environment = os.environ.copy()
-    system_root = Path(environment["SystemRoot"])
+    environment = {key.upper(): value for key, value in os.environ.items()}
+    if not environment.get("SYSTEMROOT"):
+        raise ValueError("Windows qualification requires SYSTEMROOT")
+    system_root = Path(environment["SYSTEMROOT"])
     environment["PATH"] = os.pathsep.join((str(system_root / "System32"), str(system_root)))
     result = run_checked(
         [executable, "--version"], cwd=cwd, env=environment,
@@ -127,6 +129,13 @@ def qualify_windows(app, tag):
     if source.is_symlink() or not source.is_file():
         raise ValueError(f"Missing regular Windows executable: {source}")
     require_windows_image(source.read_bytes())
+    command_gates = {
+        "seq": "apps/seq/scripts/release/command_surface_gate.sh",
+        "ledger": "apps/ledger/scripts/release/command_surface_gate.sh",
+        "memory-note": "apps/memory-note/scripts/test-cli.sh",
+    }
+    if app in command_gates:
+        run_checked(["bash", command_gates[app], source.relative_to(ROOT).as_posix()], cwd=ROOT)
     output = ROOT / f"{tag}-windows-x86_64.zip"
     with tempfile.TemporaryDirectory(prefix="windows release ") as scratch:
         scratch = Path(scratch)

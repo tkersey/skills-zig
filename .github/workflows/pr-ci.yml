@@ -351,6 +351,7 @@ jobs:
       - uses: mlugg/setup-zig@v2
         with:
           version: 0.17.0
+          cache-key: app-${{ matrix.app }}
       - name: Qualify and package native Windows release artifact
         run: python .github/scripts/release_artifacts.py windows "${{ matrix.app }}"
       - name: Retain qualified Windows release candidate
