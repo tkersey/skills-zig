@@ -120,6 +120,9 @@ case "$mode" in
         tools/durable_store_perf.zig)
           mark_app seq
           ;;
+        .github/scripts/release_artifacts.py|.github/scripts/test_release_artifacts.py|.github/scripts/test_release_artifact_ownership.sh)
+          mark_all
+          ;;
         .github/workflows/release-seq.yml)
           mark_app seq
           ;;

@@ -33,7 +33,14 @@ jobs:
           - target: darwin-arm64
             zig_target: aarch64-macos.15.0
             runs_on: macos-15
+          - target: windows-x86_64
+            zig_target: x86_64-windows-gnu
+            runs_on: windows-2025
     runs-on: ${{ matrix.runs_on }}
+    timeout-minutes: 10
+    defaults:
+      run:
+        shell: bash
     steps:
       - uses: actions/checkout@v4
         with:
@@ -48,9 +55,14 @@ jobs:
       - uses: mlugg/setup-zig@v2
         with:
           version: 0.17.0
+      - name: Qualify and package native Windows artifact
+        if: runner.os == 'Windows'
+        run: python .github/scripts/release_artifacts.py windows lift --tag "$RELEASE_TAG"
       - name: Build lift binaries
+        if: runner.os != 'Windows'
         run: zig build build-lift -Dtarget=${{ matrix.zig_target }} -Dcpu=baseline -Doptimize=fast
       - name: Package lift artifact
+        if: runner.os != 'Windows'
         run: |
           package_dir="$(mktemp -d)"
           trap 'rm -rf "$package_dir"' EXIT
@@ -58,11 +70,12 @@ jobs:
           TAR_NAME="${RELEASE_TAG}-${{ matrix.target }}.tar.gz"
           tar -czf "${TAR_NAME}" -C "$package_dir" .
           .github/scripts/verify_lift_archive.sh "$TAR_NAME"
+          echo "RELEASE_ARCHIVE=$TAR_NAME" >> "$GITHUB_ENV"
       - name: Upload lift workflow artifact
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ env.RELEASE_TAG }}-${{ matrix.target }}.tar.gz
-          path: ${{ env.RELEASE_TAG }}-${{ matrix.target }}.tar.gz
+          name: ${{ env.RELEASE_ARCHIVE }}
+          path: ${{ env.RELEASE_ARCHIVE }}
           if-no-files-found: error
           overwrite: false
 
@@ -70,23 +83,22 @@ jobs:
     needs: release
     runs-on: ubuntu-latest
     steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: refs/tags/${{ env.RELEASE_TAG }}
       - name: Download lift release artifacts
         uses: actions/download-artifact@v4
         with:
-          pattern: ${{ env.RELEASE_TAG }}-*.tar.gz
+          pattern: ${{ env.RELEASE_TAG }}-*
           path: release-assets
-          merge-multiple: true
+          merge-multiple: false
       - name: Verify lift artifact set
-        run: |
-          set -euo pipefail
-          count="$(find release-assets -maxdepth 1 -type f -name '*.tar.gz' | wc -l | tr -d '[:space:]')"
-          if [ "${count}" -ne 2 ]; then
-            echo "Expected 2 release archives, got ${count}" >&2
-            exit 1
-          fi
+        run: python3 .github/scripts/release_artifacts.py verify-set lift "$RELEASE_TAG" release-assets
       - name: Publish lift release assets
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ env.RELEASE_TAG }}
           fail_on_unmatched_files: true
-          files: release-assets/*.tar.gz
+          files: |
+            release-assets/**/*.tar.gz
+            release-assets/**/*.zip

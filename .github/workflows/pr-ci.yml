@@ -38,6 +38,7 @@ jobs:
       memory_note: ${{ steps.classify.outputs.memory_note }}
       siwc: ${{ steps.classify.outputs.siwc }}
       perf: ${{ steps.classify.outputs.perf }}
+      windows_apps: ${{ steps.classify.outputs.windows_apps }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -50,9 +51,10 @@ jobs:
           base="${{ github.event.pull_request.base.sha }}"
           head="${{ github.event.pull_request.head.sha }}"
           declare -A selected=()
+          affected="$(.github/scripts/release_apps.sh ci-affected "$base" "$head")"
           while IFS= read -r app; do
-            selected["$app"]=true
-          done < <(.github/scripts/release_apps.sh ci-affected "$base" "$head")
+            if [[ -n "$app" ]]; then selected["$app"]=true; fi
+          done <<< "$affected"
 
           changed_paths="$(git diff --name-only "$base" "$head")"
           if grep -Fxq ".github/scripts/linux_fuzz_gate.sh" <<<"$changed_paths"; then
@@ -60,10 +62,14 @@ jobs:
             selected[lift]=true
           fi
 
+          windows_apps=()
           for app in seq lift ledger memory-note siwc; do
             output_name="${app//-/_}"
             echo "${output_name}=${selected[$app]:-false}" >> "$GITHUB_OUTPUT"
+            if [[ "${selected[$app]:-false}" == true ]]; then windows_apps+=("$app"); fi
           done
+          windows_json="$(printf '%s\n' "${windows_apps[@]}" | jq -Rsc 'split("\n") | map(select(length > 0))')"
+          echo "windows_apps=$windows_json" >> "$GITHUB_OUTPUT"
 
           perf=${selected[seq]:-false}
           if grep -Fxq 'build.zig' <<<"$changed_paths" ||
@@ -96,22 +102,27 @@ jobs:
           fetch-depth: 0
       - name: Test release app classifier
         run: .github/scripts/test_release_apps.sh
+      - name: Test shared release helper ownership
+        run: bash .github/scripts/test_release_artifact_ownership.sh
       - name: Test Seq CI proof matrix
         run: .github/scripts/test_seq_ci_job.sh
       - name: Test Seq qualify-before-tag release transaction
         run: .github/scripts/test_seq_release_transaction.sh
       - name: Test Lift archive verifier
         run: .github/scripts/test_verify_lift_archive.sh
+      - name: Test release archive admission and failure propagation
+        run: python3 -m unittest discover -s .github/scripts -p test_release_artifacts.py -v
       - name: Require VERSION bumps for release-relevant CLI changes
         run: |
           set -euo pipefail
           base="${{ github.event.pull_request.base.sha }}"
           head="${{ github.event.pull_request.head.sha }}"
-          mapfile -t affected < <(.github/scripts/release_apps.sh affected "$base" "$head")
-          if [ "${#affected[@]}" -eq 0 ]; then
+          affected_text="$(.github/scripts/release_apps.sh affected "$base" "$head")"
+          if [[ -z "$affected_text" ]]; then
             echo "No release-relevant CLI surfaces changed."
             exit 0
           fi
+          mapfile -t affected <<< "$affected_text"
 
           echo "Affected release apps: ${affected[*]}"
           missing=()
@@ -323,11 +334,11 @@ jobs:
 
   windows:
     needs: changes
-    if: contains(needs.changes.outputs.*, 'true')
+    if: needs.changes.outputs.windows_apps != '[]'
     strategy:
       fail-fast: false
       matrix:
-        app: [seq, lift, ledger, memory-note, siwc]
+        app: ${{ fromJson(needs.changes.outputs.windows_apps) }}
     runs-on: windows-2025
     timeout-minutes: 10
     defaults:
@@ -335,12 +346,17 @@ jobs:
         shell: bash
     steps:
       - uses: actions/checkout@v4
+      - name: Test archive admission on Windows
+        run: python -m unittest discover -s .github/scripts -p test_release_artifacts.py -v
       - uses: mlugg/setup-zig@v2
         with:
           version: 0.17.0
-      - name: Build native Windows release executable
-        run: zig build build-${{ matrix.app }} -Dtarget=x86_64-windows-gnu -Dcpu=baseline -Doptimize=fast -j2 --summary all
-      - name: Test native Windows application in Debug
-        run: zig build test-${{ matrix.app }} -Dtarget=x86_64-windows-gnu -Dcpu=baseline -Doptimize=debug -j2 --summary all
-      - name: Test native Windows application in ReleaseSafe
-        run: zig build test-${{ matrix.app }} -Dtarget=x86_64-windows-gnu -Dcpu=baseline -Doptimize=safe -j2 --summary all
+      - name: Qualify and package native Windows release artifact
+        run: python .github/scripts/release_artifacts.py windows "${{ matrix.app }}"
+      - name: Retain qualified Windows release candidate
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.RELEASE_ARCHIVE }}
+          path: ${{ env.RELEASE_ARCHIVE }}
+          if-no-files-found: error
+          retention-days: 7
