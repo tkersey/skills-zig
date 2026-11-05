@@ -2,7 +2,7 @@
     .name = .seq,
     .version = "1.0.0",
     .fingerprint = 0x967ed153543a90ec,
-    .minimum_zig_version = "0.17.0",
+    .minimum_zig_version = "0.17.1",
     .dependencies = .{
         .translate_c = .{
             .url = "git+https://codeberg.org/ziglang/translate-c#02ff0c523fb92a38939b04d0145c4a9602a74d56",

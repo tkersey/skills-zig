@@ -83,7 +83,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: mlugg/setup-zig@v2
         with:
-          version: 0.17.0
+          version: 0.17.1
       - name: Verify cold and cached install destination admission
         run: scripts/test-install-prefix.sh
 
@@ -136,16 +136,16 @@ jobs:
       - uses: actions/checkout@v4
       - uses: mlugg/setup-zig@v2
         with:
-          version: 0.17.0
+          version: 0.17.1
       - name: Restore Zig cache
         uses: actions/cache@v4
         with:
           path: |
             .zig-cache
             .zig-cache-global
-          key: zig-seq-${{ runner.os }}-0.17.0-${{ hashFiles('build.zig', 'build.zig.zon', 'build/**', 'apps/seq/**', 'libs/core/**', 'libs/definition_core/src/*', 'libs/definition_core/tests/*', 'libs/trace_core/src/*', 'libs/trace_core/tests/*', '.github/workflows/pr-ci.yml') }}
+          key: zig-seq-${{ runner.os }}-0.17.1-${{ hashFiles('build.zig', 'build.zig.zon', 'build/**', 'apps/seq/**', 'libs/core/**', 'libs/definition_core/src/*', 'libs/definition_core/tests/*', 'libs/trace_core/src/*', 'libs/trace_core/tests/*', '.github/workflows/pr-ci.yml') }}
           restore-keys: |
-            zig-seq-${{ runner.os }}-0.17.0-
+            zig-seq-${{ runner.os }}-0.17.1-
       - name: Build seq integration surface
         run: zig build build-seq -Doptimize=fast --summary all
       - name: Test Seq 1.0 kernel and command surface
@@ -174,7 +174,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: mlugg/setup-zig@v2
         with:
-          version: 0.17.0
+          version: 0.17.1
       - name: Fuzz passive definition parsing (Linux)
         run: >-
           .github/scripts/linux_fuzz_gate.sh -- zig build test-definition-core
@@ -188,7 +188,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: mlugg/setup-zig@v2
         with:
-          version: 0.17.0
+          version: 0.17.1
       - name: Build lift binaries
         run: zig build build-lift -Doptimize=fast
       - name: Test lift
@@ -203,7 +203,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: mlugg/setup-zig@v2
         with:
-          version: 0.17.0
+          version: 0.17.1
       - name: Fuzz lift bench_stats (Linux)
         run: >-
           .github/scripts/linux_fuzz_gate.sh -- zig build test-lift-bench-stats
@@ -218,7 +218,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: mlugg/setup-zig@v2
         with:
-          version: 0.17.0
+          version: 0.17.1
       - name: Install full-suite guard dependency
         run: sudo apt-get update && sudo apt-get install --yes ripgrep
       - name: Qualify full suite on native Linux
@@ -233,7 +233,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: mlugg/setup-zig@v2
         with:
-          version: 0.17.0
+          version: 0.17.1
       - name: Build and verify the surviving executable inventory
         run: |
           zig build -Doptimize=fast -j2 --summary all
@@ -249,7 +249,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: mlugg/setup-zig@v2
         with:
-          version: 0.17.0
+          version: 0.17.1
       - name: Test performance hub
         run: zig build test-perf-hub
 
@@ -261,7 +261,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: mlugg/setup-zig@v2
         with:
-          version: 0.17.0
+          version: 0.17.1
       - name: Build ledger
         run: zig build build-ledger -Doptimize=fast
       - name: Test Ledger 1.0 kernel and command surface
@@ -281,7 +281,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: mlugg/setup-zig@v2
         with:
-          version: 0.17.0
+          version: 0.17.1
       - name: Build memory-note
         run: zig build build-memory-note -Doptimize=fast
       - name: Test memory-note
@@ -306,7 +306,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: mlugg/setup-zig@v2
         with:
-          version: 0.17.0
+          version: 0.17.1
       - name: Build SIWC release surface
         run: zig build build-siwc -Dtarget=${{ matrix.target }} -Dcpu=baseline -Doptimize=fast
       - name: Test SIWC in Debug

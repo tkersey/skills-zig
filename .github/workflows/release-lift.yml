@@ -47,7 +47,7 @@ jobs:
           fi
       - uses: mlugg/setup-zig@v2
         with:
-          version: 0.17.0
+          version: 0.17.1
       - name: Build lift binaries
         run: zig build build-lift -Dtarget=${{ matrix.zig_target }} -Dcpu=baseline -Doptimize=fast
       - name: Package lift artifact

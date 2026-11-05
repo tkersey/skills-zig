@@ -51,7 +51,7 @@ login, credential acquisition, and launching compatible Responses applications.
 
 ## Build
 
-Use Zig **0.17.0**. Shipped macOS binaries require macOS **15 or newer**;
+Use Zig **0.17.1**. Shipped macOS binaries require macOS **15 or newer**;
 release builds explicitly target `aarch64-macos.15.0` and the baseline CPU.
 Linux release targets retain each surviving CLI's established ABI.
 
