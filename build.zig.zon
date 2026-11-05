@@ -2,7 +2,7 @@
     .name = .skills_zig,
     .version = "0.0.0",
     .fingerprint = 0xcfd557cc7567edb9,
-    .minimum_zig_version = "0.17.0",
+    .minimum_zig_version = "0.17.1",
     .dependencies = .{
         .zlinter = .{
             .url = "git+https://github.com/kurtwagner/zlinter#4937a301d9bc06e013cf2f9fb3ee1fdc8793df1f",

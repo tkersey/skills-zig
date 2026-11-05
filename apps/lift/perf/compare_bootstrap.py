@@ -17,7 +17,7 @@ def arguments():
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--rounds", type=int, default=9)
     parser.add_argument("--ci-samples", type=int, default=1000)
-    parser.add_argument("--toolchain", default="0.17.0")
+    parser.add_argument("--toolchain", default="0.17.1")
     parser.add_argument("--build-mode", default="fast")
     args = parser.parse_args()
     if not 1 <= args.rounds <= 31 or not 1 <= args.ci_samples <= 5000:

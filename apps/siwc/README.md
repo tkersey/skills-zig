@@ -19,7 +19,7 @@ credentials or ChatGPT's private backend.
 
 ## Build and test
 
-Use Zig **0.17.0** from the repository root:
+Use Zig **0.17.1** from the repository root:
 
 ```sh
 zig build build-siwc -Doptimize=fast

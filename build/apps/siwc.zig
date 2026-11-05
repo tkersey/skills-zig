@@ -1,4 +1,3 @@
-const std = @import("std");
 const support = @import("../support.zig");
 const BuildContext = support.BuildContext;
 const SharedModules = support.SharedModules;

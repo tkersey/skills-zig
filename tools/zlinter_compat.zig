@@ -50,7 +50,14 @@ const patches = [_]Patch{
     .{
         .path = patched_files[0],
         .before = "                .zig_lib,",
-        .after = "                .zig_lib,\n                .libc_runtimes,",
+        .after =
+        \\                .zig_lib,
+        \\                .libc_runtimes,
+        \\                .deployed_prefix,
+        \\                .deployed_lib,
+        \\                .deployed_bin,
+        \\                .deployed_include,
+        ,
     },
     .{
         .path = patched_files[1],
