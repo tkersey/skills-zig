@@ -28,6 +28,11 @@ pub const Catalog = struct {
         self.* = undefined;
     }
 
+    pub fn containsStoreRoot(self: *const Catalog, store_id: []const u8, root: []const u8) bool {
+        const registered = self.value.stores.map.get(store_id) orelse return false;
+        return std.mem.eql(u8, registered, root);
+    }
+
     pub fn associate(self: *Catalog, aliases: []const []const u8, store_id: []const u8) !bool {
         var changed = false;
         for (aliases) |alias| {

@@ -67,8 +67,10 @@ ledger context --catalog-root <catalog> --store-id <retained-id> \
   --definition <definition.json> --owner-manifest <migration.json> --read-only
 ```
 
-Success returns `cataloged: false`; it does not publish the pending identity or
-permit write preparation. Investigate the original failure and owner health before
+For an unpublished identity, success returns `cataloged: false`. This field reports
+ID/root membership in the selected catalog, independently of workspace associations
+and owner health. Reading does not publish the identity or permit write preparation.
+Investigate the original failure and owner health before
 using existing explicit `context --register-root <retained-root> --store-id
 <retained-id>` to publish that exact identity. Registration is identity maintenance,
 not certification of source coverage or writer cutover. Never allocate a replacement

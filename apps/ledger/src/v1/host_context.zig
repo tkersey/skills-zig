@@ -18,7 +18,7 @@ pub const ContextValue = struct {
     store_root: []const u8,
     native_args: []const []const u8,
     storage_mutated: bool,
-    cataloged: bool = true,
+    cataloged: bool,
     authority_granted: bool = false,
 };
 
@@ -68,6 +68,7 @@ pub fn context(
     workspace_root: ?[]const u8,
     common: ?[]const u8,
     mutated: bool,
+    cataloged: bool,
 ) !Context {
     var arena = std.heap.ArenaAllocator.init(allocator);
     errdefer arena.deinit();
@@ -84,6 +85,7 @@ pub fn context(
         .store_root = owned_root,
         .native_args = args,
         .storage_mutated = mutated,
+        .cataloged = cataloged,
     };
     return .{ .arena = arena, .value = value };
 }
@@ -96,10 +98,11 @@ pub fn checkedRoot(
     workspace_root: ?[]const u8,
     common: ?[]const u8,
     mutated: bool,
+    cataloged: bool,
 ) !Context {
     const control = try catalog.checkedRoot(allocator, io, root, id);
     defer control.close(io);
-    return context(allocator, root, id, workspace_root, common, mutated);
+    return context(allocator, root, id, workspace_root, common, mutated, cataloged);
 }
 
 pub fn resolve(
@@ -122,6 +125,7 @@ pub fn resolve(
         associations.workspace_root,
         associations.git_common_dir,
         false,
+        true,
     );
 }
 
@@ -185,6 +189,7 @@ pub fn registerRoot(
         associations.workspace_root,
         associations.git_common_dir,
         changed,
+        true,
     );
 }
 
@@ -199,6 +204,8 @@ pub fn associateRootLocked(
     control: std.Io.Dir,
 ) !bool {
     try checkLegacyRegistration(allocator, io, associations.git_common_dir, root, id);
+    var selected = try lock.read(allocator);
+    defer selected.deinit();
     var candidate = try context(
         allocator,
         root,
@@ -206,6 +213,7 @@ pub fn associateRootLocked(
         associations.workspace_root,
         associations.git_common_dir,
         false,
+        selected.containsStoreRoot(id, root),
     );
     defer candidate.deinit();
     try @import("host_pending.zig").syncPendingContext(
@@ -216,8 +224,6 @@ pub fn associateRootLocked(
         candidate.value,
         lock,
     );
-    var selected = try lock.read(allocator);
-    defer selected.deinit();
     _ = try selected.select(associations.aliases, null, true);
     var changed = try selected.register(id, root);
     changed = (try selected.associate(associations.aliases, id)) or changed;
@@ -395,6 +401,7 @@ pub fn initialize(
                 associations.workspace_root,
                 associations.git_common_dir,
                 false,
+                true,
             );
         }
     }
@@ -412,6 +419,7 @@ pub fn initialize(
             associations.workspace_root,
             associations.git_common_dir,
             false,
+            true,
         );
     }
     try admitInitialization(allocator, io, environment, options, &associations, &lock);
@@ -519,6 +527,7 @@ fn publishInitialization(
         &id,
         associations.workspace_root,
         associations.git_common_dir,
+        true,
         true,
     );
 }

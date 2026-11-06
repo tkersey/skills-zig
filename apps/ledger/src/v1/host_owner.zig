@@ -529,7 +529,9 @@ fn resolveExisting(
     if (!try host.catalog.exists(io, path)) return null;
     var registration = try host.readRegistration(allocator, io, path);
     defer registration.deinit();
-    var selected = try host.checkedRoot(
+    var registered = try host.catalog.read(allocator, io, options.catalog_root);
+    defer registered.deinit();
+    return try host.checkedRoot(
         allocator,
         io,
         registration.value.store_root,
@@ -537,15 +539,8 @@ fn resolveExisting(
         associations.workspace_root,
         common,
         false,
+        registered.containsStoreRoot(registration.value.store_id, registration.value.store_root),
     );
-    errdefer selected.deinit();
-    var registered = try host.catalog.read(allocator, io, options.catalog_root);
-    defer registered.deinit();
-    selected.value.cataloged = if (registered.value.stores.map.get(selected.value.store_id)) |root|
-        std.mem.eql(u8, root, selected.value.store_root)
-    else
-        false;
-    return selected;
 }
 
 fn inspect(
@@ -1394,6 +1389,7 @@ test "retained pending owner remains readable by identity after workspace remova
             null,
             null,
             false,
+            target.context.value.cataloged,
         );
     };
     try testAppendOwner(&environment, options.definition, selected.value.store_root);

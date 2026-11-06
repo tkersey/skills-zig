@@ -273,7 +273,7 @@ fn finishAdoption(
     _ = try catalog.register(id, custody);
     _ = try catalog.associate(associations.aliases, id);
     try lock.publish(allocator, catalog.value);
-    return host.context(allocator, custody, id, associations.workspace_root, common, true);
+    return host.context(allocator, custody, id, associations.workspace_root, common, true, true);
 }
 
 fn stageAdoption(

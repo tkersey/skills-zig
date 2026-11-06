@@ -137,13 +137,13 @@ pub fn readById(
     defer registered.deinit();
     // Publication can complete after the caller's first catalog lookup.
     if (registered.value.stores.map.get(id)) |root| {
-        return host.checkedRoot(allocator, io, root, id, null, null, false);
+        return host.checkedRoot(allocator, io, root, id, null, null, false, true);
     }
     const values = try scanRetained(arena.allocator(), io, home, &registered, id);
     for (values) |value| {
         if (!std.mem.eql(u8, value.registration.store_id, id)) continue;
         if (value.state == .allocated) return error.PendingInitializationRequiresPreparation;
-        var selected = try host.checkedRoot(
+        return host.checkedRoot(
             allocator,
             io,
             value.registration.store_root,
@@ -151,9 +151,8 @@ pub fn readById(
             null,
             null,
             false,
+            false,
         );
-        selected.value.cataloged = false;
-        return selected;
     }
     return error.SelectedStoreNotCataloged;
 }
@@ -280,6 +279,7 @@ pub fn migrationScratch(
         associations.workspace_root,
         associations.git_common_dir,
         false,
+        selected.cataloged,
     );
     defer checked.deinit();
     const root = try catalog.openDirectory(io, checked.value.store_root, false);
@@ -666,7 +666,15 @@ fn admitPendingContext(
         return error.PendingCustodyConflictsWithCatalog;
     }
     if (lock != null) try syncRegistration(io, controls);
-    var pending = try materializePending(allocator, io, associations, value, controls, lock);
+    var pending = try materializePending(
+        allocator,
+        io,
+        associations,
+        value,
+        controls,
+        lock,
+        selected.cataloged,
+    );
     defer pending.deinit();
 }
 
@@ -793,9 +801,12 @@ fn pendingTargetObserved(
     publication_lock: ?*const catalog.Lock,
 ) !host.Context {
     const root = associations.workspace_root orelse return error.PreparationRequiresWorkspace;
-    if (publication_lock) |lock| {
-        var selected = try lock.read(allocator);
-        defer selected.deinit();
+    var selected = if (publication_lock) |lock|
+        try lock.read(allocator)
+    else
+        try catalog.read(allocator, io, home);
+    defer selected.deinit();
+    if (publication_lock != null) {
         if (try selected.select(associations.aliases, null, false)) |id| {
             return host.checkedRoot(
                 allocator,
@@ -805,6 +816,7 @@ fn pendingTargetObserved(
                 root,
                 associations.git_common_dir,
                 false,
+                true,
             );
         }
     }
@@ -819,7 +831,15 @@ fn pendingTargetObserved(
         controls_path,
         publication_lock,
     );
-    return materializePending(allocator, io, associations, value, controls_path, publication_lock);
+    return materializePending(
+        allocator,
+        io,
+        associations,
+        value,
+        controls_path,
+        publication_lock,
+        selected.containsStoreRoot(value.store_id, value.store_root),
+    );
 }
 
 fn pendingRegistration(
@@ -900,6 +920,7 @@ fn materializePending(
     value: Registration,
     controls_path: []const u8,
     publication_lock: ?*const catalog.Lock,
+    cataloged: bool,
 ) !host.Context {
     const marker_path = try std.fs.path.join(allocator, &.{ value.store_root, marker_name });
     defer allocator.free(marker_path);
@@ -912,10 +933,10 @@ fn materializePending(
             associations.workspace_root,
             associations.git_common_dir,
             false,
+            cataloged,
         );
         errdefer checked.deinit();
         if (publication_lock != null) try syncPending(io, value.store_root, controls_path);
-        checked.value.cataloged = false;
         return checked;
     }
     if (publication_lock == null) return error.PendingInitializationRequiresPreparation;
@@ -932,7 +953,7 @@ fn materializePending(
     try prepareMarker(allocator, io, controls, value.store_id);
     try controls.renamePreserve(candidate_name, custody, marker_name, io);
     try syncPending(io, value.store_root, controls_path);
-    var selected = try host.checkedRoot(
+    return host.checkedRoot(
         allocator,
         io,
         value.store_root,
@@ -940,9 +961,8 @@ fn materializePending(
         associations.workspace_root,
         associations.git_common_dir,
         true,
+        cataloged,
     );
-    selected.value.cataloged = false;
-    return selected;
 }
 
 fn syncPending(io: std.Io, root: []const u8, controls_path: []const u8) !void {
@@ -1234,6 +1254,51 @@ test "pending target persists identity across preparation retries and does not p
     );
     defer published.deinit();
     try std.testing.expect(published.value.storage_mutated);
+}
+
+test "pending target observes catalog membership without workspace aliases" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = try workspace.testPlainDirectory();
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(root);
+    const home = try std.fs.path.join(allocator, &.{ root, "home" });
+    defer allocator.free(home);
+    var environment = std.process.Environ.Map.init(allocator);
+    defer environment.deinit();
+    const options: host.Options = .{ .catalog_root = home, .workspace = root };
+    var first = try prepareTarget(allocator, io, &environment, options, true);
+    const id = try allocator.dupe(u8, first.context.value.store_id);
+    defer allocator.free(id);
+    const custody = try allocator.dupe(u8, first.context.value.store_root);
+    defer allocator.free(custody);
+    try std.testing.expect(!first.context.value.cataloged);
+    first.deinit();
+    var published = try host.registerRoot(
+        allocator,
+        io,
+        &environment,
+        .{ .catalog_root = home, .store_id = id },
+        custody,
+        id,
+    );
+    defer published.deinit();
+    try std.testing.expect(published.value.cataloged);
+    try std.testing.expectError(error.UnregisteredContext, host.resolve(
+        allocator,
+        io,
+        &environment,
+        options,
+    ));
+    for ([_]bool{ false, true }) |apply| {
+        var retry = try prepareTarget(allocator, io, &environment, options, apply);
+        defer retry.deinit();
+        try std.testing.expectEqualStrings(id, retry.context.value.store_id);
+        try std.testing.expectEqualStrings(custody, retry.context.value.store_root);
+        try std.testing.expect(retry.context.value.cataloged);
+        try std.testing.expect(!retry.context.value.storage_mutated);
+    }
 }
 
 test "pending target refuses foreign skeleton data and retains locator identity" {

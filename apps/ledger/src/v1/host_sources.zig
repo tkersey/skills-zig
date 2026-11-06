@@ -520,6 +520,7 @@ test "host sources select archived events and bindings without unrelated reads" 
         null,
         null,
         false,
+        false,
     );
     defer target.deinit();
     const slot = "owner/events.jsonl";
@@ -674,6 +675,7 @@ test "host archive discovery retains old stages beside valid generations" {
         null,
         null,
         false,
+        false,
     );
     defer target.deinit();
     const slot = "owner/events.jsonl";
@@ -713,6 +715,7 @@ test "host archive discovery identifies unsupported flat evidence without skippi
         "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
         null,
         null,
+        false,
         false,
     );
     defer target.deinit();

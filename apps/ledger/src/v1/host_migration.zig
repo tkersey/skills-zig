@@ -496,6 +496,8 @@ fn currentContext(
         if (try host.catalog.exists(io, path)) {
             var registration = try host.readRegistration(allocator, io, path);
             defer registration.deinit();
+            var registered = try host.catalog.read(allocator, io, options.catalog_root);
+            defer registered.deinit();
             var old = try host.checkedRoot(
                 allocator,
                 io,
@@ -504,6 +506,10 @@ fn currentContext(
                 associations.workspace_root,
                 common,
                 false,
+                registered.containsStoreRoot(
+                    registration.value.store_id,
+                    registration.value.store_root,
+                ),
             );
             if (selected) |current| {
                 defer old.deinit();
@@ -1847,6 +1853,42 @@ test "host migration current history archives broad material repairs bindings an
     );
 }
 
+test "host migration observes published pending membership before owner import completes" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var fixture = try Fixture.init(true);
+    defer fixture.deinit();
+    var staged = try execute(allocator, io, &fixture.environment, fixture.options(true));
+    defer staged.deinit();
+    try expectStatus(staged, "owner-import-required");
+    const selected = staged.value.object.get("context").?;
+    try std.testing.expect(!selected.object.get("cataloged").?.bool);
+    const id = try string(selected, "store_id");
+    const root = try string(selected, "store_root");
+    var published = try host.registerRoot(
+        allocator,
+        io,
+        &fixture.environment,
+        .{ .catalog_root = fixture.home, .store_id = id },
+        root,
+        id,
+    );
+    defer published.deinit();
+    var listed = try host.list(allocator, io, fixture.home);
+    defer listed.deinit();
+    try std.testing.expectEqual(@as(usize, 1), listed.value.stores.len);
+    try std.testing.expectEqual(@as(usize, 0), listed.value.stores[0].aliases.len);
+    try std.testing.expectEqual(@as(usize, 0), listed.value.pending.len);
+    var retry = try execute(allocator, io, &fixture.environment, fixture.options(true));
+    defer retry.deinit();
+    try expectStatus(retry, "owner-import-required");
+    const repeated = retry.value.object.get("context").?;
+    try std.testing.expectEqualStrings(id, try string(repeated, "store_id"));
+    try std.testing.expectEqualStrings(root, try string(repeated, "store_root"));
+    try std.testing.expect(repeated.object.get("cataloged").?.bool);
+    try std.testing.expect(!repeated.object.get("authority_granted").?.bool);
+}
+
 test "host migration retired conversion stages stable custody and rejects unscoped finalization" {
     var fixture = try Fixture.init(true);
     defer fixture.deinit();
@@ -2529,9 +2571,16 @@ test "host migration archives a legacy registered root without catalog or pendin
         4096,
     );
     try fixtureWrite(fixture.source, ".ledger/unselected/legacy", "legacy registered evidence");
+    var preview = try execute(allocator, io, &fixture.environment, fixture.options(false));
+    defer preview.deinit();
+    try expectStatus(preview, "planned");
+    try std.testing.expect(!preview.value.object.get("context").?.object.get("cataloged").?.bool);
+    try std.testing.expect(!preview.value.object.get("storage_mutated").?.bool);
+    try std.testing.expect(!try host.catalog.existsAt(io, home, host.catalog.filename));
     var retry = try execute(allocator, io, &fixture.environment, fixture.options(true));
     defer retry.deinit();
     try expectStatus(retry, "verified");
+    try std.testing.expect(retry.value.object.get("context").?.object.get("cataloged").?.bool);
     try std.testing.expectEqualStrings(
         id,
         try string(retry.value.object.get("context").?, "store_id"),
