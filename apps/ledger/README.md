@@ -69,7 +69,10 @@ ledger context --catalog-root <catalog> --store-id <retained-id> \
 
 For an unpublished identity, success returns `cataloged: false`. This field reports
 ID/root membership in the selected catalog, independently of workspace associations
-and owner health. Reading does not publish the identity or permit write preparation.
+and owner health. Equivalent checked root spellings retain the same membership
+without changing recovery paths. If publication becomes visible before a durability
+failure, the blocked response retains `cataloged: true` and the original error.
+Reading does not publish the identity or permit write preparation.
 Investigate the original failure and owner health before
 using existing explicit `context --register-root <retained-root> --store-id
 <retained-id>` to publish that exact identity. Registration is identity maintenance,

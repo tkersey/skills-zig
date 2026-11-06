@@ -295,6 +295,25 @@ snapshot "$registration/imported" >"$scratch/catalog-after.snapshot"
 cmp "$scratch/catalog-before.snapshot" "$scratch/catalog-after.snapshot"
 snapshot "$registered_root" >"$scratch/after.snapshot"
 cmp "$scratch/before.snapshot" "$scratch/after.snapshot"
+for equivalent_root in "$registered_root/" "$registered_root//"; do
+  "$json" -n --arg id "$registered_id" --arg root "$equivalent_root" \
+    '{schema:"ledger-repository-registration/v1",store_id:$id,store_root:$root}' \
+    >"$registration/repo/.git/ledger-store.json"
+  context --catalog-root "$registration/equivalent" \
+    --import-registration "$registration/repo/.git/ledger-store.json"
+  assert_json '.cataloged == true'
+  snapshot "$registration/equivalent" >"$scratch/equivalent-before.snapshot"
+  context --catalog-root "$registration/equivalent" --workspace "$registration/repo" --read-only \
+    --definition "$definition" --owner-manifest "$manifest"
+  assert_json '.cataloged == true and .owner_health.healthy and .storage_mutated == false'
+  test "$("$json" -r '.store_root' "$scratch/result.json")" = "$equivalent_root"
+  context --catalog-root "$registration/equivalent" --store-id "$registered_id" --read-only \
+    --definition "$definition" --owner-manifest "$manifest"
+  assert_json '.cataloged == true and .owner_health.healthy and .storage_mutated == false'
+  snapshot "$registration/equivalent" >"$scratch/equivalent-after.snapshot"
+  cmp "$scratch/equivalent-before.snapshot" "$scratch/equivalent-after.snapshot"
+done
+cp "$registration/registration.saved" "$registration/repo/.git/ledger-store.json"
 cp -R "$registered_root" "$registration/copied-root"
 blocked StoreAlreadyCatalogedAtAnotherRoot context --catalog-root "$registration/home" \
   --register-root "$registration/copied-root" --store-id "$registered_id"

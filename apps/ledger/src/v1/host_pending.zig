@@ -838,7 +838,7 @@ fn pendingTargetObserved(
         value,
         controls_path,
         publication_lock,
-        selected.containsStoreRoot(value.store_id, value.store_root),
+        try selected.containsStoreRoot(allocator, io, value.store_id, value.store_root),
     );
 }
 

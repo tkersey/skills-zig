@@ -495,13 +495,16 @@ fn registerContext(
     selected: host.ContextValue,
 ) !void {
     try result.beginMutation();
-    var registered = try host.registerRoot(
+    var cataloged = selected.cataloged;
+    defer result.value.object.getPtr("cataloged").?.* = .{ .bool = cataloged };
+    var registered = try host.registerRootObserved(
         result.arena.allocator(),
         io,
         environment,
         options.context,
         selected.store_root,
         selected.store_id,
+        &cataloged,
     );
     defer registered.deinit();
     try result.setContext(registered.value);
@@ -539,7 +542,12 @@ fn resolveExisting(
         associations.workspace_root,
         common,
         false,
-        registered.containsStoreRoot(registration.value.store_id, registration.value.store_root),
+        try registered.containsStoreRoot(
+            allocator,
+            io,
+            registration.value.store_id,
+            registration.value.store_root,
+        ),
     );
 }
 
@@ -1624,4 +1632,71 @@ fn testAppendOwner(
     );
     defer result.deinit(allocator);
     try std.testing.expect(result.validation_result.valid and result.storage_mutated);
+}
+
+test "owner registration retains observed membership across publication failures" {
+    const fault = host.catalog.TestPublicationFault;
+    for ([_]bool{ false, true }) |published| {
+        for (std.enums.values(fault.Kind)) |kind| {
+            const allocator = std.testing.allocator;
+            const io = std.testing.io;
+            var temporary = try host.workspace.testPlainDirectory();
+            defer temporary.cleanup();
+            var arena = std.heap.ArenaAllocator.init(allocator);
+            defer arena.deinit();
+            const owned = arena.allocator();
+            const root = try temporary.dir.realPathFileAlloc(io, ".", owned);
+            try testOwnerInputs(temporary.dir);
+            const options = try testOwnerOptions(owned, root);
+            var environment = std.process.Environ.Map.init(allocator);
+            defer environment.deinit();
+            var seed = try host.initialize(allocator, io, &environment, .{
+                .catalog_root = try std.fs.path.join(owned, &.{ root, "catalog-seed" }),
+            });
+            defer seed.deinit();
+            if (published) {
+                var registered = try host.registerRoot(allocator, io, &environment, .{
+                    .catalog_root = options.context.catalog_root,
+                }, seed.value.store_root, seed.value.store_id);
+                registered.deinit();
+            }
+            var result: Result = .{
+                .arena = std.heap.ArenaAllocator.init(allocator),
+                .value = .{ .object = .{} },
+            };
+            defer result.deinit();
+            var selected = seed.value;
+            // The retained snapshot predates registration in the selected catalog.
+            selected.cataloged = false;
+            try result.setContext(selected);
+            var vtable = io.vtable.*;
+            fault.install(&vtable, kind);
+            var injected = io;
+            injected.vtable = &vtable;
+            try std.testing.expectError(
+                if (kind == .before_rename) error.HardwareFailure else error.InputOutput,
+                registerContext(
+                    &result,
+                    injected,
+                    &environment,
+                    options,
+                    selected,
+                ),
+            );
+            try std.testing.expect(fault.reached);
+            var actual = try host.catalog.read(allocator, io, options.context.catalog_root);
+            defer actual.deinit();
+            const visible = actual.value.stores.map.get(selected.store_id) != null;
+            try std.testing.expectEqual(published or kind == .after_rename, visible);
+            try std.testing.expectEqual(visible, result.value.object.get("cataloged").?.bool);
+            try std.testing.expectEqualStrings(
+                selected.store_id,
+                result.value.object.get("store_id").?.string,
+            );
+            try std.testing.expectEqualStrings(
+                selected.store_root,
+                result.value.object.get("store_root").?.string,
+            );
+        }
+    }
 }

@@ -28,9 +28,24 @@ pub const Catalog = struct {
         self.* = undefined;
     }
 
-    pub fn containsStoreRoot(self: *const Catalog, store_id: []const u8, root: []const u8) bool {
+    pub fn containsStoreRoot(
+        self: *const Catalog,
+        allocator: std.mem.Allocator,
+        io: std.Io,
+        store_id: []const u8,
+        root: []const u8,
+    ) !bool {
         const registered = self.value.stores.map.get(store_id) orelse return false;
-        return std.mem.eql(u8, registered, root);
+        if (std.mem.eql(u8, registered, root)) return true;
+        const selected_control = try checkedRoot(allocator, io, root, store_id);
+        defer selected_control.close(io);
+        const registered_control = try checkedRoot(allocator, io, registered, store_id);
+        defer registered_control.close(io);
+        const selected_path = try std.Io.Dir.cwd().realPathFileAlloc(io, root, allocator);
+        defer allocator.free(selected_path);
+        const registered_path = try std.Io.Dir.cwd().realPathFileAlloc(io, registered, allocator);
+        defer allocator.free(registered_path);
+        return std.mem.eql(u8, selected_path, registered_path);
     }
 
     pub fn associate(self: *Catalog, aliases: []const []const u8, store_id: []const u8) !bool {
@@ -274,8 +289,26 @@ pub const Lock = struct {
     }
 
     pub fn publish(self: *const Lock, allocator: std.mem.Allocator, value: Document) !void {
+        var visible = false;
+        try self.publishObserved(allocator, value, &visible);
+    }
+
+    pub fn publishObserved(
+        self: *const Lock,
+        allocator: std.mem.Allocator,
+        value: Document,
+        visible: *bool,
+    ) !void {
         try validate(value);
-        try writeJson(allocator, self.io, self.dir, filename, value, max_catalog_bytes);
+        try writeJsonObserved(
+            allocator,
+            self.io,
+            self.dir,
+            filename,
+            value,
+            max_catalog_bytes,
+            visible,
+        );
     }
 };
 
@@ -399,6 +432,19 @@ pub fn writeJson(
     value: anytype,
     limit: usize,
 ) !void {
+    var visible = false;
+    try writeJsonObserved(allocator, io, dir, name, value, limit, &visible);
+}
+
+fn writeJsonObserved(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    dir: std.Io.Dir,
+    name: []const u8,
+    value: anytype,
+    limit: usize,
+    visible: *bool,
+) !void {
     const bytes = try std.json.Stringify.valueAlloc(allocator, value, .{});
     defer allocator.free(bytes);
     if (bytes.len >= limit) return error.CatalogSizeBoundExceeded;
@@ -425,6 +471,8 @@ pub fn writeJson(
     try file.writeStreamingAll(io, "\n");
     try file.sync(io);
     try dir.rename(temporary, dir, name, io);
+    // Visibility survives a later durability failure; callers retain both facts.
+    visible.* = true;
     try sync(io, dir);
 }
 
@@ -708,3 +756,42 @@ fn testDirectorySyncRetry(part: []const u8) !void {
     defer catalog.deinit();
     try std.testing.expectEqual(@as(usize, 0), catalog.value.stores.map.count());
 }
+
+pub const TestPublicationFault = struct {
+    pub const Kind = enum { before_rename, after_rename };
+    var kind: Kind = undefined;
+    var renamed = false;
+    pub var reached = false;
+
+    pub fn install(vtable: *std.Io.VTable, selected: Kind) void {
+        kind = selected;
+        renamed = false;
+        reached = false;
+        vtable.dirRename = rename;
+        vtable.fileSync = fileSync;
+    }
+
+    fn rename(
+        userdata: ?*anyopaque,
+        from: std.Io.Dir,
+        name: []const u8,
+        to: std.Io.Dir,
+        leaf: []const u8,
+    ) std.Io.Dir.RenameError!void {
+        const selected = std.mem.eql(u8, leaf, filename);
+        if (selected and kind == .before_rename) {
+            reached = true;
+            return error.HardwareFailure;
+        }
+        try std.testing.io.vtable.dirRename(userdata, from, name, to, leaf);
+        if (selected) renamed = true;
+    }
+
+    fn fileSync(userdata: ?*anyopaque, file: std.Io.File) std.Io.File.SyncError!void {
+        if (renamed and kind == .after_rename) {
+            reached = true;
+            return error.InputOutput;
+        }
+        return std.testing.io.vtable.fileSync(userdata, file);
+    }
+};

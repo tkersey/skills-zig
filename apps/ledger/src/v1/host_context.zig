@@ -161,6 +161,19 @@ pub fn registerRoot(
     root: []const u8,
     id: []const u8,
 ) !Context {
+    var cataloged = false;
+    return registerRootObserved(allocator, io, environment, options, root, id, &cataloged);
+}
+
+pub fn registerRootObserved(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    environment: *const std.process.Environ.Map,
+    options: Options,
+    root: []const u8,
+    id: []const u8,
+    cataloged: *bool,
+) !Context {
     if (options.store_id) |selected| {
         if (!std.mem.eql(u8, selected, id)) return error.ConflictingStoreIdentity;
     }
@@ -181,6 +194,7 @@ pub fn registerRoot(
         canonical,
         id,
         control,
+        cataloged,
     );
     return context(
         allocator,
@@ -202,10 +216,12 @@ pub fn associateRootLocked(
     root: []const u8,
     id: []const u8,
     control: std.Io.Dir,
+    cataloged: *bool,
 ) !bool {
     try checkLegacyRegistration(allocator, io, associations.git_common_dir, root, id);
     var selected = try lock.read(allocator);
     defer selected.deinit();
+    cataloged.* = try selected.containsStoreRoot(allocator, io, id, root);
     var candidate = try context(
         allocator,
         root,
@@ -213,7 +229,7 @@ pub fn associateRootLocked(
         associations.workspace_root,
         associations.git_common_dir,
         false,
-        selected.containsStoreRoot(id, root),
+        cataloged.*,
     );
     defer candidate.deinit();
     try @import("host_pending.zig").syncPendingContext(
@@ -234,7 +250,7 @@ pub fn associateRootLocked(
         control,
         current,
     )) return error.StorageRootChanged;
-    if (changed) try lock.publish(allocator, selected.value);
+    if (changed) try lock.publishObserved(allocator, selected.value, cataloged);
     return changed;
 }
 
@@ -939,4 +955,90 @@ test "context initialization checks late history before publishing the family as
         try std.testing.expectEqual(@as(usize, 0), selected.value.stores.map.count());
         try std.testing.expect(try catalog.existsAt(io, tmp.dir, ".ledger/prior-history.jsonl"));
     }
+}
+
+test "catalog membership preserves admitted root equivalence without reading unrelated roots" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const owned = arena.allocator();
+    const root = try tmp.dir.realPathFileAlloc(io, ".", owned);
+    var environment = std.process.Environ.Map.init(allocator);
+    defer environment.deinit();
+    var seed = try initialize(allocator, io, &environment, .{
+        .catalog_root = try std.fs.path.join(owned, &.{ root, "home" }),
+    });
+    defer seed.deinit();
+    var selected = try catalog.read(allocator, io, try std.fs.path.join(owned, &.{ root, "home" }));
+    defer selected.deinit();
+    _ = try selected.register("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", "/missing-unrelated-custody");
+    const spellings = [_][]const u8{
+        seed.value.store_root,
+        try std.fmt.allocPrint(owned, "{s}/", .{seed.value.store_root}),
+        try std.fmt.allocPrint(owned, "{s}//home//repos//{s}", .{ root, seed.value.store_id }),
+    };
+    for (spellings) |stored| {
+        selected.value.stores.map.getPtr(seed.value.store_id).?.* = stored;
+        for (spellings) |candidate| try std.testing.expect(try selected.containsStoreRoot(
+            allocator,
+            io,
+            seed.value.store_id,
+            candidate,
+        ));
+    }
+    try std.testing.expect(!try selected.containsStoreRoot(
+        allocator,
+        io,
+        "cccccccccccccccccccccccccccccccc",
+        seed.value.store_root,
+    ));
+    try testCatalogRootRefusals(owned, tmp.dir, root, &selected, seed.value.store_id);
+}
+
+fn testCatalogRootRefusals(
+    allocator: std.mem.Allocator,
+    directory: std.Io.Dir,
+    root: []const u8,
+    selected: *catalog.Catalog,
+    id: []const u8,
+) !void {
+    const io = std.testing.io;
+    try directory.createDir(io, "other", .default_dir);
+    const other = try directory.openDir(io, "other", .{});
+    defer other.close(io);
+    try other.createDir(io, ".ledger", .default_dir);
+    try catalog.writeJson(allocator, io, other, ".ledger-root.json", .{
+        .schema = "ledger-storage-root/v1",
+        .store_id = id,
+    }, 4096);
+    try std.testing.expect(!try selected.containsStoreRoot(
+        allocator,
+        io,
+        id,
+        try std.fs.path.join(allocator, &.{ root, "other" }),
+    ));
+    try directory.symLink(io, selected.value.stores.map.get(id).?, "linked", .{});
+    const linked = try std.fs.path.join(allocator, &.{ root, "linked" });
+    if (selected.containsStoreRoot(allocator, io, id, linked)) |_| {
+        return error.TestExpectedError;
+    } else |err| try std.testing.expect(
+        err == error.SymlinkComponent or err == error.StorageRootNotDirectory,
+    );
+    const dot = try std.fmt.allocPrint(allocator, "{s}/.", .{selected.value.stores.map.get(id).?});
+    try std.testing.expectError(error.InvalidStorageRootPath, selected.containsStoreRoot(
+        allocator,
+        io,
+        id,
+        dot,
+    ));
+    const missing = try std.fs.path.join(allocator, &.{ root, "missing" });
+    try std.testing.expectError(error.StorageRootMissing, selected.containsStoreRoot(
+        allocator,
+        io,
+        id,
+        missing,
+    ));
 }
