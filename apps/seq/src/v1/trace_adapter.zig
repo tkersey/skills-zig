@@ -304,6 +304,7 @@ pub fn relationParseOptions(
         .ongoing_threshold_secs = options.ongoing_threshold_secs,
         .include_occurrences = false,
         .include_message_bodies = false,
+        .include_tool_output_parts = false,
     };
     for (relations) |relation| {
         result.include_raw = result.include_raw or relation == .source_events;
@@ -312,11 +313,14 @@ pub fn relationParseOptions(
             relation == .messages or
             relation == .tool_invocations or
             relation == .tool_results or
+            relation == .tool_lifecycle or
             relation == .token_events or
             relation == .structured_documents or
             relation == .structured_values;
         result.include_token_events = result.include_token_events or
             relation == .token_events;
+        result.include_tool_output_parts = result.include_tool_output_parts or
+            relation == .tool_results or relation == .tool_lifecycle;
         result.include_message_bodies = result.include_message_bodies or
             relation == .turns or relation == .messages;
     }
@@ -1495,6 +1499,11 @@ pub fn traceParseOptions(
     demanded_fields: []const u16,
     options: Options,
 ) trace_core.TraceParseOptions {
+    const include_tool_parts = switch (relation) {
+        .tool_results => containsField(demanded_fields, 12),
+        .tool_lifecycle => containsField(demanded_fields, 20),
+        else => false,
+    };
     return .{
         .ongoing_threshold_secs = options.ongoing_threshold_secs,
         .include_raw = relation == .source_events and
@@ -1507,11 +1516,12 @@ pub fn traceParseOptions(
             relation == .token_events or
             (relation == .tool_invocations and
                 containsField(demanded_fields, 12)) or
-            (relation == .tool_results and
-                containsField(demanded_fields, 10)) or
+            (relation == .tool_results and containsField(demanded_fields, 10)) or
+            include_tool_parts or
             relation == .structured_documents or
             relation == .structured_values,
         .include_token_events = relation == .token_events,
+        .include_tool_output_parts = include_tool_parts,
         .include_message_bodies = relation == .turns and
             (containsField(demanded_fields, 9) or
                 containsField(demanded_fields, 10)),
@@ -1744,6 +1754,7 @@ fn fillToolResult(
             else
                 .null,
             11 => .{ .string = tool.path },
+            12 => optionalJson(tool.output_parts_json),
             else => return error.InvalidTracePhysicalFieldIndex,
         };
     }
@@ -1776,6 +1787,7 @@ fn fillToolLifecycle(
             17 => optionalInteger(tool.declared_line),
             18 => optionalInteger(tool.finalized_line),
             19 => .{ .string = tool.path },
+            20 => optionalJson(tool.output_parts_json),
             else => return error.InvalidTracePhysicalFieldIndex,
         };
     }

@@ -45,6 +45,9 @@ pub const TraceParseOptions = struct {
     include_occurrence_payloads: bool = true,
     include_token_events: bool = false,
     include_message_bodies: bool = true,
+    /// Derived output parts are unnecessary for queries that only need wrapper
+    /// fields or raw source events. Text normalization still occurs without them.
+    include_tool_output_parts: bool = true,
     /// Retain the stable top N tools ordered by turn_index descending. This
     /// matches the tool_lifecycle dataset's limit semantics without retaining
     /// large payloads for rows that cannot reach that result.
@@ -200,6 +203,10 @@ pub const ToolLifecycleRecord = struct {
     arguments_json: ?[]u8 = null,
     input_text: ?[]u8 = null,
     output_text: ?[]u8 = null,
+    output_parts_json: ?[]u8 = null,
+    // Serialized parts are appended in source order and joined once at EOF.
+    // They retain yielded output even when a later result completes the call.
+    output_parts: std.ArrayList([]u8) = .empty,
     command_text: ?[]u8 = null,
     cwd: ?[]u8 = null,
     exit_code: ?i64 = null,
@@ -227,6 +234,9 @@ pub const ToolLifecycleRecord = struct {
         freeOpt(allocator, self.arguments_json);
         freeOpt(allocator, self.input_text);
         freeOpt(allocator, self.output_text);
+        freeOpt(allocator, self.output_parts_json);
+        for (self.output_parts.items) |part| allocator.free(part);
+        self.output_parts.deinit(allocator);
         freeOpt(allocator, self.command_text);
         freeOpt(allocator, self.cwd);
         freeOpt(allocator, self.mcp_server);
@@ -1651,7 +1661,7 @@ const TraceParser = struct {
                     event_type,
                     record.timestamp,
                     record.line_number,
-                    self.options.max_tools,
+                    self.options,
                 );
             }
             return;
@@ -1779,7 +1789,7 @@ const TraceParser = struct {
                 "function_call_output",
                 record.timestamp,
                 record.line_number,
-                self.options.max_tools,
+                self.options,
             );
         }
     }
@@ -1868,6 +1878,7 @@ fn finalizeTrace(
     }
     for (trace.tools.items) |*tool| {
         if (tool.lifecycle_status == .declared) tool.lifecycle_status = .unresolved;
+        try finishToolOutputParts(allocator, tool);
     }
     trace.session.turn_count = @intCast(trace.turns.items.len);
 }
@@ -3094,7 +3105,7 @@ fn applyResponseItem(
             payload_type,
             timestamp,
             line_number,
-            options.max_tools,
+            options,
         );
     }
 }
@@ -3374,6 +3385,10 @@ fn writeToolTraceDigest(writer: anytype, tool: ToolLifecycleRecord) !void {
     }
     try writer.writeByte('|');
     if (tool.exit_code) |value| try writer.print("{d}", .{value});
+    if (tool.output_parts_json) |value| {
+        try writer.writeAll("|output_parts:");
+        try writeTraceContentDigest(writer, value);
+    }
     try writer.writeByte('\n');
 }
 
@@ -3427,6 +3442,10 @@ test "retained trace digest changes with observed tool payload" {
     const after = try completeTraceDigest(std.testing.allocator, trace);
     defer std.testing.allocator.free(after);
     try std.testing.expect(!std.mem.eql(u8, before, after));
+    try replaceOpt(std.testing.allocator, &trace.tools.items[0].output_parts_json, "[]");
+    const with_parts = try completeTraceDigest(std.testing.allocator, trace);
+    defer std.testing.allocator.free(with_parts);
+    try std.testing.expect(!std.mem.eql(u8, after, with_parts));
 }
 
 test "message text-part projection preserves ordered source boundaries" {
@@ -3607,7 +3626,7 @@ fn finalizeToolEvent(
     event_type: []const u8,
     timestamp: ?[]const u8,
     line_number: usize,
-    max_tools: ?usize,
+    options: TraceParseOptions,
 ) !void {
     try finalizeToolOutput(
         allocator,
@@ -3618,7 +3637,7 @@ fn finalizeToolEvent(
         event_type,
         timestamp,
         line_number,
-        max_tools,
+        options,
     );
     if (std.mem.eql(u8, event_type, "collab_agent_spawn_end")) {
         try appendGraphEdge(allocator, trace, payload, timestamp);
@@ -3636,13 +3655,21 @@ fn finalizeToolOutput(
     event_type: []const u8,
     timestamp: ?[]const u8,
     line_number: usize,
-    max_tools: ?usize,
+    options: TraceParseOptions,
 ) !void {
     const call_id = stringField(payload, "call_id") orelse
         stringField(payload, "id") orelse event_type;
     const idx = lookup.find(trace, call_id) orelse blk: {
         if (trace.omitted_tool_call_ids.contains(call_id)) return;
-        try inferToolRecord(allocator, trace, lookup, turn_idx, call_id, timestamp, max_tools);
+        try inferToolRecord(
+            allocator,
+            trace,
+            lookup,
+            turn_idx,
+            call_id,
+            timestamp,
+            options.max_tools,
+        );
         if (trace.omitted_tool_call_ids.contains(call_id)) return;
         const retained_index = lookup.find(trace, call_id) orelse return;
         break :blk retained_index;
@@ -3651,7 +3678,20 @@ fn finalizeToolOutput(
     rec.kind = kindFromEndEvent(event_type, rec.tool_name);
     rec.finalized_line = @intCast(line_number);
     if (timestamp) |ts| try replaceOpt(allocator, &rec.completed_at, ts);
-    try applyToolOutput(allocator, rec, payload);
+    const occurrence = if (trace.occurrences.items.len > 0)
+        &trace.occurrences.items[trace.occurrences.items.len - 1]
+    else
+        null;
+    const source = ToolOutputSource{
+        .include_parts = options.include_tool_output_parts,
+        .line_number = line_number,
+        .timestamp = timestamp,
+        .source_event_id = if (occurrence) |value|
+            if (value.line_number == line_number) value.sourceEventId() else null
+        else
+            null,
+    };
+    try applyToolOutput(allocator, rec, payload, source);
     rec.lifecycle_status = completedToolStatus(rec.exit_code, boolField(payload, "success"));
 }
 
@@ -3680,10 +3720,9 @@ fn applyToolOutput(
     allocator: std.mem.Allocator,
     rec: *ToolLifecycleRecord,
     payload: std.json.ObjectMap,
+    source: ToolOutputSource,
 ) !void {
-    const output = stringField(payload, "output") orelse
-        stringField(payload, "aggregated_output") orelse stringField(payload, "stdout") orelse "";
-    try replaceOpt(allocator, &rec.output_text, output);
+    try applyToolOutputText(allocator, rec, payload, source);
     if (stringField(payload, "command")) |v| try replaceOpt(allocator, &rec.command_text, v);
     if (stringField(payload, "cwd")) |v| try replaceOpt(allocator, &rec.cwd, v);
     if (intField(payload, "exit_code")) |v| rec.exit_code = v;
@@ -3706,6 +3745,445 @@ fn applyToolOutput(
         if (stringField(action, "url")) |v| try replaceOpt(allocator, &rec.web_url, v);
     }
     if (stringField(payload, "prompt")) |v| try replaceOpt(allocator, &rec.image_prompt, v);
+}
+
+const ToolOutputSource = struct {
+    include_parts: bool,
+    source_event_id: ?[]const u8,
+    line_number: usize,
+    timestamp: ?[]const u8,
+};
+
+const ReportedProcessStatus = enum { completed, failed, running, unknown };
+
+const ReportedProcessResult = struct {
+    // This pointer addresses the JSON decoded from one complete text part.
+    json_pointer: []const u8,
+    process_status: ReportedProcessStatus,
+    exit_code: ?i64,
+    session_id: ?i64,
+    chunk_id: ?[]const u8,
+    wall_time_seconds: f64,
+    output: []const u8,
+};
+
+fn applyToolOutputText(
+    allocator: std.mem.Allocator,
+    rec: *ToolLifecycleRecord,
+    payload: std.json.ObjectMap,
+    source: ToolOutputSource,
+) !void {
+    const field = for ([_][]const u8{ "output", "aggregated_output", "stdout" }) |key| {
+        if (payload.get(key)) |value| {
+            if (value == .string or value == .array) break key;
+        }
+    } else {
+        try replaceOpt(allocator, &rec.output_text, "");
+        return;
+    };
+    const value = payload.get(field).?;
+    const decode_processes = source.include_parts and isProcessResultWrapper(rec.tool_name);
+    if (value == .string) {
+        try replaceOpt(allocator, &rec.output_text, value.string);
+        if (decode_processes) {
+            const pointer = try allocator.print("/{s}", .{field});
+            defer allocator.free(pointer);
+            try appendToolOutputPart(allocator, rec, source, pointer, value.string, true);
+        }
+        return;
+    }
+    var output: std.ArrayList(u8) = .empty;
+    defer output.deinit(allocator);
+    var text_count: usize = 0;
+    for (value.array.items, 0..) |block, index| {
+        const object = valueObject(block) orelse continue;
+        if (!oneOfString(stringField(object, "type") orelse "", &.{
+            "text", "input_text", "output_text",
+        })) continue;
+        const text = stringField(object, "text") orelse continue;
+        if (text_count > 0) try output.append(allocator, '\n');
+        try output.appendSlice(allocator, text);
+        text_count += 1;
+        if (source.include_parts) {
+            const pointer = try allocator.print("/{s}/{d}/text", .{ field, index });
+            defer allocator.free(pointer);
+            try appendToolOutputPart(allocator, rec, source, pointer, text, decode_processes);
+        }
+    }
+    try replaceOpt(allocator, &rec.output_text, output.items);
+}
+
+fn isProcessResultWrapper(name: ?[]const u8) bool {
+    // These wrappers may return text(exec_command(...)) or text(write_stdin(...)).
+    // A command's stdout, messages, and arbitrary nested objects are not results.
+    return oneOfString(name orelse "", &.{ "functions.exec", "exec", "functions.wait", "wait" });
+}
+
+fn appendToolOutputPart(
+    allocator: std.mem.Allocator,
+    rec: *ToolLifecycleRecord,
+    source: ToolOutputSource,
+    pointer: []const u8,
+    text: []const u8,
+    decode_processes: bool,
+) !void {
+    // Scratch is bounded by this source text part. Returned JSON owns all bytes;
+    // no parsed strings survive the current source record's lifetime.
+    var scratch = std.heap.ArenaAllocator.init(allocator);
+    defer scratch.deinit();
+    const temporary = scratch.allocator();
+    const results = if (decode_processes)
+        try reportedProcessResults(temporary, text)
+    else
+        &.{};
+    const json = try std.json.Stringify.valueAlloc(allocator, .{
+        .source_event_id = source.source_event_id,
+        .line_number = source.line_number,
+        .timestamp = source.timestamp,
+        .payload_pointer = pointer,
+        .text = text,
+        .process_results = results,
+    }, .{});
+    errdefer allocator.free(json);
+    try rec.output_parts.append(allocator, json);
+}
+
+fn reportedProcessResults(
+    temporary: std.mem.Allocator,
+    text: []const u8,
+) ![]const ReportedProcessResult {
+    const trimmed = std.mem.trim(u8, text, " \t\r\n");
+    if (trimmed.len == 0 or (trimmed[0] != '{' and trimmed[0] != '[')) return &.{};
+    const value = std.json.parseFromSliceLeaky(std.json.Value, temporary, trimmed, .{
+        .duplicate_field_behavior = .@"error",
+    }) catch |err| switch (err) {
+        error.OutOfMemory => return err,
+        else => return &.{},
+    };
+    var results: std.ArrayList(ReportedProcessResult) = .empty;
+    switch (value) {
+        .object => |object| {
+            if (reportedProcessResult(object, "")) |result| try results.append(temporary, result);
+        },
+        .array => |array| for (array.items, 0..) |item, index| {
+            const object = valueObject(item) orelse continue;
+            var result = reportedProcessResult(object, "") orelse continue;
+            result.json_pointer = try temporary.print("/{d}", .{index});
+            try results.append(temporary, result);
+        },
+        else => {},
+    }
+    return results.items;
+}
+
+fn reportedProcessResult(
+    object: std.json.ObjectMap,
+    pointer: []const u8,
+) ?ReportedProcessResult {
+    const output = stringField(object, "output") orelse return null;
+    const elapsed = object.get("wall_time_seconds") orelse return null;
+    const seconds: f64 = switch (elapsed) {
+        .integer => |value| @floatFromInt(value),
+        .float => |value| value,
+        else => return null,
+    };
+    if (!std.math.isFinite(seconds) or seconds < 0) return null;
+    if (object.get("chunk_id") == null and object.get("exit_code") == null and
+        object.get("session_id") == null) return null;
+    const exit = exactIntegerField(object, "exit_code");
+    const session = exactIntegerField(object, "session_id");
+    const status: ReportedProcessStatus = if (exit) |code|
+        if (code == 0) .completed else .failed
+    else if (session != null and
+        (object.get("exit_code") == null or object.get("exit_code").? == .null))
+        .running
+    else
+        .unknown;
+    return .{
+        .json_pointer = pointer,
+        .process_status = status,
+        .exit_code = exit,
+        .session_id = session,
+        .chunk_id = stringField(object, "chunk_id"),
+        .wall_time_seconds = seconds,
+        .output = output,
+    };
+}
+
+fn exactIntegerField(object: std.json.ObjectMap, key: []const u8) ?i64 {
+    const value = object.get(key) orelse return null;
+    return switch (value) {
+        .integer => |integer| integer,
+        else => null,
+    };
+}
+
+fn finishToolOutputParts(allocator: std.mem.Allocator, rec: *ToolLifecycleRecord) !void {
+    if (rec.output_parts.items.len == 0) return;
+    var output: std.ArrayList(u8) = .empty;
+    defer output.deinit(allocator);
+    try output.append(allocator, '[');
+    for (rec.output_parts.items, 0..) |part, index| {
+        if (index > 0) try output.append(allocator, ',');
+        try output.appendSlice(allocator, part);
+    }
+    try output.append(allocator, ']');
+    rec.output_parts_json = try output.toOwnedSlice(allocator);
+    for (rec.output_parts.items) |part| allocator.free(part);
+    rec.output_parts.deinit(allocator);
+    rec.output_parts = .empty;
+}
+
+fn nestedOutputFixture(allocator: std.mem.Allocator) !CanonicalSessionTrace {
+    return parseSessionTrace(
+        std.testing.io,
+        std.Io.Dir.cwd(),
+        allocator,
+        "libs/trace_core/testdata/nested_tool_outputs.jsonl",
+        .{ .include_raw = true, .ongoing_threshold_secs = 0 },
+    );
+}
+
+test "nested process results retain independent status and source attribution" {
+    const allocator = std.testing.allocator;
+    var trace = try nestedOutputFixture(allocator);
+    defer trace.deinit(allocator);
+    try std.testing.expectEqual(@as(usize, 6), trace.tools.items.len);
+    try std.testing.expectEqual(@as(i64, 6), trace.turns.items[0].tool_count);
+    const tool = trace.tools.items[0];
+    try std.testing.expectEqual(@as(?i64, 0), tool.exit_code);
+    try std.testing.expectEqual(ToolLifecycleStatus.completed, tool.lifecycle_status);
+    try std.testing.expect(std.mem.indexOf(u8, tool.output_text.?, "UnavailableWorktree") != null);
+    var parsed = try std.json.parseFromSlice(
+        std.json.Value,
+        allocator,
+        tool.output_parts_json.?,
+        .{},
+    );
+    defer parsed.deinit();
+    const parts = parsed.value.array.items;
+    try std.testing.expectEqual(@as(usize, 2), parts.len);
+    try std.testing.expectEqualStrings(
+        trace.occurrences.items[3].sourceEventId(),
+        stringField(parts[0].object, "source_event_id").?,
+    );
+    try std.testing.expectEqualStrings(
+        "/output/0/text",
+        stringField(parts[0].object, "payload_pointer").?,
+    );
+    const failed = parts[0].object.get("process_results").?.array.items[0].object;
+    try std.testing.expectEqual(@as(?i64, 3), intField(failed, "exit_code"));
+    try std.testing.expectEqualStrings("failed", stringField(failed, "process_status").?);
+    const batch = parts[1].object.get("process_results").?.array.items;
+    try std.testing.expectEqual(@as(usize, 2), batch.len);
+    try std.testing.expectEqual(@as(?i64, 0), intField(batch[0].object, "exit_code"));
+    try std.testing.expectEqualStrings("/0", stringField(batch[0].object, "json_pointer").?);
+    try std.testing.expectEqualStrings("/1", stringField(batch[1].object, "json_pointer").?);
+    try std.testing.expectEqualStrings(
+        "unknown",
+        stringField(batch[1].object, "process_status").?,
+    );
+    try std.testing.expect(batch[1].object.get("exit_code").? == .null);
+    const raw = trace.occurrences.items[3].raw_json.?;
+    try std.testing.expect(std.mem.indexOf(u8, raw, "synthetic-fixture") != null);
+    try std.testing.expect(std.mem.indexOf(u8, raw, "ledger-failure") != null);
+}
+
+test "yield and completion retain separate observations without invented process calls" {
+    const allocator = std.testing.allocator;
+    var trace = try nestedOutputFixture(allocator);
+    defer trace.deinit(allocator);
+    const tool = trace.tools.items[1];
+    try std.testing.expect(tool.exit_code == null);
+    try std.testing.expectEqual(@as(?i64, 7), tool.finalized_line);
+    var parsed = try std.json.parseFromSlice(
+        std.json.Value,
+        allocator,
+        tool.output_parts_json.?,
+        .{},
+    );
+    defer parsed.deinit();
+    const parts = parsed.value.array.items;
+    try std.testing.expectEqual(@as(usize, 2), parts.len);
+    try std.testing.expectEqual(@as(?i64, 6), intField(parts[0].object, "line_number"));
+    try std.testing.expectEqual(@as(?i64, 7), intField(parts[1].object, "line_number"));
+    for (parts, 5..) |part, line_index| {
+        try std.testing.expectEqualStrings(
+            trace.occurrences.items[line_index].sourceEventId(),
+            stringField(part.object, "source_event_id").?,
+        );
+    }
+    const running = parts[0].object.get("process_results").?.array.items[0].object;
+    const finished = parts[1].object.get("process_results").?.array.items[0].object;
+    try std.testing.expectEqualStrings("running", stringField(running, "process_status").?);
+    try std.testing.expectEqual(@as(?i64, 41), intField(running, "session_id"));
+    try std.testing.expect(running.get("exit_code").? == .null);
+    try std.testing.expectEqualStrings("failed", stringField(finished, "process_status").?);
+    try std.testing.expectEqual(@as(?i64, 7), intField(finished, "exit_code"));
+    var waited = try std.json.parseFromSlice(
+        std.json.Value,
+        allocator,
+        trace.tools.items[2].output_parts_json.?,
+        .{},
+    );
+    defer waited.deinit();
+    const wait_parts = waited.value.array.items;
+    try std.testing.expectEqual(
+        @as(usize, 0),
+        wait_parts[0].object.get("process_results").?.array.items.len,
+    );
+    const waiting = wait_parts[1].object.get("process_results").?.array.items[0].object;
+    try std.testing.expectEqualStrings("running", stringField(waiting, "process_status").?);
+}
+
+test "readback and quoted examples do not become additional executions" {
+    const allocator = std.testing.allocator;
+    var trace = try nestedOutputFixture(allocator);
+    defer trace.deinit(allocator);
+    var readback = try std.json.parseFromSlice(
+        std.json.Value,
+        allocator,
+        trace.tools.items[3].output_parts_json.?,
+        .{},
+    );
+    defer readback.deinit();
+    const results = readback.value.array.items[0].object.get("process_results").?.array.items;
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqual(@as(?i64, 0), intField(results[0].object, "exit_code"));
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        stringField(results[0].object, "output").?,
+        "previous-command",
+    ) != null);
+    var quoted = try std.json.parseFromSlice(
+        std.json.Value,
+        allocator,
+        trace.tools.items[4].output_parts_json.?,
+        .{},
+    );
+    defer quoted.deinit();
+    for (quoted.value.array.items[0..2]) |part| {
+        try std.testing.expectEqual(
+            @as(usize, 0),
+            part.object.get("process_results").?.array.items.len,
+        );
+    }
+    for (quoted.value.array.items[2..]) |part| {
+        const unknown = part.object.get("process_results").?.array.items[0].object;
+        try std.testing.expectEqualStrings("unknown", stringField(unknown, "process_status").?);
+        try std.testing.expect(unknown.get("exit_code").? == .null);
+    }
+    var documentation = try std.json.parseFromSlice(
+        std.json.Value,
+        allocator,
+        trace.tools.items[5].output_parts_json.?,
+        .{},
+    );
+    defer documentation.deinit();
+    try std.testing.expectEqual(
+        @as(usize, 0),
+        documentation.value.array.items[0].object.get("process_results").?.array.items.len,
+    );
+}
+
+test "text block normalization preserves text and non-text source payloads" {
+    const input =
+        \\{"type":"response_item","payload":{"type":"function_call","call_id":"text","name":"read_file"}}
+        \\{"type":"response_item","payload":{"type":"function_call_output","call_id":"text","output":[{"type":"text","text":"one"},{"type":"image","data":"retained"},{"type":"output_text","text":""},{"type":"input_text","text":"two"},{"type":"text","text":7}]}}
+    ;
+    const allocator = std.testing.allocator;
+    var trace = try parseSessionTraceBytes(std.testing.io, allocator, "text.jsonl", input, 0, .{});
+    defer trace.deinit(allocator);
+    try std.testing.expectEqualStrings("one\n\ntwo", trace.tools.items[0].output_text.?);
+    var parsed = try std.json.parseFromSlice(
+        std.json.Value,
+        allocator,
+        trace.tools.items[0].output_parts_json.?,
+        .{},
+    );
+    defer parsed.deinit();
+    const parts = parsed.value.array.items;
+    try std.testing.expectEqual(@as(usize, 3), parts.len);
+    try std.testing.expectEqualStrings(
+        "/output/3/text",
+        stringField(parts[2].object, "payload_pointer").?,
+    );
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        trace.occurrences.items[1].payload_json.?,
+        "retained",
+    ) != null);
+    var text_only = try parseSessionTraceBytes(
+        std.testing.io,
+        allocator,
+        "text.jsonl",
+        input,
+        0,
+        .{ .include_tool_output_parts = false, .include_occurrences = false },
+    );
+    defer text_only.deinit(allocator);
+    try std.testing.expectEqualStrings("one\n\ntwo", text_only.tools.items[0].output_text.?);
+    try std.testing.expect(text_only.tools.items[0].output_parts_json == null);
+}
+
+test "reported process envelopes reject quoted nested malformed and invalid transport data" {
+    const rejected = [_][]const u8{
+        "Example: {\"exit_code\":0,\"wall_time_seconds\":1,\"output\":\"example\"}",
+        "```json\n{\"exit_code\":0,\"wall_time_seconds\":1,\"output\":\"example\"}\n```",
+        "{\"example\":{\"exit_code\":0,\"wall_time_seconds\":1,\"output\":\"example\"}}",
+        "[[{\"exit_code\":0,\"wall_time_seconds\":1,\"output\":\"example\"}]]",
+        "{\"exit_code\":0,\"output\":\"missing duration\"}",
+        "{\"exit_code\":0,\"wall_time_seconds\":-1,\"output\":\"bad duration\"}",
+        "{\"exit_code\":0,\"wall_time_seconds\":true,\"output\":\"bad duration\"}",
+        "{\"exit_code\":0,\"wall_time_seconds\":1,\"output\":7}",
+        "{\"exit_code\":0,\"exit_code\":3,\"wall_time_seconds\":1,\"output\":\"duplicate\"}",
+        "{\"exit_code\":0,\"wall_time_seconds\":1,\"output\":",
+    };
+    for (rejected) |text| {
+        var scratch = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer scratch.deinit();
+        try std.testing.expectEqual(
+            @as(usize, 0),
+            (try reportedProcessResults(scratch.allocator(), text)).len,
+        );
+    }
+}
+
+test "missing null and invalid process exit statuses remain unknown" {
+    const exits = [_][]const u8{ "null", "true", "\"0\"", "0.5", "1e100" };
+    for (exits) |exit| {
+        var scratch = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer scratch.deinit();
+        const allocator = scratch.allocator();
+        const text = try allocator.print(
+            "{{\"exit_code\":{s},\"wall_time_seconds\":0,\"output\":\"unknown\"}}",
+            .{exit},
+        );
+        const results = try reportedProcessResults(allocator, text);
+        try std.testing.expectEqual(@as(usize, 1), results.len);
+        try std.testing.expectEqual(ReportedProcessStatus.unknown, results[0].process_status);
+        try std.testing.expect(results[0].exit_code == null);
+    }
+}
+
+test "nested output ownership survives every allocation failure" {
+    try @import("test_support").checkAllAllocationFailures(
+        std.testing.allocator,
+        exerciseNestedOutputOwnership,
+        .{},
+    );
+}
+
+fn exerciseNestedOutputOwnership(allocator: std.mem.Allocator) !void {
+    const input =
+        \\{"type":"response_item","payload":{"type":"custom_tool_call","call_id":"batch","name":"functions.exec"}}
+        \\{"type":"response_item","payload":{"type":"custom_tool_call_output","call_id":"batch","output":[{"type":"text","text":"[{\"exit_code\":0,\"wall_time_seconds\":1,\"output\":\"ok\"},{\"session_id\":7,\"wall_time_seconds\":1,\"output\":\"running\"}]"},{"type":"text","text":"plain"}]}}
+        \\{"type":"response_item","payload":{"type":"custom_tool_call_output","call_id":"batch","output":"{\"exit_code\":3,\"wall_time_seconds\":1,\"output\":\"failed\"}"}}
+    ;
+    var trace = try parseSessionTraceBytes(std.testing.io, allocator, "oom.jsonl", input, 0, .{});
+    defer trace.deinit(allocator);
+    try std.testing.expect(trace.tools.items[0].output_parts_json != null);
+    try std.testing.expect(trace.tools.items[0].exit_code == null);
 }
 
 fn completedToolStatus(exit_code: ?i64, success: ?bool) ToolLifecycleStatus {
