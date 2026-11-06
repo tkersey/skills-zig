@@ -538,7 +538,13 @@ fn resolveExisting(
         common,
         false,
     );
-    selected.value.cataloged = false;
+    errdefer selected.deinit();
+    var registered = try host.catalog.read(allocator, io, options.catalog_root);
+    defer registered.deinit();
+    selected.value.cataloged = if (registered.value.stores.map.get(selected.value.store_id)) |root|
+        std.mem.eql(u8, root, selected.value.store_root)
+    else
+        false;
     return selected;
 }
 
@@ -1432,6 +1438,10 @@ fn testRegisterPendingRead(
 ) !void {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
+    try std.testing.expectError(
+        error.SelectedStoreNotCataloged,
+        host.resolve(allocator, io, environment, options.context),
+    );
     var registered = try host.registerRoot(
         allocator,
         io,
@@ -1441,6 +1451,18 @@ fn testRegisterPendingRead(
         selected.store_id,
     );
     defer registered.deinit();
+    // Publication can occur between the catalog miss and retained-ID fallback.
+    var fallback = try pending.readById(
+        allocator,
+        io,
+        options.context.catalog_root,
+        selected.store_id,
+    );
+    defer fallback.deinit();
+    try std.testing.expect(fallback.value.cataloged);
+    try std.testing.expect(!fallback.value.storage_mutated);
+    try std.testing.expectEqualStrings(selected.store_id, fallback.value.store_id);
+    try std.testing.expectEqualStrings(selected.store_root, fallback.value.store_root);
     var after = try host.list(allocator, io, options.context.catalog_root);
     defer after.deinit();
     try std.testing.expectEqual(@as(usize, 1), after.value.stores.len);

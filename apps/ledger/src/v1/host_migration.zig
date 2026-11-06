@@ -749,7 +749,9 @@ const Migration = struct {
         );
         const retired = try self.retireCopy(selected, guard);
         self.result.value = saved;
-        try self.result.put("context", selected);
+        var published = selected;
+        published.cataloged = true;
+        try self.result.put("context", published);
         try self.result.put("storage_mutated", changed or retired);
     }
 
@@ -952,6 +954,9 @@ const Migration = struct {
             self.options.context.catalog_root,
             selected,
         );
+        var published = selected;
+        published.cataloged = true;
+        try result.put("context", published);
     }
 };
 
@@ -1705,6 +1710,60 @@ fn testHash(root: std.Io.Dir, path: []const u8) !legacy.Witness {
     return legacy.hashFile(std.testing.io, dir, std.fs.path.basename(path), 4096);
 }
 
+test "host migration publishes a saved receipt without retaining pending catalog state" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var fixture = try Fixture.init(false);
+    defer fixture.deinit();
+    var vtable = io.vtable.*;
+    vtable.dirRename = struct {
+        fn rename(
+            userdata: ?*anyopaque,
+            from: std.Io.Dir,
+            name: []const u8,
+            to: std.Io.Dir,
+            leaf: []const u8,
+        ) std.Io.Dir.RenameError!void {
+            if (std.mem.eql(u8, leaf, "catalog.json")) return error.HardwareFailure;
+            return std.testing.io.vtable.dirRename(userdata, from, name, to, leaf);
+        }
+    }.rename;
+    var injected = io;
+    injected.vtable = &vtable;
+    var failed = try execute(allocator, injected, &fixture.environment, fixture.options(true));
+    defer failed.deinit();
+    try expectStatus(failed, "blocked");
+    try std.testing.expectEqualStrings("HardwareFailure", try string(failed.value, "error_code"));
+    const selected = failed.value.object.get("context").?;
+    try std.testing.expect(!selected.object.get("cataloged").?.bool);
+    const root = try host.catalog.openDirectory(io, try string(selected, "store_root"), false);
+    defer root.close(io);
+    try std.testing.expect(try host.catalog.existsAt(io, root, "migration-receipt.json"));
+    var before = try host.list(allocator, io, fixture.home);
+    defer before.deinit();
+    try std.testing.expectEqual(@as(usize, 0), before.value.stores.len);
+    var retry = try execute(allocator, io, &fixture.environment, fixture.options(true));
+    defer retry.deinit();
+    try expectStatus(retry, "verified");
+    const resumed = retry.value.object.get("context").?;
+    try std.testing.expect(resumed.object.get("cataloged").?.bool);
+    try std.testing.expectEqualStrings(
+        try string(selected, "store_id"),
+        try string(resumed, "store_id"),
+    );
+    try std.testing.expectEqualStrings(
+        try string(selected, "store_root"),
+        try string(resumed, "store_root"),
+    );
+    var after = try host.list(allocator, io, fixture.home);
+    defer after.deinit();
+    try std.testing.expectEqual(@as(usize, 1), after.value.stores.len);
+    try std.testing.expectEqualStrings(
+        try string(resumed, "store_id"),
+        after.value.stores[0].store_id,
+    );
+}
+
 test "host migration current history archives broad material repairs bindings and reuses receipt" {
     var fixture = try Fixture.init(false);
     defer fixture.deinit();
@@ -1726,6 +1785,7 @@ test "host migration current history archives broad material repairs bindings an
     defer applied.deinit();
     try expectStatus(applied, "verified");
     const selected = applied.value.object.get("context").?;
+    try std.testing.expect(selected.object.get("cataloged").?.bool);
     const custody = try string(selected, "store_root");
     const fingerprint_value = try string(applied.value, "fingerprint");
     const archive = try std.fmt.allocPrint(
@@ -1759,6 +1819,7 @@ test "host migration current history archives broad material repairs bindings an
     var repeated = try execute(allocator, io, &fixture.environment, fixture.options(true));
     defer repeated.deinit();
     try expectStatus(repeated, "verified");
+    try std.testing.expect(repeated.value.object.get("context").?.object.get("cataloged").?.bool);
     try std.testing.expect(!repeated.value.object.get("storage_mutated").?.bool);
     try std.testing.expectEqualStrings(
         fingerprint_value,
@@ -1778,6 +1839,7 @@ test "host migration retired conversion stages stable custody and rejects unscop
     var staged = try execute(allocator, io, &fixture.environment, fixture.options(true));
     defer staged.deinit();
     try expectStatus(staged, "owner-import-required");
+    try std.testing.expect(!staged.value.object.get("context").?.object.get("cataloged").?.bool);
     const selected = staged.value.object.get("context").?;
     const home = try host.catalog.openDirectory(io, fixture.home, false);
     defer home.close(io);

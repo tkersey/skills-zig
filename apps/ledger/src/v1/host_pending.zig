@@ -135,6 +135,10 @@ pub fn readById(
     defer arena.deinit();
     var registered = try catalog.read(allocator, io, home);
     defer registered.deinit();
+    // Publication can complete after the caller's first catalog lookup.
+    if (registered.value.stores.map.get(id)) |root| {
+        return host.checkedRoot(allocator, io, root, id, null, null, false);
+    }
     const values = try scanRetained(arena.allocator(), io, home, &registered, id);
     for (values) |value| {
         if (!std.mem.eql(u8, value.registration.store_id, id)) continue;

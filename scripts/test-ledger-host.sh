@@ -254,11 +254,18 @@ context --catalog-root "$registration/seed" --initialize
 registered_id=$("$json" -r '.store_id' "$scratch/result.json")
 registered_root=$("$json" -r '.store_root' "$scratch/result.json")
 printf '%s\n' preserved >"$registered_root/.ledger/opaque"
+printf '%s\n' '{"kind":"one","value":1}' >"$scratch/event.json"
+"$binary" transact --definition "$definition" --store-root "$registered_root" --store-id "$registered_id" \
+  --operation append --param request=registration --input "event=$scratch/event.json" --format json >"$scratch/capture.json"
 "$json" -n --arg id "$registered_id" --arg root "$registered_root" \
   '{schema:"ledger-repository-registration/v1",store_id:$id,store_root:$root}' \
   >"$registration/repo/.git/ledger-store.json"
 cp "$registration/repo/.git/ledger-store.json" "$registration/registration.saved"
 snapshot "$registered_root" >"$scratch/before.snapshot"
+context --catalog-root "$registration/uncataloged" --workspace "$registration/repo" --read-only \
+  --definition "$definition" --owner-manifest "$manifest"
+assert_json '.cataloged == false and .owner_health.healthy and .storage_mutated == false'
+test ! -e "$registration/uncataloged"
 blocked UnregisteredContext context --catalog-root "$registration/home" --workspace "$registration/repo"
 blocked ExistingRegistrationRequiresImport context --catalog-root "$registration/home" --workspace "$registration/repo" --initialize
 test ! -e "$registration/home"
@@ -273,6 +280,21 @@ cmp "$scratch/before.snapshot" "$scratch/after.snapshot"
 cmp "$registration/registration.saved" "$registration/repo/.git/ledger-store.json"
 context --catalog-root "$registration/imported" --import-registration "$registration/registration.saved"
 test "$("$json" -r '.store_id' "$scratch/result.json")" = "$registered_id"
+snapshot "$registration/imported" >"$scratch/catalog-before.snapshot"
+context --catalog-root "$registration/imported" --workspace "$registration/repo" --read-only \
+  --definition "$definition" --owner-manifest "$manifest"
+assert_json '.cataloged == true and .owner_health.healthy and .storage_mutated == false'
+test "$("$json" -r '.store_id' "$scratch/result.json")" = "$registered_id"
+context --catalog-root "$registration/imported" --store-id "$registered_id" --read-only \
+  --definition "$definition" --owner-manifest "$manifest"
+assert_json '.cataloged == true and .owner_health.healthy and .storage_mutated == false'
+context --catalog-root "$registration/imported" --list-stores
+assert_json '.stores | length == 1'
+assert_json '.stores[0].aliases == [] and .pending == []'
+snapshot "$registration/imported" >"$scratch/catalog-after.snapshot"
+cmp "$scratch/catalog-before.snapshot" "$scratch/catalog-after.snapshot"
+snapshot "$registered_root" >"$scratch/after.snapshot"
+cmp "$scratch/before.snapshot" "$scratch/after.snapshot"
 cp -R "$registered_root" "$registration/copied-root"
 blocked StoreAlreadyCatalogedAtAnotherRoot context --catalog-root "$registration/home" \
   --register-root "$registration/copied-root" --store-id "$registered_id"
