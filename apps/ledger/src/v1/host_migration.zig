@@ -747,11 +747,11 @@ const Migration = struct {
             self.options.context.catalog_root,
             selected,
         );
-        const retired = try self.retireCopy(selected, guard);
         self.result.value = saved;
         var published = selected;
         published.cataloged = true;
         try self.result.put("context", published);
+        const retired = try self.retireCopy(selected, guard);
         try self.result.put("storage_mutated", changed or retired);
     }
 
@@ -1742,6 +1742,22 @@ test "host migration publishes a saved receipt without retaining pending catalog
     var before = try host.list(allocator, io, fixture.home);
     defer before.deinit();
     try std.testing.expectEqual(@as(usize, 0), before.value.stores.len);
+    vtable = io.vtable.*;
+    vtable.dirDeleteDir = struct {
+        fn remove(
+            userdata: ?*anyopaque,
+            directory: std.Io.Dir,
+            name: []const u8,
+        ) std.Io.Dir.DeleteDirError!void {
+            if (std.mem.eql(u8, name, ".migration-copy")) return error.AccessDenied;
+            return std.testing.io.vtable.dirDeleteDir(userdata, directory, name);
+        }
+    }.remove;
+    var cleanup = try execute(allocator, injected, &fixture.environment, fixture.options(true));
+    defer cleanup.deinit();
+    try expectStatus(cleanup, "blocked");
+    try std.testing.expectEqualStrings("AccessDenied", try string(cleanup.value, "error_code"));
+    try std.testing.expect(cleanup.value.object.get("context").?.object.get("cataloged").?.bool);
     var retry = try execute(allocator, io, &fixture.environment, fixture.options(true));
     defer retry.deinit();
     try expectStatus(retry, "verified");
