@@ -26,6 +26,221 @@ pub const Registration = struct {
     git_common_dir: ?[]const u8,
 };
 
+pub const Retained = struct {
+    registration: Registration,
+    // Allocation can survive before the marker is materialized. Neither state
+    // establishes owner health, source coverage, or publication in the catalog.
+    state: enum { allocated, materialized },
+};
+
+pub fn retained(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    home: []const u8,
+    registered: *const catalog.Catalog,
+) ![]Retained {
+    return scanRetained(allocator, io, home, registered, null);
+}
+
+fn scanRetained(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    home: []const u8,
+    registered: *const catalog.Catalog,
+    selected_id: ?[]const u8,
+) ![]Retained {
+    const path = try std.fs.path.join(allocator, &.{ home, "preparations" });
+    const controls = catalog.openDirectory(io, path, false) catch |err| switch (err) {
+        error.FileNotFound => return allocator.alloc(Retained, 0),
+        else => return err,
+    };
+    defer controls.close(io);
+    var values: std.ArrayList(Retained) = .empty;
+    var entries = controls.iterate();
+    var count: usize = 0;
+    while (try entries.next(io)) |entry| {
+        if (count == max_sources) return error.PendingCustodyDiscoveryBoundExceeded;
+        count += 1;
+        const child = try controls.openDir(io, entry.name, .{ .follow_symlinks = false });
+        defer child.close(io);
+        const value = try readRetainedRegistration(
+            allocator,
+            io,
+            home,
+            child,
+            entry.name,
+        ) orelse continue;
+        if (selected_id) |id| if (!std.mem.eql(u8, id, value.store_id)) continue;
+        if (registered.value.stores.map.get(value.store_id)) |root| {
+            if (!std.mem.eql(u8, root, value.store_root))
+                return error.PendingCustodyConflictsWithCatalog;
+            continue;
+        }
+        for (values.items) |previous| {
+            if (std.mem.eql(u8, previous.registration.store_id, value.store_id))
+                return error.ConflictingPendingIdentity;
+        }
+        const marker = try std.fs.path.join(allocator, &.{ value.store_root, marker_name });
+        const materialized = try catalog.exists(io, marker);
+        if (materialized) {
+            const control = try catalog.checkedRoot(
+                allocator,
+                io,
+                value.store_root,
+                value.store_id,
+            );
+            control.close(io);
+        } else try checkSkeleton(io, value.store_root);
+        try values.append(allocator, .{
+            .registration = value,
+            .state = if (materialized) .materialized else .allocated,
+        });
+    }
+    std.mem.sort(Retained, values.items, {}, struct {
+        fn less(_: void, left: Retained, right: Retained) bool {
+            return std.mem.lessThan(u8, left.registration.store_id, right.registration.store_id);
+        }
+    }.less);
+    return values.toOwnedSlice(allocator);
+}
+
+fn readRetainedRegistration(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    home: []const u8,
+    directory: std.Io.Dir,
+    name: []const u8,
+) !?Registration {
+    if (!try catalog.existsAt(io, directory, "registration.json")) return null;
+    const bytes = try catalog.readBytes(allocator, io, directory, "registration.json", 4096);
+    const value = try std.json.parseFromSliceLeaky(Registration, allocator, bytes, .{
+        .allocate = .alloc_always,
+        .duplicate_field_behavior = .@"error",
+    });
+    try validRegistration(allocator, value, home);
+    const expected = try controlsPath(allocator, value.workspace_root, value.git_common_dir, home);
+    if (!std.mem.eql(u8, name, std.fs.path.basename(expected)))
+        return error.ConflictingPendingIdentity;
+    return value;
+}
+
+pub fn readById(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    home: []const u8,
+    id: []const u8,
+) !host.Context {
+    try catalog.validStoreId(id);
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    var registered = try catalog.read(allocator, io, home);
+    defer registered.deinit();
+    const values = try scanRetained(arena.allocator(), io, home, &registered, id);
+    for (values) |value| {
+        if (!std.mem.eql(u8, value.registration.store_id, id)) continue;
+        if (value.state == .allocated) return error.PendingInitializationRequiresPreparation;
+        var selected = try host.checkedRoot(
+            allocator,
+            io,
+            value.registration.store_root,
+            id,
+            null,
+            null,
+            false,
+        );
+        selected.value.cataloged = false;
+        return selected;
+    }
+    return error.SelectedStoreNotCataloged;
+}
+
+test "pending inventory rejects transplanted locators and conflicting root markers" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = try workspace.testPlainDirectory();
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const owned = arena.allocator();
+    const root = try tmp.dir.realPathFileAlloc(io, ".", owned);
+    const home = try std.fs.path.join(owned, &.{ root, "home" });
+    var environment = std.process.Environ.Map.init(allocator);
+    defer environment.deinit();
+    var target = try prepareTarget(
+        allocator,
+        io,
+        &environment,
+        .{ .catalog_root = home, .workspace = root },
+        true,
+    );
+    defer target.deinit();
+    const id = target.context.value.store_id;
+    const controls_path = try controlsPath(owned, root, null, home);
+    const controls = try catalog.openDirectory(io, std.fs.path.dirname(controls_path).?, false);
+    defer controls.close(io);
+    const basename = std.fs.path.basename(controls_path);
+    try controls.renamePreserve(basename, controls, "displaced", io);
+    try std.testing.expectError(error.ConflictingPendingIdentity, host.list(allocator, io, home));
+    try controls.renamePreserve("displaced", controls, basename, io);
+    const custody = try catalog.openDirectory(io, target.context.value.store_root, false);
+    defer custody.close(io);
+    const original = try catalog.readBytes(owned, io, custody, marker_name, 4096);
+    try custody.deleteFile(io, marker_name);
+    var allocated = try host.list(allocator, io, home);
+    defer allocated.deinit();
+    try std.testing.expectEqual(.allocated, allocated.value.pending[0].state);
+    try std.testing.expectError(
+        error.PendingInitializationRequiresPreparation,
+        readById(allocator, io, home, id),
+    );
+    try std.testing.expect(!try catalog.existsAt(io, custody, marker_name));
+    try catalog.writeJson(allocator, io, custody, marker_name, Marker{
+        .schema = "ledger-storage-root/v1",
+        .store_id = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    }, 4096);
+    try std.testing.expectError(
+        error.StorageRootIdentityMismatch,
+        readById(allocator, io, home, id),
+    );
+    try custody.writeFile(io, .{ .sub_path = marker_name, .data = original });
+    var verified = try host.list(allocator, io, home);
+    defer verified.deinit();
+    try std.testing.expectEqual(@as(usize, 1), verified.value.pending.len);
+    try std.testing.expectEqualStrings(id, verified.value.pending[0].registration.store_id);
+    try std.testing.expect(!verified.value.storage_mutated);
+    try testUnrelatedPendingRoot(&environment, tmp.dir, root, home, id);
+}
+
+fn testUnrelatedPendingRoot(
+    environment: *const std.process.Environ.Map,
+    directory: std.Io.Dir,
+    root: []const u8,
+    home: []const u8,
+    id: []const u8,
+) !void {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    try directory.createDir(io, "other", .default_dir);
+    const other_workspace = try std.fs.path.join(allocator, &.{ root, "other" });
+    defer allocator.free(other_workspace);
+    var other = try prepareTarget(
+        allocator,
+        io,
+        environment,
+        .{ .catalog_root = home, .workspace = other_workspace },
+        true,
+    );
+    defer other.deinit();
+    const other_custody = try catalog.openDirectory(io, other.context.value.store_root, false);
+    defer other_custody.close(io);
+    try other_custody.deleteDir(io, ".ledger");
+    var readable = try readById(allocator, io, home, id);
+    defer readable.deinit();
+    try std.testing.expectEqualStrings(id, readable.value.store_id);
+    try std.testing.expect(!readable.value.cataloged);
+    try std.testing.expectError(error.StorageRootMissing, host.list(allocator, io, home));
+}
+
 pub fn migrationScratch(
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -696,6 +911,7 @@ fn materializePending(
         );
         errdefer checked.deinit();
         if (publication_lock != null) try syncPending(io, value.store_root, controls_path);
+        checked.value.cataloged = false;
         return checked;
     }
     if (publication_lock == null) return error.PendingInitializationRequiresPreparation;
@@ -712,7 +928,7 @@ fn materializePending(
     try prepareMarker(allocator, io, controls, value.store_id);
     try controls.renamePreserve(candidate_name, custody, marker_name, io);
     try syncPending(io, value.store_root, controls_path);
-    return host.checkedRoot(
+    var selected = try host.checkedRoot(
         allocator,
         io,
         value.store_root,
@@ -721,6 +937,8 @@ fn materializePending(
         associations.git_common_dir,
         true,
     );
+    selected.value.cataloged = false;
+    return selected;
 }
 
 fn syncPending(io: std.Io, root: []const u8, controls_path: []const u8) !void {
@@ -1099,9 +1317,9 @@ test "pending matching marker candidate keeps its inode and malformed candidate 
     const id = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
     try tmp.dir.writeFile(io, .{ .sub_path = candidate_name, .data = "{partial" });
     if (prepareMarker(allocator, io, tmp.dir, id)) |_| return error.TestExpectedError else |_| {}
-    const retained = try catalog.readBytes(allocator, io, tmp.dir, candidate_name, 4096);
-    defer allocator.free(retained);
-    try std.testing.expectEqualStrings("{partial", retained);
+    const retained_bytes = try catalog.readBytes(allocator, io, tmp.dir, candidate_name, 4096);
+    defer allocator.free(retained_bytes);
+    try std.testing.expectEqualStrings("{partial", retained_bytes);
     try tmp.dir.deleteFile(io, candidate_name);
     try catalog.writeJson(allocator, io, tmp.dir, candidate_name, Marker{
         .schema = "ledger-storage-root/v1",

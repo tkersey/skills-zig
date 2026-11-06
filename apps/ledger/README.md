@@ -29,6 +29,53 @@ zig build test-ledger-segmented -Doptimize=fast
 
 The binary is written to `zig-out/bin/ledger`.
 
+## Canonical owner reads and retained custody (Ledger 1.7)
+
+Use the owner definition and migration declaration when selecting a history:
+
+```bash
+ledger context --catalog-root <catalog> --workspace <workspace> \
+  --definition <definition.json> --owner-manifest <migration.json> --read-only
+```
+
+This verifies the selected canonical owner, its binding, replay and unresolved
+publication state. A healthy present owner remains readable when an unrelated
+sibling checkout is missing, empty or divergent. The returned `owner_health`
+identifies the validated revision; `source_coverage: "not_checked"` explicitly
+leaves migration coverage unknown. Read selection creates no history, catalog
+association or writer authority. `--ensure-owner` retains source discovery and
+coordination requirements for preparation and writes.
+
+An absent unbound owner returns `OwnerPreparationRequired`. Missing bytes with a
+surviving binding return `StoreBindingWithoutSlot`, preserving the verified store
+ID and root for exact recovery. Other corruption and identity failures keep their
+specific errors. They are not empty-history observations. See
+[preparation and exact restoration](PREPARATION.md) for archive recovery and the
+atomic `--restore-bound-history` guard.
+
+`ledger context --catalog-root <catalog> --list-stores` includes a separate
+`pending` array for retained unpublished registrations. Each entry contains the
+original registration and its `allocated` or `materialized` state, after validating
+the locator placement, store identity and any materialized root marker. This
+inventory is read-only and does not assert owner health.
+
+A materialized pending history can be inspected with the original ID, even after
+the original checkout disappears:
+
+```bash
+ledger context --catalog-root <catalog> --store-id <retained-id> \
+  --definition <definition.json> --owner-manifest <migration.json> --read-only
+```
+
+Success returns `cataloged: false`; it does not publish the pending identity or
+permit write preparation. Investigate the original failure and owner health before
+using existing explicit `context --register-root <retained-root> --store-id
+<retained-id>` to publish that exact identity. Registration is identity maintenance,
+not certification of source coverage or writer cutover. Never allocate a replacement
+ID, remove retained controls or treat a failed projection as an empty history.
+Semantic repository scopes stored in owner records remain independent of custody
+IDs and must be supplied unchanged to projections.
+
 ## Definitions
 
 Definitions use `ledger-artifact-definition/v1` and require

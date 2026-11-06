@@ -816,9 +816,10 @@ pub fn validateArchive(
     const index = basename[9..];
     _ = std.fmt.parseInt(usize, index, 10) catch return error.InvalidPreparationArchive;
     const parent = std.fs.path.dirname(source.root) orelse return error.InvalidPreparationArchive;
+    const flat_layout = std.mem.eql(u8, std.fs.path.basename(parent), "legacy-archive");
     const archive_parent = std.fs.path.dirname(parent) orelse
         return error.InvalidPreparationArchive;
-    if (!std.mem.eql(u8, std.fs.path.basename(archive_parent), "legacy-archive")) {
+    if (!flat_layout and !std.mem.eql(u8, std.fs.path.basename(archive_parent), "legacy-archive")) {
         return error.InvalidPreparationArchive;
     }
     var directory = try storage_root.openRoot(io, parent);
@@ -839,6 +840,7 @@ pub fn validateArchive(
     if (!std.mem.eql(u8, schema, "ledger-legacy-archive/v1")) {
         return error.InvalidPreparationArchive;
     }
+    if (flat_layout) return error.UnsupportedLegacyArchiveLayout;
     const sources = try definition_core.json.object(
         object.get("sources") orelse return error.InvalidPreparationArchive,
     );

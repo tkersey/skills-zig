@@ -339,8 +339,11 @@ test -f "$owner/repo/.ledger/unrelated/sparse.bin"
 project --store-root "$owner_root" --store-id "$owner_id" >"$scratch/owner-projection.json"
 assert_json 'length == 2' "$scratch/owner-projection.json"
 snapshot "$owner" >"$scratch/before.snapshot"
+context --catalog-root "$owner/home" --workspace "$owner/prefix" \
+  --definition "$definition" --owner-manifest "$manifest" --read-only
+assert_json '.source_coverage == "not_checked" and .owner_health.healthy and .authority_granted == false'
 blocked PreparationRequiresQuiescence context --catalog-root "$owner/home" \
-  --workspace "$owner/prefix" --definition "$definition" --owner-manifest "$manifest" --read-only
+  --workspace "$owner/prefix" --definition "$definition" --owner-manifest "$manifest" --ensure-owner
 snapshot "$owner" >"$scratch/after.snapshot"
 cmp "$scratch/before.snapshot" "$scratch/after.snapshot"
 while IFS= read -r advisory; do
@@ -362,14 +365,30 @@ project --store-root "$owner_root" --store-id "$owner_id" >"$scratch/restored-pr
 cmp "$scratch/owner-projection.json" "$scratch/restored-projection.json"
 capture "$owner/prefix" owner-divergent 999
 snapshot "$owner_root" >"$scratch/before.snapshot"
-blocked OwnerPreparationRequired context --catalog-root "$owner/home" --workspace "$owner/prefix" \
+context --catalog-root "$owner/home" --workspace "$owner/prefix" \
   --definition "$definition" --owner-manifest "$manifest" --read-only
+assert_json '.source_coverage == "not_checked" and .owner_health.healthy and .storage_mutated == false'
 snapshot "$owner_root" >"$scratch/after.snapshot"
 cmp "$scratch/before.snapshot" "$scratch/after.snapshot"
 cp "$owner_root/.ledger/example/events.jsonl" "$scratch/retained-events.jsonl"
 blocked '' context --catalog-root "$owner/home" --workspace "$owner/prefix" --definition "$definition" \
   --owner-manifest "$manifest" --ensure-owner --confirm-no-legacy-writers
 cmp "$scratch/retained-events.jsonl" "$owner_root/.ledger/example/events.jsonl"
+
+mv "$owner/prefix" "$owner/prefix-unavailable"
+snapshot "$owner_root" >"$scratch/before.snapshot"
+context --catalog-root "$owner/home" --workspace "$owner/repo" \
+  --definition "$definition" --owner-manifest "$manifest" --read-only
+assert_json '.source_coverage == "not_checked" and .owner_health.healthy and .storage_mutated == false'
+workspace_revision=$("$json" -r '.owner_health.slots[0].revision' "$scratch/result.json")
+context --catalog-root "$owner/home" --store-id "$owner_id" \
+  --definition "$definition" --owner-manifest "$manifest" --read-only
+test "$("$json" -r '.owner_health.slots[0].revision' "$scratch/result.json")" = "$workspace_revision"
+blocked UnavailableWorktree context --catalog-root "$owner/home" --workspace "$owner/repo" \
+  --definition "$definition" --owner-manifest "$manifest" --ensure-owner --confirm-no-legacy-writers
+snapshot "$owner_root" >"$scratch/after.snapshot"
+cmp "$scratch/before.snapshot" "$scratch/after.snapshot"
+mv "$owner/prefix-unavailable" "$owner/prefix"
 
 printf '%s\n' 'host CLI: healthy segmented history and unsupported preparation'
 segmented="$scratch/segmented"
@@ -391,11 +410,12 @@ assert_json '.storage_mutated == true' "$scratch/capture.json"
 mkdir -p "$segmented_root/legacy-archive/broken"
 printf '%s\n' 'malformed archive must not be read' >"$segmented_root/legacy-archive/broken/manifest.json"
 snapshot "$segmented/home" >"$scratch/before.snapshot"
-for mode in --ensure-owner --read-only; do
-  blocked PreparationRequiresQuiescence context --catalog-root "$segmented/home" \
-    --workspace "$segmented/work" "$mode" --definition "$segmented/owner/definition.json" \
-    --owner-manifest "$segmented/owner/migration.json"
-done
+blocked PreparationRequiresQuiescence context --catalog-root "$segmented/home" \
+  --workspace "$segmented/work" --ensure-owner --definition "$segmented/owner/definition.json" \
+  --owner-manifest "$segmented/owner/migration.json"
+context --catalog-root "$segmented/home" --workspace "$segmented/work" --read-only \
+  --definition "$segmented/owner/definition.json" --owner-manifest "$segmented/owner/migration.json"
+assert_json '.source_coverage == "not_checked" and .owner_health.healthy and .storage_mutated == false'
 test ! -e "$segmented/work/.ledger"
 context --catalog-root "$segmented/home" --workspace "$segmented/work" --ensure-owner \
   --confirm-no-legacy-writers --definition "$segmented/owner/definition.json" \

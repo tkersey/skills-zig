@@ -61,6 +61,13 @@ pub const Result = struct {
         try self.put("storage_mutated", @as(?bool, null));
     }
 
+    fn block(self: *Result, code: []const u8) !void {
+        self.exit_code = 3;
+        try self.put("schema", "ledger-workspace-context-error/v1");
+        try self.put("status", "blocked");
+        try self.put("error_code", code);
+    }
+
     fn setContext(self: *Result, value: host.ContextValue) !void {
         const allocator = self.arena.allocator();
         const bytes = try std.json.Stringify.valueAlloc(allocator, value, .{});
@@ -95,10 +102,7 @@ pub fn execute(
     try result.put("storage_mutated", false);
     try result.put("authority_granted", false);
     run(&result, io, environment, options) catch |err| {
-        result.exit_code = 3;
-        try result.put("schema", "ledger-workspace-context-error/v1");
-        try result.put("status", "blocked");
-        try result.put("error_code", @errorName(err));
+        try result.block(@errorName(err));
     };
     return result;
 }
@@ -195,13 +199,16 @@ fn runPlan(
         options.context.workspace,
     );
     defer associations.deinit();
-    var selected = try resolveExisting(allocator, io, environment, options.context, &associations);
+    var selected = try resolveOwnerContext(allocator, io, environment, options, &associations);
     defer if (selected) |*value| value.deinit();
     if (options.repair_archive and selected == null) {
         return error.ArchiveRepairRequiresExistingCustody;
     }
     var discover_archives = true;
     if (selected) |*current| {
+        if (!options.ensure) {
+            return admitRead(result, io, options, plan, bindings, &associations, current.value);
+        }
         const coverage = try existingCoverage(
             result,
             io,
@@ -215,9 +222,7 @@ fn runPlan(
         );
         discover_archives = coverage.discover_archives;
         if (coverage.covered) {
-            if (options.ensure) {
-                try registerContext(result, io, environment, options, current.value);
-            }
+            try registerContext(result, io, environment, options, current.value);
             return;
         }
     }
@@ -245,6 +250,58 @@ fn runPlan(
         retired,
         discover_archives,
     );
+}
+
+fn resolveOwnerContext(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    environment: *const std.process.Environ.Map,
+    options: Options,
+    associations: *const host.workspace.Associations,
+) !?host.Context {
+    return resolveExisting(allocator, io, environment, options.context, associations) catch |err| {
+        if (err != error.SelectedStoreNotCataloged or options.ensure or
+            options.context.workspace != null)
+            return err;
+        return try pending.readById(
+            allocator,
+            io,
+            options.context.catalog_root,
+            options.context.store_id.?,
+        );
+    };
+}
+
+// Read readiness belongs to the selected canonical owner. Source-family coverage
+// is a preparation/write obligation and must not revoke an already valid snapshot.
+fn admitRead(
+    result: *Result,
+    io: std.Io,
+    options: Options,
+    plan: *const compiled.PlanSet,
+    bindings: *const parameters.Bindings,
+    associations: *const host.workspace.Associations,
+    selected: host.ContextValue,
+) !void {
+    const allocator = result.arena.allocator();
+    try result.setContext(selected);
+    try result.put("source_coverage", "not_checked");
+    try pending.checkPendingContext(
+        allocator,
+        io,
+        associations,
+        options.context.catalog_root,
+        selected,
+    );
+    var health = try inspect(allocator, io, plan, bindings, selected);
+    defer health.deinit(allocator);
+    try result.put("owner_health", health);
+    if (health.preparation_error) |failure| return result.block(failure);
+    if (health.pending_transactions != 0) return error.TransactionRecoveryRequired;
+    if (health.preparation_pending) return error.OwnerPreparationRequired;
+    if (health.slots[0].error_code) |failure| return result.block(failure);
+    if (health.slots[0].state == .missing) return error.OwnerPreparationRequired;
+    if (!health.healthy) return error.OwnerHistoryUnhealthy;
 }
 
 const Coverage = struct {
@@ -472,7 +529,7 @@ fn resolveExisting(
     if (!try host.catalog.exists(io, path)) return null;
     var registration = try host.readRegistration(allocator, io, path);
     defer registration.deinit();
-    return try host.checkedRoot(
+    var selected = try host.checkedRoot(
         allocator,
         io,
         registration.value.store_root,
@@ -481,6 +538,8 @@ fn resolveExisting(
         common,
         false,
     );
+    selected.value.cataloged = false;
+    return selected;
 }
 
 fn inspect(
@@ -1169,7 +1228,10 @@ test "owner empty source requires quiescence before allocation and on repeated c
     }
     options.ensure = false;
     options.confirm_no_writers = false;
-    try expectOwnerError(io, &environment, options, "PreparationRequiresQuiescence");
+    var readable = try execute(allocator, io, &environment, options);
+    defer readable.deinit();
+    try std.testing.expectEqual(@as(u8, 0), readable.exit_code);
+    try std.testing.expect(!readable.value.object.get("storage_mutated").?.bool);
     try std.testing.expect(!try host.catalog.existsAt(io, temporary.dir, "workspace/.ledger"));
 }
 
@@ -1226,7 +1288,6 @@ test "segmented owner absence needs quiescence or all existing publication guard
         );
         guard.close(io);
     }
-    options.ensure = false;
     var protected = try execute(allocator, io, &environment, options);
     defer protected.deinit();
     try std.testing.expectEqual(@as(u8, 0), protected.exit_code);
@@ -1253,6 +1314,152 @@ fn testSegmentedDefinition(allocator: std.mem.Allocator, directory: std.Io.Dir) 
     );
     defer allocator.free(definition);
     try directory.writeFile(std.testing.io, .{ .sub_path = "definition.json", .data = definition });
+}
+
+test "canonical read preserves missing-binding diagnosis and selected identity" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var temporary = try host.workspace.testPlainDirectory();
+    defer temporary.cleanup();
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const owned = arena.allocator();
+    const root = try temporary.dir.realPathFileAlloc(io, ".", owned);
+    try testOwnerInputs(temporary.dir);
+    var environment = std.process.Environ.Map.init(allocator);
+    defer environment.deinit();
+    var options = try testOwnerOptions(owned, root);
+    var selected = try host.initialize(allocator, io, &environment, options.context);
+    defer selected.deinit();
+    try expectOwnerError(io, &environment, options, "OwnerPreparationRequired");
+    try testAppendOwner(&environment, options.definition, selected.value.store_root);
+    const target = try host.catalog.openDirectory(io, selected.value.store_root, false);
+    defer target.close(io);
+    try target.deleteFile(io, ".ledger/example/events.jsonl");
+    for ([_]bool{ false, true }) |by_id| {
+        if (by_id) {
+            options.context.workspace = null;
+            options.context.store_id = selected.value.store_id;
+        }
+        var result = try execute(allocator, io, &environment, options);
+        defer result.deinit();
+        try std.testing.expectEqual(@as(u8, 3), result.exit_code);
+        try std.testing.expectEqualStrings(
+            "StoreBindingWithoutSlot",
+            result.value.object.get("error_code").?.string,
+        );
+        try std.testing.expectEqualStrings(
+            selected.value.store_id,
+            result.value.object.get("store_id").?.string,
+        );
+        try std.testing.expectEqualStrings(
+            "not_checked",
+            result.value.object.get("source_coverage").?.string,
+        );
+        try std.testing.expect(!result.value.object.get("storage_mutated").?.bool);
+        try std.testing.expect(!try host.catalog.existsAt(
+            io,
+            target,
+            ".ledger/example/events.jsonl",
+        ));
+    }
+}
+
+test "retained pending owner remains readable by identity after workspace removal" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var temporary = try host.workspace.testPlainDirectory();
+    defer temporary.cleanup();
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const owned = arena.allocator();
+    const root = try temporary.dir.realPathFileAlloc(io, ".", owned);
+    try testOwnerInputs(temporary.dir);
+    var environment = std.process.Environ.Map.init(allocator);
+    defer environment.deinit();
+    var options = try testOwnerOptions(owned, root);
+    const selected = blk: {
+        var target = try pending.prepareTarget(allocator, io, &environment, options.context, true);
+        defer target.deinit();
+        break :blk try host.context(
+            owned,
+            target.context.value.store_root,
+            target.context.value.store_id,
+            null,
+            null,
+            false,
+        );
+    };
+    try testAppendOwner(&environment, options.definition, selected.value.store_root);
+    try temporary.dir.deleteDir(io, "workspace");
+    options.context.workspace = null;
+    options.context.store_id = selected.value.store_id;
+    var before = try host.list(allocator, io, options.context.catalog_root);
+    defer before.deinit();
+    try std.testing.expectEqual(@as(usize, 0), before.value.stores.len);
+    try std.testing.expectEqual(@as(usize, 1), before.value.pending.len);
+    try std.testing.expectEqualStrings(
+        selected.value.store_id,
+        before.value.pending[0].registration.store_id,
+    );
+    try std.testing.expectEqual(.materialized, before.value.pending[0].state);
+    var read = try execute(allocator, io, &environment, options);
+    defer read.deinit();
+    try std.testing.expectEqual(@as(u8, 0), read.exit_code);
+    try std.testing.expect(!read.value.object.get("cataloged").?.bool);
+    try std.testing.expect(!read.value.object.get("storage_mutated").?.bool);
+    options.ensure = true;
+    try expectOwnerError(io, &environment, options, "SelectedStoreNotCataloged");
+    try testRegisterPendingRead(&environment, options, selected.value, &read);
+}
+
+fn testOwnerOptions(allocator: std.mem.Allocator, root: []const u8) !Options {
+    return .{
+        .context = .{
+            .catalog_root = try std.fs.path.join(allocator, &.{ root, "home" }),
+            .workspace = try std.fs.path.join(allocator, &.{ root, "workspace" }),
+        },
+        .definition = try std.fs.path.join(allocator, &.{ root, "definition.json" }),
+        .manifest = try std.fs.path.join(allocator, &.{ root, "migration.json" }),
+    };
+}
+
+fn testRegisterPendingRead(
+    environment: *const std.process.Environ.Map,
+    options: Options,
+    selected: host.ContextValue,
+    original: *const Result,
+) !void {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var registered = try host.registerRoot(
+        allocator,
+        io,
+        environment,
+        options.context,
+        selected.store_root,
+        selected.store_id,
+    );
+    defer registered.deinit();
+    var after = try host.list(allocator, io, options.context.catalog_root);
+    defer after.deinit();
+    try std.testing.expectEqual(@as(usize, 1), after.value.stores.len);
+    try std.testing.expectEqual(@as(usize, 0), after.value.pending.len);
+    try std.testing.expectEqualStrings(selected.store_id, after.value.stores[0].store_id);
+    var read_options = options;
+    read_options.ensure = false;
+    var retry = try execute(allocator, io, environment, read_options);
+    defer retry.deinit();
+    try std.testing.expectEqual(@as(u8, 0), retry.exit_code);
+    try std.testing.expect(retry.value.object.get("cataloged").?.bool);
+    const original_health = original.value.object.get("owner_health").?.object;
+    const original_slot = original_health.get("slots").?.array.items[0].object;
+    const retried_health = retry.value.object.get("owner_health").?.object;
+    const retried_slot = retried_health.get("slots").?.array.items[0].object;
+    try std.testing.expectEqualStrings(
+        original_slot.get("revision").?.string,
+        retried_slot.get("revision").?.string,
+    );
 }
 
 test "owner initialization admits history after concurrent existing catalog selection" {

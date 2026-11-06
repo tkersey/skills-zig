@@ -57,7 +57,7 @@ const Help =
     \\preparation commands:
     \\  ledger prepare --definition <file> --store-root <path> --store-id <id>
     \\    [--source-root <path> | --source-store <id>=<path> | --source-archive <original-tree>]...
-    \\    [--param <name>=<value>]... [--apply] [--confirm-no-legacy-writers]
+    \\    [--param <name>=<value>]... [--apply] [--restore-bound-history] [--confirm-no-legacy-writers]
     \\    [--max-bytes <n>] [--max-files <n>] [--max-read-bytes <n>] [--format json|text]
     \\  ledger maintain --store-root <path> --store-id <id> [--apply]
     \\    [--max-bytes <n>] [--max-files <n>] [--max-read-bytes <n>] [--format json|text]
@@ -398,6 +398,10 @@ fn parsePrepareArgs(allocator: std.mem.Allocator, argv: []const []const u8) !Pre
         }
         if (std.mem.eql(u8, name, "--confirm-no-legacy-writers")) {
             options.confirm_no_legacy_writers = true;
+            continue;
+        }
+        if (std.mem.eql(u8, name, "--restore-bound-history")) {
+            options.restore_bound_history = true;
             continue;
         }
         index += 1;
@@ -2803,6 +2807,7 @@ fn isVersion(token: []const u8) bool {
 test "command surface keeps explicit preparation contexts and excludes legacy source routing" {
     try std.testing.expect(std.mem.indexOf(u8, Help, "--source ") == null);
     try std.testing.expect(std.mem.indexOf(u8, Help, "--source-root") != null);
+    try std.testing.expect(std.mem.indexOf(u8, Help, "--restore-bound-history") != null);
     try std.testing.expectError(error.UnknownOption, parsePrepareArgs(std.testing.allocator, &.{
         "--definition", "definition.json", "--source", "/source",
     }));

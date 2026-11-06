@@ -18,6 +18,7 @@ pub const ContextValue = struct {
     store_root: []const u8,
     native_args: []const []const u8,
     storage_mutated: bool,
+    cataloged: bool = true,
     authority_granted: bool = false,
 };
 
@@ -43,6 +44,7 @@ pub const StoreList = struct {
     value: struct {
         schema: []const u8 = "ledger-personal-store-list/v1",
         stores: []const Store,
+        pending: []const @import("host_pending.zig").Retained,
         storage_mutated: bool = false,
         authority_granted: bool = false,
     },
@@ -357,7 +359,8 @@ pub fn list(allocator: std.mem.Allocator, io: std.Io, home: []const u8) !StoreLi
             return std.mem.lessThan(u8, left.store_id, right.store_id);
         }
     }.less);
-    return .{ .arena = arena, .value = .{ .stores = stores } };
+    const retained = try @import("host_pending.zig").retained(owned, io, home, &selected);
+    return .{ .arena = arena, .value = .{ .stores = stores, .pending = retained } };
 }
 
 fn lessString(_: void, left: []const u8, right: []const u8) bool {
