@@ -98,6 +98,45 @@ Select OpenCode prompt history explicitly with
 tool lifecycle appear through the same physical relations used by passive
 observations; no source-specific command is restored.
 
+### Nested tool outputs
+
+Codex `tool_results` and `tool_lifecycle` expose an optional
+`output_parts_json` field. Text-block arrays are retained in source order;
+`output_text` joins their text with newlines. Each part includes its source-event
+identity, source line, timestamp, and `payload_pointer` into
+`source_events.payload_json`. Repeated outputs for one call retain their earlier
+parts, including observations made before an asynchronous completion. Non-text
+blocks and unsupported forms remain available in the original source event.
+
+For `functions.exec` and `functions.wait` (also recorded as `exec` and `wait`),
+one complete text part may contain a process-result JSON object or an array of
+such objects. Seq recognizes envelopes with string `output`, nonnegative numeric
+`wall_time_seconds`, and at least one of `chunk_id`, `exit_code`, or `session_id`.
+Each recognized envelope appears separately in the part's `process_results`.
+Its `json_pointer` addresses the JSON decoded from that part's text. These
+pointers have separate roots: `payload_pointer` locates the source string;
+`json_pointer` locates a reported result within that string.
+
+An integer exit code establishes `completed` or `failed`; a reported process
+session with an absent or null exit establishes `running`. Missing and invalid
+exit values otherwise remain `unknown`. Seq does not assign an inner result to
+the wrapper's scalar exit code, create synthetic tool calls, or infer command
+text from JavaScript. Tool lifecycle completion and process success are separate
+observations. Neither establishes an application's operation or capture success.
+
+Seq recognizes complete envelopes at those boundaries, without searching prose,
+code fences, nested arbitrary objects, or a process's stdout for more execution
+results. Reading an earlier command's redirected output therefore preserves that
+text under the read command's result. It does not create another execution of the
+earlier command. Printed envelopes are reported evidence, not independent proof
+that a command was invoked. Unsupported wrappers remain text with no inferred
+process status. Pi and OpenCode currently return null for this additive field.
+
+```bash
+seq query --path <rollout.jsonl> \
+  --spec '{"dataset":"tool_results","select":["call_id","exit_code","source_event_id","output_parts_json"],"format":"json"}'
+```
+
 ### Pi sessions
 
 Require `pi-session-jsonl/v1` in `seq capabilities --format json` before reading
