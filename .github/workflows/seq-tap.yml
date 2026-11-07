@@ -1,0 +1,86 @@
+name: Update Seq tap
+
+on:
+  workflow_run:
+    workflows: ["Release seq"]
+    types: [completed]
+  workflow_dispatch:
+    inputs:
+      tag_name:
+        description: Published Seq release tag to retry
+        required: true
+        type: string
+  pull_request:
+    paths:
+      - ".github/workflows/seq-tap.yml"
+      - ".github/homebrew-tap/**"
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: seq-tap-${{ github.event_name == 'pull_request' && github.event.pull_request.number || 'publish' }}
+  cancel-in-progress: false
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
+        with:
+          persist-credentials: false
+      - run: node --test .github/homebrew-tap/prepare.test.cjs
+
+  update:
+    needs: test
+    if: >-
+      github.repository == 'tkersey/skills-zig' &&
+      ((github.event_name == 'workflow_run' &&
+        github.event.workflow_run.conclusion == 'success' &&
+        github.event.workflow_run.head_repository.full_name == github.repository) ||
+       (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main'))
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
+        with:
+          persist-credentials: false
+      - name: Check tap credential
+        env:
+          TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+        run: |
+          if [ -z "$TAP_TOKEN" ]; then
+            echo "::error::Set HOMEBREW_TAP_TOKEN with Contents and Pull requests write access to tkersey/homebrew-tap."
+            exit 1
+          fi
+      - name: Check out tap
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
+        with:
+          repository: tkersey/homebrew-tap
+          ref: main
+          path: tap
+          token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          persist-credentials: false
+      - name: Verify published archives and update formula
+        id: formula
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ inputs.tag_name }}
+          RELEASE_RUN_ID: ${{ github.event.workflow_run.id }}
+        run: node .github/homebrew-tap/prepare.cjs seq tap/Formula/seq.rb
+      - name: Open or update tap PR
+        if: steps.formula.outputs.changed == 'true'
+        uses: peter-evans/create-pull-request@5f6978faf089d4d20b00c7766989d076bb2fc7f1
+        with:
+          token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          path: tap
+          base: main
+          branch: automation/seq-${{ steps.formula.outputs.version }}
+          add-paths: Formula/seq.rb
+          commit-message: "seq ${{ steps.formula.outputs.version }}"
+          title: "seq ${{ steps.formula.outputs.version }}"
+          body: |
+            Update Seq to [${{ steps.formula.outputs.version }}](https://github.com/tkersey/skills-zig/releases/tag/seq-v${{ steps.formula.outputs.version }}).
+
+            Both published platform archives were downloaded and their SHA256 digests verified before updating the formula. Automatic updates also verify that the published bytes match the successful release run's artifacts. The tap's macOS and Linux CI must pass before merge.
