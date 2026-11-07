@@ -1295,6 +1295,113 @@ test ! -e "$preparation_archive_target/.ledger/unrelated-evidence"
   --format jsonl >"$preparation_dir/archive-projection.jsonl"
 cmp -s "$preparation_dir/expected.jsonl" "$preparation_dir/archive-projection.jsonl"
 
+# The manifest must attest both selected native files, including their bytes.
+cp "$preparation_dir/legacy-archive/fixture/manifest.json" "$preparation_dir/archive-manifest-before.json"
+preparation_archive_binding=$(find "$preparation_archive/.ledger/.bindings" -name '*.jsonl' -type f -print -quit)
+for preparation_required_entry in .ledger/example/events.jsonl "${preparation_archive_binding#"$preparation_archive/"}"; do
+  "$json_cli" --arg path "$preparation_required_entry" 'del(.sources["0"].entries[$path])' \
+    "$preparation_dir/archive-manifest-before.json" >"$preparation_dir/legacy-archive/fixture/manifest.json"
+  preparation_expect_failure PreparationArchiveEvidenceMissing "$preparation_dir/archive-inventory-missing.json" \
+    prepare --definition "$event_definition" --store-root "$preparation_empty" \
+    --store-id preparation-smoke --source-archive "$preparation_archive" --apply --format json
+done
+"$json_cli" '.sources["0"].entries[".ledger/example/events.jsonl"].sha256 = "untrusted-digest"' \
+  "$preparation_dir/archive-manifest-before.json" >"$preparation_dir/legacy-archive/fixture/manifest.json"
+preparation_expect_failure PreparationArchiveEvidenceMismatch "$preparation_dir/archive-digest-mismatch.json" \
+  prepare --definition "$event_definition" --store-root "$preparation_empty" \
+  --store-id preparation-smoke --source-archive "$preparation_archive" --apply --format json
+cp "$preparation_dir/archive-manifest-before.json" "$preparation_dir/legacy-archive/fixture/manifest.json"
+
+# Manifest selection cannot turn a damaged generation into empty history.
+mv "$preparation_archive/.ledger/example/events.jsonl" "$preparation_dir/archive-event-retained"
+preparation_expect_failure StoreBindingWithoutSlot "$preparation_dir/archive-event-missing.json" \
+  prepare --definition "$event_definition" --store-root "$preparation_empty" \
+  --store-id preparation-smoke --source-archive "$preparation_archive" --apply --format json
+mv "$preparation_dir/archive-event-retained" "$preparation_archive/.ledger/example/events.jsonl"
+mv "$preparation_archive/.ledger/.bindings" "$preparation_dir/archive-bindings-retained"
+preparation_expect_failure StoreSlotWithoutBinding "$preparation_dir/archive-binding-missing.json" \
+  prepare --definition "$event_definition" --store-root "$preparation_empty" \
+  --store-id preparation-smoke --source-archive "$preparation_archive" --apply --format json
+mv "$preparation_dir/archive-bindings-retained" "$preparation_archive/.ledger/.bindings"
+test ! -e "$preparation_empty/.ledger/example/events.jsonl"
+
+# An explicit candidate can restore only the exact surviving native binding.
+# This is not a fixture for the unpublished flat archive inventory: the schema
+# marker deliberately carries no authority to admit history through that route.
+preparation_flat="$preparation_dir/flat-evidence/legacy-archive/worktree-0"
+preparation_flat_target="$preparation_dir/flat-bound-target"
+mkdir -p "$preparation_flat/.ledger"
+cp -R "$preparation_source/.ledger/example" "$preparation_source/.ledger/.bindings" \
+  "$preparation_source/.ledger/.definitions" "$preparation_flat/.ledger/"
+printf '%s\n' '{"schema":"ledger-legacy-archive/v1"}' \
+  >"$preparation_dir/flat-evidence/legacy-archive/manifest.json"
+preparation_init "$preparation_flat_target"
+cp -R "$preparation_flat/.ledger/.bindings" "$preparation_flat/.ledger/.definitions" \
+  "$preparation_flat_target/.ledger/"
+"$binary" prepare --definition "$event_definition" --store-root "$preparation_flat_target" \
+  --store-id preparation-smoke --restore-bound-history --source-root "$preparation_flat" \
+  --confirm-no-legacy-writers --format json >"$preparation_dir/flat-bound-ready.json"
+"$json_cli" -e '.outcome == "ready" and .records == 2 and .storage_mutated == false' \
+  "$preparation_dir/flat-bound-ready.json" >/dev/null
+# A prior inspection cannot authorize initialization if the target binding is
+# lost before apply. The explicit bound-history guard is checked again.
+mv "$preparation_flat_target/.ledger/.bindings" "$preparation_dir/flat-target-bindings-retained"
+preparation_fingerprint "$preparation_flat_target" >"$preparation_dir/flat-unbound-before"
+preparation_expect_failure PreparationRequiresBoundHistory "$preparation_dir/flat-target-unbound.json" \
+  prepare --definition "$event_definition" --store-root "$preparation_flat_target" \
+  --store-id preparation-smoke --restore-bound-history --source-root "$preparation_flat" \
+  --confirm-no-legacy-writers --apply --format json
+"$json_cli" -e '.storage_mutated == false' "$preparation_dir/flat-target-unbound.json" >/dev/null
+preparation_fingerprint "$preparation_flat_target" >"$preparation_dir/flat-unbound-after"
+cmp -s "$preparation_dir/flat-unbound-before" "$preparation_dir/flat-unbound-after"
+mv "$preparation_dir/flat-target-bindings-retained" "$preparation_flat_target/.ledger/.bindings"
+preparation_fingerprint "$preparation_flat_target" >"$preparation_dir/flat-target-before"
+preparation_expect_failure UnsupportedLegacyArchiveLayout "$preparation_dir/flat-archive-blocked.json" \
+  prepare --definition "$event_definition" --store-root "$preparation_flat_target" \
+  --store-id preparation-smoke --restore-bound-history --source-archive "$preparation_flat" --apply --format json
+preparation_fingerprint "$preparation_flat_target" >"$preparation_dir/flat-target-after"
+cmp -s "$preparation_dir/flat-target-before" "$preparation_dir/flat-target-after"
+
+mv "$preparation_flat/.ledger/example/events.jsonl" "$preparation_dir/flat-event-retained"
+preparation_expect_failure StoreBindingWithoutSlot "$preparation_dir/flat-event-missing.json" \
+  prepare --definition "$event_definition" --store-root "$preparation_flat_target" \
+  --store-id preparation-smoke --restore-bound-history --source-root "$preparation_flat" \
+  --confirm-no-legacy-writers --apply --format json
+ln -s "$preparation_dir/flat-event-retained" "$preparation_flat/.ledger/example/events.jsonl"
+preparation_expect_failure SymlinkComponent "$preparation_dir/flat-event-symlink.json" \
+  prepare --definition "$event_definition" --store-root "$preparation_flat_target" \
+  --store-id preparation-smoke --restore-bound-history --source-root "$preparation_flat" \
+  --confirm-no-legacy-writers --apply --format json
+rm "$preparation_flat/.ledger/example/events.jsonl"
+mv "$preparation_dir/flat-event-retained" "$preparation_flat/.ledger/example/events.jsonl"
+mv "$preparation_flat/.ledger/.bindings" "$preparation_dir/flat-bindings-retained"
+preparation_expect_failure StoreSlotWithoutBinding "$preparation_dir/flat-binding-missing.json" \
+  prepare --definition "$event_definition" --store-root "$preparation_flat_target" \
+  --store-id preparation-smoke --restore-bound-history --source-root "$preparation_flat" \
+  --confirm-no-legacy-writers --apply --format json
+mv "$preparation_dir/flat-bindings-retained" "$preparation_flat/.ledger/.bindings"
+preparation_fingerprint "$preparation_flat_target" >"$preparation_dir/flat-target-after"
+cmp -s "$preparation_dir/flat-target-before" "$preparation_dir/flat-target-after"
+
+preparation_fingerprint "$preparation_conflict" >"$preparation_dir/flat-conflict-before"
+preparation_expect_failure PreparationBindingConflict "$preparation_dir/flat-binding-conflict.json" \
+  prepare --definition "$event_definition" --store-root "$preparation_conflict" \
+  --store-id preparation-smoke --restore-bound-history --source-root "$preparation_flat" \
+  --confirm-no-legacy-writers --apply --format json
+preparation_fingerprint "$preparation_conflict" >"$preparation_dir/flat-conflict-after"
+cmp -s "$preparation_dir/flat-conflict-before" "$preparation_dir/flat-conflict-after"
+preparation_fingerprint "$preparation_dir/flat-evidence" >"$preparation_dir/flat-evidence-before"
+"$binary" prepare --definition "$event_definition" --store-root "$preparation_flat_target" \
+  --store-id preparation-smoke --restore-bound-history --source-root "$preparation_flat" \
+  --confirm-no-legacy-writers --apply --format json >"$preparation_dir/flat-bound-restored.json"
+"$json_cli" -e '.outcome == "prepared" and .records == 2 and .authority_granted == false' \
+  "$preparation_dir/flat-bound-restored.json" >/dev/null
+cmp -s "$preparation_dir/expected.jsonl" "$preparation_flat_target/.ledger/example/events.jsonl"
+preparation_flat_binding=$(find "$preparation_flat_target/.ledger/.bindings" -name '*.jsonl' -type f -print -quit)
+cmp -s "$preparation_dir/binding-before" "$preparation_flat_binding"
+preparation_fingerprint "$preparation_dir/flat-evidence" >"$preparation_dir/flat-evidence-after"
+cmp -s "$preparation_dir/flat-evidence-before" "$preparation_dir/flat-evidence-after"
+
 preparation_required=$(find "$preparation_archive/.ledger/.definitions" -name '*.json' -type f -print -quit)
 cp "$preparation_required" "$preparation_dir/required-before.json"
 printf '%s\n' '{}' >"$preparation_required"
