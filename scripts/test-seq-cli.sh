@@ -296,6 +296,10 @@ jq -e 'length == 6 and
     .output_parts_json[0].process_results[0].exit_code == 0)' \
   <<<"$nested_lifecycle" >/dev/null
 
+nested_detail=$("$binary" session-detail --path "$nested_outputs" --format json)
+jq -e --argjson lifecycle "$nested_lifecycle" '.tools == $lifecycle' \
+  <<<"$nested_detail" >/dev/null
+
 tail_output=$("$binary" tail --path "$rollout" --once --format json)
 grep -Fq '"entry_type":"session_meta"' <<<"$tail_output"
 grep -Fq '"entry_type":"event_msg"' <<<"$tail_output"
