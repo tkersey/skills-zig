@@ -209,6 +209,7 @@ fn appendArchives(
         else => return err,
     };
     defer archive_dir.close(io);
+    try rejectFlatArchive(scratch, io, archive_dir);
     const generations = try archiveGenerations(allocator, io, archive_dir);
     const selected_slot = try std.fmt.allocPrint(allocator, ".ledger/{s}", .{slot});
     var hash: [32]u8 = undefined;
@@ -258,6 +259,30 @@ fn appendArchives(
     while (keys.next()) |key| : (index += 1) ordered[index] = key.*;
     std.mem.sort([]const u8, ordered, {}, lessString);
     for (ordered) |original| try sources.append(allocator, .{ .root = original, .archive = true });
+}
+
+fn rejectFlatArchive(allocator: std.mem.Allocator, io: std.Io, directory: std.Io.Dir) !void {
+    if (!try catalog.existsAt(io, directory, "manifest.json")) return;
+    // The earlier flat archive reused this schema name with a different
+    // inventory shape. Do not interpret its worktrees as generations or
+    // silently skip historical evidence that needs a verified importer.
+    const bytes = try catalog.readBytes(
+        allocator,
+        io,
+        directory,
+        "manifest.json",
+        32 * 1024 * 1024,
+    );
+    defer allocator.free(bytes);
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, bytes, .{
+        .duplicate_field_behavior = .@"error",
+    });
+    defer parsed.deinit();
+    if (parsed.value != .object) return error.InvalidArchiveManifest;
+    const schema = parsed.value.object.get("schema") orelse return error.InvalidArchiveManifest;
+    if (schema != .string or !std.mem.eql(u8, schema.string, "ledger-legacy-archive/v1"))
+        return error.InvalidArchiveManifest;
+    return error.UnsupportedLegacyArchiveLayout;
 }
 
 fn noSymlinks(io: std.Io, path: []const u8) !bool {
@@ -495,6 +520,7 @@ test "host sources select archived events and bindings without unrelated reads" 
         null,
         null,
         false,
+        false,
     );
     defer target.deinit();
     const slot = "owner/events.jsonl";
@@ -649,6 +675,7 @@ test "host archive discovery retains old stages beside valid generations" {
         null,
         null,
         false,
+        false,
     );
     defer target.deinit();
     const slot = "owner/events.jsonl";
@@ -669,6 +696,61 @@ test "host archive discovery retains old stages beside valid generations" {
     try testWrite(root, "legacy-archive/.archiving-unknown/partial", "unclassified");
     try std.testing.expectError(
         error.FileNotFound,
+        discover(allocator, io, &environment, null, target.value, slot, &.{}, true),
+    );
+}
+
+test "host archive discovery identifies unsupported flat evidence without skipping it" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(root);
+    var environment = std.process.Environ.Map.init(allocator);
+    defer environment.deinit();
+    var target = try host.context(
+        allocator,
+        root,
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        null,
+        null,
+        false,
+        false,
+    );
+    defer target.deinit();
+    const slot = "owner/events.jsonl";
+    try testArchiveManifest(root, slot);
+    const manifest_path = "legacy-archive/manifest.json";
+    // This reproduces the layout discriminator, not a guessed historical
+    // inventory. A schema name alone must never authorize archive recovery.
+    const manifest = "{\"schema\":\"ledger-legacy-archive/v1\"}";
+    const retained_path = "legacy-archive/worktree-0/.ledger/owner/events.jsonl";
+    try testWrite(root, manifest_path, manifest);
+    try testWrite(root, retained_path, "retain original evidence\n");
+    try std.testing.expectError(
+        error.UnsupportedLegacyArchiveLayout,
+        discover(allocator, io, &environment, null, target.value, slot, &.{}, true),
+    );
+    const saved_manifest = try catalog.readBytes(allocator, io, tmp.dir, manifest_path, 4096);
+    defer allocator.free(saved_manifest);
+    try std.testing.expectEqualStrings(manifest, saved_manifest);
+    const retained = try catalog.readBytes(allocator, io, tmp.dir, retained_path, 4096);
+    defer allocator.free(retained);
+    try std.testing.expectEqualStrings("retain original evidence\n", retained);
+    var skipped = try discover(allocator, io, &environment, null, target.value, slot, &.{}, false);
+    defer skipped.deinit();
+    try std.testing.expectEqual(@as(usize, 0), skipped.sources.len);
+
+    try testWrite(root, manifest_path, "[]");
+    try std.testing.expectError(
+        error.InvalidArchiveManifest,
+        discover(allocator, io, &environment, null, target.value, slot, &.{}, true),
+    );
+    try tmp.dir.deleteFile(io, manifest_path);
+    try tmp.dir.symLink(io, "a/manifest.json", manifest_path, .{});
+    try std.testing.expectError(
+        error.SymlinkComponent,
         discover(allocator, io, &environment, null, target.value, slot, &.{}, true),
     );
 }

@@ -26,6 +26,510 @@ pub const Registration = struct {
     git_common_dir: ?[]const u8,
 };
 
+pub const Retained = struct {
+    registration: Registration,
+    // Allocation can survive before the marker is materialized. Neither state
+    // establishes owner health, source coverage, or publication in the catalog.
+    state: enum { allocated, materialized },
+};
+
+pub fn retained(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    home: []const u8,
+    registered: *const catalog.Catalog,
+) ![]Retained {
+    return scanRetained(allocator, io, home, registered, null);
+}
+
+fn scanRetained(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    home: []const u8,
+    registered: *const catalog.Catalog,
+    selected_id: ?[]const u8,
+) ![]Retained {
+    const path = try std.fs.path.join(allocator, &.{ home, "preparations" });
+    const controls = catalog.openDirectory(io, path, false) catch |err| switch (err) {
+        error.FileNotFound => return allocator.alloc(Retained, 0),
+        else => return err,
+    };
+    defer controls.close(io);
+    var values: std.ArrayList(Retained) = .empty;
+    var entries = controls.iterate();
+    var count: usize = 0;
+    while (try entries.next(io)) |entry| {
+        if (count == max_sources) return error.PendingCustodyDiscoveryBoundExceeded;
+        count += 1;
+        const child = try controls.openDir(io, entry.name, .{ .follow_symlinks = false });
+        defer child.close(io);
+        const value = try readRetainedRegistration(
+            allocator,
+            io,
+            home,
+            child,
+            entry.name,
+        ) orelse continue;
+        if (selected_id) |id| if (!std.mem.eql(u8, id, value.store_id)) continue;
+        if (registered.value.stores.map.contains(value.store_id)) continue;
+        for (values.items) |previous| {
+            if (std.mem.eql(u8, previous.registration.store_id, value.store_id))
+                return error.ConflictingPendingIdentity;
+        }
+        const marker = try std.fs.path.join(allocator, &.{ value.store_root, marker_name });
+        const materialized = try catalog.exists(io, marker);
+        if (materialized) {
+            const control = try catalog.checkedRoot(
+                allocator,
+                io,
+                value.store_root,
+                value.store_id,
+            );
+            control.close(io);
+        } else try checkSkeleton(io, value.store_root);
+        try values.append(allocator, .{
+            .registration = value,
+            .state = if (materialized) .materialized else .allocated,
+        });
+    }
+    std.mem.sort(Retained, values.items, {}, struct {
+        fn less(_: void, left: Retained, right: Retained) bool {
+            return std.mem.lessThan(u8, left.registration.store_id, right.registration.store_id);
+        }
+    }.less);
+    return values.toOwnedSlice(allocator);
+}
+
+fn readRetainedRegistration(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    home: []const u8,
+    directory: std.Io.Dir,
+    name: []const u8,
+) !?Registration {
+    if (!try catalog.existsAt(io, directory, "registration.json")) return null;
+    const bytes = try catalog.readBytes(allocator, io, directory, "registration.json", 4096);
+    const value = try std.json.parseFromSliceLeaky(Registration, allocator, bytes, .{
+        .allocate = .alloc_always,
+        .duplicate_field_behavior = .@"error",
+    });
+    try validRegistration(io, value, home);
+    const expected = try controlsPath(allocator, value.workspace_root, value.git_common_dir, home);
+    if (!std.mem.eql(u8, name, std.fs.path.basename(expected)))
+        return error.ConflictingPendingIdentity;
+    return value;
+}
+
+pub fn readById(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    home: []const u8,
+    id: []const u8,
+) !host.Context {
+    try catalog.validStoreId(id);
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    var registered = try catalog.read(allocator, io, home);
+    defer registered.deinit();
+    // Publication can complete after the caller's first catalog lookup.
+    if (registered.value.stores.map.get(id)) |root| {
+        return host.checkedRoot(allocator, io, root, id, null, null, false, true);
+    }
+    const values = try scanRetained(arena.allocator(), io, home, &registered, id);
+    for (values) |value| {
+        if (!std.mem.eql(u8, value.registration.store_id, id)) continue;
+        if (value.state == .allocated) return error.PendingInitializationRequiresPreparation;
+        return host.checkedRoot(
+            allocator,
+            io,
+            value.registration.store_root,
+            id,
+            null,
+            null,
+            false,
+            false,
+        );
+    }
+    return error.SelectedStoreNotCataloged;
+}
+
+test "pending inventory rejects transplanted locators and conflicting root markers" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = try workspace.testPlainDirectory();
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const owned = arena.allocator();
+    const root = try tmp.dir.realPathFileAlloc(io, ".", owned);
+    const home = try std.fs.path.join(owned, &.{ root, "home" });
+    var environment = std.process.Environ.Map.init(allocator);
+    defer environment.deinit();
+    var target = try prepareTarget(
+        allocator,
+        io,
+        &environment,
+        .{ .catalog_root = home, .workspace = root },
+        true,
+    );
+    defer target.deinit();
+    const id = target.context.value.store_id;
+    const controls_path = try controlsPath(owned, root, null, home);
+    const controls = try catalog.openDirectory(io, std.fs.path.dirname(controls_path).?, false);
+    defer controls.close(io);
+    const basename = std.fs.path.basename(controls_path);
+    try controls.renamePreserve(basename, controls, "displaced", io);
+    try std.testing.expectError(error.ConflictingPendingIdentity, host.list(allocator, io, home));
+    try controls.renamePreserve("displaced", controls, basename, io);
+    const custody = try catalog.openDirectory(io, target.context.value.store_root, false);
+    defer custody.close(io);
+    const original = try catalog.readBytes(owned, io, custody, marker_name, 4096);
+    try custody.deleteFile(io, marker_name);
+    var allocated = try host.list(allocator, io, home);
+    defer allocated.deinit();
+    try std.testing.expectEqual(.allocated, allocated.value.pending[0].state);
+    try std.testing.expectError(
+        error.PendingInitializationRequiresPreparation,
+        readById(allocator, io, home, id),
+    );
+    try std.testing.expect(!try catalog.existsAt(io, custody, marker_name));
+    try catalog.writeJson(allocator, io, custody, marker_name, Marker{
+        .schema = "ledger-storage-root/v1",
+        .store_id = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    }, 4096);
+    try std.testing.expectError(
+        error.StorageRootIdentityMismatch,
+        readById(allocator, io, home, id),
+    );
+    try custody.writeFile(io, .{ .sub_path = marker_name, .data = original });
+    var verified = try host.list(allocator, io, home);
+    defer verified.deinit();
+    try std.testing.expectEqual(@as(usize, 1), verified.value.pending.len);
+    try std.testing.expectEqualStrings(id, verified.value.pending[0].registration.store_id);
+    try std.testing.expect(!verified.value.storage_mutated);
+    try testUnrelatedPendingRoot(&environment, tmp.dir, root, home, id);
+}
+
+test "pending inventory preserves absent and materialized roots across equivalent homes" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = try workspace.testPlainDirectory();
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const owned = arena.allocator();
+    const root = try tmp.dir.realPathFileAlloc(io, ".", owned);
+    const home = try std.fs.path.join(owned, &.{ root, "home" });
+    var environment = std.process.Environ.Map.init(allocator);
+    defer environment.deinit();
+    var target = try prepareTarget(
+        allocator,
+        io,
+        &environment,
+        .{ .catalog_root = home, .workspace = root },
+        true,
+    );
+    const id = try owned.dupe(u8, target.context.value.store_id);
+    const custody = try owned.dupe(u8, target.context.value.store_root);
+    target.deinit();
+    const controls_path = try controlsPath(owned, root, null, home);
+    const controls = try catalog.openDirectory(io, controls_path, false);
+    defer controls.close(io);
+    const original = try catalog.readBytes(owned, io, controls, "registration.json", 4096);
+    const homes = [_][]const u8{
+        home,
+        try std.fmt.allocPrint(owned, "{s}/", .{home}),
+        try std.fmt.allocPrint(owned, "{s}//home//", .{root}),
+    };
+    for ([_]@FieldType(Retained, "state"){ .materialized, .allocated }) |state| {
+        if (state == .allocated) try std.Io.Dir.cwd().deleteTree(io, custody);
+        for (homes) |selected_home| {
+            var listed = try host.list(allocator, io, selected_home);
+            defer listed.deinit();
+            try std.testing.expectEqual(@as(usize, 1), listed.value.pending.len);
+            const pending = listed.value.pending[0];
+            try std.testing.expectEqual(state, pending.state);
+            try std.testing.expectEqualStrings(id, pending.registration.store_id);
+            try std.testing.expectEqualStrings(custody, pending.registration.store_root);
+            try std.testing.expect(!listed.value.storage_mutated);
+            try std.testing.expectEqual(state == .materialized, try catalog.exists(io, custody));
+            const after = try catalog.readBytes(owned, io, controls, "registration.json", 4096);
+            try std.testing.expectEqualStrings(original, after);
+        }
+    }
+}
+
+test "pending inventory recognizes canonical publication without rewriting retained paths" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = try workspace.testPlainDirectory();
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const owned = arena.allocator();
+    const root = try tmp.dir.realPathFileAlloc(io, ".", owned);
+    const home = try std.fmt.allocPrint(owned, "{s}//home", .{root});
+    const home_dir = try catalog.openDirectory(io, home, true);
+    defer home_dir.close(io);
+    try home_dir.createDir(io, "Repos", .fromMode(0o700));
+    var environment = std.process.Environ.Map.init(allocator);
+    defer environment.deinit();
+    var target = try prepareTarget(
+        allocator,
+        io,
+        &environment,
+        .{ .catalog_root = home, .workspace = root },
+        true,
+    );
+    const id = try owned.dupe(u8, target.context.value.store_id);
+    const custody = try owned.dupe(u8, target.context.value.store_root);
+    target.deinit();
+    const controls_path = try controlsPath(owned, root, null, home);
+    const controls = try catalog.openDirectory(io, controls_path, false);
+    defer controls.close(io);
+    const original = try catalog.readBytes(owned, io, controls, "registration.json", 4096);
+    var published = try host.registerRoot(
+        allocator,
+        io,
+        &environment,
+        .{ .catalog_root = home, .store_id = id },
+        custody,
+        id,
+    );
+    defer published.deinit();
+    var listed = try host.list(allocator, io, home);
+    defer listed.deinit();
+    try std.testing.expectEqual(@as(usize, 0), listed.value.pending.len);
+    try std.testing.expectEqual(@as(usize, 1), listed.value.stores.len);
+    try std.testing.expectEqualStrings(id, listed.value.stores[0].store_id);
+    try std.testing.expect(!listed.value.storage_mutated);
+    try testPublishedRootUnavailable(owned, home, custody, id);
+    try testPublishedSelectionRejectsConflictingPreparation(
+        owned,
+        &environment,
+        tmp.dir,
+        root,
+        home,
+        id,
+    );
+    const after = try catalog.readBytes(owned, io, controls, "registration.json", 4096);
+    try std.testing.expectEqualStrings(original, after);
+}
+
+fn testPublishedRootUnavailable(
+    allocator: std.mem.Allocator,
+    home: []const u8,
+    root: []const u8,
+    id: []const u8,
+) !void {
+    const io = std.testing.io;
+    const repos = try catalog.openDirectory(io, std.fs.path.dirname(root).?, false);
+    defer repos.close(io);
+    try repos.renamePreserve(id, repos, "unavailable", io);
+    var listed = try host.list(allocator, io, home);
+    defer listed.deinit();
+    try std.testing.expectEqual(@as(usize, 0), listed.value.pending.len);
+    try std.testing.expectEqual(@as(usize, 1), listed.value.stores.len);
+    try std.testing.expectEqualStrings(id, listed.value.stores[0].store_id);
+    try std.testing.expect(!listed.value.storage_mutated);
+    try std.testing.expectError(error.StorageRootMissing, readById(allocator, io, home, id));
+    try repos.renamePreserve("unavailable", repos, id, io);
+    const home_dir = try catalog.openDirectory(io, home, false);
+    defer home_dir.close(io);
+    try home_dir.renamePreserve("repos", home_dir, "unavailable-repos", io);
+    var missing_parent = try host.list(allocator, io, home);
+    defer missing_parent.deinit();
+    try std.testing.expectEqual(@as(usize, 0), missing_parent.value.pending.len);
+    try std.testing.expectEqual(@as(usize, 1), missing_parent.value.stores.len);
+    try std.testing.expectEqualStrings(id, missing_parent.value.stores[0].store_id);
+    try std.testing.expect(!missing_parent.value.storage_mutated);
+    try std.testing.expectError(error.StorageRootMissing, readById(allocator, io, home, id));
+    try home_dir.renamePreserve("unavailable-repos", home_dir, "repos", io);
+}
+
+fn testPublishedSelectionRejectsConflictingPreparation(
+    allocator: std.mem.Allocator,
+    environment: *const std.process.Environ.Map,
+    directory: std.Io.Dir,
+    root: []const u8,
+    home: []const u8,
+    id: []const u8,
+) !void {
+    const io = std.testing.io;
+    try directory.createDir(io, "other", .default_dir);
+    const other = try directory.openDir(io, "other", .{});
+    defer other.close(io);
+    try other.createDir(io, ".ledger", .default_dir);
+    try catalog.writeJson(allocator, io, other, marker_name, Marker{
+        .schema = "ledger-storage-root/v1",
+        .store_id = id,
+    }, 4096);
+    var registered = try catalog.read(allocator, io, home);
+    defer registered.deinit();
+    const other_root = try std.fs.path.join(allocator, &.{ root, "other" });
+    registered.value.stores.map.getPtr(id).?.* = other_root;
+    const values = try retained(allocator, io, home, &registered);
+    defer allocator.free(values);
+    try std.testing.expectEqual(@as(usize, 0), values.len);
+    {
+        var lock = try catalog.Lock.acquire(io, home);
+        defer lock.deinit();
+        try lock.publish(allocator, registered.value);
+    }
+    var listed = try host.list(allocator, io, home);
+    defer listed.deinit();
+    try std.testing.expectEqualStrings(other_root, listed.value.stores[0].store_root);
+    try std.testing.expectEqual(@as(usize, 0), listed.value.pending.len);
+    var selected = try readById(allocator, io, home, id);
+    defer selected.deinit();
+    try std.testing.expect(selected.value.cataloged);
+    try std.testing.expectEqualStrings(other_root, selected.value.store_root);
+    try std.testing.expectError(error.PendingCustodyConflictsWithCatalog, host.registerRoot(
+        allocator,
+        io,
+        environment,
+        .{ .catalog_root = home, .workspace = root, .store_id = id },
+        other_root,
+        id,
+    ));
+}
+
+test "pending inventory admits verified home aliases without requiring custody" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = try workspace.testPlainDirectory();
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const owned = arena.allocator();
+    const root = try tmp.dir.realPathFileAlloc(io, ".", owned);
+    const home = try std.fs.path.join(owned, &.{ root, "home" });
+    const alias = try std.fs.path.join(owned, &.{ root, "HOME" });
+    var environment = std.process.Environ.Map.init(allocator);
+    defer environment.deinit();
+    var target = try prepareTarget(
+        allocator,
+        io,
+        &environment,
+        .{ .catalog_root = home, .workspace = root },
+        true,
+    );
+    defer target.deinit();
+    const control_path = try controlsPath(owned, root, null, home);
+    const control = try catalog.openDirectory(io, control_path, false);
+    defer control.close(io);
+    const original = try catalog.readBytes(owned, io, control, "registration.json", 4096);
+    const registration = try std.json.parseFromSliceLeaky(Registration, owned, original, .{});
+    const aliased = catalog.openDirectory(io, alias, false) catch |err| switch (err) {
+        error.FileNotFound => null,
+        else => return err,
+    };
+    if (aliased) |dir| {
+        defer dir.close(io);
+        const id = target.context.value.store_id;
+        const repos = try catalog.openDirectory(
+            io,
+            std.fs.path.dirname(target.context.value.store_root).?,
+            false,
+        );
+        defer repos.close(io);
+        for ([_]bool{ true, false }) |materialized| {
+            if (!materialized) try repos.renamePreserve(id, repos, "unavailable", io);
+            var listed = try host.list(allocator, io, alias);
+            defer listed.deinit();
+            try std.testing.expectEqual(@as(usize, 1), listed.value.pending.len);
+            try std.testing.expectEqualStrings(id, listed.value.pending[0].registration.store_id);
+            const expected_state: @TypeOf(listed.value.pending[0].state) =
+                if (materialized) .materialized else .allocated;
+            try std.testing.expectEqual(expected_state, listed.value.pending[0].state);
+            try std.testing.expect(!listed.value.storage_mutated);
+            const after = try catalog.readBytes(owned, io, control, "registration.json", 4096);
+            try std.testing.expectEqualStrings(original, after);
+        }
+    } else {
+        try std.testing.expectError(error.InvalidPendingTarget, validRegistration(
+            io,
+            registration,
+            alias,
+        ));
+    }
+    const foreign = try std.fs.path.join(owned, &.{ root, "foreign" });
+    const other = try catalog.openDirectory(io, foreign, true);
+    defer other.close(io);
+    try std.testing.expectError(error.InvalidPendingTarget, validRegistration(
+        io,
+        registration,
+        foreign,
+    ));
+}
+
+test "pending registration placement rejects dot relative and relocated paths" {
+    const io = std.testing.io;
+    const id = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    var value: Registration = .{
+        .schema = catalog.registration_schema,
+        .store_id = id,
+        .store_root = "/home/repos/" ++ id,
+        .workspace_root = "/workspace",
+        .git_common_dir = null,
+    };
+    const accepted = [_][]const u8{
+        "/home/repos/" ++ id,
+        "/home/repos/" ++ id ++ "/",
+        "//home//repos//" ++ id ++ "//",
+    };
+    for (accepted) |path| {
+        value.store_root = path;
+        try validRegistration(io, value, "/home");
+        try validRegistration(io, value, "//home//");
+    }
+    const rejected = [_][]const u8{
+        "home/repos/" ++ id,
+        "/home/./repos/" ++ id,
+        "/home/other/../repos/" ++ id,
+        "/home/repos/" ++ id ++ "/.",
+        "/other/repos/" ++ id,
+        "/home/repos/" ++ id ++ "/extra",
+    };
+    for (rejected) |path| {
+        value.store_root = path;
+        try std.testing.expectError(
+            error.InvalidPendingTarget,
+            validRegistration(io, value, "/home"),
+        );
+    }
+}
+
+fn testUnrelatedPendingRoot(
+    environment: *const std.process.Environ.Map,
+    directory: std.Io.Dir,
+    root: []const u8,
+    home: []const u8,
+    id: []const u8,
+) !void {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    try directory.createDir(io, "other", .default_dir);
+    const other_workspace = try std.fs.path.join(allocator, &.{ root, "other" });
+    defer allocator.free(other_workspace);
+    var other = try prepareTarget(
+        allocator,
+        io,
+        environment,
+        .{ .catalog_root = home, .workspace = other_workspace },
+        true,
+    );
+    defer other.deinit();
+    const other_custody = try catalog.openDirectory(io, other.context.value.store_root, false);
+    defer other_custody.close(io);
+    try other_custody.deleteDir(io, ".ledger");
+    var readable = try readById(allocator, io, home, id);
+    defer readable.deinit();
+    try std.testing.expectEqualStrings(id, readable.value.store_id);
+    try std.testing.expect(!readable.value.cataloged);
+    try std.testing.expectError(error.StorageRootMissing, host.list(allocator, io, home));
+}
+
 pub fn migrationScratch(
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -61,6 +565,7 @@ pub fn migrationScratch(
         associations.workspace_root,
         associations.git_common_dir,
         false,
+        selected.cataloged,
     );
     defer checked.deinit();
     const root = try catalog.openDirectory(io, checked.value.store_root, false);
@@ -183,7 +688,7 @@ pub fn archiveScratch(
         home,
     );
     defer allocator.free(path);
-    const controls = try catalog.openDirectory(io, path, true);
+    const controls = try catalog.openDirectory(io, path, false);
     defer controls.close(io);
     return migration_archive.Scratch.open(
         allocator,
@@ -283,7 +788,7 @@ pub const Guard = struct {
 
     pub fn acquire(io: std.Io, path: []const u8) !Guard {
         const parent = std.fs.path.dirname(path) orelse return error.InvalidPath;
-        const dir = try catalog.openDirectory(io, parent, true);
+        const dir = try catalog.openDirectory(io, parent, false);
         errdefer dir.close(io);
         const basename = std.fs.path.basename(path);
         const file = try catalog.openLock(io, dir, basename);
@@ -332,6 +837,43 @@ pub fn controlsPath(
     return std.fs.path.join(allocator, &.{ home, "preparations", &hex });
 }
 
+pub fn reserveControls(io: std.Io, home: []const u8, path: []const u8) !void {
+    var lock = try catalog.Lock.acquire(io, home);
+    defer lock.deinit();
+    const controls = try openReservedControls(&lock, path);
+    controls.close(io);
+}
+
+fn openReservedControls(lock: *const catalog.Lock, path: []const u8) !std.Io.Dir {
+    const io = lock.io;
+    const existing = catalog.openDirectory(io, path, false) catch |err| switch (err) {
+        error.FileNotFound => null,
+        else => return err,
+    };
+    if (existing) |dir| {
+        dir.close(io);
+    } else {
+        const controls = lock.dir.openDir(
+            io,
+            "preparations",
+            .{ .follow_symlinks = false, .iterate = true },
+        ) catch |err| switch (err) {
+            error.FileNotFound => null,
+            else => return err,
+        };
+        if (controls) |dir| {
+            defer dir.close(io);
+            var entries = dir.iterate();
+            var count: usize = 0;
+            while (try entries.next(io) != null) {
+                count += 1;
+                if (count == max_sources) return error.PendingCustodyDiscoveryBoundExceeded;
+            }
+        }
+    }
+    return catalog.openDirectory(io, path, true);
+}
+
 pub fn prepareTarget(
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -378,8 +920,7 @@ pub fn prepareTarget(
         ),
         .guard = null,
     };
-    const control_dir = try catalog.openDirectory(io, controls, true);
-    control_dir.close(io);
+    try reserveControls(io, options.catalog_root, controls);
     const lock_path = try std.fs.path.join(
         allocator,
         &.{ associations.git_common_dir orelse controls, "ledger-store.lock" },
@@ -447,11 +988,19 @@ fn admitPendingContext(
         return error.PendingCustodyConflictsWithCatalog;
     }
     if (lock != null) try syncRegistration(io, controls);
-    var pending = try materializePending(allocator, io, associations, value, controls, lock);
+    var pending = try materializePending(
+        allocator,
+        io,
+        associations,
+        value,
+        controls,
+        lock,
+        selected.cataloged,
+    );
     defer pending.deinit();
 }
 
-fn validRegistration(allocator: std.mem.Allocator, value: Registration, home: []const u8) !void {
+fn validRegistration(io: std.Io, value: Registration, home: []const u8) !void {
     if (!std.mem.eql(
         u8,
         value.schema,
@@ -462,9 +1011,34 @@ fn validRegistration(allocator: std.mem.Allocator, value: Registration, home: []
     if (value.git_common_dir) |common| {
         if (!std.fs.path.isAbsolute(common)) return error.InvalidPendingIdentity;
     }
-    const expected = try std.fs.path.join(allocator, &.{ home, "repos", value.store_id });
-    defer allocator.free(expected);
-    if (!std.mem.eql(u8, value.store_root, expected)) return error.InvalidPendingTarget;
+    if (!std.fs.path.isAbsolute(value.store_root)) return error.InvalidPendingTarget;
+    const path = std.mem.trimEnd(u8, value.store_root, "/");
+    if (!std.mem.eql(u8, std.fs.path.basename(path), value.store_id))
+        return error.InvalidPendingTarget;
+    const repos = std.fs.path.dirname(path) orelse return error.InvalidPendingTarget;
+    if (!std.mem.eql(u8, std.fs.path.basename(repos), "repos")) return error.InvalidPendingTarget;
+    const recorded_home = std.fs.path.dirname(repos) orelse return error.InvalidPendingTarget;
+    if (sameAbsoluteComponents(recorded_home, home)) return;
+    const recorded = catalog.openDirectory(io, recorded_home, false) catch
+        return error.InvalidPendingTarget;
+    defer recorded.close(io);
+    const selected = catalog.openDirectory(io, home, false) catch return error.InvalidPendingTarget;
+    defer selected.close(io);
+    if (!try @import("durable_store").sameDirectoryObject(io, recorded, selected))
+        return error.InvalidPendingTarget;
+}
+
+fn sameAbsoluteComponents(left: []const u8, right: []const u8) bool {
+    if (!std.fs.path.isAbsolute(left) or !std.fs.path.isAbsolute(right)) return false;
+    var left_parts = std.fs.path.componentIterator(left);
+    var right_parts = std.fs.path.componentIterator(right);
+    if (!std.mem.eql(u8, left_parts.root().?, right_parts.root().?)) return false;
+    while (left_parts.next()) |part| {
+        if (std.mem.eql(u8, part.name, ".") or std.mem.eql(u8, part.name, "..")) return false;
+        const other = right_parts.next() orelse return false;
+        if (!std.mem.eql(u8, part.name, other.name)) return false;
+    }
+    return right_parts.next() == null;
 }
 
 pub fn rejectUnregisteredCustody(
@@ -504,7 +1078,7 @@ pub fn rejectUnregisteredCustody(
                 bytes,
                 .{ .duplicate_field_behavior = .@"error" },
             );
-            try validRegistration(owned, value, home);
+            try validRegistration(io, value, home);
             if (root != null and std.mem.eql(u8, value.workspace_root, root.?) and
                 !catalog.optionalEqual(value.git_common_dir, common))
             {
@@ -574,9 +1148,12 @@ fn pendingTargetObserved(
     publication_lock: ?*const catalog.Lock,
 ) !host.Context {
     const root = associations.workspace_root orelse return error.PreparationRequiresWorkspace;
-    if (publication_lock) |lock| {
-        var selected = try lock.read(allocator);
-        defer selected.deinit();
+    var selected = if (publication_lock) |lock|
+        try lock.read(allocator)
+    else
+        try catalog.read(allocator, io, home);
+    defer selected.deinit();
+    if (publication_lock != null) {
         if (try selected.select(associations.aliases, null, false)) |id| {
             return host.checkedRoot(
                 allocator,
@@ -586,6 +1163,7 @@ fn pendingTargetObserved(
                 root,
                 associations.git_common_dir,
                 false,
+                true,
             );
         }
     }
@@ -600,7 +1178,15 @@ fn pendingTargetObserved(
         controls_path,
         publication_lock,
     );
-    return materializePending(allocator, io, associations, value, controls_path, publication_lock);
+    return materializePending(
+        allocator,
+        io,
+        associations,
+        value,
+        controls_path,
+        publication_lock,
+        try selected.containsStoreRoot(allocator, io, value.store_id, value.store_root),
+    );
 }
 
 fn pendingRegistration(
@@ -629,14 +1215,14 @@ fn pendingRegistration(
         .git_common_dir = associations.git_common_dir,
     };
     if (try catalog.exists(io, value.store_root)) return error.PendingTargetAlreadyExists;
-    const controls = try catalog.openDirectory(io, controls_path, true);
+    const controls = try openReservedControls(lock, controls_path);
     defer controls.close(io);
     try catalog.writeJson(allocator, io, controls, "registration.json", value, 4096);
     return value;
 }
 
 fn syncRegistration(io: std.Io, controls_path: []const u8) !void {
-    const controls = try catalog.openDirectory(io, controls_path, true);
+    const controls = try catalog.openDirectory(io, controls_path, false);
     defer controls.close(io);
     const locator = try controls.openFile(io, "registration.json", .{ .follow_symlinks = false });
     defer locator.close(io);
@@ -655,7 +1241,7 @@ fn readPendingRegistration(
 ) !Registration {
     var parsed = try catalog.readJson(Registration, allocator, io, path, 4096);
     defer parsed.deinit();
-    try validRegistration(allocator, parsed.value, home);
+    try validRegistration(io, parsed.value, home);
     if (!catalog.optionalEqual(parsed.value.git_common_dir, associations.git_common_dir) or
         (associations.git_common_dir == null and
             !std.mem.eql(u8, parsed.value.workspace_root, associations.workspace_root.?)))
@@ -681,6 +1267,7 @@ fn materializePending(
     value: Registration,
     controls_path: []const u8,
     publication_lock: ?*const catalog.Lock,
+    cataloged: bool,
 ) !host.Context {
     const marker_path = try std.fs.path.join(allocator, &.{ value.store_root, marker_name });
     defer allocator.free(marker_path);
@@ -693,6 +1280,7 @@ fn materializePending(
             associations.workspace_root,
             associations.git_common_dir,
             false,
+            cataloged,
         );
         errdefer checked.deinit();
         if (publication_lock != null) try syncPending(io, value.store_root, controls_path);
@@ -720,6 +1308,7 @@ fn materializePending(
         associations.workspace_root,
         associations.git_common_dir,
         true,
+        cataloged,
     );
 }
 
@@ -1014,6 +1603,51 @@ test "pending target persists identity across preparation retries and does not p
     try std.testing.expect(published.value.storage_mutated);
 }
 
+test "pending target observes catalog membership without workspace aliases" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = try workspace.testPlainDirectory();
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(root);
+    const home = try std.fs.path.join(allocator, &.{ root, "home" });
+    defer allocator.free(home);
+    var environment = std.process.Environ.Map.init(allocator);
+    defer environment.deinit();
+    const options: host.Options = .{ .catalog_root = home, .workspace = root };
+    var first = try prepareTarget(allocator, io, &environment, options, true);
+    const id = try allocator.dupe(u8, first.context.value.store_id);
+    defer allocator.free(id);
+    const custody = try allocator.dupe(u8, first.context.value.store_root);
+    defer allocator.free(custody);
+    try std.testing.expect(!first.context.value.cataloged);
+    first.deinit();
+    var published = try host.registerRoot(
+        allocator,
+        io,
+        &environment,
+        .{ .catalog_root = home, .store_id = id },
+        custody,
+        id,
+    );
+    defer published.deinit();
+    try std.testing.expect(published.value.cataloged);
+    try std.testing.expectError(error.UnregisteredContext, host.resolve(
+        allocator,
+        io,
+        &environment,
+        options,
+    ));
+    for ([_]bool{ false, true }) |apply| {
+        var retry = try prepareTarget(allocator, io, &environment, options, apply);
+        defer retry.deinit();
+        try std.testing.expectEqualStrings(id, retry.context.value.store_id);
+        try std.testing.expectEqualStrings(custody, retry.context.value.store_root);
+        try std.testing.expect(retry.context.value.cataloged);
+        try std.testing.expect(!retry.context.value.storage_mutated);
+    }
+}
+
 test "pending target refuses foreign skeleton data and retains locator identity" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
@@ -1099,9 +1733,9 @@ test "pending matching marker candidate keeps its inode and malformed candidate 
     const id = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
     try tmp.dir.writeFile(io, .{ .sub_path = candidate_name, .data = "{partial" });
     if (prepareMarker(allocator, io, tmp.dir, id)) |_| return error.TestExpectedError else |_| {}
-    const retained = try catalog.readBytes(allocator, io, tmp.dir, candidate_name, 4096);
-    defer allocator.free(retained);
-    try std.testing.expectEqualStrings("{partial", retained);
+    const retained_bytes = try catalog.readBytes(allocator, io, tmp.dir, candidate_name, 4096);
+    defer allocator.free(retained_bytes);
+    try std.testing.expectEqualStrings("{partial", retained_bytes);
     try tmp.dir.deleteFile(io, candidate_name);
     try catalog.writeJson(allocator, io, tmp.dir, candidate_name, Marker{
         .schema = "ledger-storage-root/v1",
@@ -1473,4 +2107,294 @@ test "registration preserves pending identity and completes marker durability be
     var resolved = try host.resolve(allocator, io, &environment, options);
     defer resolved.deinit();
     try std.testing.expectEqualStrings(selected.store_id, resolved.value.store_id);
+}
+const ReservationContender = struct {
+    threadlocal var active: ?*ReservationContender = null;
+
+    io: std.Io,
+    home: []const u8,
+    path: []const u8,
+    contended: std.Io.Event = .unset,
+    failure: ?anyerror = null,
+
+    fn run(self: *ReservationContender) void {
+        active = self;
+        defer active = null;
+        var vtable = self.io.vtable.*;
+        vtable.fileTryLock = observeLock;
+        var injected = self.io;
+        injected.vtable = &vtable;
+        reserveControls(injected, self.home, self.path) catch |err| {
+            self.failure = err;
+        };
+    }
+
+    fn observeLock(
+        userdata: ?*anyopaque,
+        file: std.Io.File,
+        mode: std.Io.File.Lock,
+    ) std.Io.File.LockError!bool {
+        const self = active.?;
+        const acquired = try self.io.vtable.fileTryLock(userdata, file, mode);
+        if (!acquired) self.contended.set(self.io);
+        return acquired;
+    }
+};
+
+fn runReservationContenders(contenders: *[2]ReservationContender) !void {
+    const io = contenders[0].io;
+    var lock: ?catalog.Lock = try catalog.Lock.acquire(io, contenders[0].home);
+    var workers: [2]?std.Thread = .{ null, null };
+    defer {
+        if (lock) |*held| held.deinit();
+        for (workers) |worker| if (worker) |thread| thread.join();
+    }
+    for (contenders, &workers) |*contender, *worker| {
+        worker.* = try std.Thread.spawn(.{}, ReservationContender.run, .{contender});
+    }
+    for (contenders) |*contender| {
+        try contender.contended.waitTimeout(io, .{ .duration = .{
+            .raw = .fromSeconds(5),
+            .clock = .awake,
+        } });
+    }
+    lock.?.deinit();
+    lock = null;
+    for (&workers) |*worker| {
+        worker.*.?.join();
+        worker.* = null;
+    }
+}
+
+fn preparationChildCount(io: std.Io, dir: std.Io.Dir) !usize {
+    var entries = dir.iterate();
+    var count: usize = 0;
+    while (try entries.next(io) != null) count += 1;
+    return count;
+}
+
+fn expectInvalidReservation(io: std.Io, home: []const u8, path: []const u8) !void {
+    if (reserveControls(io, home, path)) |_| {
+        return error.TestExpectedError;
+    } else |err| switch (err) {
+        error.NotDir, error.SymLinkLoop => {},
+        else => return err,
+    }
+}
+
+test "pending reservations serialize the last slot and reuse existing controls at capacity" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = try workspace.testPlainDirectory();
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const owned = arena.allocator();
+    const root = try tmp.dir.realPathFileAlloc(io, ".", owned);
+    const home = try std.fs.path.join(owned, &.{ root, "home" });
+    const parent = try std.fs.path.join(owned, &.{ home, "preparations" });
+    const preparations = try catalog.openDirectory(io, parent, true);
+    defer preparations.close(io);
+    for (0..max_sources - 3) |index| {
+        var name_buffer: [32]u8 = undefined;
+        const name = try std.fmt.bufPrint(&name_buffer, "reserved-{d}", .{index});
+        try preparations.createDir(io, name, .fromMode(0o700));
+    }
+    try preparations.writeFile(io, .{ .sub_path = "file", .data = "preserve" });
+    try preparations.symLink(io, root, "link", .{});
+    try std.testing.expectEqual(max_sources - 1, try preparationChildCount(io, preparations));
+    const first = try std.fs.path.join(owned, &.{ parent, "first" });
+    const second = try std.fs.path.join(owned, &.{ parent, "second" });
+    var contenders: [2]ReservationContender = .{
+        .{ .io = io, .home = home, .path = first },
+        .{ .io = io, .home = home, .path = second },
+    };
+    try runReservationContenders(&contenders);
+    const winner: usize = if (contenders[0].failure == null) 0 else 1;
+    try std.testing.expectEqual(@as(?anyerror, null), contenders[winner].failure);
+    try std.testing.expectEqual(
+        @as(?anyerror, error.PendingCustodyDiscoveryBoundExceeded),
+        contenders[1 - winner].failure,
+    );
+    try std.testing.expectEqual(max_sources, try preparationChildCount(io, preparations));
+    const winning_path = contenders[winner].path;
+    try reserveControls(io, home, winning_path);
+    contenders = .{
+        .{ .io = io, .home = home, .path = winning_path },
+        .{ .io = io, .home = home, .path = winning_path },
+    };
+    try runReservationContenders(&contenders);
+    for (contenders) |contender| {
+        try std.testing.expectEqual(@as(?anyerror, null), contender.failure);
+    }
+    for ([_][]const u8{ "file", "link" }) |name| {
+        try expectInvalidReservation(io, home, try std.fs.path.join(owned, &.{ parent, name }));
+    }
+    try std.testing.expectEqual(max_sources, try preparationChildCount(io, preparations));
+    const bytes = try catalog.readBytes(owned, io, preparations, "file", 64);
+    try std.testing.expectEqualStrings("preserve", bytes);
+    const link = try preparations.statFile(io, "link", .{ .follow_symlinks = false });
+    try std.testing.expectEqual(std.Io.File.Kind.sym_link, link.kind);
+}
+
+const PreparationParentSyncFault = struct {
+    var active: ?*PreparationParentSyncFault = null;
+
+    parent: []const u8,
+    controls: []const u8,
+    parent_file: ?std.Io.File = null,
+    fail: bool = true,
+    reached: bool = false,
+    synced: bool = false,
+    published: bool = false,
+    published_before_sync: bool = false,
+
+    fn open(
+        userdata: ?*anyopaque,
+        dir: std.Io.Dir,
+        name: []const u8,
+        options: std.Io.Dir.OpenFileOptions,
+    ) std.Io.File.OpenError!std.Io.File {
+        const io = std.testing.io;
+        const file = try io.vtable.dirOpenFile(userdata, dir, name, options);
+        const self = active.?;
+        self.parent_file = null;
+        if (!std.mem.eql(u8, name, ".")) return file;
+        const path = dir.realPathFileAlloc(io, ".", std.testing.allocator) catch |err| {
+            std.debug.panic("preparation parent sync probe: {s}", .{@errorName(err)});
+        };
+        defer std.testing.allocator.free(path);
+        if (std.mem.eql(u8, path, self.parent)) self.parent_file = file;
+        return file;
+    }
+
+    fn sync(userdata: ?*anyopaque, file: std.Io.File) std.Io.File.SyncError!void {
+        const self = active.?;
+        const parent = if (self.parent_file) |opened| opened.handle == file.handle else false;
+        if (parent) {
+            const visible = catalog.exists(std.testing.io, self.controls) catch |err| {
+                std.debug.panic("preparation visibility probe: {s}", .{@errorName(err)});
+            };
+            if (visible and self.fail) {
+                self.reached = true;
+                return error.InputOutput;
+            }
+        }
+        try std.testing.io.vtable.fileSync(userdata, file);
+        if (parent) self.synced = true;
+    }
+
+    fn rename(
+        userdata: ?*anyopaque,
+        from: std.Io.Dir,
+        name: []const u8,
+        to: std.Io.Dir,
+        leaf: []const u8,
+    ) std.Io.Dir.RenameError!void {
+        const self = active.?;
+        try std.testing.io.vtable.dirRename(userdata, from, name, to, leaf);
+        if (std.mem.eql(u8, leaf, "registration.json")) {
+            self.published = true;
+            self.published_before_sync = !self.synced;
+        }
+    }
+};
+
+const PreparationSyncRoute = enum { prepare, target, locked };
+
+fn applyPreparationSyncRoute(
+    route: PreparationSyncRoute,
+    io: std.Io,
+    environment: *const std.process.Environ.Map,
+    options: host.Options,
+    associations: *const workspace.Associations,
+    controls: []const u8,
+) !void {
+    const allocator = std.testing.allocator;
+    switch (route) {
+        .prepare => {
+            var target = try prepareTarget(allocator, io, environment, options, true);
+            target.deinit();
+        },
+        .target => {
+            var target = try pendingTarget(
+                allocator,
+                io,
+                associations,
+                options.catalog_root,
+                controls,
+                true,
+            );
+            target.deinit();
+        },
+        .locked => {
+            var lock = try catalog.Lock.acquire(io, options.catalog_root);
+            defer lock.deinit();
+            var target = try pendingTargetLocked(
+                allocator,
+                io,
+                associations,
+                options.catalog_root,
+                controls,
+                &lock,
+            );
+            target.deinit();
+        },
+    }
+}
+
+fn testPreparationParentSyncRetry(route: PreparationSyncRoute) !void {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = try workspace.testPlainDirectory();
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const owned = arena.allocator();
+    const root = try tmp.dir.realPathFileAlloc(io, ".", owned);
+    const home = try std.fs.path.join(owned, &.{ root, "home" });
+    const parent = try std.fs.path.join(owned, &.{ home, "preparations" });
+    const controls = try controlsPath(owned, root, null, home);
+    const registration = try std.fs.path.join(owned, &.{ controls, "registration.json" });
+    const guard = try std.fs.path.join(owned, &.{ controls, "ledger-store.lock" });
+    var environment = std.process.Environ.Map.init(allocator);
+    defer environment.deinit();
+    var associations = try workspace.resolve(allocator, io, &environment, root);
+    defer associations.deinit();
+    const options: host.Options = .{ .catalog_root = home, .workspace = root };
+    var fault: PreparationParentSyncFault = .{ .parent = parent, .controls = controls };
+    PreparationParentSyncFault.active = &fault;
+    defer PreparationParentSyncFault.active = null;
+    var vtable = io.vtable.*;
+    vtable.dirOpenFile = PreparationParentSyncFault.open;
+    vtable.fileSync = PreparationParentSyncFault.sync;
+    vtable.dirRename = PreparationParentSyncFault.rename;
+    var injected = io;
+    injected.vtable = &vtable;
+    try std.testing.expectError(error.InputOutput, applyPreparationSyncRoute(
+        route,
+        injected,
+        &environment,
+        options,
+        &associations,
+        controls,
+    ));
+    try std.testing.expect(fault.reached);
+    try std.testing.expect(!fault.published);
+    try std.testing.expect(try catalog.exists(io, controls));
+    try std.testing.expect(!try catalog.exists(io, registration));
+    try std.testing.expect(!try catalog.exists(io, guard));
+    fault = .{ .parent = parent, .controls = controls, .fail = false };
+    try applyPreparationSyncRoute(route, injected, &environment, options, &associations, controls);
+    try std.testing.expect(fault.synced);
+    try std.testing.expect(fault.published);
+    try std.testing.expect(!fault.published_before_sync);
+    try std.testing.expect(try catalog.exists(io, registration));
+    var selected = try catalog.read(allocator, io, home);
+    defer selected.deinit();
+    try std.testing.expectEqual(@as(usize, 0), selected.value.stores.map.count());
+}
+
+test "pending registration retries preparations parent sync before publication across routes" {
+    for (std.enums.values(PreparationSyncRoute)) |route| try testPreparationParentSyncRetry(route);
 }

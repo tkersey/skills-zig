@@ -138,6 +138,30 @@ archive. Archive manifest validation covers the selected files and their require
 metadata. Sources and unrelated payload are never destinations. `--param NAME=VALUE`
 uses the existing definition parameter contract. At most 32 sources are admitted.
 
+Published archive generations have a manifest at
+`legacy-archive/<generation>/manifest.json`. A manifest directly at
+`legacy-archive/manifest.json` identifies an earlier, unsupported inventory layout
+and returns `UnsupportedLegacyArchiveLayout`. Its shared schema name does not
+prove compatibility. The archive and any neighboring generations remain intact;
+general historical import requires a verified adapter for that manifest shape.
+
+Exact restoration of an already bound, missing canonical slot has a separate
+proof available through
+`prepare --restore-bound-history --source-root ORIGINAL-TREE`. Every invocation
+requires an existing binding for a missing target slot; an empty unbound target
+returns `PreparationRequiresBoundHistory`. The candidate must contain a complete
+native history whose binding bytes equal the surviving target binding, whose event
+digest equals that binding's last revision, and whose required definition and
+revision archives pass native replay. This can use an explicitly selected retained
+tree even when its enclosing archive inventory is unsupported. Inspect preparation
+without `--apply`, then apply a `ready` exact candidate while retaining
+`--restore-bound-history` and satisfying the existing writer-coordination
+requirement. Missing candidate bindings, incomplete native metadata, mismatched
+history and symlinked payloads remain blockers. The original target binding must
+remain present and unchanged through publication. This recovers that selected
+native history without asserting general archive provenance or workspace-family
+migration completeness. Sources remain unchanged.
+
 `ledger maintain --store-root ROOT --store-id ID` inspects preparation work and a
 bounded top-level metadata view. It does not recover native transactions or prepare
 an owner. Both commands inspect by default; `--apply` selects authorized mutation.

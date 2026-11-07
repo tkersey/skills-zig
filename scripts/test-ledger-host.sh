@@ -254,11 +254,18 @@ context --catalog-root "$registration/seed" --initialize
 registered_id=$("$json" -r '.store_id' "$scratch/result.json")
 registered_root=$("$json" -r '.store_root' "$scratch/result.json")
 printf '%s\n' preserved >"$registered_root/.ledger/opaque"
+printf '%s\n' '{"kind":"one","value":1}' >"$scratch/event.json"
+"$binary" transact --definition "$definition" --store-root "$registered_root" --store-id "$registered_id" \
+  --operation append --param request=registration --input "event=$scratch/event.json" --format json >"$scratch/capture.json"
 "$json" -n --arg id "$registered_id" --arg root "$registered_root" \
   '{schema:"ledger-repository-registration/v1",store_id:$id,store_root:$root}' \
   >"$registration/repo/.git/ledger-store.json"
 cp "$registration/repo/.git/ledger-store.json" "$registration/registration.saved"
 snapshot "$registered_root" >"$scratch/before.snapshot"
+context --catalog-root "$registration/uncataloged" --workspace "$registration/repo" --read-only \
+  --definition "$definition" --owner-manifest "$manifest"
+assert_json '.cataloged == false and .owner_health.healthy and .storage_mutated == false'
+test ! -e "$registration/uncataloged"
 blocked UnregisteredContext context --catalog-root "$registration/home" --workspace "$registration/repo"
 blocked ExistingRegistrationRequiresImport context --catalog-root "$registration/home" --workspace "$registration/repo" --initialize
 test ! -e "$registration/home"
@@ -273,6 +280,40 @@ cmp "$scratch/before.snapshot" "$scratch/after.snapshot"
 cmp "$registration/registration.saved" "$registration/repo/.git/ledger-store.json"
 context --catalog-root "$registration/imported" --import-registration "$registration/registration.saved"
 test "$("$json" -r '.store_id' "$scratch/result.json")" = "$registered_id"
+snapshot "$registration/imported" >"$scratch/catalog-before.snapshot"
+context --catalog-root "$registration/imported" --workspace "$registration/repo" --read-only \
+  --definition "$definition" --owner-manifest "$manifest"
+assert_json '.cataloged == true and .owner_health.healthy and .storage_mutated == false'
+test "$("$json" -r '.store_id' "$scratch/result.json")" = "$registered_id"
+context --catalog-root "$registration/imported" --store-id "$registered_id" --read-only \
+  --definition "$definition" --owner-manifest "$manifest"
+assert_json '.cataloged == true and .owner_health.healthy and .storage_mutated == false'
+context --catalog-root "$registration/imported" --list-stores
+assert_json '.stores | length == 1'
+assert_json '.stores[0].aliases == [] and .pending == []'
+snapshot "$registration/imported" >"$scratch/catalog-after.snapshot"
+cmp "$scratch/catalog-before.snapshot" "$scratch/catalog-after.snapshot"
+snapshot "$registered_root" >"$scratch/after.snapshot"
+cmp "$scratch/before.snapshot" "$scratch/after.snapshot"
+for equivalent_root in "$registered_root/" "$registered_root//"; do
+  "$json" -n --arg id "$registered_id" --arg root "$equivalent_root" \
+    '{schema:"ledger-repository-registration/v1",store_id:$id,store_root:$root}' \
+    >"$registration/repo/.git/ledger-store.json"
+  context --catalog-root "$registration/equivalent" \
+    --import-registration "$registration/repo/.git/ledger-store.json"
+  assert_json '.cataloged == true'
+  snapshot "$registration/equivalent" >"$scratch/equivalent-before.snapshot"
+  context --catalog-root "$registration/equivalent" --workspace "$registration/repo" --read-only \
+    --definition "$definition" --owner-manifest "$manifest"
+  assert_json '.cataloged == true and .owner_health.healthy and .storage_mutated == false'
+  test "$("$json" -r '.store_root' "$scratch/result.json")" = "$equivalent_root"
+  context --catalog-root "$registration/equivalent" --store-id "$registered_id" --read-only \
+    --definition "$definition" --owner-manifest "$manifest"
+  assert_json '.cataloged == true and .owner_health.healthy and .storage_mutated == false'
+  snapshot "$registration/equivalent" >"$scratch/equivalent-after.snapshot"
+  cmp "$scratch/equivalent-before.snapshot" "$scratch/equivalent-after.snapshot"
+done
+cp "$registration/registration.saved" "$registration/repo/.git/ledger-store.json"
 cp -R "$registered_root" "$registration/copied-root"
 blocked StoreAlreadyCatalogedAtAnotherRoot context --catalog-root "$registration/home" \
   --register-root "$registration/copied-root" --store-id "$registered_id"
@@ -339,8 +380,11 @@ test -f "$owner/repo/.ledger/unrelated/sparse.bin"
 project --store-root "$owner_root" --store-id "$owner_id" >"$scratch/owner-projection.json"
 assert_json 'length == 2' "$scratch/owner-projection.json"
 snapshot "$owner" >"$scratch/before.snapshot"
+context --catalog-root "$owner/home" --workspace "$owner/prefix" \
+  --definition "$definition" --owner-manifest "$manifest" --read-only
+assert_json '.source_coverage == "not_checked" and .owner_health.healthy and .authority_granted == false'
 blocked PreparationRequiresQuiescence context --catalog-root "$owner/home" \
-  --workspace "$owner/prefix" --definition "$definition" --owner-manifest "$manifest" --read-only
+  --workspace "$owner/prefix" --definition "$definition" --owner-manifest "$manifest" --ensure-owner
 snapshot "$owner" >"$scratch/after.snapshot"
 cmp "$scratch/before.snapshot" "$scratch/after.snapshot"
 while IFS= read -r advisory; do
@@ -362,14 +406,30 @@ project --store-root "$owner_root" --store-id "$owner_id" >"$scratch/restored-pr
 cmp "$scratch/owner-projection.json" "$scratch/restored-projection.json"
 capture "$owner/prefix" owner-divergent 999
 snapshot "$owner_root" >"$scratch/before.snapshot"
-blocked OwnerPreparationRequired context --catalog-root "$owner/home" --workspace "$owner/prefix" \
+context --catalog-root "$owner/home" --workspace "$owner/prefix" \
   --definition "$definition" --owner-manifest "$manifest" --read-only
+assert_json '.source_coverage == "not_checked" and .owner_health.healthy and .storage_mutated == false'
 snapshot "$owner_root" >"$scratch/after.snapshot"
 cmp "$scratch/before.snapshot" "$scratch/after.snapshot"
 cp "$owner_root/.ledger/example/events.jsonl" "$scratch/retained-events.jsonl"
 blocked '' context --catalog-root "$owner/home" --workspace "$owner/prefix" --definition "$definition" \
   --owner-manifest "$manifest" --ensure-owner --confirm-no-legacy-writers
 cmp "$scratch/retained-events.jsonl" "$owner_root/.ledger/example/events.jsonl"
+
+mv "$owner/prefix" "$owner/prefix-unavailable"
+snapshot "$owner_root" >"$scratch/before.snapshot"
+context --catalog-root "$owner/home" --workspace "$owner/repo" \
+  --definition "$definition" --owner-manifest "$manifest" --read-only
+assert_json '.source_coverage == "not_checked" and .owner_health.healthy and .storage_mutated == false'
+workspace_revision=$("$json" -r '.owner_health.slots[0].revision' "$scratch/result.json")
+context --catalog-root "$owner/home" --store-id "$owner_id" \
+  --definition "$definition" --owner-manifest "$manifest" --read-only
+test "$("$json" -r '.owner_health.slots[0].revision' "$scratch/result.json")" = "$workspace_revision"
+blocked UnavailableWorktree context --catalog-root "$owner/home" --workspace "$owner/repo" \
+  --definition "$definition" --owner-manifest "$manifest" --ensure-owner --confirm-no-legacy-writers
+snapshot "$owner_root" >"$scratch/after.snapshot"
+cmp "$scratch/before.snapshot" "$scratch/after.snapshot"
+mv "$owner/prefix-unavailable" "$owner/prefix"
 
 printf '%s\n' 'host CLI: healthy segmented history and unsupported preparation'
 segmented="$scratch/segmented"
@@ -391,11 +451,12 @@ assert_json '.storage_mutated == true' "$scratch/capture.json"
 mkdir -p "$segmented_root/legacy-archive/broken"
 printf '%s\n' 'malformed archive must not be read' >"$segmented_root/legacy-archive/broken/manifest.json"
 snapshot "$segmented/home" >"$scratch/before.snapshot"
-for mode in --ensure-owner --read-only; do
-  blocked PreparationRequiresQuiescence context --catalog-root "$segmented/home" \
-    --workspace "$segmented/work" "$mode" --definition "$segmented/owner/definition.json" \
-    --owner-manifest "$segmented/owner/migration.json"
-done
+blocked PreparationRequiresQuiescence context --catalog-root "$segmented/home" \
+  --workspace "$segmented/work" --ensure-owner --definition "$segmented/owner/definition.json" \
+  --owner-manifest "$segmented/owner/migration.json"
+context --catalog-root "$segmented/home" --workspace "$segmented/work" --read-only \
+  --definition "$segmented/owner/definition.json" --owner-manifest "$segmented/owner/migration.json"
+assert_json '.source_coverage == "not_checked" and .owner_health.healthy and .storage_mutated == false'
 test ! -e "$segmented/work/.ledger"
 context --catalog-root "$segmented/home" --workspace "$segmented/work" --ensure-owner \
   --confirm-no-legacy-writers --definition "$segmented/owner/definition.json" \

@@ -496,6 +496,8 @@ fn currentContext(
         if (try host.catalog.exists(io, path)) {
             var registration = try host.readRegistration(allocator, io, path);
             defer registration.deinit();
+            var registered = try host.catalog.read(allocator, io, options.catalog_root);
+            defer registered.deinit();
             var old = try host.checkedRoot(
                 allocator,
                 io,
@@ -504,6 +506,12 @@ fn currentContext(
                 associations.workspace_root,
                 common,
                 false,
+                try registered.containsStoreRoot(
+                    allocator,
+                    io,
+                    registration.value.store_id,
+                    registration.value.store_root,
+                ),
             );
             if (selected) |current| {
                 defer old.deinit();
@@ -678,8 +686,7 @@ const Migration = struct {
             self.associations.git_common_dir,
             self.options.context.catalog_root,
         );
-        const controls_dir = try host.catalog.openDirectory(self.io, controls, true);
-        controls_dir.close(self.io);
+        try pending.reserveControls(self.io, self.options.context.catalog_root, controls);
         const guard_path = try std.fs.path.join(self.allocator, &.{
             self.associations.git_common_dir orelse controls, "ledger-store.lock",
         });
@@ -746,10 +753,13 @@ const Migration = struct {
             self.associations,
             self.options.context.catalog_root,
             selected,
+            self.result,
         );
-        const retired = try self.retireCopy(selected, guard);
         self.result.value = saved;
-        try self.result.put("context", selected);
+        var published = selected;
+        published.cataloged = true;
+        try self.result.put("context", published);
+        const retired = try self.retireCopy(selected, guard);
         try self.result.put("storage_mutated", changed or retired);
     }
 
@@ -951,7 +961,11 @@ const Migration = struct {
             self.associations,
             self.options.context.catalog_root,
             selected,
+            self.result,
         );
+        var published = selected;
+        published.cataloged = true;
+        try result.put("context", published);
     }
 };
 
@@ -1493,7 +1507,13 @@ fn publish(
     associations: *const host.workspace.Associations,
     home: []const u8,
     selected: host.ContextValue,
+    result: *Result,
 ) !bool {
+    var cataloged = selected.cataloged;
+    defer {
+        const retained_context = result.value.object.getPtr("context").?;
+        retained_context.object.getPtr("cataloged").?.* = .{ .bool = cataloged };
+    }
     const control = try host.catalog.checkedRoot(
         allocator,
         io,
@@ -1510,6 +1530,7 @@ fn publish(
         selected.store_root,
         selected.store_id,
         control,
+        &cataloged,
     );
 }
 
@@ -1627,6 +1648,39 @@ fn expectStatus(result: Result, expected: []const u8) !void {
     try std.testing.expectEqualStrings(expected, try string(result.value, "status"));
 }
 
+test "host migration capacity rejection preserves bounded inventory" {
+    const io = std.testing.io;
+    var fixture = try Fixture.init(true);
+    defer fixture.deinit();
+    const owned = fixture.arena.allocator();
+    const path = try std.fs.path.join(owned, &.{ fixture.home, "preparations" });
+    const controls = try host.catalog.openDirectory(io, path, true);
+    defer controls.close(io);
+    for (0..128) |index| {
+        const name = try std.fmt.allocPrint(owned, "{x:0>64}", .{index});
+        try controls.createDir(io, name, .fromMode(0o700));
+    }
+    var before = try host.list(std.testing.allocator, io, fixture.home);
+    defer before.deinit();
+    try std.testing.expectEqual(@as(usize, 0), before.value.pending.len);
+    var result = try execute(
+        std.testing.allocator,
+        io,
+        &fixture.environment,
+        fixture.options(true),
+    );
+    defer result.deinit();
+    try std.testing.expectEqualStrings(
+        "PendingCustodyDiscoveryBoundExceeded",
+        try string(result.value, "error_code"),
+    );
+    var after = try host.list(std.testing.allocator, io, fixture.home);
+    defer after.deinit();
+    try std.testing.expectEqual(@as(usize, 0), after.value.pending.len);
+    const rejected = try pending.controlsPath(owned, fixture.source, null, fixture.home);
+    try std.testing.expect(!try host.catalog.exists(io, rejected));
+}
+
 test "host migration retries interrupted copy in the same pending identity" {
     const copy = @import("host_migration_copy.zig");
     for ([_]bool{ false, true }) |registered| {
@@ -1705,6 +1759,76 @@ fn testHash(root: std.Io.Dir, path: []const u8) !legacy.Witness {
     return legacy.hashFile(std.testing.io, dir, std.fs.path.basename(path), 4096);
 }
 
+test "host migration publishes a saved receipt without retaining pending catalog state" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var fixture = try Fixture.init(false);
+    defer fixture.deinit();
+    var vtable = io.vtable.*;
+    vtable.dirRename = struct {
+        fn rename(
+            userdata: ?*anyopaque,
+            from: std.Io.Dir,
+            name: []const u8,
+            to: std.Io.Dir,
+            leaf: []const u8,
+        ) std.Io.Dir.RenameError!void {
+            if (std.mem.eql(u8, leaf, "catalog.json")) return error.HardwareFailure;
+            return std.testing.io.vtable.dirRename(userdata, from, name, to, leaf);
+        }
+    }.rename;
+    var injected = io;
+    injected.vtable = &vtable;
+    var failed = try execute(allocator, injected, &fixture.environment, fixture.options(true));
+    defer failed.deinit();
+    try expectStatus(failed, "blocked");
+    try std.testing.expectEqualStrings("HardwareFailure", try string(failed.value, "error_code"));
+    const selected = failed.value.object.get("context").?;
+    try std.testing.expect(!selected.object.get("cataloged").?.bool);
+    const root = try host.catalog.openDirectory(io, try string(selected, "store_root"), false);
+    defer root.close(io);
+    try std.testing.expect(try host.catalog.existsAt(io, root, "migration-receipt.json"));
+    var before = try host.list(allocator, io, fixture.home);
+    defer before.deinit();
+    try std.testing.expectEqual(@as(usize, 0), before.value.stores.len);
+    vtable = io.vtable.*;
+    vtable.dirDeleteDir = struct {
+        fn remove(
+            userdata: ?*anyopaque,
+            directory: std.Io.Dir,
+            name: []const u8,
+        ) std.Io.Dir.DeleteDirError!void {
+            if (std.mem.eql(u8, name, ".migration-copy")) return error.AccessDenied;
+            return std.testing.io.vtable.dirDeleteDir(userdata, directory, name);
+        }
+    }.remove;
+    var cleanup = try execute(allocator, injected, &fixture.environment, fixture.options(true));
+    defer cleanup.deinit();
+    try expectStatus(cleanup, "blocked");
+    try std.testing.expectEqualStrings("AccessDenied", try string(cleanup.value, "error_code"));
+    try std.testing.expect(cleanup.value.object.get("context").?.object.get("cataloged").?.bool);
+    var retry = try execute(allocator, io, &fixture.environment, fixture.options(true));
+    defer retry.deinit();
+    try expectStatus(retry, "verified");
+    const resumed = retry.value.object.get("context").?;
+    try std.testing.expect(resumed.object.get("cataloged").?.bool);
+    try std.testing.expectEqualStrings(
+        try string(selected, "store_id"),
+        try string(resumed, "store_id"),
+    );
+    try std.testing.expectEqualStrings(
+        try string(selected, "store_root"),
+        try string(resumed, "store_root"),
+    );
+    var after = try host.list(allocator, io, fixture.home);
+    defer after.deinit();
+    try std.testing.expectEqual(@as(usize, 1), after.value.stores.len);
+    try std.testing.expectEqualStrings(
+        try string(resumed, "store_id"),
+        after.value.stores[0].store_id,
+    );
+}
+
 test "host migration current history archives broad material repairs bindings and reuses receipt" {
     var fixture = try Fixture.init(false);
     defer fixture.deinit();
@@ -1726,6 +1850,7 @@ test "host migration current history archives broad material repairs bindings an
     defer applied.deinit();
     try expectStatus(applied, "verified");
     const selected = applied.value.object.get("context").?;
+    try std.testing.expect(selected.object.get("cataloged").?.bool);
     const custody = try string(selected, "store_root");
     const fingerprint_value = try string(applied.value, "fingerprint");
     const archive = try std.fmt.allocPrint(
@@ -1759,6 +1884,7 @@ test "host migration current history archives broad material repairs bindings an
     var repeated = try execute(allocator, io, &fixture.environment, fixture.options(true));
     defer repeated.deinit();
     try expectStatus(repeated, "verified");
+    try std.testing.expect(repeated.value.object.get("context").?.object.get("cataloged").?.bool);
     try std.testing.expect(!repeated.value.object.get("storage_mutated").?.bool);
     try std.testing.expectEqualStrings(
         fingerprint_value,
@@ -1770,6 +1896,42 @@ test "host migration current history archives broad material repairs bindings an
     );
 }
 
+test "host migration observes published pending membership before owner import completes" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var fixture = try Fixture.init(true);
+    defer fixture.deinit();
+    var staged = try execute(allocator, io, &fixture.environment, fixture.options(true));
+    defer staged.deinit();
+    try expectStatus(staged, "owner-import-required");
+    const selected = staged.value.object.get("context").?;
+    try std.testing.expect(!selected.object.get("cataloged").?.bool);
+    const id = try string(selected, "store_id");
+    const root = try string(selected, "store_root");
+    var published = try host.registerRoot(
+        allocator,
+        io,
+        &fixture.environment,
+        .{ .catalog_root = fixture.home, .store_id = id },
+        root,
+        id,
+    );
+    defer published.deinit();
+    var listed = try host.list(allocator, io, fixture.home);
+    defer listed.deinit();
+    try std.testing.expectEqual(@as(usize, 1), listed.value.stores.len);
+    try std.testing.expectEqual(@as(usize, 0), listed.value.stores[0].aliases.len);
+    try std.testing.expectEqual(@as(usize, 0), listed.value.pending.len);
+    var retry = try execute(allocator, io, &fixture.environment, fixture.options(true));
+    defer retry.deinit();
+    try expectStatus(retry, "owner-import-required");
+    const repeated = retry.value.object.get("context").?;
+    try std.testing.expectEqualStrings(id, try string(repeated, "store_id"));
+    try std.testing.expectEqualStrings(root, try string(repeated, "store_root"));
+    try std.testing.expect(repeated.object.get("cataloged").?.bool);
+    try std.testing.expect(!repeated.object.get("authority_granted").?.bool);
+}
+
 test "host migration retired conversion stages stable custody and rejects unscoped finalization" {
     var fixture = try Fixture.init(true);
     defer fixture.deinit();
@@ -1778,6 +1940,7 @@ test "host migration retired conversion stages stable custody and rejects unscop
     var staged = try execute(allocator, io, &fixture.environment, fixture.options(true));
     defer staged.deinit();
     try expectStatus(staged, "owner-import-required");
+    try std.testing.expect(!staged.value.object.get("context").?.object.get("cataloged").?.bool);
     const selected = staged.value.object.get("context").?;
     const home = try host.catalog.openDirectory(io, fixture.home, false);
     defer home.close(io);
@@ -2451,14 +2614,60 @@ test "host migration archives a legacy registered root without catalog or pendin
         4096,
     );
     try fixtureWrite(fixture.source, ".ledger/unselected/legacy", "legacy registered evidence");
+    var preview = try execute(allocator, io, &fixture.environment, fixture.options(false));
+    defer preview.deinit();
+    try expectStatus(preview, "planned");
+    try std.testing.expect(!preview.value.object.get("context").?.object.get("cataloged").?.bool);
+    try std.testing.expect(!preview.value.object.get("storage_mutated").?.bool);
+    try std.testing.expect(!try host.catalog.existsAt(io, home, host.catalog.filename));
     var retry = try execute(allocator, io, &fixture.environment, fixture.options(true));
     defer retry.deinit();
     try expectStatus(retry, "verified");
+    try std.testing.expect(retry.value.object.get("context").?.object.get("cataloged").?.bool);
     try std.testing.expectEqualStrings(
         id,
         try string(retry.value.object.get("context").?, "store_id"),
     );
     try std.testing.expect(!try host.catalog.existsAt(io, controls, "registration.json"));
+    try testLegacyMembership(&fixture, registration, common);
+}
+
+fn testLegacyMembership(
+    fixture: *Fixture,
+    registration: host.Registration,
+    common: std.Io.Dir,
+) !void {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    {
+        var lock = try host.catalog.Lock.acquire(io, fixture.home);
+        defer lock.deinit();
+        var registered = try lock.read(allocator);
+        defer registered.deinit();
+        registered.value.aliases.map.clearRetainingCapacity();
+        registered.value.workspace_identities.map.clearRetainingCapacity();
+        try lock.publish(allocator, registered.value);
+    }
+    var equivalent = registration;
+    equivalent.store_root = try std.fmt.allocPrint(allocator, "{s}/", .{registration.store_root});
+    defer allocator.free(equivalent.store_root);
+    try host.catalog.writeJson(
+        allocator,
+        io,
+        common,
+        host.catalog.registration_name,
+        equivalent,
+        4096,
+    );
+    var observed = try execute(allocator, io, &fixture.environment, fixture.options(false));
+    defer observed.deinit();
+    try std.testing.expectEqual(@as(u8, 0), observed.exit_code);
+    const observed_context = observed.value.object.get("context").?;
+    try std.testing.expect(observed_context.object.get("cataloged").?.bool);
+    try std.testing.expectEqualStrings(
+        equivalent.store_root,
+        try string(observed_context, "store_root"),
+    );
 }
 
 const ArchiveCleanupSync = struct {
@@ -2523,4 +2732,71 @@ test "archive cleanup retains its manifest until payload removal is durable" {
         try string(selected, "store_id"),
         try string(retry.value.object.get("context").?, "store_id"),
     );
+}
+
+test "host migration reports visible publication through fresh and receipt retry failures" {
+    const fault = host.catalog.TestPublicationFault;
+    for ([_]bool{ false, true }) |reuse| {
+        for (std.enums.values(fault.Kind)) |kind| {
+            const allocator = std.testing.allocator;
+            const io = std.testing.io;
+            var fixture = try Fixture.init(false);
+            defer fixture.deinit();
+            var vtable = io.vtable.*;
+            var injected = io;
+            injected.vtable = &vtable;
+            if (reuse) {
+                fault.install(&vtable, .before_rename);
+                var first = try execute(
+                    allocator,
+                    injected,
+                    &fixture.environment,
+                    fixture.options(true),
+                );
+                defer first.deinit();
+                try expectStatus(first, "blocked");
+                try std.testing.expect(fault.reached);
+                const root = try string(first.value.object.get("context").?, "store_root");
+                const receipt = try std.fs.path.join(
+                    allocator,
+                    &.{ root, "migration-receipt.json" },
+                );
+                defer allocator.free(receipt);
+                try std.testing.expect(try host.catalog.exists(io, receipt));
+            }
+            fault.install(&vtable, kind);
+            var failed = try execute(
+                allocator,
+                injected,
+                &fixture.environment,
+                fixture.options(true),
+            );
+            defer failed.deinit();
+            try expectStatus(failed, "blocked");
+            try std.testing.expect(fault.reached);
+            try std.testing.expectEqualStrings(
+                if (kind == .before_rename) "HardwareFailure" else "InputOutput",
+                try string(failed.value, "error_code"),
+            );
+            const selected = failed.value.object.get("context").?;
+            const id = try string(selected, "store_id");
+            const root = try string(selected, "store_root");
+            var actual = try host.catalog.read(allocator, io, fixture.home);
+            defer actual.deinit();
+            const visible = actual.value.stores.map.get(id) != null;
+            try std.testing.expectEqual(kind == .after_rename, visible);
+            try std.testing.expectEqual(visible, selected.object.get("cataloged").?.bool);
+            if (visible) try std.testing.expectEqualStrings(
+                root,
+                actual.value.stores.map.get(id).?,
+            );
+            var retry = try execute(allocator, io, &fixture.environment, fixture.options(true));
+            defer retry.deinit();
+            try expectStatus(retry, "verified");
+            const resumed = retry.value.object.get("context").?;
+            try std.testing.expect(resumed.object.get("cataloged").?.bool);
+            try std.testing.expectEqualStrings(id, try string(resumed, "store_id"));
+            try std.testing.expectEqualStrings(root, try string(resumed, "store_root"));
+        }
+    }
 }
