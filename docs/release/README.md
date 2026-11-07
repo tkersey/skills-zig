@@ -90,13 +90,34 @@ The initial Homebrew formula is a separate tap handoff after the first release.
 Homebrew formula updates are intentionally handled in a separate tap repository.
 This repo does not support installing its CLIs into user-global paths from source builds.
 Build artifacts are only allowed under repo-local `zig-out/bin`; shipped installs must flow through a tagged release plus the tap formula update.
-After a tagged release in this repo:
+Ledger's `Update Ledger tap` workflow runs after a successful `Release ledger`
+workflow. It reads the version from the successful run's commit, verifies that
+the release tag still resolves to that commit, downloads both published archives,
+and checks their SHA256 digests against GitHub's release metadata. It changes
+only the version and platform checksums in `Formula/ledger.rb`, then opens or
+updates a version-specific PR in `tkersey/homebrew-tap`. Older releases cannot
+downgrade the formula already on the tap's main branch. Tap PRs still require
+normal review and macOS/Linux CI before merge.
+
+One-time setup: add the Actions secret `HOMEBREW_TAP_TOKEN` to this repository.
+Use a fine-grained personal access token scoped only to
+`tkersey/homebrew-tap`, with **Contents: read and write** and
+**Pull requests: read and write**. The tap credential allows the resulting PR
+to trigger its normal CI. A missing credential fails the tap workflow without
+changing the already-published release.
+
+The workflow must be on this repository's default branch to receive release
+completion events. To retry a published release without rebuilding it, dispatch
+`Update Ledger tap` on `main` with `tag_name=ledger-v<VERSION>`. Manual retries
+also verify both published assets and refuse draft or prerelease releases.
+
+For other CLIs, or a manual fallback:
 
 1. Copy the release asset URL and SHA256 for the relevant CLI archive.
 2. Open the separate tap repo and update only that CLI formula.
 3. Ship the formula change from the tap repo as a separate PR/release step.
 
-This keeps binary publishing (this repo) decoupled from tap formula maintenance (tap repo).
+Binary publishing and tap PR maintenance remain separate workflows.
 
 ## Queue Triage (Tag Pushes)
 
