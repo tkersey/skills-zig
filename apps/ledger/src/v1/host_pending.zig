@@ -71,8 +71,8 @@ fn scanRetained(
             entry.name,
         ) orelse continue;
         if (selected_id) |id| if (!std.mem.eql(u8, id, value.store_id)) continue;
-        if (registered.value.stores.map.get(value.store_id)) |root| {
-            if (!std.mem.eql(u8, root, value.store_root))
+        if (registered.value.stores.map.contains(value.store_id)) {
+            if (!try registered.containsStoreRoot(allocator, io, value.store_id, value.store_root))
                 return error.PendingCustodyConflictsWithCatalog;
             continue;
         }
@@ -212,6 +212,167 @@ test "pending inventory rejects transplanted locators and conflicting root marke
     try std.testing.expectEqualStrings(id, verified.value.pending[0].registration.store_id);
     try std.testing.expect(!verified.value.storage_mutated);
     try testUnrelatedPendingRoot(&environment, tmp.dir, root, home, id);
+}
+
+test "pending inventory preserves absent and materialized roots across equivalent homes" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = try workspace.testPlainDirectory();
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const owned = arena.allocator();
+    const root = try tmp.dir.realPathFileAlloc(io, ".", owned);
+    const home = try std.fs.path.join(owned, &.{ root, "home" });
+    var environment = std.process.Environ.Map.init(allocator);
+    defer environment.deinit();
+    var target = try prepareTarget(
+        allocator,
+        io,
+        &environment,
+        .{ .catalog_root = home, .workspace = root },
+        true,
+    );
+    const id = try owned.dupe(u8, target.context.value.store_id);
+    const custody = try owned.dupe(u8, target.context.value.store_root);
+    target.deinit();
+    const controls_path = try controlsPath(owned, root, null, home);
+    const controls = try catalog.openDirectory(io, controls_path, false);
+    defer controls.close(io);
+    const original = try catalog.readBytes(owned, io, controls, "registration.json", 4096);
+    const homes = [_][]const u8{
+        home,
+        try std.fmt.allocPrint(owned, "{s}/", .{home}),
+        try std.fmt.allocPrint(owned, "{s}//home//", .{root}),
+    };
+    for ([_]@FieldType(Retained, "state"){ .materialized, .allocated }) |state| {
+        if (state == .allocated) try std.Io.Dir.cwd().deleteTree(io, custody);
+        for (homes) |selected_home| {
+            var listed = try host.list(allocator, io, selected_home);
+            defer listed.deinit();
+            try std.testing.expectEqual(@as(usize, 1), listed.value.pending.len);
+            const pending = listed.value.pending[0];
+            try std.testing.expectEqual(state, pending.state);
+            try std.testing.expectEqualStrings(id, pending.registration.store_id);
+            try std.testing.expectEqualStrings(custody, pending.registration.store_root);
+            try std.testing.expect(!listed.value.storage_mutated);
+            try std.testing.expectEqual(state == .materialized, try catalog.exists(io, custody));
+            const after = try catalog.readBytes(owned, io, controls, "registration.json", 4096);
+            try std.testing.expectEqualStrings(original, after);
+        }
+    }
+}
+
+test "pending inventory recognizes canonical publication without rewriting retained paths" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = try workspace.testPlainDirectory();
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const owned = arena.allocator();
+    const root = try tmp.dir.realPathFileAlloc(io, ".", owned);
+    const home = try std.fmt.allocPrint(owned, "{s}//home", .{root});
+    var environment = std.process.Environ.Map.init(allocator);
+    defer environment.deinit();
+    var target = try prepareTarget(
+        allocator,
+        io,
+        &environment,
+        .{ .catalog_root = home, .workspace = root },
+        true,
+    );
+    const id = try owned.dupe(u8, target.context.value.store_id);
+    const custody = try owned.dupe(u8, target.context.value.store_root);
+    target.deinit();
+    const controls_path = try controlsPath(owned, root, null, home);
+    const controls = try catalog.openDirectory(io, controls_path, false);
+    defer controls.close(io);
+    const original = try catalog.readBytes(owned, io, controls, "registration.json", 4096);
+    var published = try host.registerRoot(
+        allocator,
+        io,
+        &environment,
+        .{ .catalog_root = home, .store_id = id },
+        custody,
+        id,
+    );
+    defer published.deinit();
+    var listed = try host.list(allocator, io, home);
+    defer listed.deinit();
+    try std.testing.expectEqual(@as(usize, 0), listed.value.pending.len);
+    try std.testing.expectEqual(@as(usize, 1), listed.value.stores.len);
+    try std.testing.expectEqualStrings(id, listed.value.stores[0].store_id);
+    try std.testing.expect(!listed.value.storage_mutated);
+    const after = try catalog.readBytes(owned, io, controls, "registration.json", 4096);
+    try std.testing.expectEqualStrings(original, after);
+    try testRetainedDistinctRoot(owned, tmp.dir, root, home, id);
+}
+
+fn testRetainedDistinctRoot(
+    allocator: std.mem.Allocator,
+    directory: std.Io.Dir,
+    root: []const u8,
+    home: []const u8,
+    id: []const u8,
+) !void {
+    const io = std.testing.io;
+    try directory.createDir(io, "other", .default_dir);
+    const other = try directory.openDir(io, "other", .{});
+    defer other.close(io);
+    try other.createDir(io, ".ledger", .default_dir);
+    try catalog.writeJson(allocator, io, other, marker_name, Marker{
+        .schema = "ledger-storage-root/v1",
+        .store_id = id,
+    }, 4096);
+    var registered = try catalog.read(allocator, io, home);
+    defer registered.deinit();
+    const other_root = try std.fs.path.join(allocator, &.{ root, "other" });
+    registered.value.stores.map.getPtr(id).?.* = other_root;
+    try std.testing.expectError(
+        error.PendingCustodyConflictsWithCatalog,
+        retained(allocator, io, home, &registered),
+    );
+}
+
+test "pending registration placement rejects dot relative and relocated paths" {
+    const allocator = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const owned = arena.allocator();
+    const id = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    var value: Registration = .{
+        .schema = catalog.registration_schema,
+        .store_id = id,
+        .store_root = "/home/repos/" ++ id,
+        .workspace_root = "/workspace",
+        .git_common_dir = null,
+    };
+    const accepted = [_][]const u8{
+        "/home/repos/" ++ id,
+        "/home/repos/" ++ id ++ "/",
+        "//home//repos//" ++ id ++ "//",
+    };
+    for (accepted) |path| {
+        value.store_root = path;
+        try validRegistration(owned, value, "/home");
+        try validRegistration(owned, value, "//home//");
+    }
+    const rejected = [_][]const u8{
+        "home/repos/" ++ id,
+        "/home/./repos/" ++ id,
+        "/home/other/../repos/" ++ id,
+        "/home/repos/" ++ id ++ "/.",
+        "/other/repos/" ++ id,
+        "/home/repos/" ++ id ++ "/extra",
+    };
+    for (rejected) |path| {
+        value.store_root = path;
+        try std.testing.expectError(
+            error.InvalidPendingTarget,
+            validRegistration(owned, value, "/home"),
+        );
+    }
 }
 
 fn testUnrelatedPendingRoot(
@@ -691,7 +852,20 @@ fn validRegistration(allocator: std.mem.Allocator, value: Registration, home: []
     }
     const expected = try std.fs.path.join(allocator, &.{ home, "repos", value.store_id });
     defer allocator.free(expected);
-    if (!std.mem.eql(u8, value.store_root, expected)) return error.InvalidPendingTarget;
+    if (!sameAbsoluteComponents(value.store_root, expected)) return error.InvalidPendingTarget;
+}
+
+fn sameAbsoluteComponents(left: []const u8, right: []const u8) bool {
+    if (!std.fs.path.isAbsolute(left) or !std.fs.path.isAbsolute(right)) return false;
+    var left_parts = std.fs.path.componentIterator(left);
+    var right_parts = std.fs.path.componentIterator(right);
+    if (!std.mem.eql(u8, left_parts.root().?, right_parts.root().?)) return false;
+    while (left_parts.next()) |part| {
+        if (std.mem.eql(u8, part.name, ".") or std.mem.eql(u8, part.name, "..")) return false;
+        const other = right_parts.next() orelse return false;
+        if (!std.mem.eql(u8, part.name, other.name)) return false;
+    }
+    return right_parts.next() == null;
 }
 
 pub fn rejectUnregisteredCustody(

@@ -57,7 +57,9 @@ atomic `--restore-bound-history` guard.
 `pending` array for retained unpublished registrations. Each entry contains the
 original registration and its `allocated` or `materialized` state, after validating
 the locator placement, store identity and any materialized root marker. This
-inventory is read-only and does not assert owner health.
+inventory is read-only and does not assert owner health. Equivalent separator
+spellings preserve placement and published membership without rewriting the retained
+registration. An allocated identity remains discoverable before its root exists.
 
 A materialized pending history can be inspected with the original ID, even after
 the original checkout disappears:
