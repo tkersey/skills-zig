@@ -208,6 +208,7 @@ const tool_result_fields = [_]Field{
     .{ .name = "patch_changes_json", .kind = .json },
     .{ .name = "source_event_id", .kind = .string },
     .{ .name = "path", .kind = .string, .nullable = false },
+    .{ .name = "output_parts_json", .kind = .json },
 };
 
 const tool_lifecycle_fields = [_]Field{
@@ -231,6 +232,7 @@ const tool_lifecycle_fields = [_]Field{
     .{ .name = "declared_line", .kind = .integer },
     .{ .name = "finalized_line", .kind = .integer },
     .{ .name = "path", .kind = .string, .nullable = false },
+    .{ .name = "output_parts_json", .kind = .json },
 };
 
 const session_edge_fields = [_]Field{

@@ -782,7 +782,7 @@ fn toolResultValue(field: u16, values: ToolValues) !execution.Value {
     return switch (field) {
         0 => .{ .string = values.call_id },
         1 => .{ .string = values.session_id },
-        2, 4, 8...10 => .null,
+        2, 4, 8...10, 12 => .null,
         3 => try usizeInteger(values.record_index - 1),
         5 => optionalString(values.output),
         6 => optionalInteger(values.exit_code),
@@ -796,7 +796,7 @@ fn toolLifecycleValue(field: u16, values: ToolValues) !execution.Value {
     return switch (field) {
         0 => .{ .string = values.call_id },
         1 => .{ .string = values.session_id },
-        2, 4, 5, 13 => .null,
+        2, 4, 5, 13, 20 => .null,
         3 => try usizeInteger(values.record_index - 1),
         6 => .{ .string = "tool" },
         7 => optionalString(values.tool),

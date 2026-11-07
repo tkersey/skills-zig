@@ -10,6 +10,7 @@ ranked_facts=apps/seq/src/v1/fixtures/ranked-facts.json
 rollout=apps/seq/src/v1/fixtures/rollout.jsonl
 opencode_history=apps/seq/src/v1/fixtures/opencode/prompt-history.jsonl
 pi_session=apps/seq/src/v1/fixtures/pi/session.jsonl
+nested_outputs=libs/trace_core/testdata/nested_tool_outputs.jsonl
 temp_base=$(cd "${TMPDIR:-/tmp}" && pwd -P)
 cache_dir=$(mktemp -d "$temp_base/seq-v1-smoke.XXXXXX")
 trap 'test -n "${cache_dir:-}" && rm -rf -- "$cache_dir"' EXIT
@@ -265,6 +266,39 @@ grep -Fq '"final_answer":"Observed FAILURE evidence"' <<<"$detail_output"
 
 test "$("$binary" tool-lifecycle --path "$rollout" --format json)" = '[]'
 test "$("$binary" session-graph --path "$rollout" --format json)" = '[]'
+
+nested_results=$("$binary" query --path "$nested_outputs" \
+  --spec '{"dataset":"tool_results","where":[{"field":"call_id","op":"exact","value":"batch"}],"select":["call_id","exit_code","source_event_id","output_parts_json"],"limit":1,"format":"json"}')
+jq -e 'length == 1 and (.[0] | .source_event_id as $source |
+  .output_parts_json as $parts |
+  .exit_code == 0 and
+  ($source | startswith("sha256:")) and
+  ($parts | length) == 2 and
+  ($parts | all(.source_event_id == $source)) and
+  $parts[0].payload_pointer == "/output/0/text" and
+  $parts[0].process_results[0].exit_code == 3 and
+  $parts[0].process_results[0].process_status == "failed" and
+  $parts[1].process_results[0].exit_code == 0 and
+  $parts[1].process_results[0].process_status == "completed" and
+  $parts[1].process_results[1].exit_code == null and
+  $parts[1].process_results[1].process_status == "unknown")' \
+  <<<"$nested_results" >/dev/null
+
+nested_lifecycle=$("$binary" tool-lifecycle --path "$nested_outputs" --format json)
+jq -e 'length == 6 and
+  (map(select(.call_id == "progress"))[0] |
+    .exit_code == null and
+    (.output_parts_json | length) == 2 and
+    .output_parts_json[0].process_results[0].process_status == "running" and
+    .output_parts_json[1].process_results[0].exit_code == 7) and
+  (map(select(.call_id == "readback"))[0] |
+    (.output_parts_json[0].process_results | length) == 1 and
+    .output_parts_json[0].process_results[0].exit_code == 0)' \
+  <<<"$nested_lifecycle" >/dev/null
+
+nested_detail=$("$binary" session-detail --path "$nested_outputs" --format json)
+jq -e --argjson lifecycle "$nested_lifecycle" '.tools == $lifecycle' \
+  <<<"$nested_detail" >/dev/null
 
 tail_output=$("$binary" tail --path "$rollout" --once --format json)
 grep -Fq '"entry_type":"session_meta"' <<<"$tail_output"

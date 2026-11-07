@@ -679,7 +679,7 @@ fn runSessionDetail(
         dir,
         allocator,
         paths.items[0],
-        traceOptions(.turns),
+        .{},
     );
     defer trace.deinit(allocator);
     try trace_adapter.writeTraceDetailJson(writer, &trace);
