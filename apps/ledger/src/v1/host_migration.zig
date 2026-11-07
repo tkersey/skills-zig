@@ -686,8 +686,7 @@ const Migration = struct {
             self.associations.git_common_dir,
             self.options.context.catalog_root,
         );
-        const controls_dir = try host.catalog.openDirectory(self.io, controls, true);
-        controls_dir.close(self.io);
+        try pending.reserveControls(self.io, self.options.context.catalog_root, controls);
         const guard_path = try std.fs.path.join(self.allocator, &.{
             self.associations.git_common_dir orelse controls, "ledger-store.lock",
         });
@@ -1647,6 +1646,39 @@ fn expectStatus(result: Result, expected: []const u8) !void {
         std.debug.print("unexpected migration result: {s}\n", .{rendered});
     }
     try std.testing.expectEqualStrings(expected, try string(result.value, "status"));
+}
+
+test "host migration capacity rejection preserves bounded inventory" {
+    const io = std.testing.io;
+    var fixture = try Fixture.init(true);
+    defer fixture.deinit();
+    const owned = fixture.arena.allocator();
+    const path = try std.fs.path.join(owned, &.{ fixture.home, "preparations" });
+    const controls = try host.catalog.openDirectory(io, path, true);
+    defer controls.close(io);
+    for (0..128) |index| {
+        const name = try std.fmt.allocPrint(owned, "{x:0>64}", .{index});
+        try controls.createDir(io, name, .fromMode(0o700));
+    }
+    var before = try host.list(std.testing.allocator, io, fixture.home);
+    defer before.deinit();
+    try std.testing.expectEqual(@as(usize, 0), before.value.pending.len);
+    var result = try execute(
+        std.testing.allocator,
+        io,
+        &fixture.environment,
+        fixture.options(true),
+    );
+    defer result.deinit();
+    try std.testing.expectEqualStrings(
+        "PendingCustodyDiscoveryBoundExceeded",
+        try string(result.value, "error_code"),
+    );
+    var after = try host.list(std.testing.allocator, io, fixture.home);
+    defer after.deinit();
+    try std.testing.expectEqual(@as(usize, 0), after.value.pending.len);
+    const rejected = try pending.controlsPath(owned, fixture.source, null, fixture.home);
+    try std.testing.expect(!try host.catalog.exists(io, rejected));
 }
 
 test "host migration retries interrupted copy in the same pending identity" {

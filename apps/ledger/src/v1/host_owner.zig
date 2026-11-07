@@ -1418,9 +1418,69 @@ test "retained pending owner remains readable by identity after workspace remova
     try std.testing.expectEqual(@as(u8, 0), read.exit_code);
     try std.testing.expect(!read.value.object.get("cataloged").?.bool);
     try std.testing.expect(!read.value.object.get("storage_mutated").?.bool);
+    try testFailedPendingAllocation(owned, &environment, options, root, &read);
     options.ensure = true;
     try expectOwnerError(io, &environment, options, "SelectedStoreNotCataloged");
     try testRegisterPendingRead(&environment, options, selected.value, &read);
+}
+
+fn testFailedPendingAllocation(
+    allocator: std.mem.Allocator,
+    environment: *const std.process.Environ.Map,
+    options: Options,
+    root: []const u8,
+    original: *const Result,
+) !void {
+    const io = std.testing.io;
+    const path = try std.fs.path.join(allocator, &.{
+        options.context.catalog_root, "preparations",
+    });
+    const controls = try host.catalog.openDirectory(io, path, false);
+    defer controls.close(io);
+    for (0..127) |index| {
+        const name = try std.fmt.allocPrint(allocator, "{x:0>64}", .{index});
+        try controls.createDir(io, name, .fromMode(0o700));
+    }
+    var before = try host.list(std.testing.allocator, io, options.context.catalog_root);
+    defer before.deinit();
+    try std.testing.expectEqual(@as(usize, 1), before.value.pending.len);
+    var healthy = try execute(std.testing.allocator, io, environment, options);
+    defer healthy.deinit();
+    try std.testing.expectEqual(@as(u8, 0), healthy.exit_code);
+    const workspace = try std.fs.path.join(allocator, &.{ root, "another" });
+    const directory = try host.catalog.openDirectory(io, workspace, true);
+    defer directory.close(io);
+    try std.testing.expectError(error.PendingCustodyDiscoveryBoundExceeded, pending.prepareTarget(
+        std.testing.allocator,
+        io,
+        environment,
+        .{ .catalog_root = options.context.catalog_root, .workspace = workspace },
+        true,
+    ));
+    var retried = try execute(std.testing.allocator, io, environment, options);
+    defer retried.deinit();
+    try std.testing.expectEqual(@as(u8, 0), retried.exit_code);
+    const original_health = try std.json.Stringify.valueAlloc(
+        allocator,
+        original.value.object.get("owner_health").?,
+        .{},
+    );
+    const retried_health = try std.json.Stringify.valueAlloc(
+        allocator,
+        retried.value.object.get("owner_health").?,
+        .{},
+    );
+    try std.testing.expectEqualStrings(original_health, retried_health);
+    var after = try host.list(std.testing.allocator, io, options.context.catalog_root);
+    defer after.deinit();
+    try std.testing.expectEqual(@as(usize, 1), after.value.pending.len);
+    const rejected = try pending.controlsPath(
+        allocator,
+        workspace,
+        null,
+        options.context.catalog_root,
+    );
+    try std.testing.expect(!try host.catalog.exists(io, rejected));
 }
 
 fn testOwnerOptions(allocator: std.mem.Allocator, root: []const u8) !Options {

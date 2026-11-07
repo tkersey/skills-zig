@@ -58,8 +58,16 @@ atomic `--restore-bound-history` guard.
 original registration and its `allocated` or `materialized` state, after validating
 the locator placement, store identity and any materialized root marker. This
 inventory is read-only and does not assert owner health. Equivalent separator
-spellings preserve placement and published membership without rewriting the retained
-registration. An allocated identity remains discoverable before its root exists.
+spellings and verified aliases of the same catalog home preserve retained placement
+without rewriting the registration. An allocated identity remains discoverable
+before its root exists. Cataloged IDs are omitted from `pending`; published
+inventory remains available when custody is missing. This filtering does not
+certify agreement between catalog and retained roots or relax preparation checks.
+
+Preparation admits new control directories under the catalog lock before creating
+them. At the discovery limit, a rejected allocation leaves existing retained IDs
+readable. Retries reuse an existing directory, including an empty reservation left
+by an interrupted attempt.
 
 A materialized pending history can be inspected with the original ID, even after
 the original checkout disappears:
