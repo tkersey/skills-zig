@@ -40,7 +40,6 @@ pub const ToolLifecycleStatus = enum {
 
 pub const TraceParseOptions = struct {
     ongoing_threshold_secs: i64 = 60,
-    /// Freeze all freshness decisions in an observation to the same instant.
     as_of_ns: ?i128 = null,
     include_raw: bool = false,
     include_occurrences: bool = true,

@@ -336,8 +336,6 @@ const GraphExecution = struct {
                 return error.ObservationExternalGraphInputUnsupported;
             const input = self.tables[first_index] orelse return error.ObservationInputNotExecuted;
             const exclusive = self.owned[first_index] and self.consumers[first_index] == 1;
-            // Filters and folds compact their first input. A sibling consumer or
-            // caller-owned scan must retain its original values and lifetime.
             const copy_input = !exclusive and switch (stage.operation) {
                 .filter => true,
                 .generic => |generic| generic.operator == .ordered_fold,
@@ -381,7 +379,6 @@ const GraphExecution = struct {
             const input = self.native_plan.findStage(name) orelse continue;
             const prior = self.tables[input] orelse continue;
             if (table.values.ptr != prior.values.ptr) continue;
-            // Empty independent allocations may use the same sentinel pointer.
             const allocation = self.allocations[input] orelse continue;
             if (allocation.len == 0) continue;
             std.debug.assert(self.owned[input] and self.consumers[input] == 1);

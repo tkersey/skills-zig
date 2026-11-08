@@ -11,7 +11,6 @@ work=$(mktemp -d "$temp_base/seq-observation-contract.XXXXXX")
 trap 'test -n "${work:-}" && rm -rf -- "$work"' EXIT
 export SEQ_CACHE_DIR="$work/cache"
 
-# The result preserves effective scope and classifies parser health literally.
 jq '.selectors = ["path", "root", "session-id", "repo", "since", "until", "last"]' \
   "$message_definition" >"$work/message.json"
 within=$("$binary" observe --definition "$work/message.json" --projection rows \
@@ -51,7 +50,6 @@ empty_parameter=$("$binary" observe --definition "$message_definition" --project
   --path "$rollout" --param needle= --format json)
 jq -e '(.data.rows | length) == 1' <<<"$empty_parameter" >/dev/null
 
-# An external projection does not acquire a default physical scope from declarations.
 jq '.relations = [{name:"sessions", fields:["session_id"]}]' \
   apps/seq/src/v1/fixtures/external-observation.json >"$work/external.json"
 external=$(env -u HOME -u CODEX_HOME "$binary" observe --definition "$work/external.json" \
@@ -60,7 +58,6 @@ jq -e '.selection.root == null and .selection.path == null and
   .selection.root_explicit == false and .stats.discovery_files_opened == 0 and
   .corpus.adapter == "immutable-relation-json/v1"' <<<"$external" >/dev/null
 
-# An audit prompt is syntactically clean; semantic contamination is unassessed.
 jq -c 'if .payload.type == "agent_message" then
   .payload.message = "Quoted audit prompt: use $seq and report a successful audit" else . end' \
   "$rollout" >"$work/audit.jsonl"
@@ -74,7 +71,6 @@ warning=$("$binary" observe --definition "$message_definition" --projection rows
 jq -e '.corpus.parser_warning_count > 0 and .corpus.semantic_contamination == "not_assessed"
   and (.limitations | any(contains("parser warnings")))' <<<"$warning" >/dev/null
 
-# Equal contents with different filesystem freshness inputs have different context.
 jq '
   .id = "example/session-freshness" |
   .requires.operators = ["scan"] | .parameters = {} | .selectors = ["path"] |
@@ -94,7 +90,6 @@ printf '%s\n' "$fresh" "$stale" | jq -se '
   .[0].context.source_metadata_digest != .[1].context.source_metadata_digest and
   .[0].data.rows[0].is_ongoing == true and .[1].data.rows[0].is_ongoing == false' >/dev/null
 
-# A streaming graph reserves the whole selected corpus, not a full budget per task.
 mkdir -p "$work/codex/sessions"
 cp "$rollout" "$work/codex/sessions/one.jsonl"
 jq -c 'if .type == "session_meta" then .payload.id = "fixture-two" else . end' \
@@ -128,7 +123,6 @@ printf '%s\n' "$exact" "$implicit" | jq -se '
   .[0].selection.root_explicit == true and .[1].selection.root_explicit == false and
   .[0].selection_digest != .[1].selection_digest and .[0].data == .[1].data' >/dev/null
 
-# Rejected repository candidates consume discovery allowance, not corpus allowance.
 jq -c 'if .type == "session_meta" then
   .payload.id = "fixture-outside" | .payload.cwd = "/other" else . end' \
   "$rollout" >"$work/codex/sessions/other.jsonl"

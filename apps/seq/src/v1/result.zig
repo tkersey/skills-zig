@@ -14,7 +14,6 @@ pub const Selection = struct {
     since_ms: ?i64 = null,
     until_ms: ?i64 = null,
 
-    /// Hash resolved values, not flag spellings or environment-variable names.
     pub fn digest(self: Selection) [71]u8 {
         var hasher = std.crypto.hash.sha2.Sha256.init(.{});
         hasher.update("seq-observation-selection/v1\x00");
