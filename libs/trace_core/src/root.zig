@@ -2588,9 +2588,7 @@ fn sessionSummaryLineCouldMatter(line: []const u8, pending_spawns: bool) bool {
             std.mem.containsAtLeast(u8, line, 1, "sub_agent_activity") or
             std.mem.containsAtLeast(u8, line, 1, "\"error\"");
     }
-    return pending_spawns or std.mem.containsAtLeast(u8, line, 1, "spawn_agent") or
-        std.mem.containsAtLeast(u8, line, 1, "\"id\"") and
-            std.mem.containsAtLeast(u8, line, 1, "\"timestamp\"");
+    return true;
 }
 
 fn fastTimestampSlice(line: []const u8) ?[]const u8 {
@@ -4529,12 +4527,13 @@ fn workerRecordUnlocated(
     trace: *CanonicalSessionTrace,
     record: ParsedRecord,
 ) !bool {
-    if (trace.session.subagent_history_start_ordinal == null or record.ordinal() != null) {
-        return false;
-    }
+    const boundary_missing = trace.session.subagent_history_start_ordinal == null;
+    if (boundary_missing and trace.session.forked_from_session_id == null) return false;
+    if (!boundary_missing and record.ordinal() != null) return false;
+    const missing = if (boundary_missing) "inherited-history boundary" else "rollout ordinal";
     const warning = try allocator.print(
-        "{s}:{d}: missing or invalid rollout ordinal; worker ownership is unresolved",
-        .{ trace.session.path, record.line_number },
+        "{s}:{d}: missing or invalid {s}; worker ownership is unresolved",
+        .{ trace.session.path, record.line_number, missing },
     );
     errdefer allocator.free(warning);
     try trace.warnings.append(allocator, warning);
@@ -6144,4 +6143,159 @@ test "token assertion count includes zero and incomplete tuples but excludes neu
     try std.testing.expectEqual(@as(i64, 3), assertions);
     try std.testing.expectEqual(assertions, full.session.token_usage_observation_count);
     try std.testing.expectEqual(assertions, summary.session.token_usage_observation_count);
+}
+
+fn workerGraphTestTraces(source: []const u8, spaced: bool) ![2]CanonicalSessionTrace {
+    const allocator = std.testing.allocator;
+    const formatted = try std.mem.replaceOwned(
+        u8,
+        allocator,
+        source,
+        "\":",
+        if (spaced) "\" : " else "\":",
+    );
+    defer allocator.free(formatted);
+    var full = try parseSessionTraceBytes(
+        std.testing.io,
+        allocator,
+        "worker.jsonl",
+        formatted,
+        0,
+        .{},
+    );
+    errdefer full.deinit(allocator);
+    var reader = std.Io.Reader.fixed(formatted);
+    const summary = try parseSessionSummaryTraceReader(
+        std.testing.io,
+        allocator,
+        "worker.jsonl",
+        &reader,
+        0,
+        .{},
+    );
+    return .{ full, summary };
+}
+
+test "fork worker attribution requires a history boundary even with record ordinals" {
+    const allocator = std.testing.allocator;
+    for ([_]bool{ false, true }) |with_ordinals| {
+        const source = try allocator.print(
+            "{{\"type\":\"session_meta\",\"payload\":{{\"id\":\"child\"," ++
+                "\"forked_from_id\":\"history\",\"parent_thread_id\":\"controller\"}}}}\n" ++
+                "{{\"type\":\"session_meta\",\"payload\":{{\"id\":\"history\"}}}}\n" ++
+                "{{{s}\"type\":\"response_item\",\"payload\":{{\"type\":\"function_call\"," ++
+                "\"name\":\"functions.spawn_agent\",\"call_id\":\"old\"," ++
+                "\"arguments\":\"{{}}\"}}}}\n" ++
+                "{{{s}\"type\":\"response_item\",\"payload\":{{" ++
+                "\"type\":\"function_call_output\",\"call_id\":\"old\"," ++
+                "\"output\":\"{{\\\"agent_id\\\":\\\"old-worker\\\"}}\"}}}}\n" ++
+                "{{{s}\"type\":\"event_msg\",\"payload\":{{\"type\":\"collab_agent_spawn_end\"," ++
+                "\"sender_thread_id\":\"child\",\"new_thread_id\":\"event-worker\"}}}}\n" ++
+                "{{{s}\"type\":\"event_msg\",\"payload\":{{\"type\":\"sub_agent_activity\"," ++
+                "\"agent_thread_id\":\"activity-worker\",\"kind\":\"started\"}}}}\n",
+            .{
+                if (with_ordinals) "\"ordinal\":1," else "",
+                if (with_ordinals) "\"ordinal\":2," else "",
+                if (with_ordinals) "\"ordinal\":3," else "",
+                if (with_ordinals) "\"ordinal\":4," else "",
+            },
+        );
+        defer allocator.free(source);
+        for ([_]bool{ false, true }) |spaced| {
+            var traces = try workerGraphTestTraces(source, spaced);
+            defer for (&traces) |*trace| trace.deinit(allocator);
+            for (&traces) |*trace| {
+                try std.testing.expectEqual(@as(i64, 0), trace.session.spawned_worker_count);
+                try std.testing.expectEqual(@as(usize, 1), trace.graph_edges.items.len);
+                try std.testing.expectEqualStrings(
+                    "controller",
+                    trace.graph_edges.items[0].parent_session_id.?,
+                );
+                try std.testing.expectEqualStrings(
+                    "child",
+                    trace.graph_edges.items[0].worker_session_id.?,
+                );
+                try std.testing.expectEqual(@as(usize, 3), trace.warnings.items.len);
+                for (trace.warnings.items) |warning| {
+                    try std.testing.expect(std.mem.containsAtLeast(
+                        u8,
+                        warning,
+                        1,
+                        "missing or invalid inherited-history boundary",
+                    ));
+                }
+            }
+            try std.testing.expectEqual(@as(usize, 6), traces[0].occurrences.items.len);
+            try std.testing.expectEqual(@as(usize, 2), traces[0].tools.items.len);
+            try std.testing.expectEqual(@as(i64, 0), traces[0].turns.items[0].spawned_worker_count);
+        }
+    }
+}
+
+test "root and control-only spawns and ordinal-proven fork spawns remain attributable" {
+    const cases = [_]struct { meta: []const u8, with_boundary: bool, incoming_edges: usize }{
+        .{ .meta = "\"id\":\"parent\"", .with_boundary = false, .incoming_edges = 0 },
+        .{
+            .meta = "\"id\":\"parent\",\"parent_thread_id\":\"controller\"",
+            .with_boundary = false,
+            .incoming_edges = 1,
+        },
+        .{ .meta = "\"id\":\"parent\",\"forked_from_id\":\"history\"," ++
+            "\"subagent_history_start_ordinal\":10", .with_boundary = true, .incoming_edges = 0 },
+    };
+    for (cases) |case| {
+        const allocator = std.testing.allocator;
+        const source = try allocator.print(
+            "{{\"type\":\"session_meta\",\"payload\":{{{s}}}}}\n" ++
+                "{{{s}\"type\":\"response_item\",\"payload\":{{\"type\":\"function_call\"," ++
+                "\"name\":\"spawn_agent\",\"call_id\":\"own\",\"arguments\":\"{{}}\"}}}}\n" ++
+                "{{{s}\"type\":\"response_item\",\"payload\":{{" ++
+                "\"type\":\"function_call_output\"," ++
+                "\"call_id\":\"own\"," ++
+                "\"output\":\"{{\\\"agent_id\\\":\\\"own-worker\\\"}}\"}}}}\n" ++
+                "{{{s}\"type\":\"event_msg\",\"payload\":{{\"type\":\"sub_agent_activity\"," ++
+                "\"agent_thread_id\":\"activity-worker\",\"kind\":\"started\"}}}}\n",
+            .{
+                case.meta,
+                if (case.with_boundary) "\"ordinal\":10," else "",
+                if (case.with_boundary) "\"ordinal\":11," else "",
+                if (case.with_boundary) "\"ordinal\":12," else "",
+            },
+        );
+        defer allocator.free(source);
+        for ([_]bool{ false, true }) |spaced| {
+            var traces = try workerGraphTestTraces(source, spaced);
+            defer for (&traces) |*trace| trace.deinit(allocator);
+            for (&traces) |*trace| {
+                try std.testing.expectEqual(@as(i64, 2), trace.session.spawned_worker_count);
+                try std.testing.expectEqual(case.incoming_edges + 2, trace.graph_edges.items.len);
+                const outgoing = trace.graph_edges.items[case.incoming_edges];
+                try std.testing.expectEqualStrings("parent", outgoing.parent_session_id.?);
+                try std.testing.expectEqualStrings("own-worker", outgoing.worker_session_id.?);
+                try std.testing.expectEqual(@as(usize, 0), trace.warnings.items.len);
+            }
+            try std.testing.expectEqual(@as(i64, 2), traces[0].turns.items[0].spawned_worker_count);
+        }
+    }
+}
+
+test "summary retains later noncompact metadata without timestamps" {
+    const source =
+        \\{"type":"session_meta","payload":{"id":"owner"}}
+        \\{"type":"session_meta","payload":{"id":"unrelated"}}
+    ;
+    for ([_]bool{ false, true }) |spaced| {
+        var traces = try workerGraphTestTraces(source, spaced);
+        defer for (&traces) |*trace| trace.deinit(std.testing.allocator);
+        for (&traces) |*trace| {
+            try std.testing.expectEqualStrings("owner", trace.session.session_id.?);
+            try std.testing.expectEqual(@as(usize, 1), trace.warnings.items.len);
+            try std.testing.expect(std.mem.containsAtLeast(
+                u8,
+                trace.warnings.items[0],
+                1,
+                "conflicting later session_meta unrelated",
+            ));
+        }
+    }
 }

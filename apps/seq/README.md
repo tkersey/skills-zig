@@ -167,6 +167,9 @@ Copied prefix events do not spawn new children. When a result provides only a
 task path, `agent_path` is present and `worker_session_id` remains null; no UUID
 is invented. `spawned_worker_count` counts distinct observed successful links,
 not attempted calls or a claim that every worker's transcript was available.
+On a declared fork, worker-creation records without a usable replay boundary or
+record ordinal remain unattributed and emit a warning. Primary metadata control
+links remain available independently of those creation records.
 
 Strict native row commands stage their bounded output before writing it.
 Parser warnings remain failures, with source path, count, and a representative
