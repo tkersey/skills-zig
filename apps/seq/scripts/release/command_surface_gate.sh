@@ -59,7 +59,7 @@ jq -e --arg version "$version" \
       "seq-definition-description/v1",
       "seq-index-result/v1",
       "seq-observation-plan/v1",
-      "seq-observation-result/v1"
+      "seq-observation-result/v2"
     ] | sort)
   ' \
   <<<"$capabilities" >/dev/null

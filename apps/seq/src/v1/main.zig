@@ -8,6 +8,7 @@ const Version = std.mem.trim(u8, app_meta.version, " \t\r\n");
 const source_adapter_version = "seq-source-adapter-set/v2";
 const max_output_cells: usize = 4_000_000;
 const max_discovery_bytes: usize = 256 * 1024 * 1024;
+const ongoing_threshold_secs: i64 = 60;
 
 const Help =
     \\seq
@@ -74,7 +75,28 @@ const ObserveArgs = struct {
     input_specs: []const []const u8,
     parameter_specs: []const []const u8,
     format: Format,
+    resolved_root: ?[]const u8 = null,
+    as_of_ms: i64 = 0,
 
+    fn selection(self: *const ObserveArgs) seq.result.Selection {
+        return .{
+            .path = self.selectors.path,
+            .root = self.resolved_root orelse self.selectors.root,
+            .root_explicit = self.selectors.root != null,
+            .session_id = self.selectors.session_id,
+            .repo = self.selectors.repo,
+            .since_ms = self.selectors.since_ms,
+            .until_ms = self.selectors.until_ms,
+        };
+    }
+
+    fn traceOptions(self: *const ObserveArgs, max_input_bytes: usize) seq.trace_adapter.Options {
+        return .{
+            .max_input_bytes = max_input_bytes,
+            .ongoing_threshold_secs = ongoing_threshold_secs,
+            .as_of_ns = @as(i128, self.as_of_ms) * std.time.ns_per_ms,
+        };
+    }
     fn deinit(self: *ObserveArgs, allocator: std.mem.Allocator) void {
         allocator.free(self.input_specs);
         allocator.free(self.parameter_specs);
@@ -394,44 +416,16 @@ fn emitGraphObservation(
         bindings,
     );
     defer graph.deinit(allocator);
-    const execution_ns = elapsedNanoseconds(io, execution_start);
-    var execution_stats = definition_core.result.ExecutionStats{
-        .execution_ns = execution_ns,
-        .physical_passes = 1,
-        .files_opened = graph.files_opened,
-        .bytes_read = graph.bytes_read,
-        .rows_scanned = graph.result.source_row_count,
-        .rows_materialized = graph.result.materialized_row_count,
-        .output_rows = graph.result.row_count,
-    };
-    const rendered = try renderObservationAlloc(
+    return emitObservationResult(
+        io,
         allocator,
-        .{
-            .definition_plan = &context.definition_plan,
-            .projection_name = args.projection,
-            .parameters_digest = &bindings.values_digest,
-            .corpus = .{
-                .adapter = graph.corpus_adapter,
-                .digest = &graph.corpus_digest,
-                .files = graph.corpus_files,
-                .sessions = graph.corpus_sessions,
-                .contaminated = graph.warning_count != 0,
-            },
-            .rows = graph.result.rows(),
-            .compile_stats = context.stats,
-            .execution_stats = execution_stats,
-            .limitations = observationLimitations(
-                graph.warning_count,
-                false,
-            ),
-        },
-        &execution_stats,
+        args,
+        context,
+        bindings,
+        &graph,
+        elapsedNanoseconds(io, execution_start),
+        false,
     );
-    defer allocator.free(rendered);
-    var stdout_writer = std.Io.File.stdout().writer(io, &.{});
-    try stdout_writer.interface.writeAll(rendered);
-    try stdout_writer.interface.writeByte('\n');
-    return 0;
 }
 
 fn writeExplanationText(
@@ -726,6 +720,7 @@ fn runObserve(
         context.definition_plan.projections,
         args.projection,
     ) orelse return error.UnknownObservationProjection;
+    args.as_of_ms = @intCast(@divTrunc(std.Io.Clock.real.now(io).nanoseconds, std.time.ns_per_ms));
     const json_renderer_bit = @as(u8, 1) <<
         @intCast(@backingInt(seq.definition.Renderer.json));
     if ((projection.renderer_mask & json_renderer_bit) == 0) {
@@ -738,6 +733,15 @@ fn runObserve(
     );
     defer bindings.deinit(allocator);
     if (usesRelationGraph(&context.definition_plan)) {
+        const resolved_root = try seq.native.resolveRootAlloc(
+            allocator,
+            environment,
+            args.selectors.root,
+            io,
+            dir,
+        );
+        defer allocator.free(resolved_root);
+        args.resolved_root = resolved_root;
         return emitGraphObservation(
             io,
             dir,
@@ -747,21 +751,39 @@ fn runObserve(
             &bindings,
         );
     }
+    return emitLinearObservation(io, dir, allocator, environment, &args, &context, &bindings);
+}
+
+fn emitLinearObservation(
+    io: std.Io,
+    dir: std.Io.Dir,
+    allocator: std.mem.Allocator,
+    environment: *const std.process.Environ.Map,
+    args: *ObserveArgs,
+    context: *const seq.compiled_plan.PlanSet,
+    bindings: *const definition_core.parameters.Bindings,
+) !u8 {
     var program = try seq.execution.compile(
         allocator,
         &context.definition_plan,
         &context.native_plan,
-        &bindings,
+        bindings,
         args.projection,
     );
     defer program.deinit(allocator);
+    const resolved_root = if (program.source == .physical and args.selectors.path == null)
+        try seq.native.resolveRootAlloc(allocator, environment, args.selectors.root, io, dir)
+    else
+        null;
+    defer if (resolved_root) |root| allocator.free(root);
+    args.resolved_root = resolved_root;
     return emitObservation(
         io,
         dir,
         allocator,
-        &args,
-        &context,
-        &bindings,
+        args,
+        context,
+        bindings,
         &program,
     );
 }
@@ -832,7 +854,28 @@ fn emitObservation(
         output,
     );
     defer execution.deinit(allocator);
-    const execution_ns = elapsedNanoseconds(io, execution_start);
+    return emitObservationResult(
+        io,
+        allocator,
+        args,
+        context,
+        bindings,
+        &execution,
+        elapsedNanoseconds(io, execution_start),
+        programMayTruncate(program),
+    );
+}
+
+fn emitObservationResult(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    args: *const ObserveArgs,
+    context: *const seq.compiled_plan.PlanSet,
+    bindings: *const definition_core.parameters.Bindings,
+    execution: *const ObservationExecution,
+    execution_ns: u64,
+    projection_bounded: bool,
+) !u8 {
     var execution_stats = definition_core.result.ExecutionStats{
         .execution_ns = execution_ns,
         .physical_passes = 1,
@@ -848,19 +891,28 @@ fn emitObservation(
             .definition_plan = &context.definition_plan,
             .projection_name = args.projection,
             .parameters_digest = &bindings.values_digest,
+            .seq_version = Version,
+            .selection = args.selection(),
+            .context = .{
+                .as_of_ms = args.as_of_ms,
+                .ongoing_threshold_secs = ongoing_threshold_secs,
+                .source_metadata_digest = &execution.source_metadata_digest,
+            },
             .corpus = .{
                 .adapter = execution.corpus_adapter,
                 .digest = &execution.corpus_digest,
                 .files = execution.corpus_files,
                 .sessions = execution.corpus_sessions,
-                .contaminated = execution.warning_count != 0,
+                .parser_warning_count = execution.warning_count,
             },
             .rows = execution.result.rows(),
             .compile_stats = context.stats,
             .execution_stats = execution_stats,
+            .discovery_files_opened = execution.discovery_files_opened,
+            .discovery_bytes_read = execution.discovery_bytes_read,
             .limitations = observationLimitations(
                 execution.warning_count,
-                programMayTruncate(program),
+                projection_bounded,
             ),
         },
         &execution_stats,
@@ -882,6 +934,9 @@ const ObservationExecution = struct {
     corpus_sessions: usize,
     files_opened: usize,
     bytes_read: usize,
+    discovery_files_opened: usize = 0,
+    discovery_bytes_read: usize = 0,
+    source_metadata_digest: [71]u8,
     warning_count: usize = 0,
     graph_arena: ?*std.heap.ArenaAllocator = null,
     graph_result_owned: bool = false,
@@ -972,6 +1027,9 @@ const GraphObservationContext = struct {
             .corpus_sessions = metrics.sessions,
             .files_opened = metrics.opened,
             .bytes_read = metrics.bytes_read,
+            .discovery_files_opened = metrics.discovery_opened,
+            .discovery_bytes_read = metrics.discovery_bytes,
+            .source_metadata_digest = metrics.source_metadata.digest(),
             .warning_count = metrics.warnings,
             .graph_arena = self.arena,
         };
@@ -1136,15 +1194,14 @@ fn readMaterializedGraphPaths(
             graph.allocator,
             rows.relations.items,
             path,
-            .{ .max_input_bytes = input_bound -| metrics.corpus_bytes },
+            graph.args.traceOptions(input_bound -| metrics.corpus_bytes),
             .{ .repo = graph.args.selectors.repo },
         );
         defer if (selected.parsed) |*parsed| parsed.deinit(graph.allocator);
-        if (selected.file_opened) metrics.opened += 1;
-        try recordDiscoveryBytes(metrics, selected.discovery_bytes_read);
+        try recordTraceRead(metrics, selected);
         const parsed = if (selected.parsed) |*value| value else continue;
         try metrics.admitAdapter(seq.trace_adapter.adapterId(&parsed.trace));
-        try recordCorpusBytes(metrics, parsed.metrics.bytes_read);
+        try recordCorpusBytes(metrics, parsed.metrics.bytes_read, input_bound);
         try admitTraceSession(metrics, parsed);
         digest_set.add(path, &parsed.corpus_digest);
         for (rows.rows) |*scan| {
@@ -1239,6 +1296,7 @@ const StreamingParseTask = struct {
     path: []const u8,
     relation: seq.physical.Relation,
     max_input_bytes: usize,
+    as_of_ns: i128 = 0,
     repo: ?[]const u8,
     selected: ?seq.trace_adapter.SelectedParse = null,
     failure: ?anyerror = null,
@@ -1250,7 +1308,11 @@ const StreamingParseTask = struct {
             self.allocator,
             &.{self.relation},
             self.path,
-            .{ .max_input_bytes = self.max_input_bytes },
+            .{
+                .max_input_bytes = self.max_input_bytes,
+                .ongoing_threshold_secs = ongoing_threshold_secs,
+                .as_of_ns = self.as_of_ns,
+            },
             .{ .repo = self.repo },
         ) catch |err| {
             self.failure = err;
@@ -1280,6 +1342,7 @@ const DiscoveredSessions = struct {
         allocator: std.mem.Allocator,
         paths: []const []const u8,
         max_depth: usize,
+        args: *const ObserveArgs,
     ) !DiscoveredSessions {
         var result: DiscoveredSessions = .{
             .items = try allocator.alloc(DiscoveredSession, paths.len),
@@ -1294,7 +1357,8 @@ const DiscoveredSessions = struct {
                     dir,
                     allocator,
                     path,
-                    .{},
+                    args.traceOptions(max_discovery_bytes - result.identity_bytes),
+                    args.selectors.repo,
                 ),
             };
             result.initialized_count += 1;
@@ -1303,6 +1367,9 @@ const DiscoveredSessions = struct {
                 result.identity_bytes,
                 item.identity.bytes_read,
             );
+            if (result.identity_bytes > max_discovery_bytes) {
+                return error.ObservationDiscoveryByteBoundExceeded;
+            }
             try indexDiscoveredSession(&result.indices, item.*, index);
         }
         try result.orderByDepth(allocator, max_depth);
@@ -1385,7 +1452,9 @@ fn createStreamingParseTasks(
 ) ![]StreamingParseTask {
     var tasks: std.ArrayList(StreamingParseTask) = .empty;
     defer tasks.deinit(graph.allocator);
+    var reserved_bytes: usize = 0;
     for (discovered.items, 0..) |item, index| {
+        if (!item.identity.repo_matches) continue;
         if (!sessionInSelectionClosure(
             discovered.items,
             &discovered.indices,
@@ -1399,12 +1468,18 @@ fn createStreamingParseTasks(
         if (seq.opencode_adapter.recognizes(path)) {
             return error.GraphObservationOpenCodeUnsupported;
         }
+        try reserveInputBytes(
+            &reserved_bytes,
+            item.identity.file_size,
+            graph.plans.definition_plan.bounds.max_input_bytes,
+        );
         try tasks.append(graph.allocator, .{
             .io = graph.io,
             .dir = graph.dir,
             .path = path,
             .relation = graph.plans.native_plan.stages[schedule.scan_stage].operation.scan.relation,
-            .max_input_bytes = graph.plans.definition_plan.bounds.max_input_bytes,
+            .max_input_bytes = item.identity.file_size,
+            .as_of_ns = @as(i128, graph.args.as_of_ms) * std.time.ns_per_ms,
             .repo = graph.args.selectors.repo,
         });
     }
@@ -1420,6 +1495,22 @@ const StreamingGraphState = struct {
     source_rows: usize = 0,
     materialized_rows: usize,
 
+    fn recordDiscovery(
+        self: *StreamingGraphState,
+        discovered: *const DiscoveredSessions,
+        paths: []const []const u8,
+    ) !void {
+        self.metrics.opened = discovered.items.len;
+        self.metrics.discovery_opened = discovered.items.len;
+        try recordDiscoveryBytes(&self.metrics, discovered.identity_bytes);
+        for (discovered.items) |item| {
+            self.metrics.source_metadata.add(
+                paths[item.path_index],
+                item.identity.source_mtime_ns,
+            );
+        }
+    }
+
     fn consume(
         self: *StreamingGraphState,
         task: *StreamingParseTask,
@@ -1428,11 +1519,14 @@ const StreamingGraphState = struct {
         var selected = task.selected orelse return error.ObservationPhysicalParseMissing;
         task.selected = null;
         defer if (selected.parsed) |*parsed| parsed.deinit(task.allocator);
-        if (selected.file_opened) self.metrics.opened += 1;
-        try recordDiscoveryBytes(&self.metrics, selected.discovery_bytes_read);
+        try recordTraceRead(&self.metrics, selected);
         const parsed = if (selected.parsed) |*value| value else return;
         try self.metrics.admitAdapter(seq.trace_adapter.adapterId(&parsed.trace));
-        try recordCorpusBytes(&self.metrics, parsed.metrics.bytes_read);
+        try recordCorpusBytes(
+            &self.metrics,
+            parsed.metrics.bytes_read,
+            self.graph.plans.definition_plan.bounds.max_input_bytes,
+        );
         try admitTraceSession(&self.metrics, parsed);
         self.digest_set.add(task.path, &parsed.corpus_digest);
         try self.appendPartition(parsed, reducer);
@@ -1476,10 +1570,8 @@ const StreamingGraphState = struct {
         self: *StreamingGraphState,
         reducer: *seq.relation_graph.StreamingLineageReducer,
         session_seed: *seq.relation_graph.ScanInput,
-        identity_bytes: usize,
     ) !ObservationExecution {
         const graph = self.graph;
-        self.metrics.bytes_read = try std.math.add(usize, self.metrics.bytes_read, identity_bytes);
         const owned = try reducer.finish();
         var scans = [_]seq.relation_graph.ScanInput{
             session_seed.*,
@@ -1567,6 +1659,7 @@ fn executeStreamingGraphObservation(
         allocator,
         paths.items,
         context.definition_plan.bounds.max_graph_depth,
+        args,
     );
     defer discovered.deinit(allocator);
     var session_seed = [_]seq.relation_graph.ScanInput{
@@ -1593,11 +1686,12 @@ fn executeStreamingGraphObservation(
         .schedule = schedule,
         .materialized_rows = lineage_graph.materialized_rows,
     };
+    try state.recordDiscovery(&discovered, paths.items);
     defer state.interner.deinit(graph.table_allocator);
     const tasks = try createStreamingParseTasks(&graph, schedule, &discovered, paths.items);
     defer allocator.free(tasks);
     try runStreamingParseTasks(&state, tasks, &reducer);
-    return state.finish(&reducer, &session_seed[0], discovered.identity_bytes);
+    return state.finish(&reducer, &session_seed[0]);
 }
 
 fn sessionInSelectionClosure(
@@ -1896,6 +1990,9 @@ fn executePhysicalObservation(
         .corpus_sessions = metrics.sessions,
         .files_opened = metrics.opened,
         .bytes_read = metrics.bytes_read,
+        .discovery_files_opened = metrics.discovery_opened,
+        .discovery_bytes_read = metrics.discovery_bytes,
+        .source_metadata_digest = metrics.source_metadata.digest(),
         .warning_count = metrics.warnings,
     };
 }
@@ -1906,6 +2003,9 @@ const PhysicalMetrics = struct {
     opened: usize = 0,
     bytes_read: usize = 0,
     corpus_bytes: usize = 0,
+    discovery_opened: usize = 0,
+    discovery_bytes: usize = 0,
+    source_metadata: SourceMetadataHasher = .{},
     warnings: usize = 0,
     adapter: ?[]const u8 = null,
 
@@ -1998,16 +2098,7 @@ fn feedOpenCodeFile(
     );
     try metrics.admitAdapter(seq.opencode_adapter.adapter_id);
     metrics.opened += 1;
-    metrics.bytes_read = try std.math.add(
-        usize,
-        metrics.bytes_read,
-        observed.bytes_read,
-    );
-    metrics.corpus_bytes = try std.math.add(
-        usize,
-        metrics.corpus_bytes,
-        observed.bytes_read,
-    );
+    try recordCorpusBytes(metrics, observed.bytes_read, bounds.max_input_bytes);
     metrics.warnings = try std.math.add(
         usize,
         metrics.warnings,
@@ -2057,12 +2148,7 @@ fn feedTraceFile(
         allocator,
         program,
         path,
-        .{
-            .max_input_bytes = if (metrics.corpus_bytes < bounds.max_input_bytes)
-                bounds.max_input_bytes - metrics.corpus_bytes
-            else
-                0,
-        },
+        args.traceOptions(bounds.max_input_bytes -| metrics.corpus_bytes),
         .{
             .session_id = args.selectors.session_id,
             .exclude_session_id = seq.execution.excludedSessionId(program),
@@ -2072,12 +2158,11 @@ fn feedTraceFile(
             .filter_time = relation == .sessions,
         },
     );
-    if (selected.file_opened) metrics.opened += 1;
-    try recordDiscoveryBytes(metrics, selected.discovery_bytes_read);
+    try recordTraceRead(metrics, selected);
     var parsed = selected.parsed orelse return .continue_scanning;
     defer parsed.deinit(allocator);
     try metrics.admitAdapter(seq.trace_adapter.adapterId(&parsed.trace));
-    try recordCorpusBytes(metrics, parsed.metrics.bytes_read);
+    try recordCorpusBytes(metrics, parsed.metrics.bytes_read, bounds.max_input_bytes);
     if (relation == .sessions) {
         if (!seq.native.sessionPasses(
             parsed.trace.session,
@@ -2102,26 +2187,39 @@ fn feedTraceFile(
     );
 }
 
-fn recordDiscoveryBytes(metrics: *PhysicalMetrics, bytes: usize) !void {
-    metrics.bytes_read = std.math.add(
-        usize,
-        metrics.bytes_read,
-        bytes,
-    ) catch return error.ObservationMetricOverflow;
-    if (metrics.bytes_read > max_discovery_bytes + metrics.corpus_bytes) {
-        return error.ObservationDiscoveryByteBoundExceeded;
+fn recordTraceRead(metrics: *PhysicalMetrics, selected: seq.trace_adapter.SelectedParse) !void {
+    if (selected.file_opened) {
+        metrics.opened += 1;
+        if (selected.parsed == null) metrics.discovery_opened += 1;
     }
+    try recordDiscoveryBytes(metrics, selected.discovery_bytes_read);
 }
 
-fn recordCorpusBytes(metrics: *PhysicalMetrics, bytes: usize) !void {
+fn recordDiscoveryBytes(metrics: *PhysicalMetrics, bytes: usize) !void {
+    metrics.discovery_bytes = std.math.add(usize, metrics.discovery_bytes, bytes) catch
+        return error.ObservationMetricOverflow;
+    if (metrics.discovery_bytes > max_discovery_bytes) {
+        return error.ObservationDiscoveryByteBoundExceeded;
+    }
     metrics.bytes_read = std.math.add(
         usize,
         metrics.bytes_read,
         bytes,
     ) catch return error.ObservationMetricOverflow;
-    metrics.corpus_bytes = std.math.add(
+}
+
+fn reserveInputBytes(reserved: *usize, bytes: usize, bound: usize) !void {
+    if (reserved.* > bound or bytes > bound - reserved.*) {
+        return error.ObservationInputByteBoundExceeded;
+    }
+    reserved.* += bytes;
+}
+
+fn recordCorpusBytes(metrics: *PhysicalMetrics, bytes: usize, bound: usize) !void {
+    try reserveInputBytes(&metrics.corpus_bytes, bytes, bound);
+    metrics.bytes_read = std.math.add(
         usize,
-        metrics.corpus_bytes,
+        metrics.bytes_read,
         bytes,
     ) catch return error.ObservationMetricOverflow;
 }
@@ -2137,6 +2235,7 @@ fn admitTraceSession(
     ) catch return error.ObservationMetricOverflow;
     metrics.files += 1;
     metrics.sessions += 1;
+    metrics.source_metadata.add(parsed.trace.session.path, parsed.source_mtime_ns);
 }
 
 fn feedTraceRows(
@@ -2237,6 +2336,7 @@ fn executeExternalObservation(
         .corpus_sessions = 0,
         .files_opened = files_opened,
         .bytes_read = relation.input_bytes,
+        .source_metadata_digest = (SourceMetadataHasher{}).digest(),
     };
 }
 
@@ -2529,6 +2629,31 @@ fn validateSelectedSelectors(
     }
 }
 
+const SourceMetadataHasher = struct {
+    hasher: std.crypto.hash.sha2.Sha256 = init: {
+        var value = std.crypto.hash.sha2.Sha256.init(.{});
+        value.update("seq-source-metadata/v1\x00");
+        break :init value;
+    },
+
+    fn add(self: *SourceMetadataHasher, path: []const u8, mtime_ns: i128) void {
+        var length: [8]u8 = undefined;
+        std.mem.writeInt(u64, &length, @intCast(path.len), .big);
+        self.hasher.update(&length);
+        self.hasher.update(path);
+        var modified: [16]u8 = undefined;
+        std.mem.writeInt(i128, &modified, mtime_ns, .big);
+        self.hasher.update(&modified);
+    }
+
+    fn digest(self: SourceMetadataHasher) [71]u8 {
+        var mutable = self;
+        var raw: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
+        mutable.hasher.final(&raw);
+        return "sha256:".* ++ std.fmt.bytesToHex(raw, .lower);
+    }
+};
+
 const CorpusSetHasher = struct {
     hasher: std.crypto.hash.sha2.Sha256 = init: {
         var value = std.crypto.hash.sha2.Sha256.init(.{});
@@ -2719,7 +2844,7 @@ fn bindParameters(
     for (specs, 0..) |spec, index| {
         const separator = std.mem.indexOfScalar(u8, spec, '=') orelse
             return error.InvalidParameterBinding;
-        if (separator == 0 or separator + 1 >= spec.len) {
+        if (separator == 0) {
             return error.InvalidParameterBinding;
         }
         inputs[index] = .{
@@ -2782,7 +2907,7 @@ fn emitCapabilities(io: std.Io, argv: []const []const u8) !u8 {
             "\"seq-definition-description/v1\"," ++
             "\"seq-index-result/v1\"," ++
             "\"seq-observation-plan/v1\"," ++
-            "\"seq-observation-result/v1\"]}}\n",
+            "\"seq-observation-result/v2\"]}}\n",
         .{ definition_core.cache.format_version, max_output_cells },
     );
     return 0;
@@ -2966,6 +3091,64 @@ test "observe parser accepts explicit definition selectors and parameters" {
     try std.testing.expectEqual(@as(usize, 1), args.parameter_specs.len);
 }
 
+test "explicit empty string parameters remain distinct from missing bindings" {
+    const allocator = std.testing.allocator;
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator,
+        \\{"excluded":{"type":"string","required":true},"count":{"type":"integer","default":1}}
+    , .{});
+    defer parsed.deinit();
+    var declarations = try definition_core.parameters.compile(allocator, parsed.value);
+    defer declarations.deinit(allocator);
+    var bindings = try bindParameters(allocator, &declarations, &.{"excluded="});
+    defer bindings.deinit(allocator);
+    try std.testing.expectEqualStrings("", bindings.find("excluded").?.value.string);
+    try std.testing.expectError(
+        error.MissingParameter,
+        bindParameters(allocator, &declarations, &.{}),
+    );
+    try std.testing.expectError(
+        error.InvalidParameterBinding,
+        bindParameters(allocator, &declarations, &.{"excluded"}),
+    );
+    try std.testing.expectError(
+        error.InvalidParameterBinding,
+        bindParameters(allocator, &declarations, &.{"=value"}),
+    );
+    try std.testing.expectError(
+        error.InvalidInteger,
+        bindParameters(allocator, &declarations, &.{ "excluded=", "count=" }),
+    );
+}
+
+test "aggregate input reservation admits the exact bound and rejects before overcommit" {
+    var reserved: usize = 0;
+    try reserveInputBytes(&reserved, 7, 14);
+    try reserveInputBytes(&reserved, 7, 14);
+    try std.testing.expectEqual(14, reserved);
+    try std.testing.expectError(
+        error.ObservationInputByteBoundExceeded,
+        reserveInputBytes(&reserved, 1, 14),
+    );
+    try std.testing.expectEqual(14, reserved);
+    try reserveInputBytes(&reserved, 0, 14);
+    var large: usize = std.math.maxInt(usize) - 1;
+    try std.testing.expectError(
+        error.ObservationInputByteBoundExceeded,
+        reserveInputBytes(&large, 2, std.math.maxInt(usize)),
+    );
+}
+
+test "source metadata identity binds the modification time independently of bytes" {
+    var first = SourceMetadataHasher{};
+    first.add("/session.jsonl", 10);
+    var same = SourceMetadataHasher{};
+    same.add("/session.jsonl", 10);
+    var changed = SourceMetadataHasher{};
+    changed.add("/session.jsonl", 11);
+    try std.testing.expectEqualStrings(&first.digest(), &same.digest());
+    try std.testing.expect(!std.mem.eql(u8, &first.digest(), &changed.digest()));
+}
+
 fn testObservation(selectors: seq.native.Options) ObserveArgs {
     return .{
         .definition_path = "definition.json",
@@ -3072,7 +3255,7 @@ test "an outside explicit file excludes default corpus while an inside file reta
     try std.testing.expectEqualStrings("two.jsonl", std.fs.path.basename(lineage.items[1]));
 }
 
-test "selected parser warnings contaminate the observation envelope" {
+test "selected parser warnings qualify observation completeness" {
     try std.testing.expectEqual(
         @as(usize, 0),
         observationLimitations(0, false).len,

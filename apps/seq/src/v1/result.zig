@@ -3,24 +3,72 @@ const definition_core = @import("definition_core");
 const definition = @import("definition.zig");
 const execution = @import("execution.zig");
 
-pub const schema = "seq-observation-result/v1";
+pub const schema = "seq-observation-result/v2";
+
+pub const Selection = struct {
+    path: ?[]const u8 = null,
+    root: ?[]const u8 = null,
+    root_explicit: bool = false,
+    session_id: ?[]const u8 = null,
+    repo: ?[]const u8 = null,
+    since_ms: ?i64 = null,
+    until_ms: ?i64 = null,
+
+    /// Hash resolved values, not flag spellings or environment-variable names.
+    pub fn digest(self: Selection) [71]u8 {
+        var hasher = std.crypto.hash.sha2.Sha256.init(.{});
+        hasher.update("seq-observation-selection/v1\x00");
+        hasher.update(&.{@intFromBool(self.root_explicit)});
+        inline for (.{ "path", "root", "session_id", "repo" }) |field| {
+            if (@field(self, field)) |value| {
+                hasher.update(&.{1});
+                var length: [8]u8 = undefined;
+                std.mem.writeInt(u64, &length, @intCast(value.len), .big);
+                hasher.update(&length);
+                hasher.update(value);
+            } else hasher.update(&.{0});
+        }
+        inline for (.{ "since_ms", "until_ms" }) |field| {
+            if (@field(self, field)) |value| {
+                hasher.update(&.{1});
+                var bytes: [8]u8 = undefined;
+                std.mem.writeInt(i64, &bytes, value, .big);
+                hasher.update(&bytes);
+            } else hasher.update(&.{0});
+        }
+        var raw: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
+        hasher.final(&raw);
+        return "sha256:".* ++ std.fmt.bytesToHex(raw, .lower);
+    }
+};
+
+pub const Context = struct {
+    as_of_ms: i64,
+    ongoing_threshold_secs: i64,
+    source_metadata_digest: []const u8,
+};
 
 pub const Corpus = struct {
     adapter: []const u8,
     digest: []const u8,
     files: usize,
     sessions: usize,
-    contaminated: bool,
+    parser_warning_count: usize,
 };
 
 pub const Envelope = struct {
     definition_plan: *const definition.Plan,
     projection_name: []const u8,
     parameters_digest: []const u8,
+    seq_version: []const u8,
+    selection: Selection,
+    context: Context,
     corpus: Corpus,
     rows: execution.Rows,
     compile_stats: definition_core.result.CompileStats,
     execution_stats: definition_core.result.ExecutionStats,
+    discovery_files_opened: usize = 0,
+    discovery_bytes_read: usize = 0,
     limitations: []const []const u8 = &.{},
 };
 
@@ -52,6 +100,8 @@ fn writeIdentityAndCorpus(
 ) !void {
     try output.raw("{\"schema\":");
     try output.string(schema);
+    try output.raw(",\"seq_version\":");
+    try output.string(envelope.seq_version);
     try output.raw(",\"definition\":{\"id\":");
     try output.string(envelope.definition_plan.id);
     try output.raw(",\"digest\":");
@@ -66,12 +116,41 @@ fn writeIdentityAndCorpus(
     try output.usizeValue(envelope.corpus.files);
     try output.raw(",\"sessions\":");
     try output.usizeValue(envelope.corpus.sessions);
-    try output.raw(",\"contaminated\":");
-    try output.boolean(envelope.corpus.contaminated);
+    try output.raw(",\"parser_warning_count\":");
+    try output.usizeValue(envelope.corpus.parser_warning_count);
+    try output.raw(",\"semantic_contamination\":\"not_assessed\"");
     try output.raw("},\"parameters_digest\":");
     try output.string(envelope.parameters_digest);
     try output.raw(",\"projection\":");
     try output.string(envelope.projection_name);
+    try output.raw(",\"selection\":{");
+    inline for (.{ "path", "root", "session_id", "repo" }, 0..) |field, index| {
+        if (index != 0) try output.raw(",");
+        try output.string(field);
+        try output.raw(":");
+        if (@field(envelope.selection, field)) |value| {
+            try output.string(value);
+        } else try output.raw("null");
+    }
+    inline for (.{ "since_ms", "until_ms" }) |field| {
+        try output.raw(",");
+        try output.string(field);
+        try output.raw(":");
+        if (@field(envelope.selection, field)) |value| {
+            try output.i128Value(value);
+        } else try output.raw("null");
+    }
+    try output.raw(",\"root_explicit\":");
+    try output.boolean(envelope.selection.root_explicit);
+    try output.raw("},\"selection_digest\":");
+    try output.string(&envelope.selection.digest());
+    try output.raw(",\"context\":{\"as_of_ms\":");
+    try output.i128Value(envelope.context.as_of_ms);
+    try output.raw(",\"ongoing_threshold_secs\":");
+    try output.i128Value(envelope.context.ongoing_threshold_secs);
+    try output.raw(",\"source_metadata_digest\":");
+    try output.string(envelope.context.source_metadata_digest);
+    try output.raw("}");
 }
 
 fn writeRows(
@@ -119,6 +198,12 @@ fn writeStats(
     try output.usizeValue(envelope.execution_stats.files_opened);
     try output.raw(",\"bytes_read\":");
     try output.usizeValue(envelope.execution_stats.bytes_read);
+    try output.raw(",\"discovery_files_opened\":");
+    try output.usizeValue(envelope.discovery_files_opened);
+    try output.raw(",\"discovery_bytes_read\":");
+    try output.usizeValue(envelope.discovery_bytes_read);
+    try output.raw(",\"corpus_bytes_read\":");
+    try output.usizeValue(envelope.execution_stats.bytes_read - envelope.discovery_bytes_read);
     try output.raw(",\"rows_scanned\":");
     try output.usizeValue(envelope.execution_stats.rows_scanned);
     try output.raw(",\"rows_materialized\":");
@@ -148,6 +233,12 @@ fn validateEnvelope(envelope: Envelope) !void {
     ) orelse return error.UnknownObservationProjection;
     try definition_core.json.digest(envelope.parameters_digest);
     try definition_core.json.digest(envelope.corpus.digest);
+    try definition_core.json.digest(envelope.context.source_metadata_digest);
+    if (envelope.discovery_files_opened > envelope.execution_stats.files_opened or
+        envelope.discovery_bytes_read > envelope.execution_stats.bytes_read)
+    {
+        return error.ObservationResultStatsMismatch;
+    }
     if (envelope.corpus.adapter.len == 0 or
         envelope.corpus.adapter.len > 128 or
         !std.unicode.utf8ValidateSlice(envelope.corpus.adapter))
@@ -268,6 +359,13 @@ const BoundedJson = struct {
 
     fn u64Value(self: *BoundedJson, value: u64) !void {
         var buffer: [32]u8 = undefined;
+        var writer = std.Io.Writer.fixed(&buffer);
+        writer.print("{d}", .{value}) catch return error.IntegerFormatFailed;
+        try self.raw(writer.buffered());
+    }
+
+    fn i128Value(self: *BoundedJson, value: i128) !void {
+        var buffer: [40]u8 = undefined;
         var writer = std.Io.Writer.fixed(&buffer);
         writer.print("{d}", .{value}) catch return error.IntegerFormatFailed;
         try self.raw(writer.buffered());
@@ -494,12 +592,19 @@ fn testEnvelope(
         .definition_plan = plan,
         .projection_name = "rows",
         .parameters_digest = parameters_digest,
+        .seq_version = "1.4.0",
+        .selection = .{},
+        .context = .{
+            .as_of_ms = 1_000,
+            .ongoing_threshold_secs = 60,
+            .source_metadata_digest = zero_digest,
+        },
         .corpus = .{
             .adapter = "immutable-relation/v1",
             .digest = zero_digest,
             .files = 1,
             .sessions = 0,
-            .contaminated = false,
+            .parser_warning_count = 0,
         },
         .rows = .{ .values = values, .width = 3 },
         .compile_stats = compile_stats,
@@ -567,6 +672,18 @@ fn expectResultEnvelope(rendered: []const u8) !void {
         root.get("schema").?.string,
     );
     try std.testing.expect(!root.get("authority_granted").?.bool);
+    try std.testing.expectEqualStrings("1.4.0", root.get("seq_version").?.string);
+    const corpus = root.get("corpus").?.object;
+    try std.testing.expect(corpus.get("contaminated") == null);
+    try std.testing.expectEqual(@as(i64, 0), corpus.get("parser_warning_count").?.integer);
+    try std.testing.expectEqualStrings(
+        "not_assessed",
+        corpus.get("semantic_contamination").?.string,
+    );
+    try std.testing.expectEqualStrings(
+        &(Selection{}).digest(),
+        root.get("selection_digest").?.string,
+    );
     try std.testing.expectEqualStrings(
         "row\none",
         root.get("data").?.object.get("rows").?.array.items[0]
@@ -583,6 +700,32 @@ fn expectResultEnvelope(rendered: []const u8) !void {
             "\"a\":9007199254740992.1",
         ) != null,
     );
+}
+
+test "selection identity retains every resolved selector and default-root provenance" {
+    const base = Selection{
+        .path = "/sessions/one.jsonl",
+        .root = "/sessions",
+        .session_id = "one",
+        .repo = "/repo",
+        .since_ms = 1,
+        .until_ms = 2,
+    };
+    inline for (.{ "path", "root", "session_id", "repo" }) |field| {
+        var changed = base;
+        @field(changed, field) = "different";
+        try std.testing.expect(!std.mem.eql(u8, &base.digest(), &changed.digest()));
+        @field(changed, field) = null;
+        try std.testing.expect(!std.mem.eql(u8, &base.digest(), &changed.digest()));
+    }
+    inline for (.{ "since_ms", "until_ms" }) |field| {
+        var changed = base;
+        @field(changed, field) = 3;
+        try std.testing.expect(!std.mem.eql(u8, &base.digest(), &changed.digest()));
+    }
+    var explicit = base;
+    explicit.root_explicit = true;
+    try std.testing.expect(!std.mem.eql(u8, &base.digest(), &explicit.digest()));
 }
 
 test "observation result fails before emitting beyond the declared byte bound" {

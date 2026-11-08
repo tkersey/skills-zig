@@ -2144,7 +2144,7 @@ pub fn freePaths(
     paths.deinit(allocator);
 }
 
-fn resolveRootAlloc(
+pub fn resolveRootAlloc(
     allocator: std.mem.Allocator,
     environment: ?*const std.process.Environ.Map,
     root: ?[]const u8,
@@ -2155,11 +2155,15 @@ fn resolveRootAlloc(
         return absolutePathAlloc(allocator, environment, explicit, io, dir);
     }
     if (environmentValue(environment, "CODEX_HOME")) |codex_home| {
-        return std.fs.path.join(allocator, &.{ codex_home, "sessions" });
+        const base = try absolutePathAlloc(allocator, environment, codex_home, io, dir);
+        defer allocator.free(base);
+        return std.fs.path.join(allocator, &.{ base, "sessions" });
     }
     const home = environmentValue(environment, "HOME") orelse
         return error.EnvironmentVariableNotFound;
-    return std.fs.path.join(allocator, &.{ home, ".codex", "sessions" });
+    const base = try absolutePathAlloc(allocator, environment, home, io, dir);
+    defer allocator.free(base);
+    return std.fs.path.join(allocator, &.{ base, ".codex", "sessions" });
 }
 
 fn resolvePiRootAlloc(

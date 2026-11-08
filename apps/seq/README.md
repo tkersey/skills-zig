@@ -56,9 +56,57 @@ seq observe \
   --format json
 ```
 
-JSON observations use `seq-observation-result/v1` and bind the definition
-closure digest, selected corpus, parameters, projection, data, statistics, and
-limitations. `authority_granted` is always `false`.
+JSON observations use `seq-observation-result/v2`. Check `result_schemas` in
+`seq capabilities` for this contract; the observation definition ABI remains
+`seq-observation-abi/v1`. Results bind the definition closure digest, selected
+corpus, declared parameters, projection, data, statistics, and limitations.
+`authority_granted` is always `false`.
+
+The envelope also includes `seq_version` and a `selection` receipt with absolute
+`path`, `root`, and `repo`, the selected `session_id`, and resolved UTC epoch
+`since_ms`/`until_ms` bounds. This includes the absolute window resolved from
+`--last`. `root` records the discovery root, including an environment/default
+root; `root_explicit` distinguishes it from an explicit root selector. An
+external-only observation has no physical selection. `selection_digest` hashes
+these resolved values with a versioned, length-framed encoding. Equivalent
+`.`/`..` paths and time-zone spellings have the same selection identity; a
+different window does not reuse the identity merely because it visited the same
+files. Definition-owned exclusions remain declared parameters and are bound by
+`parameters_digest`.
+
+`context.as_of_ms` is the single observation instant used by every trace parser
+to assess freshness. `ongoing_threshold_secs` records the policy, and
+`source_metadata_digest` binds the ordered paths and exact nanosecond mtimes
+observed for trace discovery and parsing. Keep this context alongside corpus
+identity: identical session content can have different current liveness. The
+metadata digest distinguishes those inputs; it does not store a replayable
+filesystem snapshot or prove that a multi-file read was atomic. Trace corpus
+digests bind paths and framed source lines; external input digests bind their
+supplied bytes. A `source_event_id` is a path/line/ordinal locator and must travel
+with its corpus identity.
+
+`corpus.parser_warning_count` reports parser warnings. The independent
+`corpus.semantic_contamination` field is `"not_assessed"`: syntactically clean
+audit prompts, quoted reports, and injected instructions can still contaminate a
+semantic analysis. The owning definition or analyst must assess that question.
+The former `contaminated` boolean is absent from v2.
+
+`bounds.max_input_bytes` applies to the aggregate corpus admitted for parsing.
+Streaming lineage execution reserves the selected files' discovered sizes before
+prefetch, enforces each reservation while reading, and checks the aggregate again
+when consuming results. A growing file that exceeds its reservation fails with
+`ObservationInputByteBoundExceeded`; a failed read never yields a partial success.
+Discovery has a separate 256 MiB byte allowance. `stats.files_opened` counts source
+file opens, including discovery reopens; `discovery_files_opened` and
+`discovery_bytes_read` identify that additional work. `corpus_bytes_read` counts
+execution input, and `bytes_read` is its sum with discovery bytes.
+`physical_passes` counts relation execution passes, so one pass does not imply
+that lineage discovery performed no additional I/O.
+
+Shared graph inputs remain intact until all their consuming stages have run.
+Filtering, folding, and membership joins may reuse storage only for an exclusively
+owned final consumer. Comparisons between two integers preserve signed 64-bit
+precision, including values above `2^53`.
 
 ## Native surface
 

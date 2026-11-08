@@ -40,6 +40,8 @@ pub const ToolLifecycleStatus = enum {
 
 pub const TraceParseOptions = struct {
     ongoing_threshold_secs: i64 = 60,
+    /// Freeze all freshness decisions in an observation to the same instant.
+    as_of_ns: ?i128 = null,
     include_raw: bool = false,
     include_occurrences: bool = true,
     include_occurrence_payloads: bool = true,
@@ -1304,7 +1306,8 @@ const PiParser = struct {
     }
 
     fn finish(self: *PiParser, io: std.Io, source_mtime_ns: i128) !void {
-        const age_secs = @divTrunc(nowRealtimeNs(io) - source_mtime_ns, std.time.ns_per_s);
+        const as_of_ns = self.options.as_of_ns orelse nowRealtimeNs(io);
+        const age_secs = @divTrunc(as_of_ns - source_mtime_ns, std.time.ns_per_s);
         const fresh = age_secs <= self.options.ongoing_threshold_secs;
         for (self.turn_states.items, 0..) |state, index| {
             if (state.status != .ongoing) continue;
@@ -1860,7 +1863,8 @@ fn finalizeTrace(
     source_mtime_ns: i128,
     options: TraceParseOptions,
 ) !void {
-    const age_secs = @divTrunc(nowRealtimeNs(io) - source_mtime_ns, std.time.ns_per_s);
+    const as_of_ns = options.as_of_ns orelse nowRealtimeNs(io);
+    const age_secs = @divTrunc(as_of_ns - source_mtime_ns, std.time.ns_per_s);
     for (trace.turns.items) |*turn| {
         if (turn.status != .ongoing) continue;
         const fresh = age_secs <= options.ongoing_threshold_secs;
@@ -2119,7 +2123,8 @@ const SummaryParser = struct {
         options: TraceParseOptions,
     ) !void {
         const session = &self.trace.session;
-        const age_secs = @divTrunc(nowRealtimeNs(io) - source_mtime_ns, std.time.ns_per_s);
+        const as_of_ns = options.as_of_ns orelse nowRealtimeNs(io);
+        const age_secs = @divTrunc(as_of_ns - source_mtime_ns, std.time.ns_per_s);
         if (self.last_turn_open) {
             const fresh = age_secs <= options.ongoing_threshold_secs;
             const reason = if (fresh) "fresh_ongoing_turn" else "stale_ongoing_file";
@@ -4890,6 +4895,32 @@ test "trace ongoing status uses the supplied clock at the threshold" {
                 if (modified_seconds == 60) "fresh_ongoing_turn" else "stale_ongoing_file",
                 trace.session.status_reason.?,
             );
+        }
+    }
+}
+
+test "one observation instant controls full summary and Pi freshness" {
+    const codex = "{\"type\":\"event_msg\",\"payload\":" ++
+        "{\"type\":\"task_started\",\"turn_id\":\"open\"}}\n";
+    const pi =
+        \\{"type":"session","version":3,"id":"pi-open","timestamp":"2026-07-26T10:00:00Z","cwd":"/repo"}
+        \\{"type":"message","id":"user-1","parentId":null,"timestamp":"2026-07-26T10:00:01Z","message":{"role":"user","content":[{"type":"text","text":"continue"}]}}
+    ;
+    inline for (.{ parseSessionTraceReader, parseSessionSummaryTraceReader }) |parse| {
+        for ([_][]const u8{ codex, pi }) |source| {
+            for ([_]i128{ 120, 121 }) |as_of_seconds| {
+                var reader: std.Io.Reader = .fixed(source);
+                var trace = try parse(
+                    std.testing.io,
+                    std.testing.allocator,
+                    "session.jsonl",
+                    &reader,
+                    60 * std.time.ns_per_s,
+                    .{ .as_of_ns = as_of_seconds * std.time.ns_per_s },
+                );
+                defer trace.deinit(std.testing.allocator);
+                try std.testing.expectEqual(as_of_seconds == 120, trace.session.is_ongoing);
+            }
         }
     }
 }

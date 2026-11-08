@@ -331,6 +331,21 @@ const GraphExecution = struct {
             self.allocations[index] = found.allocation orelse found.table.values;
             break :blk found.table;
         } else blk: {
+            const stage = self.native_plan.stages[index];
+            const first_index = self.native_plan.findStage(step.input_names[0]) orelse
+                return error.ObservationExternalGraphInputUnsupported;
+            const input = self.tables[first_index] orelse return error.ObservationInputNotExecuted;
+            const exclusive = self.owned[first_index] and self.consumers[first_index] == 1;
+            // Filters and folds compact their first input. A sibling consumer or
+            // caller-owned scan must retain its original values and lifetime.
+            const copy_input = !exclusive and switch (stage.operation) {
+                .filter => true,
+                .generic => |generic| generic.operator == .ordered_fold,
+                else => false,
+            };
+            const working = if (copy_input) try copyTable(self.allocator, input) else input;
+            var copy_adopted = false;
+            defer if (copy_input and !copy_adopted) self.allocator.free(working.values);
             const value = try executeStage(
                 self.allocator,
                 self.retained_allocator,
@@ -338,11 +353,17 @@ const GraphExecution = struct {
                 self.native_plan,
                 self.bindings,
                 self.selectors,
-                self.native_plan.stages[index],
+                stage,
                 step,
                 self.tables,
+                working,
+                exclusive,
             );
-            self.adoptTable(index, step, value);
+            if (copy_input and value.values.ptr == working.values.ptr) {
+                self.owned[index] = true;
+                self.allocations[index] = working.values;
+                copy_adopted = true;
+            } else self.adoptTable(index, step, value);
             break :blk value;
         };
         // Record the owner before any subsequent fallible validation.
@@ -360,6 +381,10 @@ const GraphExecution = struct {
             const input = self.native_plan.findStage(name) orelse continue;
             const prior = self.tables[input] orelse continue;
             if (table.values.ptr != prior.values.ptr) continue;
+            // Empty independent allocations may use the same sentinel pointer.
+            const allocation = self.allocations[input] orelse continue;
+            if (allocation.len == 0) continue;
+            std.debug.assert(self.owned[input] and self.consumers[input] == 1);
             self.owned[index] = self.owned[input];
             self.owned[input] = false;
             self.allocations[index] = self.allocations[input];
@@ -539,10 +564,11 @@ fn executeStage(
     stage: plan.Stage,
     step: definition.Step,
     tables: []const ?Table,
+    input: Table,
+    input_is_exclusive: bool,
 ) !Table {
     const first_index = native_plan.findStage(step.input_names[0]) orelse
         return error.ObservationExternalGraphInputUnsupported;
-    const input = tables[first_index] orelse return error.ObservationInputNotExecuted;
     return switch (stage.operation) {
         .filter => |filter| try filterTable(
             allocator,
@@ -579,6 +605,7 @@ fn executeStage(
             tables,
             input,
             first_index,
+            input_is_exclusive,
         ),
         .aggregate => |aggregate| try aggregateTable(
             allocator,
@@ -650,6 +677,7 @@ fn executeGenericStage(
     tables: []const ?Table,
     input: Table,
     first_index: u16,
+    input_is_exclusive: bool,
 ) !Table {
     const generic = stage.operation.generic;
     return switch (generic.operator) {
@@ -671,6 +699,7 @@ fn executeGenericStage(
             stage.schema,
             generic.canonical_config,
             definition_plan.bounds,
+            input_is_exclusive,
         ),
         .ordered_fold => try orderedFoldTable(
             allocator,
@@ -1413,7 +1442,7 @@ const JoinContext = struct {
         return true;
     }
 
-    fn membership(self: *const JoinContext) !Table {
+    fn membership(self: *const JoinContext, input_is_exclusive: bool) !Table {
         const keep = try self.allocator.alloc(bool, try self.left.rowCount());
         defer self.allocator.free(keep);
         for (0..keep.len) |left_index| {
@@ -1427,19 +1456,19 @@ const JoinContext = struct {
             }
             keep[left_index] = if (std.mem.eql(u8, self.kind, "anti")) !matched else matched;
         }
-        const aliases_right = self.left.values.ptr == self.right.values.ptr;
+        const copy_output = !input_is_exclusive or self.left.values.ptr == self.right.values.ptr;
         var retained: usize = 0;
         for (keep) |retain| if (retain) {
             retained += 1;
         };
-        const output = if (aliases_right)
+        const output = if (copy_output)
             try self.allocator.alloc(execution.Value, retained * self.left.width)
         else
             self.left.values;
         var kept: usize = 0;
         for (keep, 0..) |retain, source_index| {
             if (!retain) continue;
-            if (aliases_right or kept != source_index) {
+            if (copy_output or kept != source_index) {
                 @memcpy(
                     output[kept * self.left.width ..][0..self.left.width],
                     self.left.row(source_index),
@@ -1506,6 +1535,7 @@ fn joinTable(
     output_schema: plan.Schema,
     config: []const u8,
     bounds: definition.Bounds,
+    input_is_exclusive: bool,
 ) !Table {
     if (step.input_names.len < 2 or step.input_names.len > 3) {
         return error.InvalidPipelineInputCount;
@@ -1561,7 +1591,7 @@ fn joinTable(
     };
     const membership_join = std.mem.eql(u8, kind, "semi") or std.mem.eql(u8, kind, "anti");
     if (membership_join and joinProjectsLeft(fields, context.left_schema)) {
-        return context.membership();
+        return context.membership(input_is_exclusive);
     }
     return context.materialize(membership_join);
 }
@@ -3066,6 +3096,7 @@ fn truthy(value: execution.Value) bool {
 
 fn valuesEqual(a: execution.Value, b: execution.Value, ignore_case: bool) bool {
     if (a == .null or b == .null) return a == .null and b == .null;
+    if (a == .integer and b == .integer) return a.integer == b.integer;
     if (valueFloat(a)) |left| if (valueFloat(b)) |right| return left == right;
     if (valueText(a)) |left| if (valueText(b)) |right| {
         return if (ignore_case)
@@ -3094,6 +3125,7 @@ fn compareNullable(
 }
 
 fn compareValues(a: execution.Value, b: execution.Value) std.math.Order {
+    if (a == .integer and b == .integer) return std.math.order(a.integer, b.integer);
     if (valueFloat(a)) |left| if (valueFloat(b)) |right| {
         return std.math.order(left, right);
     };
@@ -3660,6 +3692,119 @@ test "target graph output survives shared execution scratch teardown" {
     try std.testing.expectEqual(3, source[0].integer);
     try std.testing.expectEqual(3, result.source_rows);
     try std.testing.expectEqual(7, result.materialized_rows);
+}
+
+fn exerciseSharedGraph(
+    allocator: std.mem.Allocator,
+    definition_plan: *const definition.Plan,
+    native_plan: *const plan.Plan,
+    owned: bool,
+    count: usize,
+    folded: bool,
+) !void {
+    const expected = [_]execution.Value{
+        .{ .string = "assistant" }, .{ .string = "first" },
+        .{ .string = "user" },      .{ .string = "second" },
+    };
+    var borrowed = expected;
+    const values = if (owned)
+        try allocator.dupe(execution.Value, expected[0 .. count * 2])
+    else
+        borrowed[0 .. count * 2];
+    var scans = [_]ScanInput{
+        .{ .stage_index = 0, .table = .{ .values = values, .width = 2 }, .owned = owned },
+    };
+    defer if (scans[0].owned) allocator.free(values);
+    const result = try executeTarget(
+        allocator,
+        allocator,
+        definition_plan,
+        native_plan,
+        &expression_test_bindings,
+        .{},
+        native_plan.findStage("rows").?,
+        &scans,
+    );
+    defer allocator.free(result.table.values);
+    try std.testing.expectEqual(count, try result.table.rowCount());
+    for (0..count) |index| {
+        const row = result.table.row(index);
+        try std.testing.expectEqualDeep(expected[index * 2], row[0]);
+        try std.testing.expectEqualDeep(expected[index * 2 + 1], row[1]);
+        try std.testing.expectEqualDeep(
+            if (folded or index == 1) expected[index * 2] else execution.Value.null,
+            row[2],
+        );
+    }
+    if (!owned) try std.testing.expectEqualDeep(expected, borrowed);
+}
+
+test "branching filters membership joins and folds preserve shared inputs and ownership" {
+    const sources = [_][]const u8{
+        @embedFile("fixtures/shared-filter.json"),
+        @embedFile("fixtures/shared-membership.json"),
+        @embedFile("fixtures/shared-fold.json"),
+    };
+    for (sources, 0..) |source, index| {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "definition.json", .data = source });
+        var closure = try definition_core.closure.loadFromDir(
+            std.testing.io,
+            std.testing.allocator,
+            &tmp.dir,
+            "definition.json",
+            .{},
+        );
+        defer closure.deinit(std.testing.allocator);
+        var definition_plan = try definition.compile(
+            std.testing.allocator,
+            &closure,
+            "definition.json",
+        );
+        defer definition_plan.deinit(std.testing.allocator);
+        var native_plan = try plan.compile(std.testing.allocator, &definition_plan);
+        defer native_plan.deinit(std.testing.allocator);
+        for ([_]bool{ false, true }) |owned| {
+            for ([_]usize{ 0, 1, 2 }) |count| {
+                try exerciseSharedGraph(
+                    std.testing.allocator,
+                    &definition_plan,
+                    &native_plan,
+                    owned,
+                    count,
+                    index == 2,
+                );
+            }
+            try @import("test_support").checkAllAllocationFailures(
+                std.testing.allocator,
+                exerciseSharedGraph,
+                .{ &definition_plan, &native_plan, owned, @as(usize, 2), index == 2 },
+            );
+        }
+    }
+}
+
+test "integer comparison and distinct preserve adjacent values beyond float precision" {
+    const low: execution.Value = .{ .integer = 9_007_199_254_740_992 };
+    const high: execution.Value = .{ .integer = 9_007_199_254_740_993 };
+    try std.testing.expect(!valuesEqual(low, high, false));
+    try std.testing.expectEqual(std.math.Order.lt, compareValues(low, high));
+    try std.testing.expectEqual(std.math.Order.gt, compareValues(high, low));
+    try std.testing.expect(!valuesEqual(
+        .{ .integer = std.math.maxInt(i64) - 1 },
+        .{ .integer = std.math.maxInt(i64) },
+        false,
+    ));
+    var values = [_]execution.Value{ low, high, low };
+    var keys = [_]u16{0};
+    const distinct = try distinctTable(
+        std.testing.allocator,
+        .{ .values = &values, .width = 1 },
+        .{ .field_indices = &keys },
+    );
+    defer std.testing.allocator.free(distinct.values);
+    try std.testing.expectEqualDeep(&[_]execution.Value{ low, high }, distinct.values);
 }
 
 test "stage traversal checks depth before memoization and respects scan boundaries" {

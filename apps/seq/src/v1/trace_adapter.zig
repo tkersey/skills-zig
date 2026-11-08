@@ -10,6 +10,7 @@ const structured = @import("structured.zig");
 
 pub const Options = struct {
     ongoing_threshold_secs: i64 = 60,
+    as_of_ns: ?i128 = null,
     structured_limits: structured.Limits = .{},
     max_input_bytes: usize = std.math.maxInt(usize),
 };
@@ -34,6 +35,8 @@ pub const SessionIdentity = struct {
     parent_session_id: ?[]u8,
     bytes_read: usize,
     file_size: usize,
+    source_mtime_ns: i128 = 0,
+    repo_matches: bool = true,
 
     pub fn deinit(self: *SessionIdentity, allocator: std.mem.Allocator) void {
         if (self.session_id) |value| allocator.free(value);
@@ -48,13 +51,19 @@ pub fn discoverSessionIdentity(
     allocator: std.mem.Allocator,
     path: []const u8,
     options: Options,
+    repo: ?[]const u8,
 ) !SessionIdentity {
     const file = try openTraceFile(io, dir, path);
     defer file.close(io);
     const stat = try file.stat(io);
     var file_reader = file.reader(io, &.{});
-    const prefix = try readSummaryPrefixAlloc(allocator, &file_reader.interface);
+    var bounded_reader = file_reader.interface.limited(
+        .limited(options.max_input_bytes +| 1),
+        &.{},
+    );
+    const prefix = try readSummaryPrefixAlloc(allocator, &bounded_reader.interface);
     defer allocator.free(prefix);
+    if (prefix.len > options.max_input_bytes) return error.ObservationDiscoveryByteBoundExceeded;
     var reader = std.Io.Reader.fixed(prefix);
     var summary = try trace_core.parseSessionSummaryTraceReader(
         io,
@@ -62,7 +71,7 @@ pub fn discoverSessionIdentity(
         path,
         &reader,
         stat.mtime.nanoseconds,
-        .{ .ongoing_threshold_secs = options.ongoing_threshold_secs },
+        .{ .ongoing_threshold_secs = options.ongoing_threshold_secs, .as_of_ns = options.as_of_ns },
     );
     defer summary.deinit(allocator);
     return .{
@@ -77,6 +86,11 @@ pub fn discoverSessionIdentity(
         .bytes_read = prefix.len,
         .file_size = std.math.cast(usize, stat.size) orelse
             return error.ObservationInputByteBoundExceeded,
+        .source_mtime_ns = stat.mtime.nanoseconds,
+        .repo_matches = if (repo) |wanted|
+            if (summary.session.cwd) |cwd| pathEqualOrDescendant(cwd, wanted) else true
+        else
+            true,
     };
 }
 
@@ -98,6 +112,7 @@ pub const ParsedTrace = struct {
     trace: trace_core.CanonicalSessionTrace,
     metrics: trace_core.StreamMetrics,
     corpus_digest: [71]u8,
+    source_mtime_ns: i128,
 
     pub fn deinit(self: *ParsedTrace, allocator: std.mem.Allocator) void {
         self.trace.deinit(allocator);
@@ -159,9 +174,37 @@ pub fn parseFileSelected(
         return error.ObservationInputByteBoundExceeded;
     }
     var file_reader = file.reader(io, &.{});
+    var bounded_reader = file_reader.interface.limited(
+        .limited(options.max_input_bytes +| 1),
+        &.{},
+    );
+    return parseSelectedProgramReader(
+        io,
+        allocator,
+        program,
+        relation,
+        path,
+        stat.mtime.nanoseconds,
+        &bounded_reader.interface,
+        options,
+        selection,
+    );
+}
+
+fn parseSelectedProgramReader(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    program: *const execution.Program,
+    relation: physical.Relation,
+    path: []const u8,
+    source_mtime_ns: i128,
+    source_reader: *std.Io.Reader,
+    options: Options,
+    selection: ?SessionSelection,
+) !SelectedParse {
     const prefix = try readSelectionPrefixAlloc(
         allocator,
-        &file_reader.interface,
+        source_reader,
         selection,
     );
     defer allocator.free(prefix);
@@ -170,7 +213,7 @@ pub fn parseFileSelected(
             io,
             allocator,
             path,
-            stat.mtime.nanoseconds,
+            source_mtime_ns,
             options,
             selected,
             prefix,
@@ -180,11 +223,11 @@ pub fn parseFileSelected(
     if (!preselection.passes) {
         return skippedSelection(true, preselection.bytes_read);
     }
-    var replay_reader = PrefixReader.init(prefix, &file_reader.interface);
+    var replay_reader = PrefixReader.init(prefix, source_reader);
     const reader = if (selection != null)
         &replay_reader.interface
     else
-        &file_reader.interface;
+        source_reader;
     return .{
         .parsed = try parseSelectedReader(
             io,
@@ -192,7 +235,7 @@ pub fn parseFileSelected(
             program,
             relation,
             path,
-            stat.mtime.nanoseconds,
+            source_mtime_ns,
             reader,
             options,
         ),
@@ -226,9 +269,13 @@ pub fn parseRelationsFileSelected(
         return error.ObservationInputByteBoundExceeded;
     }
     var file_reader = file.reader(io, &.{});
+    var bounded_reader = file_reader.interface.limited(
+        .limited(options.max_input_bytes +| 1),
+        &.{},
+    );
     const prefix = try readSelectionPrefixAlloc(
         allocator,
-        &file_reader.interface,
+        &bounded_reader.interface,
         selection,
     );
     defer allocator.free(prefix);
@@ -247,11 +294,11 @@ pub fn parseRelationsFileSelected(
     if (!preselection.passes) {
         return skippedSelection(true, preselection.bytes_read);
     }
-    var replay_reader = PrefixReader.init(prefix, &file_reader.interface);
+    var replay_reader = PrefixReader.init(prefix, &bounded_reader.interface);
     const reader = if (selection != null)
         &replay_reader.interface
     else
-        &file_reader.interface;
+        &bounded_reader.interface;
     return parseSelectedRelations(
         io,
         allocator,
@@ -274,7 +321,7 @@ fn parseSelectedRelations(
 ) !SelectedParse {
     var metrics = trace_core.StreamMetrics{};
     var corpus_hasher = CorpusHasher{};
-    const trace = try trace_core.parseSessionTraceReaderWithVisitorMetrics(
+    var trace = try trace_core.parseSessionTraceReaderWithVisitorMetrics(
         io,
         allocator,
         path,
@@ -285,15 +332,57 @@ fn parseSelectedRelations(
         CorpusHasher.visit,
         &metrics,
     );
+    errdefer trace.deinit(allocator);
+    if (metrics.bytes_read > options.max_input_bytes) {
+        return error.ObservationInputByteBoundExceeded;
+    }
     return .{
         .parsed = .{
             .trace = trace,
             .metrics = metrics,
             .corpus_digest = corpus_hasher.digest(),
+            .source_mtime_ns = modified_at,
         },
         .discovery_bytes_read = 0,
         .file_opened = true,
     };
+}
+
+test "source growth beyond a reservation fails after at most one extra byte" {
+    const source = "{\"type\":\"session_meta\",\"payload\":{\"id\":\"growing\"}}\n \n";
+    const reserved = source.len - 2;
+    var reader: std.Io.Reader = .fixed(source);
+    var bounded = reader.limited(.limited(reserved + 1), &.{});
+    try std.testing.expectError(error.ObservationInputByteBoundExceeded, parseSelectedRelations(
+        std.testing.io,
+        std.testing.allocator,
+        "growing.jsonl",
+        &bounded.interface,
+        0,
+        &.{.sessions},
+        .{ .max_input_bytes = reserved, .as_of_ns = 0 },
+    ));
+    try std.testing.expectEqual(reserved + 1, reader.seek);
+}
+
+test "identity discovery obeys its remaining byte allowance" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "session.jsonl",
+        .data = "{\"type\":\"session_meta\",\"payload\":{\"id\":\"discovery\"}}\n",
+    });
+    try std.testing.expectError(
+        error.ObservationDiscoveryByteBoundExceeded,
+        discoverSessionIdentity(
+            std.testing.io,
+            tmp.dir,
+            std.testing.allocator,
+            "session.jsonl",
+            .{ .max_input_bytes = 8 },
+            null,
+        ),
+    );
 }
 
 pub fn relationParseOptions(
@@ -302,6 +391,7 @@ pub fn relationParseOptions(
 ) trace_core.TraceParseOptions {
     var result = trace_core.TraceParseOptions{
         .ongoing_threshold_secs = options.ongoing_threshold_secs,
+        .as_of_ns = options.as_of_ns,
         .include_occurrences = false,
         .include_message_bodies = false,
         .include_tool_output_parts = false,
@@ -401,7 +491,7 @@ fn parseSelectedReader(
         options,
     );
     var corpus_hasher = CorpusHasher{};
-    const trace = if (relation == .sessions)
+    var trace = if (relation == .sessions)
         try trace_core.parseSessionSummaryTraceReaderWithVisitorMetrics(
             io,
             allocator,
@@ -425,10 +515,15 @@ fn parseSelectedReader(
             CorpusHasher.visit,
             &metrics,
         );
+    errdefer trace.deinit(allocator);
+    if (metrics.bytes_read > options.max_input_bytes) {
+        return error.ObservationInputByteBoundExceeded;
+    }
     return ParsedTrace{
         .trace = trace,
         .metrics = metrics,
         .corpus_digest = corpus_hasher.digest(),
+        .source_mtime_ns = source_mtime_ns,
     };
 }
 
@@ -531,7 +626,7 @@ fn preselectSession(
         path,
         &reader,
         source_mtime_ns,
-        .{ .ongoing_threshold_secs = options.ongoing_threshold_secs },
+        .{ .ongoing_threshold_secs = options.ongoing_threshold_secs, .as_of_ns = options.as_of_ns },
     );
     defer summary.deinit(allocator);
     if (selection.session_id) |wanted| {
@@ -1506,6 +1601,7 @@ pub fn traceParseOptions(
     };
     return .{
         .ongoing_threshold_secs = options.ongoing_threshold_secs,
+        .as_of_ns = options.as_of_ns,
         .include_raw = relation == .source_events and
             containsField(demanded_fields, 8),
         .include_occurrence_payloads = (relation == .source_events and
