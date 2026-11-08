@@ -5,14 +5,8 @@ const definition = @import("definition.zig");
 const plan = @import("plan.zig");
 const physical = @import("physical.zig");
 
-pub const Value = union(enum) {
-    string: []const u8,
-    integer: i64,
-    float: f64,
-    boolean: bool,
-    json: []const u8,
-    null,
-};
+pub const Value = @import("value.zig").Value;
+const expressions = @import("expressions.zig");
 
 pub const Rows = struct {
     values: []const Value,
@@ -87,6 +81,7 @@ pub const RuntimeTopK = struct {
 pub const RuntimeOperation = union(enum) {
     filter_all: PredicateRange,
     filter_any: PredicateRange,
+    derive: u16,
     limit: struct {
         count: usize,
         state_index: u16,
@@ -95,6 +90,17 @@ pub const RuntimeOperation = union(enum) {
     top_k: RuntimeTopK,
     distinct: FieldRange,
     aggregate: FieldRange,
+};
+
+const RuntimeDerivation = struct {
+    compiled: expressions.Derivation,
+    input_fields: []u16,
+
+    fn deinit(self: *RuntimeDerivation, allocator: std.mem.Allocator) void {
+        self.compiled.deinit();
+        allocator.free(self.input_fields);
+        self.* = undefined;
+    }
 };
 
 pub const Program = struct {
@@ -112,8 +118,15 @@ pub const Program = struct {
     limit_state_count: u16,
     first_blocking_operation: ?u16,
     max_rows: usize,
+    derivations: []RuntimeDerivation = &.{},
+    streaming_row_width: u16 = 0,
+    expression_byte_bound: usize = 0,
+    bindings: ?definition_core.parameters.Bindings = null,
+    selectors: expressions.RuntimeSelectors = .{},
 
     pub fn deinit(self: *Program, allocator: std.mem.Allocator) void {
+        for (self.derivations) |*derivation| derivation.deinit(allocator);
+        allocator.free(self.derivations);
         allocator.free(self.source_field_indices);
         allocator.free(self.materialized_field_indices);
         allocator.free(self.operations);
@@ -215,6 +228,43 @@ pub fn compile(
         projection_name,
     ) orelse return error.UnknownObservationProjection;
     const projection = native_plan.projections[projection_index];
+    return compileProjection(allocator, definition_plan, native_plan, bindings, &projection);
+}
+
+pub fn compileTarget(
+    allocator: std.mem.Allocator,
+    definition_plan: *const definition.Plan,
+    native_plan: *const plan.Plan,
+    bindings: *const definition_core.parameters.Bindings,
+    stage_index: u16,
+    selectors: expressions.RuntimeSelectors,
+) !Program {
+    const fields = try allocator.alloc(u16, native_plan.stages[stage_index].schema.columns.len);
+    defer allocator.free(fields);
+    for (fields, 0..) |*field, index| field.* = @intCast(index);
+    const projection: plan.Projection = .{
+        .definition_index = 0,
+        .stage_index = stage_index,
+        .field_indices = fields,
+    };
+    var program = try compileProjection(
+        allocator,
+        definition_plan,
+        native_plan,
+        bindings,
+        &projection,
+    );
+    program.selectors = selectors;
+    return program;
+}
+
+fn compileProjection(
+    allocator: std.mem.Allocator,
+    definition_plan: *const definition.Plan,
+    native_plan: *const plan.Plan,
+    bindings: *const definition_core.parameters.Bindings,
+    projection: *const plan.Projection,
+) !Program {
     const resolved = try resolveSource(
         definition_plan,
         native_plan,
@@ -236,7 +286,7 @@ pub fn compile(
         ];
         try builder.applyStage(stage);
     }
-    return builder.finish(&resolved, &projection);
+    return builder.finish(&resolved, projection);
 }
 
 const ResolvedSource = struct {
@@ -303,6 +353,8 @@ const ProgramBuilder = struct {
     distinct_fields: std.ArrayList(u16) = .empty,
     aggregate_metrics: std.ArrayList(RuntimeAggregateMetric) = .empty,
     materialized_field_indices: std.ArrayList(u16) = .empty,
+    derivations: std.ArrayList(RuntimeDerivation) = .empty,
+    streaming_row_width: usize,
     limit_state_count: u16 = 0,
     first_blocking_operation: ?u16 = null,
     aggregate_seen: bool = false,
@@ -324,6 +376,7 @@ const ProgramBuilder = struct {
             .bindings = bindings,
             .field_map = undefined,
             .field_count = source_width,
+            .streaming_row_width = source_width,
         };
         for (builder.field_map[0..source_width], 0..) |*field, index| {
             field.* = @intCast(index);
@@ -332,6 +385,8 @@ const ProgramBuilder = struct {
     }
 
     fn deinit(self: *ProgramBuilder) void {
+        for (self.derivations.items) |*derivation| derivation.deinit(self.allocator);
+        self.derivations.deinit(self.allocator);
         self.predicates.deinit(self.allocator);
         self.operations.deinit(self.allocator);
         self.sort_keys.deinit(self.allocator);
@@ -353,8 +408,47 @@ const ProgramBuilder = struct {
             .aggregate => |aggregate| {
                 try self.applyAggregate(aggregate, stage);
             },
-            .generic => return error.ObservationGraphOperatorRequiresGraphExecutor,
+            .generic => |generic| {
+                if (generic.operator != .derive) {
+                    return error.ObservationGraphOperatorRequiresGraphExecutor;
+                }
+                try self.applyDerive(stage);
+            },
         }
+    }
+
+    fn applyDerive(self: *ProgramBuilder, stage: *const plan.Stage) !void {
+        try self.requireStreaming();
+        if (self.first_blocking_operation != null) {
+            return error.ObservationGraphOperatorRequiresGraphExecutor;
+        }
+        const input = switch (stage.source orelse
+            return error.ObservationPipelineSourceMissing) {
+            .stage => |index| &self.native_plan.stages[index].schema,
+            .external => return error.ObservationGraphOperatorRequiresGraphExecutor,
+        };
+        var compiled = try expressions.Derivation.init(
+            self.allocator,
+            input,
+            &stage.schema,
+            stage.operation.generic.canonical_config,
+        );
+        errdefer compiled.deinit();
+        if (compiled.output_width > self.field_map.len) {
+            return error.InvalidObservationSourceWidth;
+        }
+        const fields = try self.allocator.dupe(u16, self.field_map[0..self.field_count]);
+        errdefer self.allocator.free(fields);
+        try self.operations.append(self.allocator, .{
+            .derive = @intCast(self.derivations.items.len),
+        });
+        try self.derivations.append(self.allocator, .{
+            .compiled = compiled,
+            .input_fields = fields,
+        });
+        self.field_count = compiled.output_width;
+        for (self.field_map[0..self.field_count], 0..) |*field, index| field.* = @intCast(index);
+        self.streaming_row_width = @max(self.streaming_row_width, self.field_count);
     }
 
     fn requireStreaming(self: ProgramBuilder) !void {
@@ -599,6 +693,7 @@ const ProgramBuilder = struct {
         const aggregate_metric_slice =
             try self.aggregate_metrics.toOwnedSlice(self.allocator);
         errdefer self.allocator.free(aggregate_metric_slice);
+        const derivations = try self.derivations.toOwnedSlice(self.allocator);
         return .{
             .source = resolved.source,
             .source_width = @intCast(resolved.source_width),
@@ -614,6 +709,10 @@ const ProgramBuilder = struct {
             .limit_state_count = self.limit_state_count,
             .first_blocking_operation = self.first_blocking_operation,
             .max_rows = self.native_plan.max_rows,
+            .derivations = derivations,
+            .streaming_row_width = @intCast(self.streaming_row_width),
+            .expression_byte_bound = self.definition_plan.bounds.max_output_bytes,
+            .bindings = self.bindings.*,
         };
     }
 
@@ -692,6 +791,8 @@ pub const Runner = struct {
     output_row_count: usize = 0,
     stopped: bool = false,
     finalized: bool = false,
+    expression_workspace: ?expressions.ExpressionWorkspace = null,
+    expression_buffer: []u8 = &.{},
 
     pub fn init(program: *const Program, output: []Value) !Runner {
         try validateRunnerInputs(program);
@@ -787,6 +888,20 @@ pub const Runner = struct {
         errdefer runner.deinit();
         runner.value_allocator = allocator;
         runner.owned_value_bytes_max = owned_value_bytes_max;
+        if (program.derivations.len != 0) {
+            const bound = @min(owned_value_bytes_max, program.expression_byte_bound);
+            if (bound == 0) return error.ObservationRetainedValueByteBoundInvalid;
+            runner.expression_buffer = try allocator.alloc(u8, bound);
+            var config_bytes: usize = 0;
+            for (program.derivations) |derivation| {
+                config_bytes = @max(config_bytes, derivation.compiled.config_bytes);
+            }
+            runner.expression_workspace = .{
+                .allocator = allocator,
+                .config_bytes = config_bytes,
+                .text_budget = .{ .max_bytes = bound },
+            };
+        }
         if (streamingTopK(program) != null) {
             runner.top_k_owned_values = try allocator.alloc(
                 std.ArrayList([]u8),
@@ -798,6 +913,7 @@ pub const Runner = struct {
     }
 
     pub fn deinit(self: *Runner) void {
+        if (self.expression_workspace) |*workspace| workspace.deinit();
         if (self.allocator) |allocator| {
             allocator.free(self.materialized);
             allocator.free(self.row_refs);
@@ -805,6 +921,7 @@ pub const Runner = struct {
             allocator.free(self.duplicate_marks);
         }
         if (self.value_allocator) |allocator| {
+            allocator.free(self.expression_buffer);
             for (self.top_k_owned_values) |*values| {
                 for (values.items) |value| allocator.free(value);
                 values.deinit(allocator);
@@ -830,24 +947,33 @@ pub const Runner = struct {
             }
         }
         self.source_row_count += 1;
-
+        var scratch: [256]Value = undefined;
+        var expression_allocator = std.heap.FixedBufferAllocator.init(self.expression_buffer);
+        const working = if (self.program.derivations.len == 0) @constCast(row) else derived: {
+            if (self.expression_workspace == null) {
+                return error.ObservationDerivationWorkspaceRequired;
+            }
+            @memcpy(scratch[0..row.len], row);
+            break :derived scratch[0..self.program.streaming_row_width];
+        };
         const operation_end = self.program.first_blocking_operation orelse
             self.program.operations.len;
         const disposition = try self.applyStreaming(
-            row,
+            working,
             self.program.operations[0..operation_end],
+            expression_allocator.allocator(),
         );
         if (disposition.accepted) {
             if (streamingTopK(self.program)) |top_k| {
                 try self.materializeTopK(
-                    row,
+                    working,
                     top_k,
                     self.source_row_count - 1,
                 );
             } else if (self.program.first_blocking_operation != null) {
-                try self.materialize(row);
+                try self.materialize(working);
             } else {
-                try self.append(row);
+                try self.append(working);
             }
         }
         if (disposition.stop_after_row) {
@@ -890,6 +1016,7 @@ pub const Runner = struct {
                         range,
                     ),
                     .aggregate => return error.ObservationAggregateAfterBlocking,
+                    .derive => return error.ObservationDerivationAfterBlocking,
                 };
                 resetOrdinals(self.row_refs[0..active_count]);
             }
@@ -923,13 +1050,15 @@ pub const Runner = struct {
 
     fn applyStreaming(
         self: *Runner,
-        row: []const Value,
+        row: []Value,
         operations: []const RuntimeOperation,
+        expression_allocator: std.mem.Allocator,
     ) !StreamingDisposition {
         var accepted = true;
         var stop_after_row = false;
         for (operations) |operation| {
             switch (operation) {
+                .derive => |index| try self.applyDerivation(row, index, expression_allocator),
                 .filter_all => |range| {
                     if (!self.rowMatches(row, range, .all)) {
                         accepted = false;
@@ -968,6 +1097,28 @@ pub const Runner = struct {
             .accepted = accepted,
             .stop_after_row = stop_after_row,
         };
+    }
+
+    fn applyDerivation(
+        self: *Runner,
+        row: []Value,
+        index: u16,
+        allocator: std.mem.Allocator,
+    ) !void {
+        const derivation = &self.program.derivations[index];
+        var input: [256]Value = undefined;
+        var output: [256]Value = undefined;
+        for (derivation.input_fields, 0..) |field, column| input[column] = row[field];
+        try derivation.compiled.apply(
+            &self.expression_workspace.?,
+            allocator,
+            &self.program.bindings.?,
+            self.program.selectors,
+            input[0..derivation.input_fields.len],
+            output[0..derivation.compiled.output_width],
+        );
+        const width = derivation.compiled.output_width;
+        @memcpy(row[0..width], output[0..width]);
     }
 
     fn rowMatches(
@@ -1025,8 +1176,11 @@ pub const Runner = struct {
             return;
         }
         const worst_index = self.auxiliary_refs[0].row_index;
+        var projected: [256]Value = undefined;
+        const fields = self.program.materialized_field_indices;
+        for (fields, 0..) |field, index| projected[index] = row[field];
         if (!rowSortsBefore(
-            row,
+            projected[0..fields.len],
             ordinal,
             self.materializedRow(worst_index),
             self.row_refs[worst_index].ordinal,
@@ -2703,4 +2857,103 @@ test "owned runners bound retained value bytes" {
         error.ObservationRetainedValueByteBoundExceeded,
         runner.feed(&.{.{ .string = "four" }}),
     );
+}
+
+const derive_top_k_test_definition =
+    \\{"schema":"seq-observation-definition/v1","id":"example/derived-search",
+    \\ "requires":{"abi":"seq-observation-abi/v1",
+    \\ "operators":["derive","filter","project","scan","top-k"]},
+    \\ "parameters":{"role":{"type":"string","required":true}},
+    \\ "selectors":[],"inputs":[],
+    \\ "relations":[{"name":"messages","fields":["role","text"]}],
+    \\ "pipeline":[
+    \\ {"op":"scan","relation":"messages","as":"source"},
+    \\ {"op":"project","input":"source","as":"reordered","fields":["text","role"]},
+    \\ {"op":"derive","input":"reordered","as":"derived","fields":[
+    \\ {"name":"selected","type":"boolean","nullable":false,
+    \\ "expr":{"op":"or","args":[{"op":"eq","args":[{"param":"role"},""]},
+    \\ {"op":"eq","args":[{"field":"role"},{"param":"role"}]}]}},
+    \\ {"name":"label","type":"string","nullable":false,
+    \\ "expr":{"op":"concat","args":[{"field":"role"},":",{"field":"text"}]}}]},
+    \\ {"op":"filter","input":"derived","as":"matched","where":[
+    \\ {"field":"selected","op":"exact","value":true},
+    \\ {"field":"text","op":"contains","value":"marker"}]},
+    \\ {"op":"project","input":"matched","as":"ranked","fields":["label","text"]},
+    \\ {"op":"top-k","input":"ranked","as":"bounded",
+    \\ "by":[{"field":"text","direction":"desc"}],"limit":2}],
+    \\ "projections":{"rows":{"relation":"bounded","schema":"example-search/v1",
+    \\ "fields":["text","label"],"renderers":["json"]}},
+    \\ "bounds":{"max_rows":8,"max_output_bytes":4096,"max_fold_states":1}}
+;
+
+fn derivedRunnerProbe(allocator: std.mem.Allocator, program: *const Program) !void {
+    var output: [4]Value = undefined;
+    var runner = try Runner.initOwnedAllocBounded(allocator, program, &output, 4096);
+    defer runner.deinit();
+    for ([_][]const u8{ "marker-a", "marker-c", "marker-b" }) |text| {
+        _ = try runner.feed(&.{ .{ .string = "user" }, .{ .string = text } });
+    }
+    const result = try runner.finish();
+    try std.testing.expectEqual(@as(usize, 2), result.row_count);
+    try std.testing.expectEqualStrings("user:marker-c", result.rows().row(0)[1].string);
+    try std.testing.expectEqualStrings("user:marker-b", result.rows().row(1)[1].string);
+}
+
+test "derived native prefix keeps exact optional roles and a bounded retained working set" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    for ([_][]const u8{ "user", "", "u" }) |role| {
+        var fixture = try compileTestProgram(
+            &tmp.dir,
+            derive_top_k_test_definition,
+            &.{.{ .name = "role", .raw_value = role }},
+            "rows",
+        );
+        defer fixture.deinit();
+        var output: [4]Value = undefined;
+        var runner = try Runner.initOwnedAllocBounded(
+            std.testing.allocator,
+            &fixture.program,
+            &output,
+            4096,
+        );
+        defer runner.deinit();
+        for (0..100_001) |_| {
+            _ = try runner.feed(&.{ .{ .string = "user" }, .{ .string = "no match" } });
+        }
+        var buffer: [32]u8 = undefined;
+        for ([_]usize{ 2, 1, 0 }) |index| {
+            const text = try std.fmt.bufPrint(&buffer, "marker-{d}", .{index});
+            _ = try runner.feed(&.{
+                .{ .string = if (index == 1) "assistant" else "user" },
+                .{ .string = text },
+            });
+        }
+        @memset(&buffer, 'x');
+        const result = try runner.finish();
+        try std.testing.expectEqual(@as(usize, 100_004), result.source_row_count);
+        try std.testing.expectEqual(@as(usize, 2), runner.row_refs.len);
+        try std.testing.expect(runner.owned_value_bytes <= 4096);
+        if (std.mem.eql(u8, role, "u")) {
+            try std.testing.expectEqual(@as(usize, 0), result.row_count);
+            continue;
+        }
+        try std.testing.expectEqual(@as(usize, 2), result.row_count);
+        try std.testing.expectEqualStrings("user:marker-2", result.rows().row(0)[1].string);
+        try std.testing.expectEqualStrings(
+            if (role.len == 0) "assistant:marker-1" else "user:marker-0",
+            result.rows().row(1)[1].string,
+        );
+        if (role.len == 0) continue;
+        try @import("test_support").checkAllAllocationFailures(
+            std.testing.allocator,
+            compileForAllocationFailure,
+            .{ &fixture.definition_plan, &fixture.native_plan, &fixture.bindings },
+        );
+        try @import("test_support").checkAllAllocationFailures(
+            std.testing.allocator,
+            derivedRunnerProbe,
+            .{&fixture.program},
+        );
+    }
 }

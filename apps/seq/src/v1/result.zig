@@ -8,6 +8,7 @@ pub const schema = "seq-observation-result/v2";
 pub const Selection = struct {
     path: ?[]const u8 = null,
     root: ?[]const u8 = null,
+    archive_root: ?[]const u8 = null,
     root_explicit: bool = false,
     session_id: ?[]const u8 = null,
     repo: ?[]const u8 = null,
@@ -16,9 +17,9 @@ pub const Selection = struct {
 
     pub fn digest(self: Selection) [71]u8 {
         var hasher = std.crypto.hash.sha2.Sha256.init(.{});
-        hasher.update("seq-observation-selection/v1\x00");
+        hasher.update("seq-observation-selection/v2\x00");
         hasher.update(&.{@intFromBool(self.root_explicit)});
-        inline for (.{ "path", "root", "session_id", "repo" }) |field| {
+        inline for (.{ "path", "root", "archive_root", "session_id", "repo" }) |field| {
             if (@field(self, field)) |value| {
                 hasher.update(&.{1});
                 var length: [8]u8 = undefined;
@@ -123,7 +124,7 @@ fn writeIdentityAndCorpus(
     try output.raw(",\"projection\":");
     try output.string(envelope.projection_name);
     try output.raw(",\"selection\":{");
-    inline for (.{ "path", "root", "session_id", "repo" }, 0..) |field, index| {
+    inline for (.{ "path", "root", "archive_root", "session_id", "repo" }, 0..) |field, index| {
         if (index != 0) try output.raw(",");
         try output.string(field);
         try output.raw(":");

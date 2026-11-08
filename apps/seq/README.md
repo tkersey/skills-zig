@@ -38,15 +38,16 @@ seq definition check \
 
 seq observe \
   --definition <observation.json> \
-  --root "${CODEX_HOME:-$HOME/.codex}/sessions" \
   --since 2026-07-01T00:00:00Z \
   --param needle=review \
   --projection rows \
   --format json
 ```
 
-Use `--path` or `--session-id` for an exact source. Definitions may also
-declare immutable external inputs:
+Native `--path` and `--session-id` select physical sources. An observation
+definition owns its semantic scope: a lineage definition can read ancestors
+and include descendants of that selection. Definitions may also declare
+immutable external inputs:
 
 ```bash
 seq observe \
@@ -63,10 +64,12 @@ corpus, declared parameters, projection, data, statistics, and limitations.
 `authority_granted` is always `false`.
 
 The envelope also includes `seq_version` and a `selection` receipt with absolute
-`path`, `root`, and `repo`, the selected `session_id`, and resolved UTC epoch
+`path`, `root`, `archive_root`, and `repo`, the selected `session_id`, and resolved UTC epoch
 `since_ms`/`until_ms` bounds. This includes the absolute window resolved from
 `--last`. `root` records the discovery root, including an environment/default
-root; `root_explicit` distinguishes it from an explicit root selector. An
+root; `archive_root` records the additional default Codex archive discovery
+root and is null for an explicit root. `root_explicit` distinguishes default
+discovery from an explicit root selector. An
 external-only observation has no physical selection. `selection_digest` hashes
 these resolved values with a versioned, length-framed encoding. Equivalent
 `.`/`..` paths and time-zone spellings have the same selection identity; a
@@ -91,15 +94,18 @@ audit prompts, quoted reports, and injected instructions can still contaminate a
 semantic analysis. The owning definition or analyst must assess that question.
 The former `contaminated` boolean is absent from v2.
 
-`bounds.max_input_bytes` applies to the aggregate corpus admitted for parsing.
-Streaming lineage execution reserves the selected files' discovered sizes before
-prefetch, enforces each reservation while reading, and checks the aggregate again
-when consuming results. A growing file that exceeds its reservation fails with
+`bounds.max_input_bytes` applies to aggregate decoded JSONL admitted for parsing.
+Plain-only streaming lineage execution reserves discovered file sizes before
+prefetch and checks the aggregate again when consuming results. A corpus with
+compressed files is parsed sequentially against the remaining decoded budget;
+compressed disk sizes are never substituted for decoded reservations. A growing
+plain file that exceeds its reservation fails with
 `ObservationInputByteBoundExceeded`; a failed read never yields a partial success.
-Discovery has a separate 256 MiB byte allowance. `stats.files_opened` counts source
+Discovery has a separate 256 MiB decoded-byte allowance. `stats.files_opened` counts source
 file opens, including discovery reopens; `discovery_files_opened` and
-`discovery_bytes_read` identify that additional work. `corpus_bytes_read` counts
-execution input, and `bytes_read` is its sum with discovery bytes.
+`discovery_bytes_read` identify that additional work. `corpus_bytes_read` and
+`discovery_bytes_read` count decoded source bytes, and `bytes_read` is their sum.
+These are not compressed disk-I/O measurements.
 `physical_passes` counts relation execution passes, so one pass does not imply
 that lineage discovery performed no additional I/O.
 
@@ -107,6 +113,73 @@ Shared graph inputs remain intact until all their consuming stages have run.
 Filtering, folding, and membership joins may reuse storage only for an exclusively
 owned final consumer. Comparisons between two integers preserve signed 64-bit
 precision, including values above `2^53`.
+
+Single-source graphs with a native `top-k` prefix stream physical selection,
+filters, and row-local derivations through the native runner. Only the retained
+top-k rows enter the remaining graph. `seq explain` reports this as
+`bounded-native-prefix`. Adding excerpt derivations to a search therefore keeps
+its path/session/time selection and avoids retaining the entire matching corpus.
+The native row, retained-byte, input-byte, and output limits still apply.
+
+## Codex source coverage and forks
+
+Default discovery reads both `${CODEX_HOME:-$HOME/.codex}/sessions` and
+`archived_sessions`. Explicit roots stay confined to the requested directory.
+Both `.jsonl` and `.jsonl.zst` rollouts are discovered; capabilities advertise
+`source_encodings`. Use time selectors over the complete intended corpus;
+calendar directories reflect session starts and can omit resumed sessions or
+needed ancestors. An empty result describes the admitted corpus, not all work
+that may have occurred outside it.
+
+Zstd decoding stays in process and verifies frame checksums. Concatenated and
+skippable frames are supported. The decoder accepts an 8 MiB maximum window;
+larger windows and external dictionaries fail explicitly. Each compressed
+source also has an encoded-byte cap of twice its decoded allowance plus 1 MiB,
+with saturating arithmetic and one sentinel byte for overrun detection. This
+bounds streams that produce little or no decoded output. Native file parsing
+has a 64 GiB decoded limit; observation definitions supply their own limits.
+Corrupt, truncated, or unsupported compressed input cannot produce successful
+empty sessions. Recognized Claude Code transcripts fail with
+`UnsupportedSessionFormat`; sharing a skill installation does not add a reader.
+
+`sessions.parent_session_id` follows history ownership: `forked_from_id`, with
+legacy fallback to the control parent. `control_parent_session_id` records the
+worker-control relationship independently. Different values are legitimate.
+`subagent_history_start_ordinal` separates an inherited prefix from the worker's
+own records when the source supplies record ordinals. Matching ancestor metadata
+inside that prefix preserves primary session identity without a conflict warning;
+unrelated or out-of-boundary metadata still warns.
+
+`token_events.persisted_ordinal` preserves the source's nullable rollout ordinal;
+`source_ordinal` remains the parsed occurrence index. Token rows also expose the
+authoritative session's history parent and history-start boundary so passive
+definitions can distinguish record provenance from ownership of a token
+increment. A child record can repeat inherited counters after its history
+boundary; the boundary alone does not prove new consumption.
+`sessions.token_usage_observation_count` counts records asserting a total or
+last-usage tuple before replay removal. Observed zero and replayed assertions
+remain evidence; neutral records do not establish a usage baseline. Unsupported
+adapters expose this field as null.
+
+Worker edges preserve recorded control parents, successful spawn results, and
+started-worker events. Declarations and failed spawns do not establish workers.
+Copied prefix events do not spawn new children. When a result provides only a
+task path, `agent_path` is present and `worker_session_id` remains null; no UUID
+is invented. `spawned_worker_count` counts distinct observed successful links,
+not attempted calls or a claim that every worker's transcript was available.
+
+Strict native row commands stage their bounded output before writing it.
+Parser warnings remain failures, with source path, count, and a representative
+warning in `seq-command-error/v1`; an error never follows partially emitted
+rows. `session-detail` exposes the trace and its warnings for investigation.
+Observations retain parser-warning counts separately from semantic contamination.
+
+The generic `text-prefix` expression returns a bounded UTF-8 prefix:
+`{"op":"text-prefix","args":[text, byte_limit]}`. It requires a nonnegative
+integer byte limit, preserves null text, and stops before splitting a codepoint.
+Compare the prefix with its input to detect truncation. Capabilities advertise
+this through `derive` version 3 and `ordered-fold` version 2. Bounded excerpts
+are not automatic redaction or semantic contamination classification.
 
 ## Native surface
 

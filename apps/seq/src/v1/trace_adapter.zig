@@ -1,6 +1,7 @@
 const std = @import("std");
 const definition_core = @import("definition_core");
 const trace_core = @import("trace_core");
+const SessionInput = trace_core.SessionInput;
 const definition = @import("definition.zig");
 const execution = @import("execution.zig");
 const physical = @import("physical.zig");
@@ -12,7 +13,7 @@ pub const Options = struct {
     ongoing_threshold_secs: i64 = 60,
     as_of_ns: ?i128 = null,
     structured_limits: structured.Limits = .{},
-    max_input_bytes: usize = std.math.maxInt(usize),
+    max_input_bytes: usize = 64 * 1024 * 1024 * 1024,
 };
 
 pub const SessionSelection = struct {
@@ -33,6 +34,11 @@ pub const SelectedParse = struct {
 pub const SessionIdentity = struct {
     session_id: ?[]u8,
     parent_session_id: ?[]u8,
+    control_parent_session_id: ?[]u8 = null,
+    forked_from_session_id: ?[]u8 = null,
+    parent_relation: ?[]u8 = null,
+    subagent_history_start_ordinal: ?u64 = null,
+    lineage_conflict: bool = false,
     bytes_read: usize,
     file_size: usize,
     source_mtime_ns: i128 = 0,
@@ -41,6 +47,9 @@ pub const SessionIdentity = struct {
     pub fn deinit(self: *SessionIdentity, allocator: std.mem.Allocator) void {
         if (self.session_id) |value| allocator.free(value);
         if (self.parent_session_id) |value| allocator.free(value);
+        if (self.control_parent_session_id) |value| allocator.free(value);
+        if (self.forked_from_session_id) |value| allocator.free(value);
+        if (self.parent_relation) |value| allocator.free(value);
         self.* = undefined;
     }
 };
@@ -56,12 +65,15 @@ pub fn discoverSessionIdentity(
     const file = try openTraceFile(io, dir, path);
     defer file.close(io);
     const stat = try file.stat(io);
-    var file_reader = file.reader(io, &.{});
-    var bounded_reader = file_reader.interface.limited(
+    var raw = file.reader(io, &.{});
+    var input = try SessionInput.init(allocator, path, &raw.interface, options.max_input_bytes);
+    defer input.deinit(allocator);
+    var bounded_reader = input.reader().limited(
         .limited(options.max_input_bytes +| 1),
         &.{},
     );
-    const prefix = try readSummaryPrefixAlloc(allocator, &bounded_reader.interface);
+    const prefix = readSummaryPrefixAlloc(allocator, &bounded_reader.interface) catch |err|
+        return input.sourceError(err);
     defer allocator.free(prefix);
     if (prefix.len > options.max_input_bytes) return error.ObservationDiscoveryByteBoundExceeded;
     var reader = std.Io.Reader.fixed(prefix);
@@ -74,15 +86,11 @@ pub fn discoverSessionIdentity(
         .{ .ongoing_threshold_secs = options.ongoing_threshold_secs, .as_of_ns = options.as_of_ns },
     );
     defer summary.deinit(allocator);
-    return .{
-        .session_id = if (summary.session.session_id) |value|
-            try allocator.dupe(u8, value)
-        else
-            null,
-        .parent_session_id = if (summary.session.parent_session_id) |value|
-            try allocator.dupe(u8, value)
-        else
-            null,
+    var identity: SessionIdentity = .{
+        .session_id = null,
+        .parent_session_id = null,
+        .lineage_conflict = summary.session.lineage_conflict,
+        .subagent_history_start_ordinal = summary.session.subagent_history_start_ordinal,
         .bytes_read = prefix.len,
         .file_size = std.math.cast(usize, stat.size) orelse
             return error.ObservationInputByteBoundExceeded,
@@ -92,6 +100,16 @@ pub fn discoverSessionIdentity(
         else
             true,
     };
+    errdefer identity.deinit(allocator);
+    inline for (.{
+        "session_id",             "parent_session_id", "control_parent_session_id",
+        "forked_from_session_id", "parent_relation",
+    }) |field| {
+        if (@field(summary.session, field)) |value| {
+            @field(identity, field) = try allocator.dupe(u8, value);
+        }
+    }
+    return identity;
 }
 
 pub const Observation = struct {
@@ -170,11 +188,13 @@ pub fn parseFileSelected(
     const file = try openTraceFile(io, dir, path);
     defer file.close(io);
     const stat = try file.stat(io);
-    if (stat.size > options.max_input_bytes) {
+    if (!trace_core.SessionInput.isCompressed(path) and stat.size > options.max_input_bytes) {
         return error.ObservationInputByteBoundExceeded;
     }
-    var file_reader = file.reader(io, &.{});
-    var bounded_reader = file_reader.interface.limited(
+    var raw = file.reader(io, &.{});
+    var input = try SessionInput.init(allocator, path, &raw.interface, options.max_input_bytes);
+    defer input.deinit(allocator);
+    var bounded_reader = input.reader().limited(
         .limited(options.max_input_bytes +| 1),
         &.{},
     );
@@ -188,7 +208,7 @@ pub fn parseFileSelected(
         &bounded_reader.interface,
         options,
         selection,
-    );
+    ) catch |err| return input.sourceError(err);
 }
 
 fn parseSelectedProgramReader(
@@ -265,19 +285,21 @@ pub fn parseRelationsFileSelected(
     const file = try openTraceFile(io, dir, path);
     defer file.close(io);
     const stat = try file.stat(io);
-    if (stat.size > options.max_input_bytes) {
+    if (!trace_core.SessionInput.isCompressed(path) and stat.size > options.max_input_bytes) {
         return error.ObservationInputByteBoundExceeded;
     }
-    var file_reader = file.reader(io, &.{});
-    var bounded_reader = file_reader.interface.limited(
+    var raw = file.reader(io, &.{});
+    var input = try SessionInput.init(allocator, path, &raw.interface, options.max_input_bytes);
+    defer input.deinit(allocator);
+    var bounded_reader = input.reader().limited(
         .limited(options.max_input_bytes +| 1),
         &.{},
     );
-    const prefix = try readSelectionPrefixAlloc(
+    const prefix = readSelectionPrefixAlloc(
         allocator,
         &bounded_reader.interface,
         selection,
-    );
+    ) catch |err| return input.sourceError(err);
     defer allocator.free(prefix);
     const preselection = if (selection) |selected|
         try preselectSession(
@@ -307,7 +329,7 @@ pub fn parseRelationsFileSelected(
         stat.mtime.nanoseconds,
         relations,
         options,
-    );
+    ) catch |err| return input.sourceError(err);
 }
 
 fn parseSelectedRelations(
@@ -383,6 +405,49 @@ test "identity discovery obeys its remaining byte allowance" {
             null,
         ),
     );
+}
+
+test "compressed discovery and execution count decoded bytes" {
+    const source = "{\"type\":\"session_meta\",\"payload\":{\"id\":\"compressed\"}}\n";
+    const block: u24 = source.len * 8 + 1;
+    const frame = "\x28\xb5\x2f\xfd" ++ [_]u8{ 0x20, source.len } ++
+        [_]u8{ @truncate(block), @truncate(block >> 8), @truncate(block >> 16) } ++ source;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "session.jsonl.zst", .data = frame });
+    var identity = try discoverSessionIdentity(
+        std.testing.io,
+        tmp.dir,
+        std.testing.allocator,
+        "session.jsonl.zst",
+        .{ .max_input_bytes = source.len },
+        null,
+    );
+    defer identity.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("compressed", identity.session_id.?);
+    try std.testing.expectEqual(source.len, identity.bytes_read);
+    try std.testing.expectEqual(frame.len, identity.file_size);
+    var selected = try parseRelationsFileSelected(
+        std.testing.io,
+        tmp.dir,
+        std.testing.allocator,
+        &.{.sessions},
+        "session.jsonl.zst",
+        .{ .max_input_bytes = source.len },
+        null,
+    );
+    defer selected.parsed.?.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("compressed", selected.parsed.?.trace.session.session_id.?);
+    try std.testing.expectEqual(source.len, selected.parsed.?.metrics.bytes_read);
+    try std.testing.expectError(error.ObservationInputByteBoundExceeded, parseRelationsFileSelected(
+        std.testing.io,
+        tmp.dir,
+        std.testing.allocator,
+        &.{.sessions},
+        "session.jsonl.zst",
+        .{ .max_input_bytes = source.len - 1 },
+        null,
+    ));
 }
 
 pub fn relationParseOptions(
@@ -1733,6 +1798,16 @@ fn fillSession(
             26 => optionalString(session.parent_relation),
             27 => .{ .boolean = session.lineage_conflict },
             28 => optionalString(session.service_tier),
+            29 => optionalString(session.control_parent_session_id),
+            30 => optionalString(session.forked_from_session_id),
+            31 => optionalInteger(if (session.subagent_history_start_ordinal) |value|
+                @intCast(value)
+            else
+                null),
+            32 => if (session.source_format == .pi_session_jsonl)
+                .null
+            else
+                .{ .integer = session.token_usage_observation_count },
             else => return error.InvalidTracePhysicalFieldIndex,
         };
     }
@@ -1898,7 +1973,7 @@ fn fillSessionEdge(
         row[index] = switch (field) {
             0 => optionalString(edge.parent_session_id),
             1 => optionalString(edge.worker_session_id),
-            2 => .{ .string = edge.parent_path },
+            2 => optionalString(edge.parent_path),
             3 => optionalString(edge.worker_path),
             4 => optionalString(edge.call_id),
             5 => optionalString(edge.agent_nickname),
@@ -1907,6 +1982,7 @@ fn fillSessionEdge(
             8 => optionalString(edge.reasoning_effort),
             9 => optionalString(edge.spawned_at),
             10 => optionalString(edge.worker_status),
+            11 => optionalString(edge.agent_path),
             else => return error.InvalidTracePhysicalFieldIndex,
         };
     }
@@ -1955,6 +2031,15 @@ fn fillTokenEvent(
                     .null
             else
                 .null,
+            28 => optionalInteger(if (event.persisted_ordinal) |value|
+                std.math.cast(i64, value) orelse return error.IntegerOverflow
+            else
+                null),
+            29 => optionalInteger(if (session.subagent_history_start_ordinal) |value|
+                std.math.cast(i64, value) orelse return error.IntegerOverflow
+            else
+                null),
+            30 => optionalString(session.parent_session_id),
             else => return error.InvalidTracePhysicalFieldIndex,
         };
     }

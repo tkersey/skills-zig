@@ -1,5 +1,6 @@
 const std = @import("std");
 const jsonl_stream = @import("jsonl_core");
+pub const SessionInput = @import("session_input.zig").SessionInput;
 
 pub const TraceFormat = enum {
     new_044_plus,
@@ -39,6 +40,7 @@ pub const ToolLifecycleStatus = enum {
 };
 
 pub const TraceParseOptions = struct {
+    max_input_bytes: usize = 64 * 1024 * 1024 * 1024,
     ongoing_threshold_secs: i64 = 60,
     as_of_ns: ?i128 = null,
     include_raw: bool = false,
@@ -110,6 +112,10 @@ pub const SessionRecord = struct {
     root_session_id: ?[]u8 = null,
     parent_session_id: ?[]u8 = null,
     parent_relation: ?[]u8 = null,
+    control_parent_session_id: ?[]u8 = null,
+    forked_from_session_id: ?[]u8 = null,
+    subagent_history_start_ordinal: ?u64 = null,
+    token_usage_observation_count: i64 = 0,
     lineage_conflict: bool = false,
     service_tier: ?[]u8 = null,
 
@@ -136,6 +142,8 @@ pub const SessionRecord = struct {
         freeOpt(allocator, self.root_session_id);
         freeOpt(allocator, self.parent_session_id);
         freeOpt(allocator, self.parent_relation);
+        freeOpt(allocator, self.control_parent_session_id);
+        freeOpt(allocator, self.forked_from_session_id);
         freeOpt(allocator, self.service_tier);
     }
 };
@@ -263,7 +271,7 @@ pub const SessionGraphNode = struct {
 pub const SessionGraphEdge = struct {
     parent_session_id: ?[]u8 = null,
     worker_session_id: ?[]u8 = null,
-    parent_path: []u8,
+    parent_path: ?[]u8 = null,
     worker_path: ?[]u8 = null,
     call_id: ?[]u8 = null,
     agent_nickname: ?[]u8 = null,
@@ -273,11 +281,12 @@ pub const SessionGraphEdge = struct {
     spawned_at: ?[]u8 = null,
     prompt_preview: ?[]u8 = null,
     worker_status: ?[]u8 = null,
+    agent_path: ?[]u8 = null,
 
     pub fn deinit(self: *SessionGraphEdge, allocator: std.mem.Allocator) void {
         freeOpt(allocator, self.parent_session_id);
         freeOpt(allocator, self.worker_session_id);
-        allocator.free(self.parent_path);
+        freeOpt(allocator, self.parent_path);
         freeOpt(allocator, self.worker_path);
         freeOpt(allocator, self.call_id);
         freeOpt(allocator, self.agent_nickname);
@@ -287,6 +296,7 @@ pub const SessionGraphEdge = struct {
         freeOpt(allocator, self.spawned_at);
         freeOpt(allocator, self.prompt_preview);
         freeOpt(allocator, self.worker_status);
+        freeOpt(allocator, self.agent_path);
     }
 };
 
@@ -350,6 +360,7 @@ pub const TraceOccurrence = struct {
 
 pub const TokenEventRecord = struct {
     occurrence_index: usize,
+    persisted_ordinal: ?u64 = null,
     turn_index: i64,
     input_tokens: ?i64 = null,
     cached_input_tokens: ?i64 = null,
@@ -580,18 +591,19 @@ pub fn parseSessionTrace(
 
     const stat = try file.stat(io);
     var reader = file.reader(io, &.{});
-    return parseSessionTraceReader(
+    return parseSessionSource(
         io,
         allocator,
         path,
         &reader.interface,
         stat.mtime.nanoseconds,
         options,
+        false,
     );
 }
 
-/// Parses the caller-owned immutable session bytes. The path is provenance
-/// only and is never reopened. `source_mtime_ns` is observed by the caller
+/// Parses the caller-owned immutable session bytes. The path selects compression
+/// and provenance; it is never reopened. `source_mtime_ns` is observed by the caller
 /// from the same held source file and is used only for ongoing-turn status.
 pub fn parseSessionTraceBytes(
     io: std.Io,
@@ -602,7 +614,99 @@ pub fn parseSessionTraceBytes(
     options: TraceParseOptions,
 ) !CanonicalSessionTrace {
     var reader = std.Io.Reader.fixed(content);
-    return parseSessionTraceReader(io, allocator, path, &reader, source_mtime_ns, options);
+    return parseSessionSource(io, allocator, path, &reader, source_mtime_ns, options, false);
+}
+
+fn parseSessionSource(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    path: []const u8,
+    raw_reader: *std.Io.Reader,
+    source_mtime_ns: i128,
+    options: TraceParseOptions,
+    comptime summary: bool,
+) !CanonicalSessionTrace {
+    const Ignore = struct {
+        fn visit(_: void, _: []const u8, _: usize) !void {}
+    };
+    var input = try SessionInput.init(allocator, path, raw_reader, options.max_input_bytes);
+    defer input.deinit(allocator);
+    var bounded = input.reader().limited(.limited(options.max_input_bytes +| 1), &.{});
+    var metrics = StreamMetrics{};
+    const parse = if (summary)
+        parseSessionSummaryTraceReaderWithVisitorMetrics
+    else
+        parseSessionTraceReaderWithVisitorMetrics;
+    var result = parse(
+        io,
+        allocator,
+        path,
+        &bounded.interface,
+        source_mtime_ns,
+        options,
+        {},
+        Ignore.visit,
+        &metrics,
+    ) catch |err| return input.sourceError(err);
+    errdefer result.deinit(allocator);
+    if (metrics.bytes_read > options.max_input_bytes) return error.SessionInputByteBoundExceeded;
+    return result;
+}
+
+test "compressed file entry points preserve decoded evidence and input bounds" {
+    const source = "{\"type\":\"session_meta\",\"payload\":{\"id\":\"compressed\"}}\n";
+    const block: u24 = source.len * 8 + 1;
+    const frame = "\x28\xb5\x2f\xfd" ++ [_]u8{ 0x20, source.len } ++
+        [_]u8{ @truncate(block), @truncate(block >> 8), @truncate(block >> 16) } ++ source;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "session.jsonl.zst", .data = frame });
+    inline for (.{ parseSessionTrace, parseSessionSummaryTrace }) |parse| {
+        var trace = try parse(
+            std.testing.io,
+            tmp.dir,
+            std.testing.allocator,
+            "session.jsonl.zst",
+            .{ .max_input_bytes = source.len },
+        );
+        defer trace.deinit(std.testing.allocator);
+        try std.testing.expectEqualStrings("compressed", trace.session.session_id.?);
+        try std.testing.expectEqual(@as(usize, 0), trace.warnings.items.len);
+        try std.testing.expectError(error.SessionInputByteBoundExceeded, parse(
+            std.testing.io,
+            tmp.dir,
+            std.testing.allocator,
+            "session.jsonl.zst",
+            .{ .max_input_bytes = source.len - 1 },
+        ));
+    }
+    var trace = try parseSessionTraceBytes(
+        std.testing.io,
+        std.testing.allocator,
+        "session.jsonl.zst",
+        frame,
+        0,
+        .{},
+    );
+    defer trace.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("compressed", trace.session.session_id.?);
+}
+
+test "Claude transcript records fail instead of yielding empty Codex sessions" {
+    const source = "{\"type\":\"file-history-snapshot\"}\n" ++
+        "{\"type\":\"user\",\"sessionId\":\"claude\",\"uuid\":\"message-1\"," ++
+        "\"message\":{\"role\":\"user\",\"content\":\"hello\"}}\n";
+    inline for (.{ parseSessionTraceReader, parseSessionSummaryTraceReader }) |parse| {
+        var reader: std.Io.Reader = .fixed(source);
+        try std.testing.expectError(error.UnsupportedSessionFormat, parse(
+            std.testing.io,
+            std.testing.allocator,
+            "claude.jsonl",
+            &reader,
+            0,
+            .{},
+        ));
+    }
 }
 
 pub fn parseSessionTraceReader(
@@ -713,6 +817,16 @@ const ParsedRecord = struct {
     fn isState(self: ParsedRecord) bool {
         return std.mem.eql(u8, stringField(self.root, "record_type") orelse "", "state");
     }
+
+    fn ordinal(self: ParsedRecord) ?u64 {
+        return ordinalField(self.root, "ordinal");
+    }
+
+    fn isInherited(self: ParsedRecord, session: SessionRecord) bool {
+        const start = session.subagent_history_start_ordinal orelse return false;
+        const position = self.ordinal() orelse return false;
+        return position < start;
+    }
 };
 
 fn appendMalformedWarning(
@@ -751,6 +865,8 @@ pub fn parseSessionTraceReaderWithVisitorMetrics(
     };
     defer parser.seen_messages.deinit();
     defer parser.tool_lookup.deinit(allocator);
+    defer parser.metadata.deinit(allocator);
+    defer parser.workers.deinit(allocator);
     var pi_parser = PiParser.init(allocator, &trace, options, false);
     defer pi_parser.deinit();
     var source_is_pi: ?bool = null;
@@ -770,6 +886,7 @@ pub fn parseSessionTraceReaderWithVisitorMetrics(
                 continue;
             },
         } orelse continue;
+        try rejectUnsupportedSource(root);
         if (source_is_pi == null) source_is_pi = isPiSessionHeader(root);
         const parsed_record = ParsedRecord.init(root, record.number, line);
         if (source_is_pi.?) {
@@ -790,6 +907,16 @@ pub fn parseSessionTraceReaderWithVisitorMetrics(
 fn isPiSessionHeader(root: std.json.ObjectMap) bool {
     return std.mem.eql(u8, stringField(root, "type") orelse "", "session") and
         stringField(root, "id") != null;
+}
+
+fn rejectUnsupportedSource(root: std.json.ObjectMap) !void {
+    if (stringField(root, "sessionId") != null and
+        stringField(root, "uuid") != null and
+        objectField(root, "message") != null and
+        oneOfString(stringField(root, "type") orelse "", &.{ "user", "assistant" }))
+    {
+        return error.UnsupportedSessionFormat;
+    }
 }
 
 fn isPiStandaloneEntry(root: std.json.ObjectMap) bool {
@@ -1522,7 +1649,8 @@ const TraceParser = struct {
     current_turn_index: ?usize = null,
     synthetic_turns: i64 = 0,
     saw_task_started: bool = false,
-    saw_primary_session_meta: bool = false,
+    metadata: PrimaryMetadata = .{},
+    workers: WorkerGraphParser = .{},
     seen_messages: MessageDigestMap,
     tool_lookup: ToolLookup,
 
@@ -1566,25 +1694,30 @@ const TraceParser = struct {
         if (record.isState()) return;
         try applySessionTimestamp(self.allocator, &self.trace.session, record.timestamp);
         if (record.root_type) |entry_type| {
-            return self.applyTyped(record, entry_type, occurrence_index);
-        }
-        if (record.payload) |payload| {
+            try self.applyTyped(record, entry_type, occurrence_index);
+        } else if (record.payload) |payload| {
             if (std.mem.eql(u8, stringField(payload, "type") orelse "", "session_meta")) {
-                try self.applyMeta(payload, record.line_number);
+                try self.applyMeta(payload, record);
             }
-            return;
+        } else {
+            try self.applyLegacy(record);
+            self.assignOccurrence(occurrence_index);
         }
-        try self.applyLegacy(record);
-        self.assignOccurrence(occurrence_index);
+        try self.workers.apply(
+            self.allocator,
+            self.trace,
+            record,
+            self.current_turn_index,
+        );
     }
 
-    fn applyMeta(self: *TraceParser, meta: std.json.ObjectMap, line_number: usize) !void {
+    fn applyMeta(self: *TraceParser, meta: std.json.ObjectMap, record: ParsedRecord) !void {
         try applyPrimarySessionMeta(
             self.allocator,
             self.trace,
             meta,
-            &self.saw_primary_session_meta,
-            line_number,
+            &self.metadata,
+            record,
         );
     }
 
@@ -1598,7 +1731,7 @@ const TraceParser = struct {
         const kind = std.meta.stringToEnum(Kind, entry_type) orelse return;
         switch (kind) {
             .session_meta => {
-                if (record.payload) |payload| try self.applyMeta(payload, record.line_number);
+                if (record.payload) |payload| try self.applyMeta(payload, record);
                 return;
             },
             .turn_context => {
@@ -1757,13 +1890,14 @@ const TraceParser = struct {
             payload,
         );
         errdefer event.deinit(self.allocator);
+        event.persisted_ordinal = record.ordinal();
         try self.trace.token_events.append(self.allocator, event);
     }
 
     fn applyLegacy(self: *TraceParser, record: ParsedRecord) !void {
         const root = record.root;
         if (root.get("id") != null and root.get("timestamp") != null) {
-            try self.applyMeta(root, record.line_number);
+            try self.applyMeta(root, record);
         } else if (root.get("role") != null and root.get("content") != null) {
             try self.applyLegacyMessage(record);
         } else if (root.get("call_id") != null and
@@ -1898,13 +2032,14 @@ pub fn parseSessionSummaryTrace(
 
     const stat = try file.stat(io);
     var reader = file.reader(io, &.{});
-    return parseSessionSummaryTraceReader(
+    return parseSessionSource(
         io,
         allocator,
         path,
         &reader.interface,
         stat.mtime.nanoseconds,
         options,
+        true,
     );
 }
 
@@ -1991,7 +2126,11 @@ pub fn parseSessionSummaryTraceReaderWithVisitorMetrics(
             if (fastTimestampSlice(line)) |timestamp| {
                 try applySessionTimestamp(allocator, &trace.session, timestamp);
             }
-            if (!sessionSummaryLineCouldMatter(line)) continue;
+            if (!sessionSummaryLineCouldMatter(line, parser.workers.pending.count() > 0) and
+                std.mem.indexOf(u8, line, "\"sessionId\"") == null)
+            {
+                continue;
+            }
         }
         const root = scratch.parse(line) catch |err| switch (err) {
             error.OutOfMemory => return err,
@@ -2000,6 +2139,7 @@ pub fn parseSessionSummaryTraceReaderWithVisitorMetrics(
                 continue;
             },
         } orelse continue;
+        try rejectUnsupportedSource(root);
         if (source_is_pi == null) source_is_pi = isPiSessionHeader(root);
         const parsed_record = ParsedRecord.init(root, record.number, line);
         if (source_is_pi.?) {
@@ -2022,21 +2162,24 @@ const SummaryParser = struct {
     trace: *CanonicalSessionTrace,
     seen_turn_ids: std.StringHashMap(void),
     last_turn_open: bool = false,
-    saw_primary_session_meta: bool = false,
+    metadata: PrimaryMetadata = .{},
+    workers: WorkerGraphParser = .{},
 
     fn deinit(self: *SummaryParser) void {
         var it = self.seen_turn_ids.keyIterator();
         while (it.next()) |key| self.allocator.free(key.*);
         self.seen_turn_ids.deinit();
+        self.metadata.deinit(self.allocator);
+        self.workers.deinit(self.allocator);
     }
 
-    fn applyMeta(self: *SummaryParser, meta: std.json.ObjectMap, line_number: usize) !void {
+    fn applyMeta(self: *SummaryParser, meta: std.json.ObjectMap, record: ParsedRecord) !void {
         try applyPrimarySessionMeta(
             self.allocator,
             self.trace,
             meta,
-            &self.saw_primary_session_meta,
-            line_number,
+            &self.metadata,
+            record,
         );
     }
 
@@ -2046,27 +2189,26 @@ const SummaryParser = struct {
         if (record.root_type) |entry_type| {
             const payload = record.payload orelse return;
             if (std.mem.eql(u8, entry_type, "session_meta")) {
-                try self.applyMeta(payload, record.line_number);
+                try self.applyMeta(payload, record);
             } else if (std.mem.eql(u8, entry_type, "turn_context")) {
                 try applySessionContextFields(self.allocator, &self.trace.session, payload);
             } else if (std.mem.eql(u8, entry_type, "event_msg")) {
                 try self.applyEvent(payload, record.timestamp);
             }
-            return;
-        }
-        if (record.payload) |payload| {
+        } else if (record.payload) |payload| {
             if (std.mem.eql(u8, stringField(payload, "type") orelse "", "session_meta")) {
-                try self.applyMeta(payload, record.line_number);
+                try self.applyMeta(payload, record);
             }
         } else if (record.root.get("id") != null and record.root.get("timestamp") != null) {
-            try self.applyMeta(record.root, record.line_number);
+            try self.applyMeta(record.root, record);
         }
+        try self.workers.apply(self.allocator, self.trace, record, null);
     }
 
     fn applyEvent(
         self: *SummaryParser,
         payload: std.json.ObjectMap,
-        timestamp: ?[]const u8,
+        _: ?[]const u8,
     ) !void {
         const event_type = stringField(payload, "type") orelse "";
         const Kind = enum {
@@ -2077,7 +2219,6 @@ const SummaryParser = struct {
             token_count,
             thread_settings_applied,
             thread_name_updated,
-            collab_agent_spawn_end,
         };
         const kind = std.meta.stringToEnum(Kind, event_type) orelse return;
         const session = &self.trace.session;
@@ -2107,10 +2248,6 @@ const SummaryParser = struct {
                 const name = stringField(payload, "thread_name") orelse
                     stringField(payload, "name");
                 if (name) |value| try replaceOpt(self.allocator, &session.thread_name, value);
-            },
-            .collab_agent_spawn_end => {
-                try appendGraphEdge(self.allocator, self.trace, payload, timestamp);
-                session.spawned_worker_count += 1;
             },
         }
     }
@@ -2434,9 +2571,11 @@ fn oneOfString(value: []const u8, allowed: []const []const u8) bool {
     return false;
 }
 
-fn sessionSummaryLineCouldMatter(line: []const u8) bool {
+fn sessionSummaryLineCouldMatter(line: []const u8, pending_spawns: bool) bool {
     const prefix = line[0..@min(line.len, 96)];
-    if (std.mem.indexOf(u8, prefix, "\"type\":\"response_item\"") != null) return false;
+    if (std.mem.indexOf(u8, prefix, "\"type\":\"response_item\"") != null) {
+        return pending_spawns or std.mem.containsAtLeast(u8, line, 1, "spawn_agent");
+    }
     if (std.mem.indexOf(u8, prefix, "\"type\":\"session_meta\"") != null) return true;
     if (std.mem.indexOf(u8, prefix, "\"type\":\"turn_context\"") != null) return true;
     if (std.mem.indexOf(u8, prefix, "\"type\":\"event_msg\"") != null) {
@@ -2446,10 +2585,12 @@ fn sessionSummaryLineCouldMatter(line: []const u8) bool {
             std.mem.containsAtLeast(u8, line, 1, "token_count") or
             std.mem.containsAtLeast(u8, line, 1, "thread_name_updated") or
             std.mem.containsAtLeast(u8, line, 1, "collab_agent_spawn_end") or
+            std.mem.containsAtLeast(u8, line, 1, "sub_agent_activity") or
             std.mem.containsAtLeast(u8, line, 1, "\"error\"");
     }
-    return std.mem.containsAtLeast(u8, line, 1, "\"id\"") and
-        std.mem.containsAtLeast(u8, line, 1, "\"timestamp\"");
+    return pending_spawns or std.mem.containsAtLeast(u8, line, 1, "spawn_agent") or
+        std.mem.containsAtLeast(u8, line, 1, "\"id\"") and
+            std.mem.containsAtLeast(u8, line, 1, "\"timestamp\"");
 }
 
 fn fastTimestampSlice(line: []const u8) ?[]const u8 {
@@ -2500,6 +2641,7 @@ fn noteSummaryTurn(
 
 fn applyTokenCountToSession(session: *SessionRecord, payload: std.json.ObjectMap) void {
     const info = objectField(payload, "info") orelse payload;
+    noteTokenUsageObservation(session, info);
     const total = objectField(info, "total_token_usage") orelse
         objectField(info, "last_token_usage") orelse return;
     if (intField(total, "input_tokens")) |v| session.input_tokens = v;
@@ -2507,6 +2649,14 @@ fn applyTokenCountToSession(session: *SessionRecord, payload: std.json.ObjectMap
     if (intField(total, "output_tokens")) |v| session.output_tokens = v;
     if (intField(total, "reasoning_output_tokens")) |v| session.reasoning_output_tokens = v;
     if (intField(total, "total_tokens")) |v| session.total_tokens = v;
+}
+
+fn noteTokenUsageObservation(session: *SessionRecord, info: std.json.ObjectMap) void {
+    if (objectField(info, "total_token_usage") != null or
+        objectField(info, "last_token_usage") != null)
+    {
+        session.token_usage_observation_count += 1;
+    }
 }
 
 fn objectField(root: std.json.ObjectMap, key: []const u8) ?std.json.ObjectMap {
@@ -2622,25 +2772,33 @@ fn applySessionMeta(
     if (stringField(meta, "git_repository_url")) |v| {
         try replaceOpt(allocator, &session.git_repository_url, v);
     }
-    const parent_thread_id = stringField(meta, "parent_thread_id");
+    const nested_parent = if (workerSource(meta)) |source|
+        stringField(source, "parent_thread_id")
+    else
+        null;
+    const parent_thread_id = stringField(meta, "parent_thread_id") orelse nested_parent;
     const forked_from_id = stringField(meta, "forked_from_id");
-    if (parent_thread_id != null and forked_from_id != null and
-        !std.mem.eql(u8, parent_thread_id.?, forked_from_id.?))
+    if (stringField(meta, "parent_thread_id") != null and nested_parent != null and
+        !std.mem.eql(u8, parent_thread_id.?, nested_parent.?))
     {
         session.lineage_conflict = true;
     }
-    if (parent_thread_id orelse forked_from_id) |v| {
+    session.control_parent_session_id = try dupOpt(allocator, parent_thread_id);
+    session.forked_from_session_id = try dupOpt(allocator, forked_from_id);
+    session.subagent_history_start_ordinal = ordinalField(meta, "subagent_history_start_ordinal");
+    if (forked_from_id orelse parent_thread_id) |v| {
         try replaceOpt(allocator, &session.parent_session_id, v);
         try replaceOpt(
             allocator,
             &session.parent_relation,
-            if (parent_thread_id != null) "parent_thread_id" else "forked_from_id",
+            if (forked_from_id != null) "forked_from_id" else "parent_thread_id",
         );
     }
     if (session.root_session_id == null) {
         if (session.session_id) |v| try replaceOpt(allocator, &session.root_session_id, v);
     }
     if (nestedObject(meta, "source", "subagent")) |_| session.is_external_worker = true;
+    if (parent_thread_id != null) session.is_external_worker = true;
     if (objectField(meta, "git")) |git| {
         if (stringField(git, "branch")) |v| try replaceOpt(allocator, &session.git_branch, v);
         if (stringField(git, "commit_hash")) |v| {
@@ -2652,25 +2810,58 @@ fn applySessionMeta(
     }
 }
 
+const PrimaryMetadata = struct {
+    seen: bool = false,
+    inherited_session_id: ?[]u8 = null,
+
+    fn deinit(self: *PrimaryMetadata, allocator: std.mem.Allocator) void {
+        freeOpt(allocator, self.inherited_session_id);
+    }
+};
+
+fn workerSource(meta: std.json.ObjectMap) ?std.json.ObjectMap {
+    const subagent = nestedObject(meta, "source", "subagent") orelse return null;
+    return objectField(subagent, "thread_spawn");
+}
+
+fn ordinalField(object: std.json.ObjectMap, field: []const u8) ?u64 {
+    const value = object.get(field) orelse return null;
+    return if (value == .integer and value.integer >= 0) @intCast(value.integer) else null;
+}
+
 fn applyPrimarySessionMeta(
     allocator: std.mem.Allocator,
     trace: *CanonicalSessionTrace,
     meta: std.json.ObjectMap,
-    seen: *bool,
-    line_number: usize,
+    state: *PrimaryMetadata,
+    record: ParsedRecord,
 ) !void {
-    if (!seen.*) {
+    if (!state.seen) {
         try applySessionMeta(allocator, &trace.session, meta);
-        seen.* = true;
+        state.inherited_session_id = try dupOpt(allocator, trace.session.forked_from_session_id);
+        try appendMetadataWorkerEdge(allocator, trace, meta);
+        state.seen = true;
         return;
     }
     const later_id = stringField(meta, "id") orelse return;
     const primary_id = trace.session.session_id orelse return;
+    if (state.inherited_session_id) |expected| {
+        const within_prefix = trace.session.subagent_history_start_ordinal == null or
+            record.isInherited(trace.session);
+        if (within_prefix and std.mem.eql(u8, later_id, expected)) {
+            try replaceNullable(
+                allocator,
+                &state.inherited_session_id,
+                stringField(meta, "forked_from_id"),
+            );
+            return;
+        }
+    }
     if (!std.mem.eql(u8, later_id, primary_id)) {
         const warning = try allocator.print(
             "{s}:{d}: conflicting later session_meta {s} preserved as an occurrence; " ++
                 "primary session {s} remains authoritative",
-            .{ trace.session.path, line_number, later_id, primary_id },
+            .{ trace.session.path, record.line_number, later_id, primary_id },
         );
         errdefer allocator.free(warning);
         try trace.warnings.append(allocator, warning);
@@ -2872,6 +3063,7 @@ fn checkMessageReplacementAllocationFailures(allocator: std.mem.Allocator) !void
 
 fn applyTokenCount(turn: *TurnRecord, session: *SessionRecord, payload: std.json.ObjectMap) void {
     const info = objectField(payload, "info") orelse payload;
+    noteTokenUsageObservation(session, info);
     if (objectField(info, "total_token_usage")) |total| {
         applyCumulativeToken(
             &turn.input_tokens,
@@ -3643,11 +3835,6 @@ fn finalizeToolEvent(
         line_number,
         options,
     );
-    if (std.mem.eql(u8, event_type, "collab_agent_spawn_end")) {
-        try appendGraphEdge(allocator, trace, payload, timestamp);
-        trace.turns.items[turn_idx].spawned_worker_count += 1;
-        trace.session.spawned_worker_count += 1;
-    }
 }
 
 fn finalizeToolOutput(
@@ -4212,30 +4399,255 @@ fn parseExecArgsIntoRecord(
     if (stringField(obj, "cwd")) |v| try replaceOpt(allocator, &record.cwd, v);
 }
 
-fn appendGraphEdge(
+const WorkerGraphParser = struct {
+    pending: std.StringHashMapUnmanaged(?usize) = .empty,
+
+    fn deinit(self: *WorkerGraphParser, allocator: std.mem.Allocator) void {
+        var keys = self.pending.keyIterator();
+        while (keys.next()) |key| allocator.free(key.*);
+        self.pending.deinit(allocator);
+    }
+
+    fn apply(
+        self: *WorkerGraphParser,
+        allocator: std.mem.Allocator,
+        trace: *CanonicalSessionTrace,
+        record: ParsedRecord,
+        turn_index: ?usize,
+    ) !void {
+        if (record.isInherited(trace.session)) return;
+        const payload = record.payload orelse record.root;
+        const kind = stringField(payload, "type") orelse "";
+        const event = std.mem.eql(u8, record.root_type orelse "", "event_msg");
+        if (event and std.mem.eql(u8, kind, "collab_agent_spawn_end")) {
+            if (try workerRecordUnlocated(allocator, trace, record)) return;
+            return appendSpawnGraphEdge(
+                allocator,
+                trace,
+                payload,
+                record.timestamp,
+                turn_index,
+                null,
+            );
+        }
+        if (event and std.mem.eql(u8, kind, "sub_agent_activity")) {
+            if (std.mem.eql(u8, stringField(payload, "kind") orelse "", "started")) {
+                if (try workerRecordUnlocated(allocator, trace, record)) return;
+                try appendSpawnGraphEdge(
+                    allocator,
+                    trace,
+                    payload,
+                    record.timestamp,
+                    turn_index,
+                    null,
+                );
+            }
+            return;
+        }
+        if (event) return;
+        const legacy = record.root_type == null and record.payload == null;
+        const declaration = oneOfString(kind, &.{ "function_call", "custom_tool_call" }) or
+            legacy and (payload.contains("arguments") or payload.contains("input"));
+        const result = oneOfString(kind, &.{ "function_call_output", "custom_tool_call_output" }) or
+            legacy and payload.contains("output");
+        const call_id = stringField(payload, "call_id") orelse return;
+        const name = stringField(payload, "name") orelse "";
+        if (declaration and kindFromName(name) == .spawn_agent and
+            !self.pending.contains(call_id))
+        {
+            if (try workerRecordUnlocated(allocator, trace, record)) return;
+            const key = try allocator.dupe(u8, call_id);
+            errdefer allocator.free(key);
+            try self.pending.put(allocator, key, turn_index);
+        }
+        if (result) if (payload.get("output")) |output| {
+            const pending = self.pending.fetchRemove(call_id) orelse return;
+            defer allocator.free(pending.key);
+            if (try workerRecordUnlocated(allocator, trace, record)) return;
+            if (boolField(payload, "success") == false) return;
+            try applyOutput(
+                allocator,
+                trace,
+                output,
+                call_id,
+                record.timestamp,
+                pending.value,
+            );
+        };
+    }
+
+    fn applyOutput(
+        allocator: std.mem.Allocator,
+        trace: *CanonicalSessionTrace,
+        output: std.json.Value,
+        call_id: []const u8,
+        timestamp: ?[]const u8,
+        turn_index: ?usize,
+    ) !void {
+        if (output == .array) {
+            for (output.array.items) |item| {
+                const block = valueObject(item) orelse continue;
+                if (!std.mem.eql(u8, stringField(block, "type") orelse "", "text")) continue;
+                try applyOutputText(
+                    allocator,
+                    trace,
+                    stringField(block, "text") orelse continue,
+                    call_id,
+                    timestamp,
+                    turn_index,
+                );
+            }
+            return;
+        }
+        if (output != .string) return;
+        try applyOutputText(allocator, trace, output.string, call_id, timestamp, turn_index);
+    }
+
+    fn applyOutputText(
+        allocator: std.mem.Allocator,
+        trace: *CanonicalSessionTrace,
+        output: []const u8,
+        call_id: []const u8,
+        timestamp: ?[]const u8,
+        turn_index: ?usize,
+    ) !void {
+        var parsed = std.json.parseFromSlice(std.json.Value, allocator, output, .{}) catch |err| {
+            if (err == error.OutOfMemory) return err;
+            return;
+        };
+        defer parsed.deinit();
+        const payload = valueObject(parsed.value) orelse return;
+        if (payload.contains("error") or boolField(payload, "success") == false) return;
+        if (stringField(payload, "agent_id") == null and
+            stringField(payload, "task_name") == null) return;
+        try appendSpawnGraphEdge(allocator, trace, payload, timestamp, turn_index, call_id);
+    }
+};
+
+fn workerRecordUnlocated(
+    allocator: std.mem.Allocator,
+    trace: *CanonicalSessionTrace,
+    record: ParsedRecord,
+) !bool {
+    if (trace.session.subagent_history_start_ordinal == null or record.ordinal() != null) {
+        return false;
+    }
+    const warning = try allocator.print(
+        "{s}:{d}: missing or invalid rollout ordinal; worker ownership is unresolved",
+        .{ trace.session.path, record.line_number },
+    );
+    errdefer allocator.free(warning);
+    try trace.warnings.append(allocator, warning);
+    return true;
+}
+
+fn appendSpawnGraphEdge(
     allocator: std.mem.Allocator,
     trace: *CanonicalSessionTrace,
     payload: std.json.ObjectMap,
     timestamp: ?[]const u8,
+    turn_index: ?usize,
+    call_id: ?[]const u8,
 ) !void {
+    const worker_id = stringField(payload, "new_thread_id") orelse
+        stringField(payload, "worker_session_id") orelse
+        stringField(payload, "agent_thread_id") orelse stringField(payload, "agent_id");
+    const agent_path = stringField(payload, "agent_path") orelse stringField(payload, "task_name");
+    if (worker_id == null and agent_path == null) return;
+    if (boolField(payload, "success") == false) return;
     var edge = SessionGraphEdge{
         .parent_path = try allocator.dupe(u8, trace.session.path),
     };
     errdefer edge.deinit(allocator);
-    edge.parent_session_id = try dupOpt(allocator, trace.session.session_id);
-    const worker_id = stringField(payload, "new_thread_id") orelse
-        stringField(payload, "worker_session_id");
+    edge.parent_session_id = try dupOpt(
+        allocator,
+        stringField(payload, "sender_thread_id") orelse trace.session.session_id,
+    );
+    const owned = sameOptionalString(edge.parent_session_id, trace.session.session_id);
+    if (!owned) {
+        freeOpt(allocator, edge.parent_path);
+        edge.parent_path = null;
+    }
     edge.worker_session_id = try dupOpt(allocator, worker_id);
-    edge.call_id = try dupOpt(allocator, stringField(payload, "call_id"));
-    edge.agent_nickname = try dupOpt(allocator, stringField(payload, "agent_nickname"));
-    edge.agent_role = try dupOpt(allocator, stringField(payload, "agent_role"));
+    edge.agent_path = try dupOpt(allocator, agent_path);
+    edge.call_id = try dupOpt(
+        allocator,
+        call_id orelse stringField(payload, "call_id") orelse stringField(payload, "event_id"),
+    );
+    edge.agent_nickname = try dupOpt(allocator, stringField(payload, "agent_nickname") orelse
+        stringField(payload, "new_agent_nickname") orelse stringField(payload, "nickname"));
+    edge.agent_role = try dupOpt(allocator, stringField(payload, "agent_role") orelse
+        stringField(payload, "new_agent_role"));
     edge.model = try dupOpt(allocator, stringField(payload, "model"));
     const effort = stringField(payload, "reasoning_effort") orelse stringField(payload, "effort");
     edge.reasoning_effort = try dupOpt(allocator, effort);
     edge.spawned_at = try dupOpt(allocator, timestamp);
     if (stringField(payload, "prompt")) |v| edge.prompt_preview = try previewAlloc(allocator, v);
     edge.worker_status = try dupOpt(allocator, stringField(payload, "status"));
+    if (try retainWorkerEdge(allocator, trace, edge) and owned) {
+        trace.session.spawned_worker_count += 1;
+        if (turn_index) |index| trace.turns.items[index].spawned_worker_count += 1;
+    }
+}
+
+fn appendMetadataWorkerEdge(
+    allocator: std.mem.Allocator,
+    trace: *CanonicalSessionTrace,
+    meta: std.json.ObjectMap,
+) !void {
+    const parent = trace.session.control_parent_session_id orelse return;
+    const child = trace.session.session_id orelse return;
+    const source = workerSource(meta) orelse meta;
+    var edge = SessionGraphEdge{};
+    errdefer edge.deinit(allocator);
+    edge.parent_session_id = try allocator.dupe(u8, parent);
+    edge.worker_session_id = try allocator.dupe(u8, child);
+    edge.worker_path = try allocator.dupe(u8, trace.session.path);
+    edge.agent_path = try dupOpt(allocator, stringField(meta, "agent_path") orelse
+        stringField(source, "agent_path"));
+    edge.agent_nickname = try dupOpt(allocator, stringField(meta, "agent_nickname") orelse
+        stringField(source, "agent_nickname"));
+    edge.agent_role = try dupOpt(allocator, stringField(meta, "agent_role") orelse
+        stringField(source, "agent_role"));
+    edge.model = try dupOpt(allocator, trace.session.model);
+    edge.spawned_at = try dupOpt(allocator, stringField(meta, "timestamp") orelse
+        trace.session.start_time);
+    _ = try retainWorkerEdge(allocator, trace, edge);
+}
+
+fn retainWorkerEdge(
+    allocator: std.mem.Allocator,
+    trace: *CanonicalSessionTrace,
+    edge: SessionGraphEdge,
+) !bool {
+    for (trace.graph_edges.items) |*existing| {
+        if (!sameOptionalString(existing.parent_session_id, edge.parent_session_id)) continue;
+        const same_worker = equalPresent(existing.worker_session_id, edge.worker_session_id);
+        const same_call = equalPresent(existing.call_id, edge.call_id);
+        const conflicting_worker = existing.worker_session_id != null and
+            edge.worker_session_id != null and !same_worker;
+        if ((!same_worker and !same_call) or conflicting_worker) continue;
+        var unused = edge;
+        inline for (@typeInfo(SessionGraphEdge).@"struct".field_names) |field| {
+            if (@field(existing, field) == null) {
+                @field(existing, field) = @field(unused, field);
+                @field(unused, field) = null;
+            }
+        }
+        unused.deinit(allocator);
+        return false;
+    }
     try trace.graph_edges.append(allocator, edge);
+    return true;
+}
+
+fn equalPresent(left: ?[]const u8, right: ?[]const u8) bool {
+    return if (left) |l| if (right) |r| std.mem.eql(u8, l, r) else false else false;
+}
+
+fn sameOptionalString(left: ?[]const u8, right: ?[]const u8) bool {
+    if (left == null or right == null) return left == null and right == null;
+    return std.mem.eql(u8, left.?, right.?);
 }
 
 fn kindFromName(name: []const u8) ToolKind {
@@ -4245,7 +4657,11 @@ fn kindFromName(name: []const u8) ToolKind {
     if (std.mem.eql(u8, name, "apply_patch")) return .patch_apply;
     if (std.mem.indexOf(u8, name, "web") != null) return .web_search;
     if (std.mem.indexOf(u8, name, "image") != null) return .image_generation;
-    if (std.mem.eql(u8, name, "spawn_agent")) return .spawn_agent;
+    if (oneOfString(name, &.{
+        "spawn_agent", "functions.spawn_agent", "collaboration.spawn_agent",
+    })) {
+        return .spawn_agent;
+    }
     if (std.mem.eql(u8, name, "wait_agent")) return .wait_agent;
     if (std.mem.eql(u8, name, "close_agent")) return .close_agent;
     if (std.mem.startsWith(u8, name, "mcp__")) return .mcp_tool;
@@ -4969,7 +5385,7 @@ test "lossless token events retain lineage, both usage tuples, and event setting
     const source =
         \\{"type":"session_meta","timestamp":"2026-07-13T00:00:00Z","payload":{"id":"worker","session_id":"root","parent_thread_id":"parent","model":"gpt-before"}}
         \\{"type":"event_msg","timestamp":"2026-07-13T00:00:01Z","payload":{"type":"thread_settings_applied","thread_settings":{"model":"gpt-after","service_tier":"priority"}}}
-        \\{"type":"event_msg","timestamp":"2026-07-13T00:00:02Z","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":20,"cached_input_tokens":8,"output_tokens":3,"reasoning_output_tokens":1,"total_tokens":23},"last_token_usage":{"input_tokens":7,"cached_input_tokens":4,"output_tokens":2,"reasoning_output_tokens":1,"total_tokens":9}}}}
+        \\{"type":"event_msg","ordinal":41,"timestamp":"2026-07-13T00:00:02Z","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":20,"cached_input_tokens":8,"output_tokens":3,"reasoning_output_tokens":1,"total_tokens":23},"last_token_usage":{"input_tokens":7,"cached_input_tokens":4,"output_tokens":2,"reasoning_output_tokens":1,"total_tokens":9}}}}
         \\
     ;
     var trace = try parseSessionTraceBytes(
@@ -4992,6 +5408,8 @@ test "lossless token events retain lineage, both usage tuples, and event setting
     try std.testing.expect(!trace.session.lineage_conflict);
     try std.testing.expectEqual(@as(usize, 1), trace.token_events.items.len);
     const event = trace.token_events.items[0];
+    try std.testing.expectEqual(@as(?u64, 41), event.persisted_ordinal);
+    try std.testing.expectEqual(@as(usize, 2), event.occurrence_index);
     const occurrence = trace.occurrences.items[event.occurrence_index];
     try std.testing.expect(occurrence.payload_json == null);
     try std.testing.expect(occurrence.timestamp != null);
@@ -5480,4 +5898,250 @@ fn exerciseToolLookupPromotion(allocator: std.mem.Allocator) !void {
     try std.testing.expectEqual(@as(?usize, 0), lookup.find(&trace, "call-0"));
     try std.testing.expectEqual(@as(?usize, 64), lookup.find(&trace, "call-64"));
     try std.testing.expectEqual(@as(?usize, null), lookup.find(&trace, "missing"));
+}
+
+const fork_graph_source =
+    \\{"ordinal":0,"type":"session_meta","timestamp":"2026-11-08T12:00:00Z","payload":{"id":"child","parent_thread_id":"controller","forked_from_id":"history-parent","subagent_history_start_ordinal":6,"cwd":"/child"}}
+    \\{"ordinal":1,"type":"session_meta","payload":{"id":"history-parent","forked_from_id":"grandparent","cwd":"/parent"}}
+    \\{"ordinal":2,"type":"session_meta","payload":{"id":"grandparent","cwd":"/grandparent"}}
+    \\{"ordinal":3,"type":"event_msg","payload":{"type":"sub_agent_activity","event_id":"old-spawn","agent_thread_id":"old-worker","agent_path":"/root/old","kind":"started"}}
+    \\{"ordinal":6,"type":"event_msg","payload":{"type":"task_started","turn_id":"owned"}}
+    \\{"ordinal":7,"type":"event_msg","payload":{"type":"sub_agent_activity","event_id":"new-spawn","agent_thread_id":"new-worker","agent_path":"/root/child/new","kind":"started"}}
+;
+
+test "fork metadata and worker ownership respect recorded ordinal boundary" {
+    var reader = std.Io.Reader.fixed(fork_graph_source);
+    var full = try parseSessionTraceBytes(
+        std.testing.io,
+        std.testing.allocator,
+        "fork.jsonl",
+        fork_graph_source,
+        0,
+        .{},
+    );
+    defer full.deinit(std.testing.allocator);
+    var summary = try parseSessionSummaryTraceReader(
+        std.testing.io,
+        std.testing.allocator,
+        "fork.jsonl",
+        &reader,
+        0,
+        .{},
+    );
+    defer summary.deinit(std.testing.allocator);
+    for ([_]*CanonicalSessionTrace{ &full, &summary }) |trace| {
+        try std.testing.expectEqual(@as(usize, 0), trace.warnings.items.len);
+        try std.testing.expectEqualStrings("child", trace.session.session_id.?);
+        try std.testing.expectEqualStrings("/child", trace.session.cwd.?);
+        try std.testing.expectEqualStrings("history-parent", trace.session.parent_session_id.?);
+        try std.testing.expectEqualStrings("forked_from_id", trace.session.parent_relation.?);
+        try std.testing.expectEqualStrings("controller", trace.session.control_parent_session_id.?);
+        try std.testing.expect(!trace.session.lineage_conflict);
+        try std.testing.expectEqual(@as(i64, 1), trace.session.spawned_worker_count);
+        try std.testing.expectEqual(@as(usize, 2), trace.graph_edges.items.len);
+        const incoming = trace.graph_edges.items[0];
+        try std.testing.expectEqualStrings("controller", incoming.parent_session_id.?);
+        try std.testing.expectEqualStrings("child", incoming.worker_session_id.?);
+        try std.testing.expect(incoming.parent_path == null);
+        try std.testing.expectEqualStrings("fork.jsonl", incoming.worker_path.?);
+        try std.testing.expectEqualStrings(
+            "new-worker",
+            trace.graph_edges.items[1].worker_session_id.?,
+        );
+    }
+    try std.testing.expectEqual(@as(usize, 6), full.occurrences.items.len);
+    try std.testing.expectEqual(@as(i64, 1), full.turns.items[0].spawned_worker_count);
+}
+
+test "matching ancestor metadata outside inherited prefix remains a warning" {
+    const source =
+        \\{"ordinal":0,"type":"session_meta","payload":{"id":"child","forked_from_id":"parent","subagent_history_start_ordinal":10}}
+        \\{"ordinal":10,"type":"session_meta","payload":{"id":"parent"}}
+    ;
+    var trace = try parseSessionTraceBytes(
+        std.testing.io,
+        std.testing.allocator,
+        "late.jsonl",
+        source,
+        0,
+        .{},
+    );
+    defer trace.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 1), trace.warnings.items.len);
+    try std.testing.expectEqual(@as(usize, 0), trace.graph_edges.items.len);
+    try std.testing.expect(!trace.session.is_external_worker);
+}
+
+const spawn_graph_source =
+    \\{"type":"session_meta","payload":{"id":"parent"}}
+    \\{"type":"event_msg","payload":{"type":"task_started","turn_id":"turn"}}
+    \\{"type":"response_item","payload":{"type":"function_call","name":"collaboration.spawn_agent","call_id":"v2","arguments":"{}"}}
+    \\{"type":"event_msg","payload":{"type":"sub_agent_activity","event_id":"v2","agent_thread_id":"v2-worker","agent_path":"/root/v2","kind":"started"}}
+    \\{"type":"response_item","payload":{"type":"function_call_output","call_id":"v2","output":"{\"task_name\":\"/root/v2\"}"}}
+    \\{"type":"event_msg","payload":{"type":"sub_agent_activity","event_id":"v2","agent_thread_id":"v2-worker","agent_path":"/root/v2","kind":"started"}}
+    \\{"type":"response_item","payload":{"type":"function_call","name":"spawn_agent","call_id":"v1","arguments":"{}"}}
+    \\{"type":"response_item","payload":{"type":"function_call_output","call_id":"v1","output":[{"type":"text","text":"{\"agent_id\":\"v1-worker\",\"nickname\":\"One\"}"}]}}
+    \\{"type":"event_msg","payload":{"type":"collab_agent_spawn_end","call_id":"v1","new_thread_id":"v1-worker"}}
+    \\{"type":"event_msg","payload":{"type":"collab_agent_spawn_end","call_id":"failed","new_thread_id":null,"status":"not_found"}}
+    \\{"type":"response_item","payload":{"type":"function_call","name":"spawn_agent","call_id":"failed-result","arguments":"{}"}}
+    \\{"type":"response_item","payload":{"type":"function_call_output","call_id":"failed-result","success":false,"output":"{\"agent_id\":\"not-created\"}"}}
+    \\{"type":"response_item","payload":{"type":"function_call","name":"exec_command","call_id":"quoted","arguments":"{}"}}
+    \\{"type":"response_item","payload":{"type":"function_call_output","call_id":"quoted","output":"{\"agent_id\":\"quoted-worker\"}"}}
+    \\{"type":"response_item","payload":{"type":"function_call","name":"spawn_agent","call_id":"pending","arguments":"{}"}}
+;
+
+test "worker graph combines confirmed modern and legacy sources once" {
+    try exerciseSpawnGraph(std.testing.allocator);
+}
+
+test "worker graph survives every allocation failure" {
+    try @import("test_support").checkAllAllocationFailures(
+        std.testing.allocator,
+        exerciseSpawnGraph,
+        .{},
+    );
+}
+
+fn exerciseSpawnGraph(allocator: std.mem.Allocator) !void {
+    var reader = std.Io.Reader.fixed(spawn_graph_source);
+    var full = try parseSessionTraceBytes(
+        std.testing.io,
+        allocator,
+        "spawns.jsonl",
+        spawn_graph_source,
+        0,
+        .{ .max_tools = 0 },
+    );
+    defer full.deinit(allocator);
+    var summary = try parseSessionSummaryTraceReader(
+        std.testing.io,
+        allocator,
+        "spawns.jsonl",
+        &reader,
+        0,
+        .{},
+    );
+    defer summary.deinit(allocator);
+    for ([_]*CanonicalSessionTrace{ &full, &summary }) |trace| {
+        try std.testing.expectEqual(@as(i64, 2), trace.session.spawned_worker_count);
+        try std.testing.expectEqual(@as(usize, 2), trace.graph_edges.items.len);
+        try std.testing.expectEqualStrings(
+            "v2-worker",
+            trace.graph_edges.items[0].worker_session_id.?,
+        );
+        try std.testing.expectEqualStrings("/root/v2", trace.graph_edges.items[0].agent_path.?);
+        try std.testing.expectEqualStrings(
+            "v1-worker",
+            trace.graph_edges.items[1].worker_session_id.?,
+        );
+        try std.testing.expectEqualStrings("One", trace.graph_edges.items[1].agent_nickname.?);
+        try std.testing.expectEqual(@as(usize, 0), trace.warnings.items.len);
+    }
+    try std.testing.expectEqual(@as(i64, 2), full.turns.items[0].spawned_worker_count);
+}
+
+test "successful task-path spawn preserves unresolved thread identity" {
+    const source =
+        \\{"type":"session_meta","payload":{"id":"parent"}}
+        \\{"type":"response_item","payload":{"type":"function_call","name":"spawn_agent","call_id":"v2","arguments":"{}"}}
+        \\{"type":"response_item","payload":{"type":"function_call_output","call_id":"v2","output":"{\"task_name\":\"/root/worker\"}"}}
+    ;
+    var trace = try parseSessionTraceBytes(
+        std.testing.io,
+        std.testing.allocator,
+        "task-path.jsonl",
+        source,
+        0,
+        .{},
+    );
+    defer trace.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(i64, 1), trace.session.spawned_worker_count);
+    try std.testing.expectEqual(@as(usize, 1), trace.graph_edges.items.len);
+    try std.testing.expect(trace.graph_edges.items[0].worker_session_id == null);
+    try std.testing.expectEqualStrings("/root/worker", trace.graph_edges.items[0].agent_path.?);
+}
+
+test "legacy worker metadata supplies a graph edge but fork ancestry alone does not" {
+    const source =
+        \\{"type":"session_meta","payload":{"id":"child","forked_from_id":"history","source":{"subagent":{"thread_spawn":{"parent_thread_id":"controller","agent_path":"/root/child"}}}}}
+    ;
+    var trace = try parseSessionTraceBytes(
+        std.testing.io,
+        std.testing.allocator,
+        "child.jsonl",
+        source,
+        0,
+        .{},
+    );
+    defer trace.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(i64, 0), trace.session.spawned_worker_count);
+    try std.testing.expectEqual(@as(usize, 1), trace.graph_edges.items.len);
+    try std.testing.expectEqualStrings(
+        "controller",
+        trace.graph_edges.items[0].parent_session_id.?,
+    );
+    try std.testing.expectEqualStrings("history", trace.session.parent_session_id.?);
+    try std.testing.expectEqualStrings("/root/child", trace.graph_edges.items[0].agent_path.?);
+}
+
+test "fork worker attribution refuses missing and fractional record ordinals" {
+    for ([_][]const u8{ "", "\"ordinal\":1.5,", "\"ordinal\":-1," }) |ordinal| {
+        const source = try std.testing.allocator.print(
+            "{{\"ordinal\":0,\"type\":\"session_meta\",\"payload\":{{" ++
+                "\"id\":\"child\",\"subagent_history_start_ordinal\":10}}}}\n" ++
+                "{{{s}\"type\":\"event_msg\",\"payload\":{{\"type\":" ++
+                "\"sub_agent_activity\",\"agent_thread_id\":\"worker\",\"kind\":\"started\"}}}}\n",
+            .{ordinal},
+        );
+        defer std.testing.allocator.free(source);
+        var trace = try parseSessionTraceBytes(
+            std.testing.io,
+            std.testing.allocator,
+            "ordinal.jsonl",
+            source,
+            0,
+            .{},
+        );
+        defer trace.deinit(std.testing.allocator);
+        try std.testing.expectEqual(@as(i64, 0), trace.session.spawned_worker_count);
+        try std.testing.expectEqual(@as(usize, 0), trace.graph_edges.items.len);
+        try std.testing.expectEqual(@as(usize, 1), trace.warnings.items.len);
+    }
+}
+
+test "token assertion count includes zero and incomplete tuples but excludes neutral events" {
+    const source =
+        \\{"type":"session_meta","payload":{"id":"tokens"}}
+        \\{"type":"event_msg","payload":{"type":"token_count","info":null}}
+        \\{"type":"event_msg","payload":{"type":"token_count","info":{"rate_limits":{}}}}
+        \\{"type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"total_tokens":0}}}}
+        \\{"type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":{}}}}
+        \\{"type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{},"last_token_usage":{}}}}
+    ;
+    var reader = std.Io.Reader.fixed(source);
+    var full = try parseSessionTraceBytes(
+        std.testing.io,
+        std.testing.allocator,
+        "tokens.jsonl",
+        source,
+        0,
+        .{ .include_token_events = true },
+    );
+    defer full.deinit(std.testing.allocator);
+    var summary = try parseSessionSummaryTraceReader(
+        std.testing.io,
+        std.testing.allocator,
+        "tokens.jsonl",
+        &reader,
+        0,
+        .{},
+    );
+    defer summary.deinit(std.testing.allocator);
+    var assertions: i64 = 0;
+    for (full.token_events.items) |event| {
+        if (event.has_total_usage or event.has_last_usage) assertions += 1;
+    }
+    try std.testing.expectEqual(@as(i64, 3), assertions);
+    try std.testing.expectEqual(assertions, full.session.token_usage_observation_count);
+    try std.testing.expectEqual(assertions, summary.session.token_usage_observation_count);
 }

@@ -4,16 +4,20 @@ const definition_core = @import("definition_core");
 const definition = @import("definition.zig");
 const execution = @import("execution.zig");
 const plan = @import("plan.zig");
-const seq_time = @import("seq_time");
-
-pub const RuntimeSelectors = struct {
-    path: ?[]const u8 = null,
-    root: ?[]const u8 = null,
-    session_id: ?[]const u8 = null,
-    repo: ?[]const u8 = null,
-    since_ms: ?i64 = null,
-    until_ms: ?i64 = null,
-};
+const expressions = @import("expressions.zig");
+pub const RuntimeSelectors = expressions.RuntimeSelectors;
+const ExpressionWorkspace = expressions.ExpressionWorkspace;
+const ExpressionNode = expressions.ExpressionNode;
+const compileExpr = expressions.compileExpr;
+const evalExpr = expressions.evalExpr;
+const parseConfig = expressions.parseConfig;
+const scalarValue = expressions.scalarValue;
+const findName = expressions.findName;
+const truthy = expressions.truthy;
+const valuesEqual = expressions.valuesEqual;
+const compareValues = expressions.compareValues;
+const valueFloat = expressions.valueFloat;
+const valueText = expressions.valueText;
 
 pub const Table = struct {
     values: []execution.Value,
@@ -56,6 +60,34 @@ pub const StreamingLineagePlan = struct {
     lineage_stage: u16,
     graph_stage: u16,
 };
+
+pub fn boundedNativePrefix(
+    definition_plan: *const definition.Plan,
+    native_plan: *const plan.Plan,
+    projection_name: []const u8,
+) !?u16 {
+    const projection = findProjection(definition_plan, projection_name) orelse
+        return error.UnknownObservationProjection;
+    var current = native_plan.projections[projection].stage_index;
+    var target: ?u16 = null;
+    var depth: usize = 0;
+    while (depth < 256 and depth <= definition_plan.bounds.max_graph_depth) : (depth += 1) {
+        const stage = &native_plan.stages[current];
+        switch (stage.operation) {
+            .scan => return target,
+            .filter, .project, .alias, .limit => {},
+            .top_k => target = current,
+            .generic => |generic| if (generic.operator != .derive) return null,
+            else => return null,
+        }
+        if (definition_plan.steps[current].input_names.len != 1) return null;
+        current = switch (stage.source orelse return null) {
+            .stage => |index| index,
+            .external => return null,
+        };
+    }
+    return error.ObservationPipelineTooDeep;
+}
 
 pub fn streamingLineagePlan(
     allocator: std.mem.Allocator,
@@ -906,16 +938,6 @@ fn resolveOperand(
     };
 }
 
-fn scalarValue(value: definition_core.scalar.Value) execution.Value {
-    return switch (value) {
-        .string, .digest, .timestamp, .safe_identifier, .relative_path => |text| .{
-            .string = text,
-        },
-        .integer => |number| .{ .integer = number },
-        .boolean => |flag| .{ .boolean = flag },
-    };
-}
-
 fn valueMatches(
     left: execution.Value,
     right: execution.Value,
@@ -1158,33 +1180,13 @@ fn deriveTable(
 ) !Table {
     var workspace: ExpressionWorkspace = .{ .allocator = allocator, .config_bytes = config.len };
     defer workspace.deinit();
-    var parsed = try parseConfig(allocator, config);
-    defer parsed.deinit();
-    const root = try definition_core.json.object(parsed.value);
-    const fields = try definition_core.json.array(
-        try definition_core.json.field(root, "fields"),
+    var derivation = try expressions.Derivation.init(
+        allocator,
+        input_schema,
+        &output_schema,
+        config,
     );
-    const preserve_input = if (root.get("preserve_input")) |raw|
-        try definition_core.json.boolean(raw)
-    else
-        true;
-    const sequential = if (root.get("sequential")) |raw|
-        try definition_core.json.boolean(raw)
-    else
-        false;
-    var expression_arena = std.heap.ArenaAllocator.init(allocator);
-    defer expression_arena.deinit();
-    const expressions = try expression_arena.allocator().alloc(*CompiledExpr, fields.items.len);
-    for (fields.items, 0..) |field, index| {
-        const object = try definition_core.json.object(field);
-        expressions[index] = try compileExpr(
-            expression_arena.allocator(),
-            try definition_core.json.field(object, "expr"),
-            input_schema,
-            if (sequential) &output_schema else null,
-            index,
-        );
-    }
+    defer derivation.deinit();
     const values = try allocator.alloc(
         execution.Value,
         (try input.rowCount()) * output_schema.columns.len,
@@ -1193,217 +1195,9 @@ fn deriveTable(
     for (0..try input.rowCount()) |row_index| {
         const row = input.row(row_index);
         const out = values[row_index * output_schema.columns.len ..][0..output_schema.columns.len];
-        if (preserve_input) @memcpy(out[0..input.width], row);
-        for (expressions, 0..) |expression, index| {
-            out[(if (preserve_input) input.width else 0) + index] = try evalCompiledExpr(
-                &workspace,
-                retained_allocator,
-                expression,
-                row,
-                out,
-                input_schema,
-                bindings,
-                selectors,
-            );
-        }
+        try derivation.apply(&workspace, retained_allocator, bindings, selectors, row, out);
     }
     return .{ .values = values, .width = output_schema.columns.len };
-}
-
-const CompiledOp = enum {
-    eq,
-    ne,
-    lt,
-    le,
-    gt,
-    ge,
-    and_op,
-    or_op,
-    add,
-    subtract,
-    multiply,
-    divide,
-};
-
-const CompiledExpr = union(enum) {
-    null_value,
-    boolean: bool,
-    integer: i64,
-    float: f64,
-    text: []const u8,
-    field: u16,
-    output_field: u16,
-    dynamic: std.json.Value,
-    is_null: *CompiledExpr,
-    not: *CompiledExpr,
-    if_else: struct {
-        condition: *CompiledExpr,
-        then_value: *CompiledExpr,
-        else_value: *CompiledExpr,
-    },
-    coalesce: []*CompiledExpr,
-    binary: struct {
-        op: CompiledOp,
-        left: *CompiledExpr,
-        right: *CompiledExpr,
-    },
-};
-
-const ExpressionCompiler = struct {
-    allocator: std.mem.Allocator,
-    schema: *const plan.Schema,
-    output_schema: ?*const plan.Schema,
-    output_limit: usize,
-    tasks: std.ArrayList(Task) = .empty,
-
-    const Task = struct { source: std.json.Value, output: *CompiledExpr };
-
-    fn compile(self: *ExpressionCompiler, expression: std.json.Value) !*CompiledExpr {
-        const root = try self.allocator.create(CompiledExpr);
-        try self.tasks.append(self.allocator, .{ .source = expression, .output = root });
-        defer self.tasks.deinit(self.allocator);
-        // Each task belongs to one node of the already bounded, parsed config.
-        while (self.tasks.pop()) |task| {
-            task.output.* = try self.compileNode(task.source);
-        }
-        return root;
-    }
-
-    fn compileNode(self: *ExpressionCompiler, source: std.json.Value) !CompiledExpr {
-        return switch (source) {
-            .null => .null_value,
-            .bool => |value| .{ .boolean = value },
-            .integer => |value| .{ .integer = value },
-            .float => |value| .{ .float = value },
-            .number_string => |value| if (std.fmt.parseInt(i64, value, 10)) |integer|
-                .{ .integer = integer }
-            else |_|
-                .{ .float = try std.fmt.parseFloat(f64, value) },
-            .string => |value| .{ .text = value },
-            .array => .{ .dynamic = source },
-            .object => |object| try self.compileObject(source, object),
-        };
-    }
-
-    fn compileObject(
-        self: *ExpressionCompiler,
-        source: std.json.Value,
-        object: std.json.ObjectMap,
-    ) !CompiledExpr {
-        if (object.get("field")) |raw| return self.compileField(raw);
-        if (object.get("state") != null or object.get("param") != null or
-            object.get("selector") != null)
-        {
-            return .{ .dynamic = source };
-        }
-        const op = try definition_core.json.requiredString(object, "op");
-        const args = try definition_core.json.array(
-            try definition_core.json.field(object, "args"),
-        );
-        if (std.mem.eql(u8, op, "coalesce")) {
-            return .{ .coalesce = try self.children(args.items) };
-        }
-        if (std.mem.eql(u8, op, "if")) {
-            if (args.items.len != 3) return error.InvalidObservationExpressionArity;
-            const nodes = try self.children(args.items);
-            return .{ .if_else = .{
-                .condition = nodes[0],
-                .then_value = nodes[1],
-                .else_value = nodes[2],
-            } };
-        }
-        if (std.mem.eql(u8, op, "is-null") or std.mem.eql(u8, op, "not")) {
-            if (args.items.len != 1) return error.InvalidObservationExpressionArity;
-            const nodes = try self.children(args.items);
-            return if (std.mem.eql(u8, op, "is-null"))
-                .{ .is_null = nodes[0] }
-            else
-                .{ .not = nodes[0] };
-        }
-        const compiled_op = parseCompiledOp(op) orelse return .{ .dynamic = source };
-        if (args.items.len != 2) return error.InvalidObservationExpressionArity;
-        const nodes = try self.children(args.items);
-        return .{ .binary = .{ .op = compiled_op, .left = nodes[0], .right = nodes[1] } };
-    }
-
-    fn compileField(self: *const ExpressionCompiler, raw: std.json.Value) !CompiledExpr {
-        const name = try definition_core.json.string(raw);
-        if (self.schema.find(name)) |index| return .{ .field = index };
-        if (self.output_schema) |output| {
-            for (output.columns[0..self.output_limit], 0..) |column, index| {
-                if (std.mem.eql(u8, column.name, name)) {
-                    return .{ .output_field = @intCast(index) };
-                }
-            }
-        }
-        return error.UnknownObservationExpressionField;
-    }
-
-    fn children(self: *ExpressionCompiler, args: []const std.json.Value) ![]*CompiledExpr {
-        const nodes = try self.allocator.alloc(*CompiledExpr, args.len);
-        for (nodes) |*node| node.* = try self.allocator.create(CompiledExpr);
-        var remaining = args.len;
-        while (remaining > 0) {
-            remaining -= 1;
-            try self.tasks.append(self.allocator, .{
-                .source = args[remaining],
-                .output = nodes[remaining],
-            });
-        }
-        return nodes;
-    }
-};
-
-fn compileExpr(
-    allocator: std.mem.Allocator,
-    expression: std.json.Value,
-    schema: *const plan.Schema,
-    output_schema: ?*const plan.Schema,
-    output_limit: usize,
-) !*CompiledExpr {
-    var compiler: ExpressionCompiler = .{
-        .allocator = allocator,
-        .schema = schema,
-        .output_schema = output_schema,
-        .output_limit = output_limit,
-    };
-    return compiler.compile(expression);
-}
-
-fn parseCompiledOp(op: []const u8) ?CompiledOp {
-    if (std.mem.eql(u8, op, "eq")) return .eq;
-    if (std.mem.eql(u8, op, "ne")) return .ne;
-    if (std.mem.eql(u8, op, "lt")) return .lt;
-    if (std.mem.eql(u8, op, "le")) return .le;
-    if (std.mem.eql(u8, op, "gt")) return .gt;
-    if (std.mem.eql(u8, op, "ge")) return .ge;
-    if (std.mem.eql(u8, op, "and")) return .and_op;
-    if (std.mem.eql(u8, op, "or")) return .or_op;
-    if (std.mem.eql(u8, op, "add")) return .add;
-    if (std.mem.eql(u8, op, "subtract")) return .subtract;
-    if (std.mem.eql(u8, op, "multiply")) return .multiply;
-    if (std.mem.eql(u8, op, "divide")) return .divide;
-    return null;
-}
-
-fn evalCompiledExpr(
-    workspace: *ExpressionWorkspace,
-    allocator: std.mem.Allocator,
-    expression: *const CompiledExpr,
-    row: []const execution.Value,
-    output: []const execution.Value,
-    schema: *const plan.Schema,
-    bindings: *const definition_core.parameters.Bindings,
-    selectors: RuntimeSelectors,
-) !execution.Value {
-    return workspace.evaluate(.{ .compiled = expression }, .{
-        .allocator = allocator,
-        .row = row,
-        .output = output,
-        .schema = schema,
-        .bindings = bindings,
-        .selectors = selectors,
-    });
 }
 
 const JoinContext = struct {
@@ -1809,12 +1603,6 @@ pub const StreamingLineageReducer = struct {
                 }
             else
                 true;
-            if (!left_enabled) {
-                try self.output.appendSlice(self.allocator, row);
-                try self.next.append(self.allocator, std.math.maxInt(usize));
-                try self.checkBounds();
-                continue;
-            }
             const key_hash = self.keyHash(row) orelse {
                 try self.output.appendSlice(self.allocator, row);
                 try self.next.append(self.allocator, std.math.maxInt(usize));
@@ -1822,7 +1610,7 @@ pub const StreamingLineageReducer = struct {
                 continue;
             };
             var matched_ancestor = false;
-            var candidate = self.heads.get(key_hash);
+            var candidate = if (left_enabled) self.heads.get(key_hash) else null;
             while (candidate) |owner_index| {
                 const owner = self.ownerRow(owner_index);
                 if (self.keysMatch(row, owner) and
@@ -2635,400 +2423,6 @@ fn reachabilityClosure(
     };
 }
 
-fn parseConfig(
-    allocator: std.mem.Allocator,
-    config: []const u8,
-) !std.json.Parsed(std.json.Value) {
-    return std.json.parseFromSlice(std.json.Value, allocator, config, .{
-        .allocate = .alloc_always,
-        .duplicate_field_behavior = .@"error",
-        .parse_numbers = false,
-    });
-}
-
-const ExpressionContext = struct {
-    allocator: std.mem.Allocator,
-    row: []const execution.Value,
-    output: []const execution.Value = &.{},
-    schema: *const plan.Schema,
-    state: []const execution.Value = &.{},
-    state_names: []const []const u8 = &.{},
-    bindings: *const definition_core.parameters.Bindings,
-    selectors: RuntimeSelectors,
-};
-
-const ExpressionBranch = struct {
-    kind: enum { coalesce, if_else, unary, binary, concat },
-    op: []const u8,
-    count: usize,
-    compiled_op: ?CompiledOp = null,
-};
-
-const ExpressionInspection = union(enum) {
-    value: execution.Value,
-    branch: ExpressionBranch,
-};
-
-const ExpressionNode = union(enum) {
-    compiled: *const CompiledExpr,
-    dynamic: std.json.Value,
-
-    fn inspect(self: ExpressionNode, context: ExpressionContext) !ExpressionInspection {
-        return switch (self) {
-            .dynamic => |value| inspectDynamicExpression(value, context),
-            .compiled => |expression| switch (expression.*) {
-                .null_value => .{ .value = .null },
-                .boolean => |value| .{ .value = .{ .boolean = value } },
-                .integer => |value| .{ .value = .{ .integer = value } },
-                .float => |value| .{ .value = .{ .float = value } },
-                .text => |value| .{ .value = .{
-                    .string = try context.allocator.dupe(u8, value),
-                } },
-                .field => |index| .{ .value = context.row[index] },
-                .output_field => |index| .{ .value = context.output[index] },
-                .dynamic => |value| inspectDynamicExpression(value, context),
-                .is_null => expressionBranch("is-null", 1),
-                .not => expressionBranch("not", 1),
-                .if_else => expressionBranch("if", 3),
-                .coalesce => |children| expressionBranch("coalesce", children.len),
-                .binary => |binary| .{ .branch = .{
-                    .kind = .binary,
-                    .op = compiledOpName(binary.op),
-                    .count = 2,
-                    .compiled_op = binary.op,
-                } },
-            },
-        };
-    }
-
-    fn child(self: ExpressionNode, index: usize) ExpressionNode {
-        return switch (self) {
-            .dynamic => |value| .{ .dynamic = value.object.get("args").?.array.items[index] },
-            .compiled => |expression| switch (expression.*) {
-                .dynamic => |value| .{
-                    .dynamic = value.object.get("args").?.array.items[index],
-                },
-                .is_null, .not => |value| .{ .compiled = value },
-                .if_else => |value| .{ .compiled = switch (index) {
-                    0 => value.condition,
-                    1 => value.then_value,
-                    2 => value.else_value,
-                    else => unreachable,
-                } },
-                .coalesce => |children| .{ .compiled = children[index] },
-                .binary => |value| .{ .compiled = if (index == 0) value.left else value.right },
-                else => unreachable,
-            },
-        };
-    }
-};
-
-fn compiledOpName(op: CompiledOp) []const u8 {
-    return switch (op) {
-        .and_op => "and",
-        .or_op => "or",
-        else => @tagName(op),
-    };
-}
-
-fn expressionBranch(op: []const u8, count: usize) !ExpressionInspection {
-    const kind: @FieldType(ExpressionBranch, "kind") = if (std.mem.eql(u8, op, "coalesce"))
-        .coalesce
-    else if (std.mem.eql(u8, op, "if"))
-        .if_else
-    else if (std.mem.eql(u8, op, "concat"))
-        .concat
-    else if (std.mem.eql(u8, op, "is-null") or std.mem.eql(u8, op, "not") or
-        std.mem.eql(u8, op, "parse-time"))
-        .unary
-    else
-        .binary;
-    const required: ?usize = switch (kind) {
-        .if_else => 3,
-        .unary => 1,
-        .binary => 2,
-        .coalesce, .concat => null,
-    };
-    if (required) |arity| if (count != arity) return error.InvalidObservationExpressionArity;
-    return .{ .branch = .{ .kind = kind, .op = op, .count = count } };
-}
-
-fn inspectDynamicExpression(
-    expression: std.json.Value,
-    context: ExpressionContext,
-) !ExpressionInspection {
-    return switch (expression) {
-        .null => .{ .value = .null },
-        .bool => |value| .{ .value = .{ .boolean = value } },
-        .integer => |value| .{ .value = .{ .integer = value } },
-        .float => |value| .{ .value = .{ .float = value } },
-        .number_string => |value| .{ .value = if (std.fmt.parseInt(i64, value, 10)) |integer|
-            .{ .integer = integer }
-        else |_|
-            .{ .float = try std.fmt.parseFloat(f64, value) } },
-        .string => |value| .{ .value = .{ .string = try context.allocator.dupe(u8, value) } },
-        .array => error.InvalidObservationExpression,
-        .object => |object| inspectDynamicObject(object, context),
-    };
-}
-
-fn inspectDynamicObject(
-    object: std.json.ObjectMap,
-    context: ExpressionContext,
-) !ExpressionInspection {
-    if (object.get("field")) |raw| {
-        const name = try definition_core.json.string(raw);
-        const index = context.schema.find(name) orelse
-            return error.UnknownObservationExpressionField;
-        return .{ .value = context.row[index] };
-    }
-    if (object.get("state")) |raw| {
-        const name = try definition_core.json.string(raw);
-        const index = findName(context.state_names, name) orelse
-            return error.UnknownObservationFoldState;
-        return .{ .value = context.state[index] };
-    }
-    if (object.get("param")) |raw| {
-        const name = try definition_core.json.string(raw);
-        const binding = context.bindings.find(name) orelse return error.UnknownParameter;
-        return .{ .value = scalarValue(binding.value) };
-    }
-    if (object.get("selector")) |raw| {
-        return .{ .value = try selectorValue(
-            context.selectors,
-            try definition_core.json.string(raw),
-        ) };
-    }
-    const op = try definition_core.json.requiredString(object, "op");
-    const args = try definition_core.json.array(try definition_core.json.field(object, "args"));
-    return expressionBranch(op, args.items.len);
-}
-
-const ExpressionFrame = struct {
-    node: ExpressionNode,
-    branch: ExpressionBranch,
-    next: usize = 0,
-    left: execution.Value = .null,
-    text: std.ArrayList(u8) = .empty,
-
-    fn accept(
-        self: *ExpressionFrame,
-        value: *execution.Value,
-        scratch_allocator: std.mem.Allocator,
-        retained_allocator: std.mem.Allocator,
-    ) !bool {
-        switch (self.branch.kind) {
-            .coalesce => {
-                if (value.* != .null or self.next + 1 == self.branch.count) return true;
-                self.next += 1;
-                return false;
-            },
-            .if_else => {
-                if (self.next != 0) return true;
-                self.next = if (truthy(value.*)) 1 else 2;
-                return false;
-            },
-            .unary => value.* = unaryExpression(self.branch.op, value.*),
-            .binary => {
-                if (self.next == 0) {
-                    self.left = value.*;
-                    self.next = 1;
-                    return false;
-                }
-                value.* = if (self.branch.compiled_op) |op|
-                    try compiledBinaryExpression(op, self.left, value.*)
-                else
-                    try binaryExpression(self.branch.op, self.left, value.*);
-            },
-            .concat => {
-                try self.text.appendSlice(scratch_allocator, valueText(value.*) orelse "");
-                self.next += 1;
-                if (self.next < self.branch.count) return false;
-                value.* = .{ .string = try retained_allocator.dupe(u8, self.text.items) };
-            },
-        }
-        return true;
-    }
-};
-
-const ExpressionWorkspace = struct {
-    allocator: std.mem.Allocator,
-    // Every pending expression consumes at least one byte in this bounded config.
-    config_bytes: usize,
-    frames: std.ArrayList(ExpressionFrame) = .empty,
-
-    fn deinit(self: *ExpressionWorkspace) void {
-        std.debug.assert(self.frames.items.len == 0);
-        self.frames.deinit(self.allocator);
-    }
-
-    fn evaluate(
-        self: *ExpressionWorkspace,
-        root: ExpressionNode,
-        context: ExpressionContext,
-    ) !execution.Value {
-        std.debug.assert(self.frames.items.len == 0);
-        defer {
-            for (self.frames.items) |*frame| frame.text.deinit(self.allocator);
-            self.frames.clearRetainingCapacity();
-        }
-        var pending: ?ExpressionNode = root;
-        var value: execution.Value = .null;
-        while (pending != null or self.frames.items.len > 0) {
-            if (pending) |node| {
-                pending = null;
-                switch (try node.inspect(context)) {
-                    .value => |result| value = result,
-                    .branch => |branch| {
-                        if (branch.count == 0) {
-                            value = if (branch.kind == .concat)
-                                .{ .string = try context.allocator.alloc(u8, 0) }
-                            else
-                                .null;
-                        } else {
-                            if (self.frames.items.len >= self.config_bytes) {
-                                return error.InvalidObservationExpression;
-                            }
-                            try self.frames.append(self.allocator, .{
-                                .node = node,
-                                .branch = branch,
-                            });
-                            pending = node.child(0);
-                            continue;
-                        }
-                    },
-                }
-            }
-            if (self.frames.items.len == 0) return value;
-            const frame = &self.frames.items[self.frames.items.len - 1];
-            if (try frame.accept(&value, self.allocator, context.allocator)) {
-                frame.text.deinit(self.allocator);
-                _ = self.frames.pop();
-            } else {
-                std.debug.assert(frame.next < frame.branch.count);
-                pending = frame.node.child(frame.next);
-            }
-        }
-        return value;
-    }
-};
-
-fn unaryExpression(op: []const u8, value: execution.Value) execution.Value {
-    if (std.mem.eql(u8, op, "parse-time")) {
-        const text = valueText(value) orelse return .null;
-        return if (seq_time.parseIsoTimestampMillis(text)) |millis|
-            .{ .integer = millis }
-        else
-            .null;
-    }
-    return .{ .boolean = if (std.mem.eql(u8, op, "is-null")) value == .null else !truthy(value) };
-}
-
-fn binaryExpression(
-    op: []const u8,
-    left: execution.Value,
-    right: execution.Value,
-) !execution.Value {
-    if (parseCompiledOp(op)) |compiled| return compiledBinaryExpression(compiled, left, right);
-    return numericOperator(op, left, right);
-}
-
-fn compiledBinaryExpression(
-    op: CompiledOp,
-    left: execution.Value,
-    right: execution.Value,
-) !execution.Value {
-    return switch (op) {
-        .eq => .{ .boolean = valuesEqual(left, right, false) },
-        .ne => .{ .boolean = !valuesEqual(left, right, false) },
-        .lt => .{ .boolean = compareValues(left, right) == .lt },
-        .le => .{ .boolean = compareValues(left, right) != .gt },
-        .gt => .{ .boolean = compareValues(left, right) == .gt },
-        .ge => .{ .boolean = compareValues(left, right) != .lt },
-        .and_op => .{ .boolean = truthy(left) and truthy(right) },
-        .or_op => .{ .boolean = truthy(left) or truthy(right) },
-        .add, .subtract, .multiply, .divide => numericOperator(@tagName(op), left, right),
-    };
-}
-
-fn evalExpr(
-    workspace: *ExpressionWorkspace,
-    allocator: std.mem.Allocator,
-    expression: std.json.Value,
-    row: []const execution.Value,
-    schema: *const plan.Schema,
-    state: []const execution.Value,
-    state_names: []const []const u8,
-    bindings: *const definition_core.parameters.Bindings,
-    selectors: RuntimeSelectors,
-) !execution.Value {
-    return workspace.evaluate(.{ .dynamic = expression }, .{
-        .allocator = allocator,
-        .row = row,
-        .schema = schema,
-        .state = state,
-        .state_names = state_names,
-        .bindings = bindings,
-        .selectors = selectors,
-    });
-}
-
-fn selectorValue(
-    selectors: RuntimeSelectors,
-    name: []const u8,
-) !execution.Value {
-    if (std.mem.eql(u8, name, "since")) {
-        return if (selectors.since_ms) |value| .{ .integer = value } else .null;
-    }
-    if (std.mem.eql(u8, name, "until")) {
-        return if (selectors.until_ms) |value| .{ .integer = value } else .null;
-    }
-    const value = if (std.mem.eql(u8, name, "path"))
-        selectors.path
-    else if (std.mem.eql(u8, name, "root"))
-        selectors.root
-    else if (std.mem.eql(u8, name, "session-id"))
-        selectors.session_id
-    else if (std.mem.eql(u8, name, "repo"))
-        selectors.repo
-    else
-        return error.UnknownObservationSelector;
-    return if (value) |text| .{ .string = text } else .null;
-}
-
-fn numericOperator(
-    op: []const u8,
-    left: execution.Value,
-    right: execution.Value,
-) !execution.Value {
-    if (left == .null or right == .null) return .null;
-    if (left == .integer and right == .integer and !std.mem.eql(u8, op, "divide")) {
-        const a = left.integer;
-        const b = right.integer;
-        return .{ .integer = if (std.mem.eql(u8, op, "add"))
-            try std.math.add(i64, a, b)
-        else if (std.mem.eql(u8, op, "subtract"))
-            try std.math.sub(i64, a, b)
-        else if (std.mem.eql(u8, op, "multiply"))
-            try std.math.mul(i64, a, b)
-        else
-            return error.UnsupportedObservationExpression };
-    }
-    const a = valueFloat(left) orelse return error.ObservationExpressionTypeMismatch;
-    const b = valueFloat(right) orelse return error.ObservationExpressionTypeMismatch;
-    if (std.mem.eql(u8, op, "divide") and b == 0) return .null;
-    return .{ .float = if (std.mem.eql(u8, op, "add"))
-        a + b
-    else if (std.mem.eql(u8, op, "subtract"))
-        a - b
-    else if (std.mem.eql(u8, op, "multiply"))
-        a * b
-    else if (std.mem.eql(u8, op, "divide"))
-        a / b
-    else
-        return error.UnsupportedObservationExpression };
-}
-
 fn stringFieldIndices(
     allocator: std.mem.Allocator,
     schema: *const plan.Schema,
@@ -3075,41 +2469,6 @@ fn compileDynamicSort(
     return keys;
 }
 
-fn findName(names: []const []const u8, wanted: []const u8) ?usize {
-    for (names, 0..) |name, index| if (std.mem.eql(u8, name, wanted)) return index;
-    return null;
-}
-
-fn truthy(value: execution.Value) bool {
-    return switch (value) {
-        .boolean => |flag| flag,
-        .integer => |number| number != 0,
-        .float => |number| number != 0,
-        .string => |text| text.len != 0,
-        .json => |text| text.len != 0,
-        .null => false,
-    };
-}
-
-fn valuesEqual(a: execution.Value, b: execution.Value, ignore_case: bool) bool {
-    if (a == .null or b == .null) return a == .null and b == .null;
-    if (a == .integer and b == .integer) return a.integer == b.integer;
-    if (valueFloat(a)) |left| if (valueFloat(b)) |right| return left == right;
-    if (valueText(a)) |left| if (valueText(b)) |right| {
-        return if (ignore_case)
-            std.ascii.eqlIgnoreCase(left, right)
-        else
-            std.mem.eql(u8, left, right);
-    };
-    return switch (a) {
-        .boolean => |left| switch (b) {
-            .boolean => |right| left == right,
-            else => false,
-        },
-        else => false,
-    };
-}
-
 fn compareNullable(
     a: execution.Value,
     b: execution.Value,
@@ -3119,38 +2478,6 @@ fn compareNullable(
     if (a == .null) return if (nulls == .first) .lt else .gt;
     if (b == .null) return if (nulls == .first) .gt else .lt;
     return compareValues(a, b);
-}
-
-fn compareValues(a: execution.Value, b: execution.Value) std.math.Order {
-    if (a == .integer and b == .integer) return std.math.order(a.integer, b.integer);
-    if (valueFloat(a)) |left| if (valueFloat(b)) |right| {
-        return std.math.order(left, right);
-    };
-    if (valueText(a)) |left| if (valueText(b)) |right| {
-        return std.mem.order(u8, left, right);
-    };
-    return switch (a) {
-        .boolean => |left| switch (b) {
-            .boolean => |right| std.math.order(@intFromBool(left), @intFromBool(right)),
-            else => .eq,
-        },
-        else => .eq,
-    };
-}
-
-fn valueFloat(value: execution.Value) ?f64 {
-    return switch (value) {
-        .integer => |number| @floatFromInt(number),
-        .float => |number| number,
-        else => null,
-    };
-}
-
-fn valueText(value: execution.Value) ?[]const u8 {
-    return switch (value) {
-        .string, .json => |text| text,
-        else => null,
-    };
 }
 
 fn expectGraphTopK(input: Table, keys: []plan.SortKey, limit: usize) !void {
@@ -3330,6 +2657,83 @@ test "join equality hashes null-safe cumulative tuples consistently" {
     );
 }
 
+const lineage_eligibility_rows = [_]execution.Value{
+    .{ .string = "root" },
+    .{ .integer = 10 },
+    .{ .boolean = true },
+    .{ .boolean = true },
+    .{ .string = "child" },
+    .{ .integer = 20 },
+    .{ .boolean = false },
+    .{ .boolean = true },
+    .{ .string = "child" },
+    .{ .integer = 30 },
+    .{ .boolean = false },
+    .{ .boolean = false },
+    .{ .string = "grandchild" },
+    .{ .integer = 20 },
+    .{ .boolean = true },
+    .{ .boolean = true },
+    .{ .string = "grandchild" },
+    .{ .integer = 30 },
+    .{ .boolean = true },
+    .{ .boolean = true },
+};
+
+test "streaming lineage keeps right eligibility independent of left eligibility" {
+    var graph_columns = [_]plan.Column{
+        .{ .name = @constCast("node"), .kind = .string, .nullable = false },
+        .{ .name = @constCast("parent"), .kind = .string, .nullable = true },
+    };
+    var columns = [_]plan.Column{
+        .{ .name = @constCast("node"), .kind = .string, .nullable = false },
+        .{ .name = @constCast("key"), .kind = .integer, .nullable = false },
+        .{ .name = @constCast("left"), .kind = .boolean, .nullable = false },
+        .{ .name = @constCast("right"), .kind = .boolean, .nullable = false },
+    };
+    var graph_values = [_]execution.Value{
+        .{ .string = "root" },       .null,
+        .{ .string = "child" },      .{ .string = "root" },
+        .{ .string = "grandchild" }, .{ .string = "child" },
+    };
+    var parsed = try parseConfig(
+        std.testing.allocator,
+        "{\"left\":\"node\",\"right\":\"node\",\"node\":\"node\",\"parent\":\"parent\"}",
+    );
+    defer parsed.deinit();
+    const keys = try std.testing.allocator.alloc(CompiledJoinKey, 1);
+    keys[0] = .{ .left = 1, .right = 1, .nulls_equal = false };
+    var reducer: StreamingLineageReducer = .{
+        .allocator = std.testing.allocator,
+        .left_schema = .{ .columns = &columns },
+        .output_width = columns.len,
+        .keys = keys,
+        .lineage = try LineageIndex.init(
+            std.testing.allocator,
+            .{ .values = &graph_values, .width = graph_columns.len },
+            .{ .columns = &graph_columns },
+            try definition_core.json.object(parsed.value),
+            .{ .columns = &columns },
+            .{ .columns = &columns },
+            8,
+        ),
+        .left_true_index = 2,
+        .right_true_index = 3,
+        .max_rows = 10,
+        .max_retained_bytes = 4096,
+    };
+    defer reducer.deinit();
+    try reducer.appendPartition(.{
+        .values = @constCast(&lineage_eligibility_rows),
+        .width = columns.len,
+    });
+    const result = try reducer.finish();
+    defer std.testing.allocator.free(result.values);
+    try std.testing.expectEqual(@as(usize, 4), try result.rowCount());
+    try std.testing.expectEqualStrings("grandchild", result.row(3)[0].string);
+    try std.testing.expectEqual(@as(i64, 30), result.row(3)[1].integer);
+}
+
 test "streaming lineage lowering is selected from non-token topology" {
     const source =
         \\{
@@ -3459,6 +2863,54 @@ test "compiled field validation remains eager before row execution" {
     );
     const actual = try testExpressionValue(arena.allocator(), source, false);
     try std.testing.expectEqual(7, actual.integer);
+}
+
+test "text prefixes preserve UTF-8 and reject invalid bounds in both evaluators" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const cases = [_]struct { text: []const u8, bound: i64, expected: []const u8 }{
+        .{ .text = "plain", .bound = 0, .expected = "" },
+        .{ .text = "plain", .bound = 3, .expected = "pla" },
+        .{ .text = "plain", .bound = 100, .expected = "plain" },
+        .{ .text = "aé🌱z", .bound = 2, .expected = "a" },
+        .{ .text = "aé🌱z", .bound = 3, .expected = "aé" },
+        .{ .text = "aé🌱z", .bound = 6, .expected = "aé" },
+        .{ .text = "aé🌱z", .bound = 7, .expected = "aé🌱" },
+    };
+    for (cases) |case| {
+        const source = try std.fmt.allocPrint(
+            arena.allocator(),
+            "{{\"op\":\"text-prefix\",\"args\":[\"{s}\",{d}]}}",
+            .{ case.text, case.bound },
+        );
+        for ([_]bool{ false, true }) |compiled| {
+            const actual = try testExpressionValue(arena.allocator(), source, compiled);
+            try std.testing.expectEqualStrings(case.expected, actual.string);
+            try std.testing.expect(std.unicode.utf8ValidateSlice(actual.string));
+        }
+    }
+    for ([_]bool{ false, true }) |compiled| {
+        try std.testing.expectEqual(execution.Value.null, try testExpressionValue(
+            arena.allocator(),
+            "{\"op\":\"text-prefix\",\"args\":[null,8]}",
+            compiled,
+        ));
+        try std.testing.expectError(error.InvalidObservationTextBound, testExpressionValue(
+            arena.allocator(),
+            "{\"op\":\"text-prefix\",\"args\":[\"text\",-1]}",
+            compiled,
+        ));
+        for ([_][]const u8{
+            "{\"op\":\"text-prefix\",\"args\":[42,8]}",
+            "{\"op\":\"text-prefix\",\"args\":[\"text\",2.5]}",
+            "{\"op\":\"text-prefix\",\"args\":[\"text\",null]}",
+        }) |source| {
+            try std.testing.expectError(
+                error.ObservationExpressionTypeMismatch,
+                testExpressionValue(arena.allocator(), source, compiled),
+            );
+        }
+    }
 }
 
 test "deep expressions compile and evaluate with explicit frames" {

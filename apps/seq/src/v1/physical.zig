@@ -119,6 +119,10 @@ const session_fields = [_]Field{
     .{ .name = "parent_relation", .kind = .string },
     .{ .name = "lineage_conflict", .kind = .boolean, .nullable = false },
     .{ .name = "service_tier", .kind = .string },
+    .{ .name = "control_parent_session_id", .kind = .string },
+    .{ .name = "forked_from_session_id", .kind = .string },
+    .{ .name = "subagent_history_start_ordinal", .kind = .integer },
+    .{ .name = "token_usage_observation_count", .kind = .integer },
 };
 
 const source_event_fields = [_]Field{
@@ -238,7 +242,7 @@ const tool_lifecycle_fields = [_]Field{
 const session_edge_fields = [_]Field{
     .{ .name = "parent_session_id", .kind = .string },
     .{ .name = "worker_session_id", .kind = .string },
-    .{ .name = "parent_path", .kind = .string, .nullable = false },
+    .{ .name = "parent_path", .kind = .string },
     .{ .name = "worker_path", .kind = .string },
     .{ .name = "call_id", .kind = .string },
     .{ .name = "agent_nickname", .kind = .string },
@@ -247,6 +251,7 @@ const session_edge_fields = [_]Field{
     .{ .name = "reasoning_effort", .kind = .string },
     .{ .name = "spawned_at", .kind = .string },
     .{ .name = "worker_status", .kind = .string },
+    .{ .name = "agent_path", .kind = .string },
 };
 
 const token_event_fields = [_]Field{
@@ -278,6 +283,9 @@ const token_event_fields = [_]Field{
     .{ .name = "model", .kind = .string },
     .{ .name = "service_tier", .kind = .string },
     .{ .name = "timestamp_ms", .kind = .integer },
+    .{ .name = "persisted_ordinal", .kind = .integer },
+    .{ .name = "subagent_history_start_ordinal", .kind = .integer },
+    .{ .name = "parent_session_id", .kind = .string },
 };
 
 const structured_document_fields = [_]Field{

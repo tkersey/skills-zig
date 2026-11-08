@@ -5,7 +5,7 @@ const seq = @import("seq_v1_core");
 const durable_store = @import("durable_store");
 
 const Version = std.mem.trim(u8, app_meta.version, " \t\r\n");
-const source_adapter_version = "seq-source-adapter-set/v2";
+const source_adapter_version = "seq-source-adapter-set/v3";
 const max_output_cells: usize = 4_000_000;
 const max_discovery_bytes: usize = 256 * 1024 * 1024;
 const ongoing_threshold_secs: i64 = 60;
@@ -76,12 +76,14 @@ const ObserveArgs = struct {
     parameter_specs: []const []const u8,
     format: Format,
     resolved_root: ?[]const u8 = null,
+    resolved_archive_root: ?[]const u8 = null,
     as_of_ms: i64 = 0,
 
     fn selection(self: *const ObserveArgs) seq.result.Selection {
         return .{
             .path = self.selectors.path,
             .root = self.resolved_root orelse self.selectors.root,
+            .archive_root = self.resolved_archive_root,
             .root_explicit = self.selectors.root != null,
             .session_id = self.selectors.session_id,
             .repo = self.selectors.repo,
@@ -194,6 +196,8 @@ fn runSubcommand(
             return 0;
         }
         var stdout_writer = std.Io.File.stdout().writer(io, &.{});
+        var diagnostic: seq.native.SourceDiagnostic = .{ .allocator = allocator };
+        defer diagnostic.deinit();
         return seq.native.run(
             allocator,
             environment,
@@ -202,7 +206,12 @@ fn runSubcommand(
             &stdout_writer.interface,
             io,
             dir,
-        );
+            &diagnostic,
+        ) catch |err| {
+            if (diagnostic.path == null) return err;
+            try emitSourceError(io, err, &diagnostic);
+            return 2;
+        };
     }
     return error.UnknownCommand;
 }
@@ -319,8 +328,13 @@ fn writeGraphExplanation(
         &context.native_plan,
         args.projection,
     );
+    const native_prefix = try seq.relation_graph.boundedNativePrefix(
+        &context.definition_plan,
+        &context.native_plan,
+        args.projection,
+    );
     if (args.format == .text) {
-        try writeGraphExplanationText(writer, context, args, scans.len, streaming);
+        try writeGraphExplanationText(writer, context, args, scans.len, streaming, native_prefix);
         return;
     }
     try writer.writeAll(
@@ -346,6 +360,16 @@ fn writeGraphExplanation(
         .{ context.native_plan.stages.len, context.definition_plan.bounds.max_rows },
     );
     try writeCompileStats(writer, context.stats);
+    try writeGraphStrategyJson(writer, context, streaming, native_prefix);
+    try writer.writeAll(",\"corpus_read\":false,\"authority_granted\":false}\n");
+}
+
+fn writeGraphStrategyJson(
+    writer: *std.Io.Writer,
+    context: *const seq.compiled_plan.PlanSet,
+    streaming: ?seq.relation_graph.StreamingLineagePlan,
+    native_prefix: ?u16,
+) !void {
     if (streaming) |schedule| {
         try writer.writeAll(
             ",\"strategy\":{\"kind\":\"partition-lineage-stream\",\"partition_relation\":",
@@ -355,10 +379,17 @@ fn writeGraphExplanation(
             @tagName(context.native_plan.stages[schedule.scan_stage].operation.scan.relation),
         );
         try writer.print(",\"retained_byte_bound\":{d}}}", .{streaming_retained_byte_bound});
+    } else if (native_prefix) |stage| {
+        try writer.writeAll(
+            ",\"strategy\":{\"kind\":\"bounded-native-prefix\",\"prefix_relation\":",
+        );
+        try writeString(writer, context.native_plan.stages[stage].name);
+        try writer.print(",\"retained_value_byte_bound\":{d}}}", .{
+            context.definition_plan.bounds.max_output_bytes,
+        });
     } else {
         try writer.writeAll(",\"strategy\":{\"kind\":\"materialized-graph\"}");
     }
-    try writer.writeAll(",\"corpus_read\":false,\"authority_granted\":false}\n");
 }
 
 fn writeGraphExplanationText(
@@ -367,6 +398,7 @@ fn writeGraphExplanationText(
     args: *const ObserveArgs,
     scan_count: usize,
     streaming: ?seq.relation_graph.StreamingLineagePlan,
+    native_prefix: ?u16,
 ) !void {
     try writer.print(
         "{s}@{s}\nprojection: {s}\nsources: {d}\nstages: {d}\nmax_rows: {d}\n",
@@ -385,6 +417,15 @@ fn writeGraphExplanationText(
             "strategy: partition-lineage-stream\npartition_relation: {s}\n" ++
                 "retained_byte_bound: {d}\n",
             .{ @tagName(scan.relation), streaming_retained_byte_bound },
+        );
+    } else if (native_prefix) |stage| {
+        try writer.print(
+            "strategy: bounded-native-prefix\nprefix_relation: {s}\n" ++
+                "retained_value_byte_bound: {d}\n",
+            .{
+                context.native_plan.stages[stage].name,
+                context.definition_plan.bounds.max_output_bytes,
+            },
         );
     } else {
         try writer.writeAll("strategy: materialized-graph\n");
@@ -424,7 +465,7 @@ fn emitGraphObservation(
         bindings,
         &graph,
         elapsedNanoseconds(io, execution_start),
-        false,
+        graph.projection_bounded,
     );
 }
 
@@ -733,15 +774,23 @@ fn runObserve(
     );
     defer bindings.deinit(allocator);
     if (usesRelationGraph(&context.definition_plan)) {
-        const resolved_root = try seq.native.resolveRootAlloc(
-            allocator,
-            environment,
-            args.selectors.root,
-            io,
-            dir,
+        const native_prefix = try seq.relation_graph.boundedNativePrefix(
+            &context.definition_plan,
+            &context.native_plan,
+            args.projection,
         );
-        defer allocator.free(resolved_root);
+        const resolved_root = if (args.selectors.path == null or native_prefix == null)
+            try seq.native.resolveRootAlloc(allocator, environment, args.selectors.root, io, dir)
+        else
+            null;
+        defer if (resolved_root) |root| allocator.free(root);
         args.resolved_root = resolved_root;
+        const archive_root = if (resolved_root != null and args.selectors.root == null)
+            try seq.native.archiveRootAlloc(allocator, resolved_root.?)
+        else
+            null;
+        defer if (archive_root) |root| allocator.free(root);
+        args.resolved_archive_root = archive_root;
         return emitGraphObservation(
             io,
             dir,
@@ -777,6 +826,12 @@ fn emitLinearObservation(
         null;
     defer if (resolved_root) |root| allocator.free(root);
     args.resolved_root = resolved_root;
+    const archive_root = if (resolved_root != null and args.selectors.root == null)
+        try seq.native.archiveRootAlloc(allocator, resolved_root.?)
+    else
+        null;
+    defer if (archive_root) |root| allocator.free(root);
+    args.resolved_archive_root = archive_root;
     return emitObservation(
         io,
         dir,
@@ -940,6 +995,7 @@ const ObservationExecution = struct {
     warning_count: usize = 0,
     graph_arena: ?*std.heap.ArenaAllocator = null,
     graph_result_owned: bool = false,
+    projection_bounded: bool = false,
 
     fn deinit(self: *ObservationExecution, allocator: std.mem.Allocator) void {
         if (self.runner) |*runner| runner.deinit();
@@ -1247,6 +1303,13 @@ fn executeGraphObservation(
             schedule,
         );
     }
+    if (try seq.relation_graph.boundedNativePrefix(
+        &context.definition_plan,
+        &context.native_plan,
+        args.projection,
+    )) |stage| {
+        return executeNativePrefixObservation(io, dir, allocator, args, context, bindings, stage);
+    }
     const scan_stages = try seq.relation_graph.requiredScanStages(
         allocator,
         &context.definition_plan,
@@ -1281,6 +1344,84 @@ fn executeGraphObservation(
     return graph.retainResult(try graph.execute(scans), metrics, digest_set.digest());
 }
 
+fn executeNativePrefixObservation(
+    io: std.Io,
+    dir: std.Io.Dir,
+    allocator: std.mem.Allocator,
+    args: *const ObserveArgs,
+    context: *const seq.compiled_plan.PlanSet,
+    bindings: *const definition_core.parameters.Bindings,
+    stage: u16,
+) !ObservationExecution {
+    var program = try seq.execution.compileTarget(
+        allocator,
+        &context.definition_plan,
+        &context.native_plan,
+        bindings,
+        stage,
+        graphRuntimeSelectors(args),
+    );
+    defer program.deinit(allocator);
+    const count = program.operations[program.operations.len - 1].top_k.count;
+    const cells = try std.math.mul(usize, count, program.output_field_indices.len);
+    if (cells > max_output_cells) return error.ObservationOutputCellBoundExceeded;
+    const output = try allocator.alloc(seq.execution.Value, cells);
+    defer allocator.free(output);
+    var prefix = try executeObservation(io, dir, allocator, args, context, &program, output);
+    defer prefix.deinit(allocator);
+    const arena = try allocator.create(std.heap.ArenaAllocator);
+    errdefer allocator.destroy(arena);
+    arena.* = .init(allocator);
+    errdefer arena.deinit();
+    const graph: GraphObservationContext = .{
+        .io = io,
+        .dir = dir,
+        .allocator = allocator,
+        .arena = arena,
+        .args = args,
+        .plans = context,
+        .bindings = bindings,
+    };
+    const retained = try retainPrefixRows(arena.allocator(), prefix.result.rows().values);
+    var scans = [_]seq.relation_graph.ScanInput{.{
+        .stage_index = stage,
+        .table = .{ .values = retained, .width = prefix.result.width },
+    }};
+    const result = try graph.execute(&scans);
+    defer graph.table_allocator.free(result.table.values);
+    var execution = prefix;
+    execution.runner = null;
+    execution.graph_arena = arena;
+    execution.projection_bounded = true;
+    execution.result = .{
+        .values = try arena.allocator().dupe(seq.execution.Value, result.table.values),
+        .width = result.table.width,
+        .row_count = try result.table.rowCount(),
+        .source_row_count = prefix.result.source_row_count,
+        .materialized_row_count = try std.math.add(
+            usize,
+            prefix.result.materialized_row_count,
+            result.materialized_rows - prefix.result.row_count,
+        ),
+    };
+    return execution;
+}
+
+fn retainPrefixRows(
+    allocator: std.mem.Allocator,
+    values: []const seq.execution.Value,
+) ![]seq.execution.Value {
+    const result = try allocator.alloc(seq.execution.Value, values.len);
+    for (values, result) |value, *retained| {
+        retained.* = switch (value) {
+            .string => |text| .{ .string = try allocator.dupe(u8, text) },
+            .json => |text| .{ .json = try allocator.dupe(u8, text) },
+            else => value,
+        };
+    }
+    return result;
+}
+
 const DiscoveredSession = struct {
     path_index: usize,
     identity: seq.trace_adapter.SessionIdentity,
@@ -1296,6 +1437,8 @@ const StreamingParseTask = struct {
     path: []const u8,
     relation: seq.physical.Relation,
     max_input_bytes: usize,
+    compressed: bool = false,
+    session_seed_row: ?usize = null,
     as_of_ns: i128 = 0,
     repo: ?[]const u8,
     selected: ?seq.trace_adapter.SelectedParse = null,
@@ -1419,6 +1562,7 @@ fn buildSessionSeed(
         try std.math.mul(usize, discovered.items.len, scan.field_indices.len),
     );
     for (discovered.items) |item| {
+        if (!item.identity.repo_matches) continue;
         try appendDiscoveredSession(
             graph.table_allocator,
             graph.arena.allocator(),
@@ -1452,23 +1596,29 @@ fn createStreamingParseTasks(
 ) ![]StreamingParseTask {
     var tasks: std.ArrayList(StreamingParseTask) = .empty;
     defer tasks.deinit(graph.allocator);
+    const selected = try sessionSelectionClosure(
+        graph.allocator,
+        discovered.items,
+        &discovered.indices,
+        graph.args.selectors.session_id,
+        graph.args.selectors.path,
+        paths,
+        graph.plans.definition_plan.bounds.max_graph_depth,
+    );
+    defer graph.allocator.free(selected);
     var reserved_bytes: usize = 0;
+    var seed_row: usize = 0;
     for (discovered.items, 0..) |item, index| {
         if (!item.identity.repo_matches) continue;
-        if (!sessionInSelectionClosure(
-            discovered.items,
-            &discovered.indices,
-            index,
-            graph.args.selectors.session_id,
-            graph.args.selectors.path,
-            paths,
-            graph.plans.definition_plan.bounds.max_graph_depth,
-        )) continue;
+        const row = seed_row;
+        seed_row += 1;
+        if (!selected[index]) continue;
         const path = paths[item.path_index];
         if (seq.opencode_adapter.recognizes(path)) {
             return error.GraphObservationOpenCodeUnsupported;
         }
-        try reserveInputBytes(
+        const compressed = std.mem.endsWith(u8, path, ".jsonl.zst");
+        if (!compressed) try reserveInputBytes(
             &reserved_bytes,
             item.identity.file_size,
             graph.plans.definition_plan.bounds.max_input_bytes,
@@ -1478,7 +1628,12 @@ fn createStreamingParseTasks(
             .dir = graph.dir,
             .path = path,
             .relation = graph.plans.native_plan.stages[schedule.scan_stage].operation.scan.relation,
-            .max_input_bytes = item.identity.file_size,
+            .max_input_bytes = if (compressed)
+                graph.plans.definition_plan.bounds.max_input_bytes
+            else
+                item.identity.file_size,
+            .compressed = compressed,
+            .session_seed_row = row,
             .as_of_ns = @as(i128, graph.args.as_of_ms) * std.time.ns_per_ms,
             .repo = graph.args.selectors.repo,
         });
@@ -1494,6 +1649,8 @@ const StreamingGraphState = struct {
     interner: seq.trace_adapter.ValueInterner = .{},
     source_rows: usize = 0,
     materialized_rows: usize,
+    session_seed: ?*seq.relation_graph.ScanInput = null,
+    usage_column: ?usize = null,
 
     fn recordDiscovery(
         self: *StreamingGraphState,
@@ -1528,6 +1685,16 @@ const StreamingGraphState = struct {
             self.graph.plans.definition_plan.bounds.max_input_bytes,
         );
         try admitTraceSession(&self.metrics, parsed);
+        if (self.usage_column) |column| {
+            const seed = self.session_seed orelse return error.ObservationPhysicalParseMissing;
+            const row = task.session_seed_row orelse return error.ObservationPhysicalParseMissing;
+            const offset = row * seed.table.width + column;
+            std.debug.assert(offset < seed.table.values.len);
+            seed.table.values[offset] = if (parsed.trace.session.source_format == .pi_session_jsonl)
+                .null
+            else
+                .{ .integer = parsed.trace.session.token_usage_observation_count };
+        }
         self.digest_set.add(task.path, &parsed.corpus_digest);
         try self.appendPartition(parsed, reducer);
     }
@@ -1605,6 +1772,17 @@ fn runStreamingParseTasks(
 ) !void {
     const prefetch = 3;
     defer for (tasks) |*task| task.deinit();
+    for (tasks) |task| if (task.compressed) {
+        for (tasks) |*sequential| {
+            const remaining = state.graph.plans.definition_plan.bounds.max_input_bytes -|
+                state.metrics.corpus_bytes;
+            sequential.max_input_bytes = @min(sequential.max_input_bytes, remaining);
+            sequential.run();
+            if (sequential.failure) |failure| return failure;
+            try state.consume(sequential, reducer);
+        }
+        return;
+    };
     var threads = @as([prefetch]?std.Thread, @splat(null));
     // Parsed results may be released only after this barrier, including spawn/parse failures.
     defer for (&threads) |*thread| if (thread.*) |running| running.join();
@@ -1685,7 +1863,13 @@ fn executeStreamingGraphObservation(
         .graph = &graph,
         .schedule = schedule,
         .materialized_rows = lineage_graph.materialized_rows,
+        .session_seed = &session_seed[0],
     };
+    const session_scan = context.native_plan.stages[session_seed[0].stage_index].operation.scan;
+    for (session_scan.field_indices, 0..) |field, column| {
+        const name = seq.physical.Relation.sessions.fields()[field].name;
+        if (std.mem.eql(u8, name, "token_usage_observation_count")) state.usage_column = column;
+    }
     try state.recordDiscovery(&discovered, paths.items);
     defer state.interner.deinit(graph.table_allocator);
     const tasks = try createStreamingParseTasks(&graph, schedule, &discovered, paths.items);
@@ -1694,16 +1878,24 @@ fn executeStreamingGraphObservation(
     return state.finish(&reducer, &session_seed[0]);
 }
 
-fn sessionInSelectionClosure(
+fn sessionSelectionClosure(
+    allocator: std.mem.Allocator,
     sessions: []const DiscoveredSession,
     indices: *const std.StringHashMap(usize),
-    candidate_index: usize,
     selected_session_id: ?[]const u8,
     selected_path: ?[]const u8,
     paths: []const []const u8,
     max_depth: usize,
-) bool {
-    if (selected_session_id == null and selected_path == null) return true;
+) ![]bool {
+    const needed = try allocator.alloc(bool, sessions.len);
+    errdefer allocator.free(needed);
+    @memset(needed, selected_session_id == null and selected_path == null);
+    if (selected_session_id == null and selected_path == null) return needed;
+    const seeds = try allocator.alloc(bool, sessions.len);
+    defer allocator.free(seeds);
+    const visited = try allocator.alloc(usize, sessions.len);
+    defer allocator.free(visited);
+    @memset(visited, 0);
     for (sessions, 0..) |selected, selected_index| {
         const id_matches = if (selected_session_id) |wanted|
             if (selected.identity.session_id) |actual| std.mem.eql(u8, wanted, actual) else false
@@ -1713,40 +1905,76 @@ fn sessionInSelectionClosure(
             std.mem.eql(u8, wanted, paths[selected.path_index])
         else
             false;
-        if (!id_matches and !path_matches) continue;
-        return lineageRelated(
+        seeds[selected_index] = id_matches or path_matches;
+    }
+    const counted = try allocator.alloc(bool, sessions.len);
+    defer allocator.free(counted);
+    for (sessions, 0..) |_, index| {
+        counted[index] = try scopeDescendsFromSeed(
             sessions,
             indices,
-            candidate_index,
-            selected_index,
-            max_depth,
-        ) or lineageRelated(
-            sessions,
-            indices,
-            selected_index,
-            candidate_index,
+            index,
+            seeds,
+            visited,
             max_depth,
         );
     }
-    return false;
+    @memset(visited, 0);
+    for (counted, 0..) |include, index| {
+        if (include) try includeHistoryAncestors(
+            sessions,
+            indices,
+            index,
+            needed,
+            visited,
+            max_depth,
+        );
+    }
+    return needed;
 }
 
-fn lineageRelated(
+fn scopeDescendsFromSeed(
     sessions: []const DiscoveredSession,
     indices: *const std.StringHashMap(usize),
     descendant_index: usize,
-    ancestor_index: usize,
+    seeds: []const bool,
+    visited: []usize,
     max_depth: usize,
-) bool {
+) !bool {
+    var current = descendant_index;
+    var depth: usize = 0;
+    var selected = false;
+    while (depth <= max_depth) : (depth += 1) {
+        if (visited[current] == descendant_index + 1) return error.ObservationGraphCycle;
+        visited[current] = descendant_index + 1;
+        selected = selected or seeds[current];
+        const identity = sessions[current].identity;
+        const parent = identity.control_parent_session_id orelse
+            identity.parent_session_id orelse return selected;
+        current = indices.get(parent) orelse return selected;
+        if (depth >= max_depth) return error.ObservationGraphDepthExceeded;
+    }
+    return selected;
+}
+
+fn includeHistoryAncestors(
+    sessions: []const DiscoveredSession,
+    indices: *const std.StringHashMap(usize),
+    descendant_index: usize,
+    needed: []bool,
+    visited: []usize,
+    max_depth: usize,
+) !void {
     var current = descendant_index;
     var depth: usize = 0;
     while (depth <= max_depth) : (depth += 1) {
-        if (current == ancestor_index) return true;
-        if (depth >= max_depth) return false;
-        const parent = sessions[current].identity.parent_session_id orelse return false;
-        current = indices.get(parent) orelse return false;
+        if (visited[current] == descendant_index + 1) return error.ObservationGraphCycle;
+        visited[current] = descendant_index + 1;
+        needed[current] = true;
+        const parent = sessions[current].identity.parent_session_id orelse return;
+        current = indices.get(parent) orelse return;
+        if (depth >= max_depth) return error.ObservationGraphDepthExceeded;
     }
-    return false;
 }
 
 fn graphRuntimeSelectors(args: *const ObserveArgs) seq.relation_graph.RuntimeSelectors {
@@ -1837,13 +2065,28 @@ fn appendDiscoveredSession(
                 .{ .string = try retained_allocator.dupe(u8, text) }
             else
                 .null
-        else if (std.mem.eql(u8, field.name, "parent_session_id"))
-            if (identity.parent_session_id) |text|
+        else if (std.mem.eql(u8, field.name, "parent_session_id") or
+            std.mem.eql(u8, field.name, "control_parent_session_id") or
+            std.mem.eql(u8, field.name, "forked_from_session_id") or
+            std.mem.eql(u8, field.name, "parent_relation"))
+            if (if (std.mem.eql(u8, field.name, "parent_session_id"))
+                identity.parent_session_id
+            else if (std.mem.eql(u8, field.name, "control_parent_session_id"))
+                identity.control_parent_session_id
+            else if (std.mem.eql(u8, field.name, "forked_from_session_id"))
+                identity.forked_from_session_id
+            else
+                identity.parent_relation) |text|
                 .{ .string = try retained_allocator.dupe(u8, text) }
             else
                 .null
         else if (std.mem.eql(u8, field.name, "lineage_conflict"))
-            .{ .boolean = false }
+            .{ .boolean = identity.lineage_conflict }
+        else if (std.mem.eql(u8, field.name, "subagent_history_start_ordinal"))
+            if (identity.subagent_history_start_ordinal) |value|
+                .{ .integer = @intCast(value) }
+            else
+                .null
         else if (std.mem.eql(u8, field.name, "path"))
             .{ .string = try retained_allocator.dupe(u8, path) }
         else if (field.nullable)
@@ -2116,7 +2359,7 @@ fn openCodeSessionPasses(
     path: []const u8,
 ) !bool {
     const wanted = args.selectors.session_id;
-    const excluded = seq.execution.excludedSessionId(program);
+    const excluded = prunableExcludedSessionId(args, program);
     if (wanted == null and excluded == null) return true;
     var buffer: [64]u8 = undefined;
     const actual = try seq.opencode_adapter.sessionId(&buffer, path);
@@ -2127,6 +2370,17 @@ fn openCodeSessionPasses(
         if (std.mem.eql(u8, value, actual)) return false;
     }
     return true;
+}
+
+fn prunableExcludedSessionId(
+    args: *const ObserveArgs,
+    program: *const seq.execution.Program,
+) ?[]const u8 {
+    const excluded = seq.execution.excludedSessionId(program) orelse return null;
+    if (args.selectors.session_id) |selected| {
+        if (std.mem.eql(u8, selected, excluded)) return null;
+    }
+    return excluded;
 }
 
 fn feedTraceFile(
@@ -2151,7 +2405,7 @@ fn feedTraceFile(
         args.traceOptions(bounds.max_input_bytes -| metrics.corpus_bytes),
         .{
             .session_id = args.selectors.session_id,
-            .exclude_session_id = seq.execution.excludedSessionId(program),
+            .exclude_session_id = prunableExcludedSessionId(args, program),
             .repo = args.selectors.repo,
             .since_ms = args.selectors.since_ms,
             .until_ms = args.selectors.until_ms,
@@ -2883,7 +3137,8 @@ fn emitCapabilities(io: std.Io, argv: []const []const u8) !u8 {
             "[\"codex-rollout-jsonl/v1\"," ++
             "\"pi-session-jsonl/v1\"," ++
             "\"opencode-prompt-history-jsonl/v1\"," ++
-            "\"immutable-relation-json/v1\"],\"operators\":[",
+            "\"immutable-relation-json/v1\"]," ++
+            "\"source_encodings\":[\"jsonl\",\"jsonl.zst\"],\"operators\":[",
         .{ Version, seq.definition.abi },
     );
     var first = true;
@@ -2941,6 +3196,22 @@ fn emitCommandError(io: std.Io, err: anyerror) !void {
     stdout_writer.interface.writeAll(
         ",\"authority_granted\":false}\n",
     ) catch |write_err| return stdout_writer.err orelse write_err;
+}
+
+fn emitSourceError(
+    io: std.Io,
+    err: anyerror,
+    diagnostic: *const seq.native.SourceDiagnostic,
+) !void {
+    var stdout_writer = std.Io.File.stdout().writer(io, &.{});
+    const writer = &stdout_writer.interface;
+    try writer.writeAll("{\"schema\":\"seq-command-error/v1\",\"code\":");
+    try writeString(writer, @errorName(err));
+    try writer.writeAll(",\"path\":");
+    try writeString(writer, diagnostic.path.?);
+    try writer.print(",\"warning_count\":{d},\"message\":", .{diagnostic.warning_count});
+    try writeString(writer, diagnostic.message.?);
+    try writer.writeAll(",\"authority_granted\":false}\n");
 }
 
 fn findProjection(
@@ -3382,6 +3653,101 @@ test "session cycles precede depth errors within the current discovery walk" {
     try std.testing.expectError(error.ObservationGraphDepthExceeded, fixture.resolve(0, 0));
     try std.testing.expect(fixture.sessions[3].resolved);
     try fixture.expectNoVisiting();
+}
+
+test "selection follows worker control and reads every selected worker history ancestor" {
+    var fixture = try DepthFixture.init(6);
+    defer fixture.deinit();
+    for (fixture.sessions) |*session| session.identity.parent_session_id = null;
+    fixture.sessions[1].identity.parent_session_id = fixture.sessions[3].identity.session_id;
+    fixture.sessions[2].identity.parent_session_id = fixture.sessions[1].identity.session_id;
+    fixture.sessions[2].identity.control_parent_session_id =
+        fixture.sessions[0].identity.session_id;
+    fixture.sessions[4].identity.parent_session_id = fixture.sessions[1].identity.session_id;
+    fixture.sessions[5].identity.parent_session_id = fixture.sessions[2].identity.session_id;
+    const paths: []const []const u8 = &.{ "x", "y", "child", "ancestor", "unrelated", "worker" };
+    const selected = try sessionSelectionClosure(
+        std.testing.allocator,
+        fixture.sessions,
+        &fixture.indices,
+        fixture.sessions[0].identity.session_id,
+        null,
+        paths,
+        4,
+    );
+    defer std.testing.allocator.free(selected);
+    try std.testing.expectEqualSlices(bool, &.{ true, true, true, true, false, true }, selected);
+    const child = try sessionSelectionClosure(
+        std.testing.allocator,
+        fixture.sessions,
+        &fixture.indices,
+        null,
+        "child",
+        paths,
+        4,
+    );
+    defer std.testing.allocator.free(child);
+    try std.testing.expectEqualSlices(bool, &.{ false, true, true, true, false, true }, child);
+    try std.testing.expectError(error.ObservationGraphDepthExceeded, sessionSelectionClosure(
+        std.testing.allocator,
+        fixture.sessions,
+        &fixture.indices,
+        fixture.sessions[0].identity.session_id,
+        null,
+        paths,
+        1,
+    ));
+}
+
+test "selection rejects control cycles independently of history ancestry" {
+    var fixture = try DepthFixture.init(2);
+    defer fixture.deinit();
+    for (fixture.sessions) |*session| session.identity.parent_session_id = null;
+    fixture.sessions[0].identity.control_parent_session_id =
+        fixture.sessions[1].identity.session_id;
+    fixture.sessions[1].identity.control_parent_session_id =
+        fixture.sessions[0].identity.session_id;
+    try std.testing.expectError(error.ObservationGraphCycle, sessionSelectionClosure(
+        std.testing.allocator,
+        fixture.sessions,
+        &fixture.indices,
+        fixture.sessions[0].identity.session_id,
+        null,
+        &.{ "one", "two" },
+        2,
+    ));
+}
+
+test "discovery seed preserves lineage conflicts and leaves token coverage unknown" {
+    var retained = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer retained.deinit();
+    var values: std.ArrayList(seq.execution.Value) = .empty;
+    defer values.deinit(std.testing.allocator);
+    const fields = [_]u16{
+        try seq.physical.Relation.sessions.fieldIndex("parent_session_id"),
+        try seq.physical.Relation.sessions.fieldIndex("control_parent_session_id"),
+        try seq.physical.Relation.sessions.fieldIndex("lineage_conflict"),
+        try seq.physical.Relation.sessions.fieldIndex("token_usage_observation_count"),
+    };
+    try appendDiscoveredSession(
+        std.testing.allocator,
+        retained.allocator(),
+        &values,
+        &fields,
+        "child.jsonl",
+        .{
+            .session_id = @constCast("child"),
+            .parent_session_id = @constCast("history"),
+            .control_parent_session_id = @constCast("controller"),
+            .lineage_conflict = true,
+            .bytes_read = 10,
+            .file_size = 100,
+        },
+    );
+    try std.testing.expectEqualStrings("history", values.items[0].string);
+    try std.testing.expectEqualStrings("controller", values.items[1].string);
+    try std.testing.expect(values.items[2].boolean);
+    try std.testing.expect(values.items[3] == .null);
 }
 
 test "failed first parse joins and releases prefetched successful results" {
