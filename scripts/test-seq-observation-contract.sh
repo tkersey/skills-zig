@@ -237,6 +237,11 @@ cp "$rollout" "$work/aborted-root/one.jsonl"
 aborted_lineage=$("$binary" observe --definition "$lineage_definition" --projection rows \
   --root "$work/aborted-root" --format json)
 jq -e '(.data.rows | length) == 1' <<<"$aborted_lineage" >/dev/null
+aborted_reachability=$("$binary" observe \
+  --definition apps/seq/src/v1/fixtures/pi/graph-observation.json --projection rows \
+  --root "$work/aborted-root" --format json)
+jq -e '(.data.rows | map(.session_id) | sort) == [null, "fixture-session"]' \
+  <<<"$aborted_reachability" >/dev/null
 
 extra_scan_definition=apps/seq/src/v1/fixtures/lineage-extra-scan.json
 extra_plan=$("$binary" explain --definition "$extra_scan_definition" --projection rows --format json)
@@ -258,3 +263,126 @@ if not_utf8=$("$binary" observe --definition "$work/message.json" --projection r
   exit 1
 fi
 jq -e '.code == "ObservationSelectionNotUtf8"' <<<"$not_utf8" >/dev/null
+
+{
+  head -n 1 "$rollout"
+  printf '%s\n' '{"timestamp":"2026-07-26T10:00:05Z","type":"event_msg","payload":{"type":"agent_message","message":"dated marker"}}'
+  printf '%s\n' '{"type":"event_msg","payload":{"type":"agent_message","message":"undated marker"}}'
+} >"$work/nulls.jsonl"
+jq -n '{schema:"seq-observation-definition/v1", id:"example/null-ranking",
+  requires:{abi:"seq-observation-abi/v1", operators:["derive","project","scan","top-k"]},
+  parameters:{}, selectors:["path"], inputs:[],
+  relations:[{name:"messages", fields:["text","timestamp"]}],
+  pipeline:[{op:"scan", relation:"messages", as:"source"},
+    {op:"derive", input:"source", as:"derived", fields:[{name:"label", type:"string",
+      nullable:false, expr:{op:"concat", args:[{field:"text"}, "!"]}}]},
+    {op:"top-k", input:"derived", as:"ranked",
+      by:[{field:"timestamp", direction:"desc", nulls:"last"}], limit:1},
+    {op:"project", input:"ranked", as:"rows", fields:["text","timestamp"]}],
+  projections:{rows:{relation:"rows", schema:"example-null-ranking/v1",
+    fields:["text","timestamp"], renderers:["json"]}},
+  bounds:{max_rows:8, max_output_bytes:4096, max_fold_states:1}}' >"$work/null-top-k.json"
+jq '.requires.operators = ["derive","limit","project","scan","sort"] |
+  .pipeline[2] = {op:"sort", input:"derived", as:"sorted",
+    by:[{field:"timestamp", direction:"desc", nulls:"last"}]} |
+  .pipeline |= .[0:3] + [{op:"limit", input:"sorted", as:"ranked", limit:1}] + .[3:]' \
+  "$work/null-top-k.json" >"$work/null-sort-limit.json"
+for shape in null-top-k null-sort-limit; do
+  ranked=$("$binary" observe --definition "$work/$shape.json" --projection rows \
+    --path "$work/nulls.jsonl" --format json)
+  jq -e '.data.rows == [{"text":"dated marker","timestamp":"2026-07-26T10:00:05+00:00"}]' \
+    <<<"$ranked" >/dev/null
+done
+jq -e '.strategy.kind == "bounded-native-prefix"' <<<"$("$binary" explain \
+  --definition "$work/null-top-k.json" --projection rows --format json)" >/dev/null
+jq -e '.strategy.kind == "materialized-graph"' <<<"$("$binary" explain \
+  --definition "$work/null-sort-limit.json" --projection rows --format json)" >/dev/null
+
+windowed="$work/windowed"
+mkdir -p "$windowed/sessions/2026/07/26" "$windowed/sessions/2026/08/02" \
+  "$windowed/archived_sessions"
+jq -c 'if .type == "session_meta" then .payload.id = "fixture-live" else . end' "$rollout" \
+  >"$windowed/sessions/2026/07/26/rollout-2026-07-26T10-00-00-live.jsonl"
+sed 's/2026-07-26/2026-08-02/g; s/fixture-session/fixture-recent/' "$rollout" \
+  >"$windowed/sessions/2026/08/02/rollout-2026-08-02T10-00-00-recent.jsonl"
+cp apps/seq/testdata/rollout.jsonl.zst \
+  "$windowed/archived_sessions/rollout-2026-07-26T10-00-00-archived.jsonl.zst"
+touch -t 202607270000 "$windowed/sessions/2026/07/26/rollout-2026-07-26T10-00-00-live.jsonl" \
+  "$windowed/archived_sessions/rollout-2026-07-26T10-00-00-archived.jsonl.zst"
+for case in "--since 2026-08-01T00:00:00Z 1 1" "--until 2026-07-20T00:00:00Z 0 0" \
+  "--until 2026-07-27T00:00:00Z 2 2"; do
+  read -r selector instant files rows <<<"$case"
+  windowed_result=$(CODEX_HOME="$windowed" "$binary" observe --definition "$work/message.json" \
+    --projection rows "$selector" "$instant" --param needle=failure --format json)
+  jq -e --argjson files "$files" --argjson rows "$rows" '.corpus.files == $files and
+    .stats.files_opened == $files and (.data.rows | length) == $rows' \
+    <<<"$windowed_result" >/dev/null
+done
+
+mkdir -p "$work/selected-root" "$work/selected-home/sessions"
+cp "$rollout" "$work/selected-root/a.jsonl"
+sed 's/2026-07-26/2026-07-28/g; s/fixture-session/fixture-later/' "$rollout" \
+  >"$work/selected-root/b.jsonl"
+cp "$work/selected-root/a.jsonl" "$work/selected-root/b.jsonl" "$work/selected-home/sessions/"
+jq '.selectors = ["path","root","session-id","since","until"] |
+  .relations = [{name:"messages", fields:["session_id","text","timestamp"]}] |
+  .pipeline[2].limit = 8 | .pipeline[3].fields = ["session_id","text"] |
+  .projections.rows.fields = ["session_id","text"]' \
+  "$work/null-top-k.json" >"$work/selected-top-k.json"
+jq '.selectors = ["path","root","session-id","since","until"] |
+  .relations = [{name:"messages", fields:["session_id","text","timestamp"]}] |
+  .pipeline[3].limit = 8 | .pipeline[4].fields = ["session_id","text"] |
+  .projections.rows.fields = ["session_id","text"]' \
+  "$work/null-sort-limit.json" >"$work/selected-sort-limit.json"
+for case in "fixture-session|--root|$work/selected-root|--session-id|fixture-session" \
+  "fixture-later|--root|$work/selected-root|--since|2026-07-27T00:00:00Z" \
+  "fixture-session|--path|$work/selected-home/sessions/a.jsonl"; do
+  IFS='|' read -r -a parts <<<"$case"
+  shape_results=()
+  for shape in selected-top-k selected-sort-limit; do
+    shape_results+=("$(CODEX_HOME="$work/selected-home" "$binary" observe \
+      --definition "$work/$shape.json" --projection rows "${parts[@]:1}" --format json)")
+  done
+  jq -e -s --arg session "${parts[0]}" '
+    ([.[0].data.rows[].session_id] | unique) == [$session] and
+    .[0].data == .[1].data and .[0].corpus.files == .[1].corpus.files and
+    .[0].selection == .[1].selection' <<<"${shape_results[0]}${shape_results[1]}" >/dev/null
+done
+
+long_text=$(printf 'x%.0s' $(seq 1 3000))
+{
+  head -n 1 "$rollout"
+  jq -cn --arg text "$long_text" \
+    '{timestamp:"2026-07-26T10:00:05Z",type:"event_msg",payload:{type:"agent_message",message:$text}}'
+} >"$work/wide.jsonl"
+jq '.pipeline[1].fields = [
+    {name:"first", type:"string", nullable:false,
+      expr:{op:"concat", args:[{field:"text"}, "!"]}},
+    {name:"second", type:"string", nullable:false,
+      expr:{op:"concat", args:[{field:"text"}, "?"]}}] |
+  .pipeline[3].fields = ["timestamp"] | .projections.rows.fields = ["timestamp"]' \
+  "$work/null-top-k.json" >"$work/wide-top-k.json"
+if wide=$("$binary" observe --definition "$work/wide-top-k.json" --projection rows \
+  --path "$work/wide.jsonl" --format json); then
+  echo "native derivations exceeded their per-row bound without failing" >&2
+  exit 1
+fi
+jq -e '.code == "ObservationExpressionByteBoundExceeded"' <<<"$wide" >/dev/null
+
+if missing_source=$("$binary" turns --path "$work/"$'missing-caf\xe9.jsonl' --format json); then
+  echo "a missing non-UTF-8 source path did not fail" >&2
+  exit 1
+fi
+jq -e '.code == "FileNotFound"' <<<"$missing_source" >/dev/null
+
+pruned="$work/pruned-root"
+mkdir -p "$pruned"
+wanted_id=019f9cf9-37b3-7692-9bd6-f479dc16e385
+other_id=019fa6a7-2fe4-7d32-beba-280ecf4e9ff6
+jq -c --arg id "$wanted_id" 'if .type == "session_meta" then .payload.id = $id else . end' \
+  "$rollout" >"$pruned/rollout-2026-07-26T10-00-00-$wanted_id.jsonl"
+printf '%s\n' 'not zstd' >"$pruned/rollout-2026-07-27T10-00-00-$other_id.jsonl.zst"
+exact_session=$("$binary" observe --definition "$work/message.json" --projection rows \
+  --root "$pruned" --session-id "$wanted_id" --param needle=failure --format json)
+jq -e '.corpus.files == 1 and .stats.files_opened == 1 and (.data.rows | length) == 1' \
+  <<<"$exact_session" >/dev/null

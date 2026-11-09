@@ -7,8 +7,6 @@ const physical = @import("physical.zig");
 
 const value_module = @import("value.zig");
 pub const Value = value_module.Value;
-const compareFloat = value_module.compareFloat;
-const compareIntegerFloat = value_module.compareIntegerFloat;
 const expressions = @import("expressions.zig");
 
 pub const Rows = struct {
@@ -951,7 +949,7 @@ pub const Runner = struct {
         }
         self.source_row_count += 1;
         var scratch: [256]Value = undefined;
-        var expression_allocator = std.heap.FixedBufferAllocator.init(self.expression_buffer);
+        var expression_buffer: ExpressionBuffer = .{ .fixed = .init(self.expression_buffer) };
         const working = if (self.program.derivations.len == 0) @constCast(row) else derived: {
             if (self.expression_workspace == null) {
                 return error.ObservationDerivationWorkspaceRequired;
@@ -961,11 +959,14 @@ pub const Runner = struct {
         };
         const operation_end = self.program.first_blocking_operation orelse
             self.program.operations.len;
-        const disposition = try self.applyStreaming(
+        const disposition = self.applyStreaming(
             working,
             self.program.operations[0..operation_end],
-            expression_allocator.allocator(),
-        );
+            expression_buffer.allocator(),
+        ) catch |err| return if (err == error.OutOfMemory and expression_buffer.exhausted)
+            error.ObservationExpressionByteBoundExceeded
+        else
+            err;
         if (disposition.accepted) {
             if (streamingTopK(self.program)) |top_k| {
                 try self.materializeTopK(
@@ -1677,6 +1678,54 @@ fn sortKeySlice(
     return program.sort_keys[range.start..end];
 }
 
+const ExpressionBuffer = struct {
+    fixed: std.heap.FixedBufferAllocator,
+    exhausted: bool = false,
+
+    fn allocator(self: *ExpressionBuffer) std.mem.Allocator {
+        return .{ .ptr = self, .vtable = &.{
+            .alloc = alloc,
+            .resize = resize,
+            .remap = remap,
+            .free = free,
+        } };
+    }
+
+    fn alloc(context: *anyopaque, len: usize, alignment: std.mem.Alignment, ret: usize) ?[*]u8 {
+        const self: *ExpressionBuffer = @ptrCast(@alignCast(context));
+        const memory = self.fixed.allocator().rawAlloc(len, alignment, ret);
+        if (memory == null) self.exhausted = true;
+        return memory;
+    }
+
+    fn resize(
+        context: *anyopaque,
+        memory: []u8,
+        alignment: std.mem.Alignment,
+        new_len: usize,
+        ret: usize,
+    ) bool {
+        const self: *ExpressionBuffer = @ptrCast(@alignCast(context));
+        return self.fixed.allocator().rawResize(memory, alignment, new_len, ret);
+    }
+
+    fn remap(
+        context: *anyopaque,
+        memory: []u8,
+        alignment: std.mem.Alignment,
+        new_len: usize,
+        ret: usize,
+    ) ?[*]u8 {
+        const self: *ExpressionBuffer = @ptrCast(@alignCast(context));
+        return self.fixed.allocator().rawRemap(memory, alignment, new_len, ret);
+    }
+
+    fn free(context: *anyopaque, memory: []u8, alignment: std.mem.Alignment, ret: usize) void {
+        const self: *ExpressionBuffer = @ptrCast(@alignCast(context));
+        self.fixed.allocator().rawFree(memory, alignment, ret);
+    }
+};
+
 fn rowSortsBefore(
     left_row: []const Value,
     left_ordinal: usize,
@@ -1685,21 +1734,13 @@ fn rowSortsBefore(
     keys: []const RuntimeSortKey,
 ) bool {
     for (keys) |key| {
-        const left_value = left_row[key.field_index];
-        const right_value = right_row[key.field_index];
-        const order = compareForSort(
-            left_value,
-            right_value,
-            key.nulls,
+        const order = value_module.sortOrder(
+            left_row[key.field_index],
+            right_row[key.field_index],
+            key.direction == .descending,
+            key.nulls == .first,
         );
-        if (order == .eq) continue;
-        if (left_value == .null or right_value == .null) {
-            return order == .lt;
-        }
-        return if (key.direction == .ascending)
-            order == .lt
-        else
-            order == .gt;
+        if (order != .eq) return order == .lt;
     }
     return left_ordinal < right_ordinal;
 }
@@ -1727,7 +1768,7 @@ const DistinctContext = struct {
         const left_row = context.runner.materializedRow(left.row_index);
         const right_row = context.runner.materializedRow(right.row_index);
         for (context.fields) |field_index| {
-            const order = compareValues(
+            const order = value_module.order(
                 left_row[field_index],
                 right_row[field_index],
             );
@@ -1746,93 +1787,13 @@ fn distinctKeysEqual(
     const left_row = runner.materializedRow(left.row_index);
     const right_row = runner.materializedRow(right.row_index);
     for (fields) |field_index| {
-        if (!valuesEqual(
+        if (!value_module.equal(
             left_row[field_index],
             right_row[field_index],
             false,
         )) return false;
     }
     return true;
-}
-
-fn compareForSort(
-    left: Value,
-    right: Value,
-    nulls: plan.NullOrder,
-) std.math.Order {
-    if (left == .null or right == .null) {
-        if (left == .null and right == .null) return .eq;
-        const left_first = nulls == .first;
-        return if (left == .null)
-            if (left_first) .lt else .gt
-        else if (left_first)
-            .gt
-        else
-            .lt;
-    }
-    return compareValues(left, right);
-}
-
-fn compareValues(left: Value, right: Value) std.math.Order {
-    return switch (left) {
-        .string => |left_text| switch (right) {
-            .string => |right_text| std.mem.order(
-                u8,
-                left_text,
-                right_text,
-            ),
-            else => compareValueTags(left, right),
-        },
-        .integer => |left_number| switch (right) {
-            .integer => |right_number| std.math.order(
-                left_number,
-                right_number,
-            ),
-            .float => |right_number| compareIntegerFloat(
-                left_number,
-                right_number,
-            ),
-            else => compareValueTags(left, right),
-        },
-        .float => |left_number| switch (right) {
-            .integer => |right_number| switch (compareIntegerFloat(
-                right_number,
-                left_number,
-            )) {
-                .lt => .gt,
-                .eq => .eq,
-                .gt => .lt,
-            },
-            .float => |right_number| compareFloat(
-                left_number,
-                right_number,
-            ),
-            else => compareValueTags(left, right),
-        },
-        .boolean => |left_flag| switch (right) {
-            .boolean => |right_flag| std.math.order(
-                @intFromBool(left_flag),
-                @intFromBool(right_flag),
-            ),
-            else => compareValueTags(left, right),
-        },
-        .json => |left_json| switch (right) {
-            .json => |right_json| std.mem.order(
-                u8,
-                left_json,
-                right_json,
-            ),
-            else => compareValueTags(left, right),
-        },
-        .null => if (right == .null) .eq else .lt,
-    };
-}
-
-fn compareValueTags(left: Value, right: Value) std.math.Order {
-    return std.math.order(
-        @backingInt(std.meta.activeTag(left)),
-        @backingInt(std.meta.activeTag(right)),
-    );
 }
 
 pub fn execute(
@@ -1877,14 +1838,10 @@ fn executeRunner(
 }
 
 fn matches(value: Value, predicate: RuntimePredicate) bool {
-    const equal = valuesEqual(
-        value,
-        predicate.operand,
-        predicate.case_insensitive,
-    );
+    const operand = predicate.operand;
     return switch (predicate.operator) {
-        .exact => equal,
-        .not_equal => !equal,
+        .exact => value_module.equal(value, operand, predicate.case_insensitive),
+        .not_equal => !value_module.equal(value, operand, predicate.case_insensitive),
         .contains => stringOperation(
             value,
             predicate.operand,
@@ -1903,36 +1860,11 @@ fn matches(value: Value, predicate: RuntimePredicate) bool {
             predicate.case_insensitive,
             .suffix,
         ),
-        .less_than => if (numericOrder(value, predicate.operand)) |order|
-            order == .lt
-        else
-            false,
-        .less_or_equal => if (numericOrder(
-            value,
-            predicate.operand,
-        )) |order|
-            order == .lt or order == .eq
-        else
-            false,
-        .greater_than => if (numericOrder(value, predicate.operand)) |order|
-            order == .gt
-        else
-            false,
-        .greater_or_equal => if (numericOrder(
-            value,
-            predicate.operand,
-        )) |order|
-            order == .gt or order == .eq
-        else
-            false,
+        .less_than => value_module.holds(value, operand, .lt),
+        .less_or_equal => value_module.holds(value, operand, .le),
+        .greater_than => value_module.holds(value, operand, .gt),
+        .greater_or_equal => value_module.holds(value, operand, .ge),
     };
-}
-
-fn numericOrder(left: Value, right: Value) ?std.math.Order {
-    const left_numeric = left == .integer or left == .float;
-    const right_numeric = right == .integer or right == .float;
-    if (!left_numeric or !right_numeric) return null;
-    return compareValues(left, right);
 }
 
 const StringOperation = enum { contains, prefix, suffix };
@@ -1978,43 +1910,6 @@ fn containsIgnoreCase(haystack: []const u8, needle: []const u8) bool {
         )) return true;
     }
     return false;
-}
-
-fn valuesEqual(left: Value, right: Value, case_insensitive: bool) bool {
-    return switch (left) {
-        .string => |left_text| switch (right) {
-            .string => |right_text| if (case_insensitive)
-                std.ascii.eqlIgnoreCase(left_text, right_text)
-            else
-                std.mem.eql(u8, left_text, right_text),
-            else => false,
-        },
-        .integer => |left_number| switch (right) {
-            .integer => |right_number| left_number == right_number,
-            .float => |right_number| compareIntegerFloat(
-                left_number,
-                right_number,
-            ) == .eq,
-            else => false,
-        },
-        .float => |left_number| switch (right) {
-            .integer => |right_number| compareIntegerFloat(
-                right_number,
-                left_number,
-            ) == .eq,
-            .float => |right_number| left_number == right_number,
-            else => false,
-        },
-        .boolean => |left_flag| switch (right) {
-            .boolean => |right_flag| left_flag == right_flag,
-            else => false,
-        },
-        .json => |left_json| switch (right) {
-            .json => |right_json| std.mem.eql(u8, left_json, right_json),
-            else => false,
-        },
-        .null => right == .null,
-    };
 }
 
 fn findProjection(
@@ -2780,30 +2675,51 @@ test "compiled aggregate streams bounded numeric summaries in one pass" {
     );
 }
 
+test "native predicates and ordering stay defined for NaN against integers" {
+    const nan: Value = .{ .float = std.math.nan(f64) };
+    for ([_]plan.PredicateOperator{
+        .less_than, .less_or_equal, .greater_than, .greater_or_equal, .exact,
+    }) |operator| {
+        try std.testing.expect(!matches(nan, .{
+            .field_index = 0,
+            .operator = operator,
+            .operand = .{ .integer = 1 },
+            .case_insensitive = false,
+        }));
+    }
+    const keys = [_]RuntimeSortKey{
+        .{ .field_index = 0, .direction = .descending, .nulls = .last },
+    };
+    const integer_row = [_]Value{.{ .integer = 1 }};
+    const nan_row = [_]Value{nan};
+    try std.testing.expect(rowSortsBefore(&nan_row, 1, &integer_row, 0, &keys));
+    try std.testing.expect(!rowSortsBefore(&integer_row, 0, &nan_row, 1, &keys));
+}
+
 test "integer and float comparison preserves large integer identity" {
     const exact: i64 = 9_007_199_254_740_992;
     const adjacent: i64 = 9_007_199_254_740_993;
     const exact_float: f64 = 9_007_199_254_740_992.0;
-    try std.testing.expect(valuesEqual(
+    try std.testing.expect(value_module.equal(
         .{ .integer = exact },
         .{ .float = exact_float },
         false,
     ));
-    try std.testing.expect(!valuesEqual(
+    try std.testing.expect(!value_module.equal(
         .{ .integer = adjacent },
         .{ .float = exact_float },
         false,
     ));
     try std.testing.expectEqual(
         std.math.Order.gt,
-        compareValues(
+        value_module.order(
             .{ .integer = adjacent },
             .{ .float = exact_float },
         ),
     );
     try std.testing.expectEqual(
         std.math.Order.lt,
-        compareValues(
+        value_module.order(
             .{ .float = exact_float },
             .{ .integer = adjacent },
         ),

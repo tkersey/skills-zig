@@ -14,8 +14,8 @@ const parseConfig = expressions.parseConfig;
 const scalarValue = expressions.scalarValue;
 const findName = expressions.findName;
 const truthy = expressions.truthy;
-const valuesEqual = expressions.valuesEqual;
-const compareValues = expressions.compareValues;
+const value_module = @import("value.zig");
+const valuesEqual = value_module.equal;
 const valueFloat = expressions.valueFloat;
 const valueText = expressions.valueText;
 
@@ -312,10 +312,60 @@ pub fn requiredScanStages(
     native_plan: *const plan.Plan,
     projection_name: []const u8,
 ) ![]u16 {
+    const reachable = try reachableStages(allocator, definition_plan, native_plan, projection_name);
+    defer allocator.free(reachable);
+    var scans: std.ArrayList(u16) = .empty;
+    errdefer scans.deinit(allocator);
+    for (native_plan.stages, 0..) |stage, index| {
+        if (reachable[index] and stage.operation == .scan) {
+            try scans.append(allocator, @intCast(index));
+        }
+    }
+    return scans.toOwnedSlice(allocator);
+}
+
+pub fn selectsPhysically(
+    allocator: std.mem.Allocator,
+    definition_plan: *const definition.Plan,
+    native_plan: *const plan.Plan,
+    projection_name: []const u8,
+) !bool {
+    const reachable = try reachableStages(allocator, definition_plan, native_plan, projection_name);
+    defer allocator.free(reachable);
+    var scans: usize = 0;
+    for (native_plan.stages, reachable) |stage, is_reachable| {
+        if (!is_reachable) continue;
+        switch (stage.operation) {
+            .scan => scans += 1,
+            .generic => |generic| switch (generic.operator) {
+                .reachability => return false,
+                .join => if (try joinsLineage(allocator, generic.canonical_config)) return false,
+                else => {},
+            },
+            else => {},
+        }
+    }
+    return scans == 1;
+}
+
+fn joinsLineage(allocator: std.mem.Allocator, config: []const u8) !bool {
+    var parsed = try parseConfig(allocator, config);
+    defer parsed.deinit();
+    const root = try definition_core.json.object(parsed.value);
+    const on = try definition_core.json.object(try definition_core.json.field(root, "on"));
+    return on.get("lineage") != null;
+}
+
+fn reachableStages(
+    allocator: std.mem.Allocator,
+    definition_plan: *const definition.Plan,
+    native_plan: *const plan.Plan,
+    projection_name: []const u8,
+) ![]bool {
     const projection_index = findProjection(definition_plan, projection_name) orelse
         return error.UnknownObservationProjection;
     const reachable = try allocator.alloc(bool, native_plan.stages.len);
-    defer allocator.free(reachable);
+    errdefer allocator.free(reachable);
     @memset(reachable, false);
     try markReachable(
         allocator,
@@ -326,14 +376,7 @@ pub fn requiredScanStages(
         &.{},
         0,
     );
-    var scans: std.ArrayList(u16) = .empty;
-    errdefer scans.deinit(allocator);
-    for (native_plan.stages, 0..) |stage, index| {
-        if (reachable[index] and stage.operation == .scan) {
-            try scans.append(allocator, @intCast(index));
-        }
-    }
-    return scans.toOwnedSlice(allocator);
+    return reachable;
 }
 
 const GraphExecution = struct {
@@ -1041,10 +1084,10 @@ fn valueMatches(
             operator,
             case_insensitive,
         ),
-        .less_than => compareValues(left, right) == .lt,
-        .less_or_equal => compareValues(left, right) != .gt,
-        .greater_than => compareValues(left, right) == .gt,
-        .greater_or_equal => compareValues(left, right) != .lt,
+        .less_than => value_module.holds(left, right, .lt),
+        .less_or_equal => value_module.holds(left, right, .le),
+        .greater_than => value_module.holds(left, right, .gt),
+        .greater_or_equal => value_module.holds(left, right, .ge),
     };
 }
 
@@ -1113,16 +1156,13 @@ const SortContext = struct {
         const left = context.table.row(a);
         const right = context.table.row(b);
         for (context.keys) |key| {
-            const order = compareNullable(
+            const order = value_module.sortOrder(
                 left[key.field_index],
                 right[key.field_index],
-                key.nulls,
+                key.direction == .descending,
+                key.nulls == .first,
             );
-            if (order == .eq) continue;
-            return if (key.direction == .ascending)
-                order == .lt
-            else
-                order == .gt;
+            if (order != .eq) return order == .lt;
         }
         return a < b;
     }
@@ -1995,13 +2035,13 @@ fn joinKeysMatch(
         const matched = if (std.mem.eql(u8, op, "eq"))
             valuesEqual(left[left_index], right[right_index], false)
         else if (std.mem.eql(u8, op, "lt"))
-            compareValues(left[left_index], right[right_index]) == .lt
+            value_module.holds(left[left_index], right[right_index], .lt)
         else if (std.mem.eql(u8, op, "le"))
-            compareValues(left[left_index], right[right_index]) != .gt
+            value_module.holds(left[left_index], right[right_index], .le)
         else if (std.mem.eql(u8, op, "gt"))
-            compareValues(left[left_index], right[right_index]) == .gt
+            value_module.holds(left[left_index], right[right_index], .gt)
         else if (std.mem.eql(u8, op, "ge"))
-            compareValues(left[left_index], right[right_index]) != .lt
+            value_module.holds(left[left_index], right[right_index], .ge)
         else
             false;
         if (!matched) return false;
@@ -2263,8 +2303,9 @@ fn reachabilityTable(
     var nodes: std.StringHashMapUnmanaged(usize) = .{};
     defer nodes.deinit(allocator);
     for (0..count) |index| {
-        const node = valueText(input.row(index)[node_index]) orelse
-            return error.InvalidObservationReachabilityNode;
+        const value = input.row(index)[node_index];
+        if (value == .null) continue;
+        const node = valueText(value) orelse return error.InvalidObservationReachabilityNode;
         const entry = try nodes.getOrPut(allocator, node);
         if (entry.found_existing) return error.DuplicateObservationReachabilityNode;
         entry.value_ptr.* = index;
@@ -2556,17 +2597,6 @@ fn compileDynamicSort(
         };
     }
     return keys;
-}
-
-fn compareNullable(
-    a: execution.Value,
-    b: execution.Value,
-    nulls: plan.NullOrder,
-) std.math.Order {
-    if (a == .null and b == .null) return .eq;
-    if (a == .null) return if (nulls == .first) .lt else .gt;
-    if (b == .null) return if (nulls == .first) .gt else .lt;
-    return compareValues(a, b);
 }
 
 fn expectGraphTopK(input: Table, keys: []plan.SortKey, limit: usize) !void {
@@ -3387,8 +3417,8 @@ test "integer comparison and distinct preserve adjacent values beyond float prec
     const low: execution.Value = .{ .integer = 9_007_199_254_740_992 };
     const high: execution.Value = .{ .integer = 9_007_199_254_740_993 };
     try std.testing.expect(!valuesEqual(low, high, false));
-    try std.testing.expectEqual(std.math.Order.lt, compareValues(low, high));
-    try std.testing.expectEqual(std.math.Order.gt, compareValues(high, low));
+    try std.testing.expectEqual(std.math.Order.lt, value_module.order(low, high));
+    try std.testing.expectEqual(std.math.Order.gt, value_module.order(high, low));
     try std.testing.expect(!valuesEqual(
         .{ .integer = std.math.maxInt(i64) - 1 },
         .{ .integer = std.math.maxInt(i64) },
@@ -3424,17 +3454,9 @@ test "mixed integer and float comparisons stay exact and transitive beyond float
     try std.testing.expect(valuesEqual(low, float_low, false));
     try std.testing.expect(!valuesEqual(high, float_low, false));
     try std.testing.expect(!valuesEqual(float_low, high, false));
-    try std.testing.expectEqual(std.math.Order.eq, compareValues(low, float_low));
-    try std.testing.expectEqual(std.math.Order.lt, compareValues(float_low, high));
-    try std.testing.expectEqual(std.math.Order.gt, compareValues(high, float_low));
-    try std.testing.expectEqual(
-        std.math.Order.lt,
-        compareValues(.{ .integer = std.math.maxInt(i64) }, .{ .float = 9.3e18 }),
-    );
-    try std.testing.expectEqual(
-        std.math.Order.gt,
-        compareValues(.{ .integer = std.math.minInt(i64) }, .{ .float = -9.3e18 }),
-    );
+    try std.testing.expectEqual(std.math.Order.eq, value_module.order(low, float_low));
+    try std.testing.expectEqual(std.math.Order.lt, value_module.order(float_low, high));
+    try std.testing.expectEqual(std.math.Order.gt, value_module.order(high, float_low));
     const orders = [_][3]execution.Value{
         .{ low, float_low, high },
         .{ float_low, low, high },
@@ -3469,10 +3491,80 @@ test "graph comparisons stay defined for NaN" {
     try std.testing.expect(!valuesEqual(nan, nan, false));
     try std.testing.expect(!valuesEqual(nan, .{ .integer = 1 }, false));
     try std.testing.expect(!valuesEqual(.{ .integer = 1 }, nan, false));
-    try std.testing.expectEqual(std.math.Order.eq, compareValues(nan, .{ .integer = 1 }));
-    try std.testing.expectEqual(std.math.Order.eq, compareValues(.{ .float = 2 }, nan));
+    try std.testing.expect(!valueMatches(nan, .{ .integer = 1 }, .less_or_equal, false));
+    try std.testing.expect(!valueMatches(nan, .{ .integer = 1 }, .greater_or_equal, false));
     var values = [_]execution.Value{ nan, .{ .integer = 3 }, nan };
     try std.testing.expectEqual(@as(usize, 3), try distinctCount(&values));
+    var keys = [_]plan.SortKey{
+        .{ .field_index = 0, .direction = .ascending, .nulls = .last },
+    };
+    var mixed = [_]execution.Value{ nan, .{ .integer = 3 }, .null, .{ .float = 1.5 }, nan };
+    for ([_]plan.SortDirection{ .ascending, .descending }) |direction| {
+        keys[0].direction = direction;
+        const input = Table{ .values = &mixed, .width = 1 };
+        for (0..mixed.len + 1) |limit| try expectGraphTopK(input, &keys, limit);
+    }
+}
+
+test "reachability skips identity-less nodes" {
+    var node_name = "node".*;
+    var parent_name = "parent".*;
+    var seed_name = "seed".*;
+    var reachable_name = "reachable".*;
+    var input_columns = [_]plan.Column{
+        .{ .name = &node_name, .kind = .string, .nullable = true },
+        .{ .name = &parent_name, .kind = .string, .nullable = true },
+        .{ .name = &seed_name, .kind = .boolean, .nullable = false },
+    };
+    var output_columns = [_]plan.Column{
+        .{ .name = &node_name, .kind = .string, .nullable = true },
+        .{ .name = &reachable_name, .kind = .boolean, .nullable = false },
+    };
+    const input_schema = plan.Schema{ .columns = &input_columns };
+    var values = [_]execution.Value{
+        .{ .string = "root" },  .null,                 .{ .boolean = true },
+        .null,                  .null,                 .{ .boolean = false },
+        .{ .string = "child" }, .{ .string = "root" }, .{ .boolean = false },
+    };
+    const output = try reachabilityTable(
+        std.testing.allocator,
+        .{ .values = &values, .width = 3 },
+        &input_schema,
+        .{ .columns = &output_columns },
+        \\{"keys":{"node":"node","parent":"parent","seed":"seed","direction":"descendants"},
+        \\ "fields":[{"field":"node"},{"meta":"reachable"}]}
+    ,
+        graph_test_definition.bounds,
+    );
+    defer std.testing.allocator.free(output.values);
+    try std.testing.expectEqualDeep(&[_]execution.Value{
+        .{ .string = "root" },  .{ .boolean = true },
+        .null,                  .{ .boolean = false },
+        .{ .string = "child" }, .{ .boolean = true },
+    }, output.values);
+}
+
+test "graph sorting places nulls by position in both directions" {
+    var values = [_]execution.Value{ .null, .{ .integer = 1 }, .null, .{ .integer = 2 } };
+    var keys = [_]plan.SortKey{
+        .{ .field_index = 0, .direction = .descending, .nulls = .last },
+    };
+    const input = Table{ .values = &values, .width = 1 };
+    const sorted = try sortTable(std.testing.allocator, input, .{ .keys = &keys });
+    defer std.testing.allocator.free(sorted.values);
+    try std.testing.expectEqualDeep(
+        &[_]execution.Value{ .{ .integer = 2 }, .{ .integer = 1 }, .null, .null },
+        sorted.values,
+    );
+    keys[0].nulls = .first;
+    const nulls_first = try sortTable(std.testing.allocator, input, .{ .keys = &keys });
+    defer std.testing.allocator.free(nulls_first.values);
+    try std.testing.expectEqualDeep(
+        &[_]execution.Value{ .null, .null, .{ .integer = 2 }, .{ .integer = 1 } },
+        nulls_first.values,
+    );
+    try std.testing.expect(!valueMatches(.null, .{ .integer = 1 }, .less_or_equal, false));
+    try std.testing.expect(!valueMatches(.null, .{ .integer = 1 }, .greater_or_equal, false));
 }
 
 test "stage traversal checks depth before memoization and respects scan boundaries" {

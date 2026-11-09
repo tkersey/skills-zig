@@ -9,7 +9,7 @@ const plan = @import("plan.zig");
 const seq_time = @import("seq_time");
 const structured = @import("structured.zig");
 
-pub const max_discovery_prefix_bytes: usize = 1024 * 1024;
+pub const max_discovery_prefix_bytes: usize = 256 * 1024 * 1024;
 
 pub const Options = struct {
     ongoing_threshold_secs: i64 = 60,
@@ -423,6 +423,38 @@ test "identity discovery obeys its per-file prefix limit" {
     try std.testing.expectEqualStrings("discovery", identity.session_id.?);
 }
 
+test "identity discovery admits a header that fits although the read passes the limit" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const header = "{\"type\":\"session_meta\",\"payload\":{\"id\":\"fits\"}}\n";
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "session.jsonl",
+        .data = header ++ "{\"type\":\"event_msg\",\"payload\":{\"type\":\"token_count\"}}\n" ++
+            "{\"type\":\"event_msg\",\"payload\":{\"type\":\"token_count\"}}\n",
+    });
+    var identity = try discoverSessionIdentity(
+        std.testing.io,
+        tmp.dir,
+        std.testing.allocator,
+        "session.jsonl",
+        .{ .discovery_prefix_limit = header.len },
+        null,
+    );
+    defer identity.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("fits", identity.session_id.?);
+    try std.testing.expectError(
+        error.ObservationDiscoveryByteBoundExceeded,
+        discoverSessionIdentity(
+            std.testing.io,
+            tmp.dir,
+            std.testing.allocator,
+            "session.jsonl",
+            .{ .discovery_prefix_limit = header.len - 1 },
+            null,
+        ),
+    );
+}
+
 fn writeRepoSession(dir: std.Io.Dir, name: []const u8, cwd: []const u8) !void {
     var data: std.ArrayList(u8) = .empty;
     defer data.deinit(std.testing.allocator);
@@ -626,31 +658,21 @@ fn readDiscoveryPrefixAlloc(
     source: *std.Io.Reader,
     options: Options,
 ) ![]u8 {
-    var bounded_reader = source.limited(.limited(options.discovery_prefix_limit +| 1), &.{});
-    const prefix = try readSummaryPrefixAlloc(allocator, &bounded_reader.interface);
-    if (prefix.len > options.discovery_prefix_limit) {
-        allocator.free(prefix);
-        return error.ObservationDiscoveryByteBoundExceeded;
-    }
-    return prefix;
-}
-
-fn readSummaryPrefixAlloc(
-    allocator: std.mem.Allocator,
-    reader: *std.Io.Reader,
-) ![]u8 {
-    const max_line_bytes = 256 * 1024 * 1024;
     var prefix: std.ArrayList(u8) = .empty;
     errdefer prefix.deinit(allocator);
     var chunk: [16 * 1024]u8 = undefined;
-    while (true) { // tiger: event-loop -- bounded by newline, EOF, or max_line_bytes.
-        const read = try reader.readSliceShort(&chunk);
+    while (true) { // tiger: event-loop -- bounded by newline, EOF, or the per-file prefix limit.
+        const read = try source.readSliceShort(&chunk);
         if (read == 0) break;
-        if (read > max_line_bytes -| prefix.items.len) {
-            return error.LineTooLong;
+        const newline = std.mem.indexOfScalar(u8, chunk[0..read], '\n');
+        const line_bytes = prefix.items.len + if (newline) |index| index + 1 else read;
+        if (line_bytes > options.discovery_prefix_limit or
+            (newline == null and line_bytes == options.discovery_prefix_limit))
+        {
+            return error.ObservationDiscoveryByteBoundExceeded;
         }
         try prefix.appendSlice(allocator, chunk[0..read]);
-        if (std.mem.indexOfScalar(u8, chunk[0..read], '\n') != null) break;
+        if (newline != null) break;
     }
     return prefix.toOwnedSlice(allocator);
 }
@@ -732,7 +754,11 @@ fn canonicalPathPassesSessionSelection(
     path: []const u8,
     selection: SessionSelection,
 ) bool {
-    const basename = std.fs.path.basename(path);
+    const name = std.fs.path.basename(path);
+    const basename = if (std.mem.endsWith(u8, name, ".jsonl.zst"))
+        name[0 .. name.len - ".zst".len]
+    else
+        name;
     if (!std.mem.startsWith(u8, basename, "rollout-") or
         !std.mem.endsWith(u8, basename, ".jsonl"))
     {
@@ -793,6 +819,18 @@ test "canonical rollout paths preselect exact and excluded sessions" {
     try std.testing.expect(canonicalPathPassesSessionSelection(
         "renamed.jsonl",
         .{ .session_id = wanted },
+    ));
+    try std.testing.expect(canonicalPathPassesSessionSelection(
+        wanted_path ++ ".zst",
+        .{ .session_id = wanted },
+    ));
+    try std.testing.expect(!canonicalPathPassesSessionSelection(
+        other_path ++ ".zst",
+        .{ .session_id = wanted },
+    ));
+    try std.testing.expect(!canonicalPathPassesSessionSelection(
+        wanted_path ++ ".zst",
+        .{ .exclude_session_id = wanted },
     ));
 }
 

@@ -101,7 +101,11 @@ The former `contaminated` boolean is absent from v2.
 
 `bounds.max_input_bytes` applies to aggregate decoded JSONL admitted for parsing.
 Every strategy decides selection from a session's discovery prefix before charging
-the file against that bound, so a file the selectors skip cannot exhaust it.
+the file against that bound, so a file whose prefix places it outside the selectors
+cannot exhaust it. A prefix that omits a selected field, such as a legacy first line
+without `cwd` or a timestamp, cannot exclude its file, which is then read and
+charged. Linear and single-source strategies then drop that session when its parsed
+`cwd` or time fails the selectors; lineage and multi-scan graph scopes keep it.
 Plain-only streaming lineage execution reserves discovered file sizes before
 prefetch; compressed disk sizes are never substituted for decoded reservations.
 The unreserved remainder of the bound is spare: a session that grows after
@@ -111,8 +115,9 @@ corpus with compressed files is parsed sequentially, and each file may read the
 decoded budget that is neither admitted nor reserved by a later file. Growth
 beyond the spare fails with `ObservationInputByteBoundExceeded`; a failed read
 never yields a partial success. Each discovery read (a session identity or
-selection prefix) is limited to 1 MiB of decoded bytes per file. Discovery has no
-separate fixed total: it is bounded by that per-file limit and the native
+selection prefix) must find the first line, newline included, within 256 MiB of
+decoded bytes per file, the parser's line limit. Discovery has no separate fixed
+total: it is bounded by that per-file limit and the native
 candidate limit of 1,000,000 session files. `stats.files_opened` counts source
 file opens, including discovery reopens; `discovery_files_opened` and
 `discovery_bytes_read` identify that additional work. `corpus_bytes_read` and
@@ -129,26 +134,43 @@ Filtering, folding, and membership joins may reuse storage only for an exclusive
 owned final consumer. Numeric equality and ordering are exact for integers and
 for integers compared with floats, including values above `2^53`, so `distinct`,
 sorting, and joins do not depend on row order. Signed zeros compare and hash
-equal; NaN never equals a value and does not abort ordering. Sessions without an
-identity, such as an empty rollout, do not participate in lineage joins. A
+equal. Every strategy shares one value order. Ordering predicates and comparisons
+hold only between non-null values of one kind (numbers, text, or booleans), so
+null, NaN, and mixed kinds never satisfy them, and NaN never equals a value.
+Sorting places nulls first or last as declared in either direction, orders NaN
+after every number, and orders kinds as text, numbers, then booleans.
+Sessions without an
+identity, such as an empty rollout, do not participate in lineage joins and cannot be
+linked by reachability. A
 lineage definition whose projection reads a scan the streaming strategy cannot
 seed runs on the materialized-graph strategy. Graph projections that pass through
 `limit` or `top_k` report the definition-bounded limitation, as linear projections
 do.
 
+Single-source graph definitions apply `--path`, `--session-id`, `--since`, and
+`--until` to their corpus on every strategy, as linear definitions do; multi-scan,
+lineage, and reachability graphs read the whole root and expose those selectors to
+expressions.
 Single-source graphs with a native `top-k` prefix stream physical selection,
 filters, and row-local derivations through the native runner. Only the retained
 top-k rows enter the remaining graph. `seq explain` reports this as
 `bounded-native-prefix`. Adding excerpt derivations to a search therefore keeps
 its path/session/time selection and avoids retaining the entire matching corpus.
-The native row, retained-byte, input-byte, and output limits still apply.
+The native row, retained-byte, input-byte, and output limits still apply, and each
+row's derived strings share a buffer of `bounds.max_output_bytes`; a row that exceeds
+it fails with `ObservationExpressionByteBoundExceeded`. The materialized graph applies
+no per-row derivation bound.
 
 ## Codex source coverage and forks
 
 Default discovery reads both `${CODEX_HOME:-$HOME/.codex}/sessions` and
 `archived_sessions`. Explicit roots stay confined to the requested directory.
 Both `.jsonl` and `.jsonl.zst` rollouts are discovered; capabilities advertise
-`source_encodings`. Use time selectors over the complete intended corpus;
+`source_encodings`. Time selectors prune canonical partitions and archived rollouts
+alike, with a two-day margin: a rollout whose filename start date follows `--until`
+is skipped, and one that starts before `--since` is skipped only when its
+modification time also precedes the window. Use time selectors over the complete
+intended corpus;
 calendar directories reflect session starts and can omit resumed sessions or
 needed ancestors. An empty result describes the admitted corpus, not all work
 that may have occurred outside it.

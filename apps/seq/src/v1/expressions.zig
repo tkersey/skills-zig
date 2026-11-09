@@ -629,12 +629,12 @@ fn compiledBinaryExpression(
     right: Value,
 ) !Value {
     return switch (op) {
-        .eq => .{ .boolean = valuesEqual(left, right, false) },
-        .ne => .{ .boolean = !valuesEqual(left, right, false) },
-        .lt => .{ .boolean = compareValues(left, right) == .lt },
-        .le => .{ .boolean = compareValues(left, right) != .gt },
-        .gt => .{ .boolean = compareValues(left, right) == .gt },
-        .ge => .{ .boolean = compareValues(left, right) != .lt },
+        .eq => .{ .boolean = value_module.equal(left, right, false) },
+        .ne => .{ .boolean = !value_module.equal(left, right, false) },
+        .lt => .{ .boolean = value_module.holds(left, right, .lt) },
+        .le => .{ .boolean = value_module.holds(left, right, .le) },
+        .gt => .{ .boolean = value_module.holds(left, right, .gt) },
+        .ge => .{ .boolean = value_module.holds(left, right, .ge) },
         .and_op => .{ .boolean = truthy(left) and truthy(right) },
         .or_op => .{ .boolean = truthy(left) or truthy(right) },
         .text_prefix => textPrefix(left, right),
@@ -763,63 +763,6 @@ pub fn truthy(value: Value) bool {
         .json => |text| text.len != 0,
         .null => false,
     };
-}
-
-pub fn valuesEqual(a: Value, b: Value, ignore_case: bool) bool {
-    if (a == .null or b == .null) return a == .null and b == .null;
-    if (numericOrder(a, b)) |order| return order == .eq and !isNan(a) and !isNan(b);
-    if (valueText(a)) |left| if (valueText(b)) |right| {
-        return if (ignore_case)
-            std.ascii.eqlIgnoreCase(left, right)
-        else
-            std.mem.eql(u8, left, right);
-    };
-    return switch (a) {
-        .boolean => |left| switch (b) {
-            .boolean => |right| left == right,
-            else => false,
-        },
-        else => false,
-    };
-}
-
-pub fn compareValues(a: Value, b: Value) std.math.Order {
-    if (numericOrder(a, b)) |order| return order;
-    if (valueText(a)) |left| if (valueText(b)) |right| {
-        return std.mem.order(u8, left, right);
-    };
-    return switch (a) {
-        .boolean => |left| switch (b) {
-            .boolean => |right| std.math.order(@intFromBool(left), @intFromBool(right)),
-            else => .eq,
-        },
-        else => .eq,
-    };
-}
-
-fn numericOrder(a: Value, b: Value) ?std.math.Order {
-    return switch (a) {
-        .integer => |left| switch (b) {
-            .integer => |right| std.math.order(left, right),
-            .float => |right| integerFloatOrder(left, right),
-            else => null,
-        },
-        .float => |left| switch (b) {
-            .integer => |right| integerFloatOrder(right, left).invert(),
-            .float => |right| value_module.compareFloat(left, right),
-            else => null,
-        },
-        else => null,
-    };
-}
-
-fn integerFloatOrder(integer: i64, float: f64) std.math.Order {
-    if (std.math.isNan(float)) return .eq;
-    return value_module.compareIntegerFloat(integer, float);
-}
-
-fn isNan(value: Value) bool {
-    return value == .float and std.math.isNan(value.float);
 }
 
 pub fn valueFloat(value: Value) ?f64 {

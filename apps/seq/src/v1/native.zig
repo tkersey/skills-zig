@@ -1886,13 +1886,8 @@ pub fn resolveTargetPaths(
     }
     const root = try current.rootAlloc(allocator, options, io, dir);
     defer allocator.free(root);
-    const live_native_root = !current.pi and try isLiveNativeSessionRoot(
-        allocator,
-        options,
-        root,
-        io,
-        dir,
-    );
+    const live_native_root = !current.pi and
+        try isLiveNativeSessionRoot(allocator, options, root, io, dir);
     var paths = try collectTargetJsonlPaths(
         allocator,
         io,
@@ -1901,9 +1896,12 @@ pub fn resolveTargetPaths(
         options,
     );
     errdefer freePaths(allocator, &paths);
-    if (options.root == null and !current.pi) {
-        try appendArchivedPaths(allocator, io, dir, root, &paths);
-    }
+    const archive = if (options.root == null and !current.pi)
+        try archiveRootAlloc(allocator, root)
+    else
+        null;
+    defer if (archive) |archive_root| allocator.free(archive_root);
+    if (archive != null) try appendArchivedPaths(allocator, io, dir, archive.?, &paths);
     const exact_session_id = options.session_id orelse current.id;
     if (exact_session_id == null) {
         retainCanonicalRolloutWindow(
@@ -1913,6 +1911,7 @@ pub fn resolveTargetPaths(
             &paths,
             options,
             live_native_root,
+            archive,
         );
     }
     if (exact_session_id) |wanted| {
@@ -1937,11 +1936,9 @@ fn appendArchivedPaths(
     allocator: std.mem.Allocator,
     io: std.Io,
     dir: std.Io.Dir,
-    root: []const u8,
+    archive: []const u8,
     paths: *std.ArrayList([]u8),
 ) !void {
-    const archive = try archiveRootAlloc(allocator, root);
-    defer allocator.free(archive);
     var archived = try collectJsonlPaths(allocator, io, dir, archive, false);
     defer freePaths(allocator, &archived);
     if (archived.items.len > session_candidate_max -| paths.items.len) {
@@ -1959,6 +1956,7 @@ fn retainCanonicalRolloutWindow(
     paths: *std.ArrayList([]u8),
     options: Options,
     live_native_root: bool,
+    archive: ?[]const u8,
 ) void {
     if (options.since_ms == null and options.until_ms == null) return;
     var write_index: usize = 0;
@@ -1968,10 +1966,13 @@ fn retainCanonicalRolloutWindow(
             modifiedMillis(io, dir, path)
         else
             null;
+        const archived = archive != null and
+            std.mem.eql(u8, std.fs.path.dirname(path) orelse "", archive.?);
         if (canonicalRolloutPathPassesWindow(
             path,
             options,
             modified_ms,
+            archived,
         )) {
             paths.items[write_index] = path;
             write_index += 1;
@@ -1999,6 +2000,7 @@ fn canonicalRolloutPathPassesWindow(
     path: []const u8,
     options: Options,
     modified_ms: ?i64,
+    archived: bool,
 ) bool {
     const basename = std.fs.path.basename(path);
     const prefix = "rollout-";
@@ -2011,27 +2013,10 @@ fn canonicalRolloutPathPassesWindow(
     const filename_date = seq_time.parseDayLiteral(
         basename[prefix.len .. prefix.len + 10],
     ) orelse return true;
-    const parent = std.fs.path.basename(
-        std.fs.path.dirname(path) orelse return true,
-    );
-    const month_parent = std.fs.path.basename(
-        std.fs.path.dirname(
-            std.fs.path.dirname(path) orelse return true,
-        ) orelse return true,
-    );
-    const year_parent = std.fs.path.basename(
-        std.fs.path.dirname(
-            std.fs.path.dirname(
-                std.fs.path.dirname(path) orelse return true,
-            ) orelse return true,
-        ) orelse return true,
-    );
-    const canonical_parent_date = parsePartitionDate(
-        year_parent,
-        month_parent,
-        parent,
-    ) orelse return true;
-    if (compareDates(filename_date, canonical_parent_date) != .eq) return true;
+    if (!archived) {
+        const canonical_parent_date = canonicalPartitionDate(path) orelse return true;
+        if (compareDates(filename_date, canonical_parent_date) != .eq) return true;
+    }
 
     // A canonical partition is a session-start index. On the live native
     // source, filesystem modification time is the append frontier: a resumed
@@ -2055,6 +2040,17 @@ fn canonicalRolloutPathPassesWindow(
         if (compareDates(filename_date, upper) == .gt) return false;
     }
     return true;
+}
+
+fn canonicalPartitionDate(path: []const u8) ?seq_time.Date {
+    const day_dir = std.fs.path.dirname(path) orelse return null;
+    const month_dir = std.fs.path.dirname(day_dir) orelse return null;
+    const year_dir = std.fs.path.dirname(month_dir) orelse return null;
+    return parsePartitionDate(
+        std.fs.path.basename(year_dir),
+        std.fs.path.basename(month_dir),
+        std.fs.path.basename(day_dir),
+    );
 }
 
 fn parsePartitionDate(
@@ -2728,21 +2724,25 @@ test "canonical rollout partitions preserve resumed sessions" {
         "/sessions/2026/06/01/rollout-2026-06-01T10-00-00-old.jsonl",
         options,
         null,
+        false,
     ));
     try std.testing.expect(canonicalRolloutPathPassesWindow(
         "/sessions/2026/07/25/rollout-2026-07-25T23-59-59-margin.jsonl",
         options,
         null,
+        false,
     ));
     try std.testing.expect(canonicalRolloutPathPassesWindow(
         "/sessions/2026/06/01/renamed.jsonl",
         options,
         null,
+        false,
     ));
     try std.testing.expect(canonicalRolloutPathPassesWindow(
         "/sessions/2026/06/02/rollout-2026-06-01T10-00-00-mismatch.jsonl",
         options,
         null,
+        false,
     ));
     try std.testing.expect(!canonicalRolloutPathPassesWindow(
         "/sessions/2026/06/01/rollout-2026-06-01T10-00-00-old.jsonl",
@@ -2750,6 +2750,7 @@ test "canonical rollout partitions preserve resumed sessions" {
         seq_time.parseIsoTimestampMillis(
             "2026-06-02T00:00:00Z",
         ),
+        false,
     ));
     try std.testing.expect(canonicalRolloutPathPassesWindow(
         "/sessions/2026/06/01/rollout-2026-06-01T10-00-00-resumed.jsonl",
@@ -2757,6 +2758,48 @@ test "canonical rollout partitions preserve resumed sessions" {
         seq_time.parseIsoTimestampMillis(
             "2026-07-27T12:00:00Z",
         ),
+        false,
+    ));
+}
+
+test "archived rollouts window by start date and modification time" {
+    const options: Options = .{
+        .since_ms = seq_time.parseIsoTimestampMillis(
+            "2026-07-27T00:00:00Z",
+        ),
+        .until_ms = seq_time.parseIsoTimestampMillis(
+            "2026-07-27T23:59:59Z",
+        ),
+    };
+    try std.testing.expect(!canonicalRolloutPathPassesWindow(
+        "/archived_sessions/rollout-2026-06-01T10-00-00-old.jsonl.zst",
+        options,
+        seq_time.parseIsoTimestampMillis("2026-06-02T00:00:00Z"),
+        true,
+    ));
+    try std.testing.expect(canonicalRolloutPathPassesWindow(
+        "/archived_sessions/rollout-2026-06-01T10-00-00-resumed.jsonl.zst",
+        options,
+        seq_time.parseIsoTimestampMillis("2026-07-27T12:00:00Z"),
+        true,
+    ));
+    try std.testing.expect(canonicalRolloutPathPassesWindow(
+        "/archived_sessions/rollout-2026-06-01T10-00-00-imported.jsonl.zst",
+        options,
+        null,
+        true,
+    ));
+    try std.testing.expect(!canonicalRolloutPathPassesWindow(
+        "/archived_sessions/rollout-2026-08-01T10-00-00-later.jsonl.zst",
+        options,
+        null,
+        true,
+    ));
+    try std.testing.expect(canonicalRolloutPathPassesWindow(
+        "/archived_sessions/rollout-2026-08-01T10-00-00-later.jsonl.zst",
+        options,
+        null,
+        false,
     ));
 }
 
@@ -3299,6 +3342,41 @@ test "native failure discards every staged row and identifies the damaged source
     try std.testing.expect(std.mem.endsWith(u8, diagnostic.path.?, "b-bad.jsonl"));
     try std.testing.expectEqual(@as(usize, 1), diagnostic.warning_count);
     try std.testing.expect(diagnostic.message.?.len != 0);
+}
+
+test "default discovery windows archived rollouts by their start date" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "sessions");
+    try tmp.dir.createDirPath(std.testing.io, "archived_sessions");
+    for ([_][]const u8{
+        "archived_sessions/rollout-2026-06-01T10-00-00-earlier.jsonl.zst",
+        "archived_sessions/rollout-2026-08-01T10-00-00-later.jsonl.zst",
+        "archived_sessions/renamed.jsonl.zst",
+    }) |sub_path| {
+        try tmp.dir.writeFile(std.testing.io, .{ .sub_path = sub_path, .data = "" });
+    }
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", allocator);
+    defer allocator.free(root);
+    var environment = std.process.Environ.Map.init(allocator);
+    defer environment.deinit();
+    try environment.put("CODEX_HOME", root);
+    var paths = try resolveTargetPaths(
+        allocator,
+        std.testing.io,
+        std.Io.Dir.cwd(),
+        .{
+            .environment = &environment,
+            .until_ms = seq_time.parseIsoTimestampMillis("2026-07-27T23:59:59Z"),
+        },
+        false,
+    );
+    defer freePaths(allocator, &paths);
+    try std.testing.expectEqual(@as(usize, 2), paths.items.len);
+    for (paths.items) |path| {
+        try std.testing.expect(std.mem.indexOf(u8, path, "later") == null);
+    }
 }
 
 test "default Codex discovery includes archives while explicit roots retain their scope" {
