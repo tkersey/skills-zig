@@ -1353,6 +1353,16 @@ fn executeGraphObservation(
     )) |stage| {
         return executeNativePrefixObservation(io, dir, allocator, args, context, bindings, stage);
     }
+    if ((args.selectors.path != null or args.selectors.session_id != null) and
+        try seq.relation_graph.reachesLineageJoin(
+            allocator,
+            &context.definition_plan,
+            &context.native_plan,
+            args.projection,
+        ))
+    {
+        return error.ObservationStreamingLineageShapeUnsupported;
+    }
     return executeMaterializedGraphObservation(io, dir, allocator, args, context, bindings);
 }
 
@@ -1757,6 +1767,7 @@ const StreamingGraphState = struct {
         self.metrics.discovery_opened = discovered.items.len;
         try recordDiscoveryBytes(&self.metrics, discovered.identity_bytes);
         for (discovered.items) |item| {
+            if (!item.identity.repo_matches) continue;
             self.metrics.source_metadata.add(
                 paths[item.path_index],
                 item.identity.source_mtime_ns,

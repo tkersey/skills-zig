@@ -158,7 +158,7 @@ const Compressed = struct {
             if (err == error.EndOfStream and self.input.bufferedLen() == 0 and self.saw_frame) {
                 return error.EndOfStream;
             }
-            self.err = if (err == error.EndOfStream) error.BadMagic else err;
+            self.err = self.err orelse if (err == error.EndOfStream) error.BadMagic else err;
             return error.ReadFailed;
         };
         const magic = std.mem.readInt(u32, magic_bytes[0..4], .little);
@@ -166,7 +166,7 @@ const Compressed = struct {
         self.hasher = .init(0);
         if (magic == 0xfd2fb528) {
             const header = self.input.peek(5) catch |err| {
-                self.err = err;
+                self.err = self.err orelse err;
                 return error.ReadFailed;
             };
             self.has_checksum = header[4] & 4 != 0;
@@ -258,6 +258,28 @@ test "skippable frame input is bounded even when it produces no decoded bytes" {
         return;
     };
     _ = result;
+    return error.ExpectedCompressedInputBound;
+}
+
+test "small skippable frames keep the encoded input bound error" {
+    const frame_count = 2 * 1024 * 1024 / 8;
+    const source = try std.testing.allocator.alloc(u8, frame_count * 8);
+    defer std.testing.allocator.free(source);
+    for (0..frame_count) |index| {
+        @memcpy(source[index * 8 ..][0..4], "\x50\x2a\x4d\x18");
+        std.mem.writeInt(u32, source[index * 8 + 4 ..][0..4], 0, .little);
+    }
+    var raw: std.Io.Reader = .fixed(source);
+    var input = try SessionInput.init(std.testing.allocator, "session.jsonl.zst", &raw, 1);
+    defer input.deinit(std.testing.allocator);
+    var buffer: [1]u8 = undefined;
+    _ = input.reader().readSliceShort(&buffer) catch |err| {
+        try std.testing.expectEqual(
+            error.CompressedSessionInputByteBoundExceeded,
+            input.sourceError(err),
+        );
+        return;
+    };
     return error.ExpectedCompressedInputBound;
 }
 

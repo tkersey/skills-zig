@@ -119,7 +119,8 @@ pub fn streamingLineagePlan(
         const on = try definition_core.json.object(
             try definition_core.json.field(root, "on"),
         );
-        if (on.get("lineage") == null) continue;
+        const lineage = try definition_core.json.object(on.get("lineage") orelse continue);
+        if (!try followsHistoryParent(lineage)) return null;
         const step = definition_plan.steps[stage_index];
         if (step.input_names.len != 3 or
             !std.mem.eql(u8, step.input_names[0], step.input_names[1]))
@@ -154,6 +155,12 @@ pub fn streamingLineagePlan(
         };
     }
     return null;
+}
+
+fn followsHistoryParent(lineage: std.json.ObjectMap) !bool {
+    const node = try definition_core.json.requiredString(lineage, "node");
+    const parent = try definition_core.json.requiredString(lineage, "parent");
+    return std.mem.eql(u8, node, "session_id") and std.mem.eql(u8, parent, "parent_session_id");
 }
 
 fn streamingSeedsCover(
@@ -346,6 +353,23 @@ pub fn selectsPhysically(
         }
     }
     return scans == 1;
+}
+
+pub fn reachesLineageJoin(
+    allocator: std.mem.Allocator,
+    definition_plan: *const definition.Plan,
+    native_plan: *const plan.Plan,
+    projection_name: []const u8,
+) !bool {
+    const reachable = try reachableStages(allocator, definition_plan, native_plan, projection_name);
+    defer allocator.free(reachable);
+    for (native_plan.stages, reachable) |stage, is_reachable| {
+        if (!is_reachable or stage.operation != .generic) continue;
+        const generic = stage.operation.generic;
+        if (generic.operator != .join) continue;
+        if (try joinsLineage(allocator, generic.canonical_config)) return true;
+    }
+    return false;
 }
 
 fn joinsLineage(allocator: std.mem.Allocator, config: []const u8) !bool {
@@ -1064,7 +1088,8 @@ fn resolveOperand(
             .null => .null,
         },
         .parameter => |index| scalarValue(
-            bindings.find(definition_plan.parameter_declarations.items[index].name).?.value,
+            (bindings.find(definition_plan.parameter_declarations.items[index].name) orelse
+                return error.MissingObservationParameter).value,
         ),
     };
 }
@@ -1138,11 +1163,17 @@ fn limitCount(
 ) !usize {
     return switch (limit) {
         .fixed => |value| value,
-        .parameter => |index| switch (bindings.find(
+        .parameter => |index| switch ((bindings.find(
             definition_plan.parameter_declarations.items[index].name,
-        ).?.value) {
-            .integer => |value| std.math.cast(usize, value) orelse
-                return error.InvalidObservationLimit,
+        ) orelse return error.MissingObservationParameter).value) {
+            .integer => |value| bound: {
+                const count = std.math.cast(usize, value) orelse
+                    return error.InvalidObservationLimit;
+                if (count == 0 or count > definition_plan.bounds.max_rows) {
+                    return error.InvalidObservationLimit;
+                }
+                break :bound count;
+            },
             else => return error.ObservationLimitParameterMustBeInteger,
         },
     };
@@ -3311,6 +3342,7 @@ test "streaming lineage falls back when the projection reads an unseeded scan" {
     const Case = struct { source: []const u8, streams: bool };
     const cases = [_]Case{
         .{ .source = @embedFile("fixtures/lineage-observation.json"), .streams = true },
+        .{ .source = @embedFile("fixtures/lineage-control-parent.json"), .streams = false },
         .{ .source = @embedFile("fixtures/lineage-extra-scan.json"), .streams = false },
     };
     for (cases) |case| {
@@ -3343,7 +3375,7 @@ test "streaming lineage falls back when the projection reads an unseeded scan" {
             "rows",
         );
         try std.testing.expectEqual(case.streams, schedule != null);
-        if (case.streams) continue;
+        if (case.streams or native_plan.findStage("joined_rows") == null) continue;
         var scans = [_]ScanInput{
             .{
                 .stage_index = native_plan.findStage("session_rows").?,

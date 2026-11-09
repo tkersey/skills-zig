@@ -83,8 +83,8 @@ files. Definition-owned exclusions remain declared parameters and are bound by
 to assess freshness. `ongoing_threshold_secs` records the policy, and
 `source_metadata_digest` binds the ordered paths and exact nanosecond mtimes of
 the trace sessions whose state the observation evaluated: every admitted session
-and, for streaming lineage, every discovered session, because its session relation
-includes them. Files skipped by selection on other strategies cannot affect the
+and, for streaming lineage, every discovered session that passes `--repo`, because
+its session relation includes them. Files skipped by selection cannot affect the
 result and are not bound. Keep this context alongside corpus
 identity: identical session content can have different current liveness. The
 metadata digest distinguishes those inputs; it does not store a replayable
@@ -137,13 +137,20 @@ sorting, and joins do not depend on row order. Signed zeros compare and hash
 equal. Every strategy shares one value order. Ordering predicates and comparisons
 hold only between non-null values of one kind (numbers, text, or booleans), so
 null, NaN, and mixed kinds never satisfy them, and NaN never equals a value.
-Sorting places nulls first or last as declared in either direction, orders NaN
-after every number, and orders kinds as text, numbers, then booleans.
+Sorting places nulls first or last as declared in either direction. Ascending order
+puts NaN after every number and kinds as text, numbers, then booleans; descending
+order reverses both.
 Sessions without an
 identity, such as an empty rollout, do not participate in lineage joins and cannot be
 linked by reachability. A
 lineage definition whose projection reads a scan the streaming strategy cannot
-seed runs on the materialized-graph strategy. Graph projections that pass through
+seed, or whose lineage join walks a parent other than `parent_session_id` from
+`session_id`, runs on the materialized-graph strategy over the whole root; with
+`--path` or `--session-id` such a definition fails with
+`ObservationStreamingLineageShapeUnsupported`, because only the streaming strategy
+reads the selection's lineage closure. A `limit` or `top-k` count
+bound from a parameter must lie between 1 and `bounds.max_rows`, as a literal count
+must; other values fail with `InvalidObservationLimit` on every strategy. Graph projections that pass through
 `limit` or `top_k` report the definition-bounded limitation, as linear projections
 do.
 
@@ -156,10 +163,13 @@ filters, and row-local derivations through the native runner. Only the retained
 top-k rows enter the remaining graph. `seq explain` reports this as
 `bounded-native-prefix`. Adding excerpt derivations to a search therefore keeps
 its path/session/time selection and avoids retaining the entire matching corpus.
-The native row, retained-byte, input-byte, and output limits still apply, and each
+The native row, retained-byte, input-byte, output, and fold-state limits still apply
+(each `limit` in the prefix counts against `bounds.max_fold_states`), and each
 row's derived strings share a buffer of `bounds.max_output_bytes`; a row that exceeds
 it fails with `ObservationExpressionByteBoundExceeded`. The materialized graph applies
-no per-row derivation bound.
+no per-row derivation bound. OpenCode prompt history and the structured relations
+reach graph definitions only through this prefix; other graph strategies fail with
+`GraphObservationOpenCodeUnsupported` or `StructuredRelationRequiresIndex`.
 
 ## Codex source coverage and forks
 

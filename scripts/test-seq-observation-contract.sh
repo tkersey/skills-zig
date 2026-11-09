@@ -132,6 +132,11 @@ selected_repo=$("$binary" observe --definition "$work/lineage.json" --projection
 jq -e --argjson bytes "$bytes" '.corpus.files == 2 and (.data.rows | length) == 2 and
   .stats.files_opened == 5 and .stats.discovery_files_opened == 3 and
   .stats.corpus_bytes_read == $bytes' <<<"$selected_repo" >/dev/null
+touch -t 200101010000 "$work/codex/sessions/other.jsonl"
+touched_repo=$("$binary" observe --definition "$work/lineage.json" --projection rows \
+  --root "$work/codex/sessions" --repo /repo --format json)
+jq -e -s '.[0].context.source_metadata_digest == .[1].context.source_metadata_digest' \
+  <<<"$selected_repo$touched_repo" >/dev/null
 
 mkdir -p "$work/compressed/sessions" "$work/compressed/archived_sessions"
 cp apps/seq/testdata/rollout.jsonl.zst \
@@ -386,3 +391,63 @@ exact_session=$("$binary" observe --definition "$work/message.json" --projection
   --root "$pruned" --session-id "$wanted_id" --param needle=failure --format json)
 jq -e '.corpus.files == 1 and .stats.files_opened == 1 and (.data.rows | length) == 1' \
   <<<"$exact_session" >/dev/null
+
+for shape in null-top-k null-sort-limit; do
+  jq '.parameters = {limit: {type: "integer", required: true}} |
+    (.pipeline[] | select(.op == "top-k" or .op == "limit") | .limit) = "limit"' \
+    "$work/$shape.json" >"$work/$shape-param.json"
+  for bad in 0 9; do
+    if limited=$("$binary" observe --definition "$work/$shape-param.json" --projection rows \
+      --path "$work/nulls.jsonl" --param "limit=$bad" --format json); then
+      echo "$shape accepted an out-of-range limit parameter" >&2
+      exit 1
+    fi
+    jq -e '.code == "InvalidObservationLimit"' <<<"$limited" >/dev/null
+  done
+  limited=$("$binary" observe --definition "$work/$shape-param.json" --projection rows \
+    --path "$work/nulls.jsonl" --param limit=1 --format json)
+  jq -e '.data.rows == [{"text":"dated marker","timestamp":"2026-07-26T10:00:05+00:00"}]' \
+    <<<"$limited" >/dev/null
+done
+
+control_definition=apps/seq/src/v1/fixtures/lineage-control-parent.json
+control_plan=$("$binary" explain --definition "$control_definition" --projection rows --format json)
+jq -e '.strategy.kind == "materialized-graph"' <<<"$control_plan" >/dev/null
+control_rows=$("$binary" observe --definition "$control_definition" --projection rows \
+  --root "$work/aborted-root" --format json)
+jq -e '(.data.rows | length) == 1' <<<"$control_rows" >/dev/null
+
+lineage_home="$work/lineage-home"
+mkdir -p "$lineage_home/sessions"
+cp "$rollout" "$lineage_home/sessions/one.jsonl"
+: >"$lineage_home/sessions/aborted.jsonl"
+for scoped_source in "$lineage_definition" "$extra_scan_definition" "$control_definition"; do
+  scoped_definition="$work/scoped-$(basename "$scoped_source")"
+  jq '.selectors = ["path", "root", "session-id"]' "$scoped_source" >"$scoped_definition"
+  for scoped_flag in --session-id --path; do
+    scoped_value=fixture-session
+    [ "$scoped_flag" = --path ] && scoped_value="$lineage_home/sessions/one.jsonl"
+    if scoped_result=$(CODEX_HOME="$lineage_home" "$binary" observe \
+      --definition "$scoped_definition" --projection rows "$scoped_flag" "$scoped_value" \
+      --format json); then
+      if [ "$scoped_source" != "$lineage_definition" ]; then
+        echo "a lineage fallback widened a scoped selection" >&2
+        exit 1
+      fi
+      jq -e '.corpus.files == 1 and (.data.rows | length) == 1' <<<"$scoped_result" >/dev/null
+    else
+      [ "$scoped_source" != "$lineage_definition" ]
+      jq -e '.code == "ObservationStreamingLineageShapeUnsupported"' <<<"$scoped_result" >/dev/null
+    fi
+  done
+done
+
+jq '.parameters = {limit: {type: "integer", required: false}} |
+  (.pipeline[] | select(.op == "limit") | .limit) = "limit"' \
+  "$work/null-sort-limit.json" >"$work/optional-limit.json"
+if optional_limit=$("$binary" observe --definition "$work/optional-limit.json" --projection rows \
+  --path "$work/nulls.jsonl" --format json); then
+  echo "an unbound optional limit parameter did not fail" >&2
+  exit 1
+fi
+jq -e '.code == "MissingObservationParameter"' <<<"$optional_limit" >/dev/null
