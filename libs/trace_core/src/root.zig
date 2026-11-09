@@ -2584,6 +2584,7 @@ fn sessionSummaryLineCouldMatter(line: []const u8, pending_spawns: bool) bool {
             std.mem.containsAtLeast(u8, line, 1, "turn_aborted") or
             std.mem.containsAtLeast(u8, line, 1, "token_count") or
             std.mem.containsAtLeast(u8, line, 1, "thread_name_updated") or
+            std.mem.containsAtLeast(u8, line, 1, "thread_settings_applied") or
             std.mem.containsAtLeast(u8, line, 1, "collab_agent_spawn_end") or
             std.mem.containsAtLeast(u8, line, 1, "sub_agent_activity") or
             std.mem.containsAtLeast(u8, line, 1, "\"error\"");
@@ -6275,6 +6276,21 @@ test "root and control-only spawns and ordinal-proven fork spawns remain attribu
                 try std.testing.expectEqual(@as(usize, 0), trace.warnings.items.len);
             }
             try std.testing.expectEqual(@as(i64, 2), traces[0].turns.items[0].spawned_worker_count);
+        }
+    }
+}
+
+test "summary parsing applies compact thread settings like the full parser" {
+    const source =
+        \\{"timestamp":"2026-07-26T10:00:00Z","type":"session_meta","payload":{"id":"settings"}}
+        \\{"timestamp":"2026-07-26T10:00:01Z","type":"event_msg","payload":{"type":"thread_settings_applied","thread_settings":{"model":"gpt-test","service_tier":"flex"}}}
+    ;
+    for ([_]bool{ false, true }) |spaced| {
+        var traces = try workerGraphTestTraces(source, spaced);
+        defer for (&traces) |*trace| trace.deinit(std.testing.allocator);
+        for (&traces) |*trace| {
+            try std.testing.expectEqualDeep(@as(?[]const u8, "gpt-test"), trace.session.model);
+            try std.testing.expectEqualDeep(@as(?[]const u8, "flex"), trace.session.service_tier);
         }
     }
 }

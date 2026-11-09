@@ -451,3 +451,77 @@ if optional_limit=$("$binary" observe --definition "$work/optional-limit.json" -
   exit 1
 fi
 jq -e '.code == "MissingObservationParameter"' <<<"$optional_limit" >/dev/null
+
+jq '.parameters = {needle: {type: "string", required: false}} | .selectors = ["path", "since"] |
+  .pipeline |= (.[0:2] + [{op: "filter", input: "derived", as: "needled",
+    where: [{field: "text", op: "contains", param: "needle"}]}] + .[2:]) |
+  .pipeline[3].input = "needled" | .requires.operators += ["filter"]' \
+  "$work/null-sort-limit.json" >"$work/optional-operand.json"
+if optional_operand=$("$binary" observe --definition "$work/optional-operand.json" \
+  --projection rows --path "$work/nulls.jsonl" --since 2030-01-01T00:00:00Z --format json); then
+  echo "an unbound optional operand passed on an empty filter input" >&2
+  exit 1
+fi
+jq -e '.code == "MissingObservationParameter"' <<<"$optional_operand" >/dev/null
+
+renamed_plan=$("$binary" explain --definition apps/seq/src/v1/fixtures/lineage-renamed-parent.json \
+  --projection rows --format json)
+jq -e '.strategy.kind == "materialized-graph"' <<<"$renamed_plan" >/dev/null
+stream_plan=$("$binary" explain --definition "$lineage_definition" --projection rows --format json)
+jq -e '.strategy.kind == "partition-lineage-stream"' <<<"$stream_plan" >/dev/null
+
+if missing_lineage=$(CODEX_HOME="$lineage_home" "$binary" observe \
+  --definition "$work/scoped-$(basename "$lineage_definition")" --projection rows \
+  --session-id missing-session --format json); then
+  echo "streaming lineage accepted an unmatched session id" >&2
+  exit 1
+fi
+jq -e '.code == "SessionNotFound"' <<<"$missing_lineage" >/dev/null
+
+mkdir -p "$work/empty-home/sessions"
+jq '.parameters = {role: {type: "string", required: false}} |
+  (.pipeline[] | select(.as == "assistant_rows") | .where[0]) |= (del(.value) | .param = "role")' \
+  "$lineage_definition" >"$work/optional-role-lineage.json"
+if optional_role=$(CODEX_HOME="$work/empty-home" "$binary" observe \
+  --definition "$work/optional-role-lineage.json" --projection rows --format json); then
+  echo "streaming lineage accepted an unbound optional operand on an empty root" >&2
+  exit 1
+fi
+jq -e '.code == "MissingObservationParameter"' <<<"$optional_role" >/dev/null
+
+{
+  head -n 1 "$rollout"
+  printf '%s\n' '{"timestamp":"2026-07-26T10:00:05Z","type":"event_msg","payload":{"type":"thread_settings_applied","thread_settings":{"model":"gpt-settings","service_tier":"flex"}}}'
+} >"$work/settings.jsonl"
+jq '.relations = [{name: "sessions", fields: ["session_id", "model", "service_tier", "start_time"]}] |
+  .pipeline[0].relation = "sessions" |
+  .pipeline[1].fields = [{name: "label", type: "string", nullable: true,
+    expr: {field: "session_id"}}] |
+  (.pipeline[] | select(.op == "top-k" or .op == "sort") | .by) =
+    [{field: "start_time", direction: "desc", nulls: "last"}] |
+  .pipeline[-1].fields = ["model", "service_tier"] |
+  .projections.rows.fields = ["model", "service_tier"]' \
+  "$work/null-top-k.json" >"$work/settings-top-k.json"
+jq '.relations = [{name: "sessions", fields: ["session_id", "model", "service_tier", "start_time"]}] |
+  .pipeline[0].relation = "sessions" |
+  .pipeline[1].fields = [{name: "label", type: "string", nullable: true,
+    expr: {field: "session_id"}}] |
+  (.pipeline[] | select(.op == "top-k" or .op == "sort") | .by) =
+    [{field: "start_time", direction: "desc", nulls: "last"}] |
+  .pipeline[-1].fields = ["model", "service_tier"] |
+  .projections.rows.fields = ["model", "service_tier"]' \
+  "$work/null-sort-limit.json" >"$work/settings-sort-limit.json"
+for shape in settings-top-k settings-sort-limit; do
+  settings_rows=$("$binary" observe --definition "$work/$shape.json" --projection rows \
+    --path "$work/settings.jsonl" --format json)
+  jq -e '.data.rows == [{"model":"gpt-settings","service_tier":"flex"}]' \
+    <<<"$settings_rows" >/dev/null
+done
+
+model_definition=apps/seq/src/v1/fixtures/lineage-session-model.json
+model_plan=$("$binary" explain --definition "$model_definition" --projection rows --format json)
+jq -e '.strategy.kind == "materialized-graph"' <<<"$model_plan" >/dev/null
+model_rows=$("$binary" observe --definition "$model_definition" --projection rows \
+  --root "$work/aborted-root" --format json)
+jq -e '.data.rows == [{"session_id":"fixture-session","model":"gpt-test"}]' \
+  <<<"$model_rows" >/dev/null

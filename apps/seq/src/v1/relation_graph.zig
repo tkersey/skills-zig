@@ -131,6 +131,7 @@ pub fn streamingLineagePlan(
             return error.ObservationExternalGraphInputUnsupported;
         const graph_stage = native_plan.findStage(step.input_names[2]) orelse
             return error.ObservationExternalGraphInputUnsupported;
+        if (!try carriesSessionColumns(allocator, native_plan, graph_stage)) return null;
         const scan_stage = try partitionScanRoot(
             allocator,
             definition_plan,
@@ -155,6 +156,115 @@ pub fn streamingLineagePlan(
         };
     }
     return null;
+}
+
+pub fn requireBoundParameters(
+    allocator: std.mem.Allocator,
+    definition_plan: *const definition.Plan,
+    native_plan: *const plan.Plan,
+    bindings: *const definition_core.parameters.Bindings,
+    projection_name: []const u8,
+) !void {
+    const reachable = try reachableStages(allocator, definition_plan, native_plan, projection_name);
+    defer allocator.free(reachable);
+    for (native_plan.stages, reachable) |stage, is_reachable| {
+        if (!is_reachable) continue;
+        switch (stage.operation) {
+            .filter => |filter| for (filter.predicates) |predicate| switch (predicate.operand) {
+                .parameter => |index| try requireBinding(definition_plan, bindings, index),
+                .constant => {},
+            },
+            .limit => |limit| try requireLimitBinding(definition_plan, bindings, limit),
+            .top_k => |top_k| try requireLimitBinding(definition_plan, bindings, top_k.limit),
+            else => {},
+        }
+    }
+}
+
+fn requireLimitBinding(
+    definition_plan: *const definition.Plan,
+    bindings: *const definition_core.parameters.Bindings,
+    limit: plan.Limit,
+) !void {
+    switch (limit) {
+        .parameter => |index| try requireBinding(definition_plan, bindings, index),
+        .fixed => {},
+    }
+}
+
+fn requireBinding(
+    definition_plan: *const definition.Plan,
+    bindings: *const definition_core.parameters.Bindings,
+    index: u16,
+) !void {
+    const name = definition_plan.parameter_declarations.items[index].name;
+    if (bindings.find(name) == null) return error.MissingObservationParameter;
+}
+
+fn carriesSessionColumns(
+    allocator: std.mem.Allocator,
+    native_plan: *const plan.Plan,
+    graph_stage: u16,
+) !bool {
+    var current = graph_stage;
+    for (0..native_plan.stages.len) |_| {
+        const stage = native_plan.stages[current];
+        switch (stage.operation) {
+            .scan => return true,
+            .filter, .project, .alias, .limit, .sort, .top_k, .distinct => {},
+            .generic => |generic| {
+                if (generic.operator != .derive) return false;
+                if (!try derivePreservesSessionColumns(allocator, generic.canonical_config)) {
+                    return false;
+                }
+            },
+            .aggregate => return false,
+        }
+        current = switch (stage.source orelse return false) {
+            .stage => |index| index,
+            .external => return false,
+        };
+    }
+    return false;
+}
+
+fn derivePreservesSessionColumns(allocator: std.mem.Allocator, config: []const u8) !bool {
+    var parsed = try parseConfig(allocator, config);
+    defer parsed.deinit();
+    const root = try definition_core.json.object(parsed.value);
+    if (root.get("preserve_input")) |raw| {
+        if (!try definition_core.json.boolean(raw)) return false;
+    }
+    const fields = try definition_core.json.array(try definition_core.json.field(root, "fields"));
+    for (fields.items) |item| {
+        const field = try definition_core.json.object(item);
+        const name = try definition_core.json.requiredString(field, "name");
+        if (std.mem.eql(u8, name, "session_id") or std.mem.eql(u8, name, "parent_session_id")) {
+            return false;
+        }
+    }
+    return true;
+}
+
+fn seedsSessionFields(field_indices: []const u16) bool {
+    const seeded = [_][]const u8{
+        "session_id",
+        "path",
+        "parent_session_id",
+        "control_parent_session_id",
+        "forked_from_session_id",
+        "parent_relation",
+        "lineage_conflict",
+        "subagent_history_start_ordinal",
+        "token_usage_observation_count",
+    };
+    for (field_indices) |field_index| {
+        const name = @import("physical.zig").Relation.sessions.fields()[field_index].name;
+        for (seeded) |candidate| {
+            if (std.mem.eql(u8, name, candidate)) break;
+        } else return false;
+    }
+    return true;
 }
 
 fn followsHistoryParent(lineage: std.json.ObjectMap) !bool {
@@ -188,6 +298,7 @@ fn streamingSeedsCover(
     for (native_plan.stages, graph_reachable, 0..) |stage, reached, index| {
         if (!reached or stage.operation != .scan) continue;
         if (seeded_scan != null or stage.operation.scan.relation != .sessions) return false;
+        if (!seedsSessionFields(stage.operation.scan.field_indices)) return false;
         seeded_scan = index;
     }
     var boundary = [_]ScanInput{.{

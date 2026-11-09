@@ -145,12 +145,19 @@ identity, such as an empty rollout, do not participate in lineage joins and cann
 linked by reachability. A
 lineage definition whose projection reads a scan the streaming strategy cannot
 seed, or whose lineage join walks a parent other than `parent_session_id` from
-`session_id`, runs on the materialized-graph strategy over the whole root; with
+`session_id` as carried unchanged from the sessions relation, or whose sessions scan
+declares fields that discovery cannot seed (only identity, lineage, path, and token
+count fields are seeded), runs on the materialized-graph strategy over the whole root; with
 `--path` or `--session-id` such a definition fails with
 `ObservationStreamingLineageShapeUnsupported`, because only the streaming strategy
-reads the selection's lineage closure. A `limit` or `top-k` count
+reads the selection's lineage closure. A streaming lineage `--session-id` must
+match exactly one discovered session that passes `--repo`, or the observation
+fails with `SessionNotFound` or `AmbiguousSessionTarget`, as other strategies do. A `limit` or `top-k` count
 bound from a parameter must lie between 1 and `bounds.max_rows`, as a literal count
-must; other values fail with `InvalidObservationLimit` on every strategy. Graph projections that pass through
+must; other values fail with `InvalidObservationLimit` on every strategy. Every
+strategy checks that the parameters its filters and limits use are bound before it
+reads the corpus; an unbound optional parameter fails with
+`MissingObservationParameter`. Graph projections that pass through
 `limit` or `top_k` report the definition-bounded limitation, as linear projections
 do.
 
