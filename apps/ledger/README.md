@@ -29,7 +29,7 @@ zig build test-ledger-segmented -Doptimize=fast
 
 The binary is written to `zig-out/bin/ledger`.
 
-## Canonical owner reads and retained custody (Ledger 1.7)
+## Canonical owner access and retained custody (Ledger 1.8)
 
 Use the owner definition and migration declaration when selecting a history:
 
@@ -43,8 +43,42 @@ publication state. A healthy present owner remains readable when an unrelated
 sibling checkout is missing, empty or divergent. The returned `owner_health`
 identifies the validated revision; `source_coverage: "not_checked"` explicitly
 leaves migration coverage unknown. Read selection creates no history, catalog
-association or writer authority. `--ensure-owner` retains source discovery and
-coordination requirements for preparation and writes.
+association or writer authority. Before a semantic write, `--ensure-owner` admits
+the same healthy selected owner without rescanning sibling worktrees. Workspace
+and direct store-ID selectors have the same requirements for a present owner. Native
+transactions still enforce binding, integrity, and writer exclusion; semantic
+capture remains the caller's decision.
+Ensure waits for selected-owner lock contention and recovers supported interrupted
+native target transactions before reinspecting the owner. These conditions do
+not trigger sibling discovery. Read-only selection does not perform recovery,
+and malformed or unknown recovery state remains a failure.
+
+Use `--reconcile-owner` with the same owner inputs and a selected workspace when
+the intended operation needs source-family coverage. Successful reconciliation
+or missing-owner preparation with a workspace reports `source_coverage: "checked"`
+for that observed family. Healthy selected-owner access and archive-only repair
+report `"not_checked"`. Missing worktrees, divergent histories, and uncoordinated actual
+history remain reconciliation failures. A valid selected snapshot cannot prove
+absence across unknown history or decide an unseen lifecycle transition.
+
+For a missing owner, ensure discovers and prepares the selected source history.
+If the selected ID has cataloged workspace associations, supply the workspace
+whose source family must be checked. Store-ID-only ensure returns
+`OwnerPreparationRequiresWorkspace` instead of treating uninspected associated
+history as empty. Explicitly initialized isolated custody with no associations
+remains usable by ID and reports `source_coverage: "not_checked"`.
+Accessible empty sources establish native event/binding advisory coordination
+and hold shared custody before accepting absence. They no longer require a
+quiescence assertion merely because no writer has created a sidecar. Source
+payloads remain unchanged; newly created coordination resources are reported by
+`source_coordination_mutated`, also included in `storage_mutated`. Existing
+nonempty history without qualified coordination still requires actual quiescence.
+These guards exclude participating native writers, not unsupported writers that
+ignore them. A retained pending identity survives interrupted preparation.
+
+Discovery errors include `source_failure.source_root` and `error_code` when the
+failing worktree is known. Unknown missing history remains unknown; ensure never
+prunes the worktree or substitutes empty history.
 
 An absent unbound owner returns `OwnerPreparationRequired`. Missing bytes with a
 surviving binding return `StoreBindingWithoutSlot`, preserving the verified store

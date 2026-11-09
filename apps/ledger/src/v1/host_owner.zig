@@ -9,18 +9,22 @@ const doctor = @import("ledger_v1_core").doctor;
 const preparation = @import("ledger_v1_core").preparation;
 const compiled = @import("ledger_v1_core").compiled_plan;
 const parameters = @import("definition_core").parameters;
+const durable = @import("durable_store");
 
 const history_limits: preparation.Limits = .{
     .max_bytes = 256 * 1024 * 1024,
     .max_files = 512,
     .max_read_bytes = 2 * 1024 * 1024 * 1024,
 };
+const writer_attempts_max = 301;
+const writer_retry_delay_ms = 100;
 
 pub const Options = struct {
     context: host.Options,
     definition: []const u8,
     manifest: []const u8,
     ensure: bool = false,
+    reconcile: bool = false,
     repair_archive: bool = false,
     confirm_no_writers: bool = false,
     parameters: []const []const u8 = &.{},
@@ -59,6 +63,12 @@ pub const Result = struct {
         const previous = self.value.object.get("storage_mutated");
         if (previous) |value| if (value == .bool and value.bool) return;
         try self.put("storage_mutated", @as(?bool, null));
+    }
+
+    fn observeMutation(self: *Result, mutated: ?bool) !void {
+        const previous = self.value.object.get("storage_mutated");
+        if (previous) |value| if (value == .bool and value.bool) return;
+        try self.put("storage_mutated", mutated);
     }
 
     fn block(self: *Result, code: []const u8) !void {
@@ -152,6 +162,9 @@ fn run(
     options: Options,
 ) !void {
     if (options.confirm_no_writers and !options.ensure) return error.QuiescenceRequiresPreparation;
+    if (options.reconcile and !options.ensure) return error.ReconciliationRequiresPreparation;
+    if (options.reconcile and options.context.workspace == null)
+        return error.ReconciliationRequiresWorkspace;
     if (options.repair_archive and !options.ensure) return error.ArchiveRepairRequiresPreparation;
     const allocator = result.arena.allocator();
     var manifest = try loadManifest(allocator, io, options.manifest, options.definition);
@@ -204,10 +217,52 @@ fn runPlan(
     if (options.repair_archive and selected == null) {
         return error.ArchiveRepairRequiresExistingCustody;
     }
+    try runSelectedPlan(
+        result,
+        io,
+        environment,
+        options,
+        plan,
+        bindings,
+        &associations,
+        if (selected) |value| value.value else null,
+        retired,
+    );
+}
+
+fn runSelectedPlan(
+    result: *Result,
+    io: std.Io,
+    environment: *const std.process.Environ.Map,
+    options: Options,
+    plan: *const compiled.PlanSet,
+    bindings: *const parameters.Bindings,
+    associations: *const host.workspace.Associations,
+    selected: ?host.ContextValue,
+    retired: []const []const u8,
+) !void {
     var discover_archives = true;
-    if (selected) |*current| {
+    if (selected) |current| {
         if (!options.ensure) {
-            return admitRead(result, io, options, plan, bindings, &associations, current.value);
+            return admitRead(result, io, options, plan, bindings, associations, current);
+        }
+        if (!options.reconcile and !options.repair_archive) {
+            switch (try admitPresentOwner(
+                result,
+                io,
+                options,
+                plan,
+                bindings,
+                associations,
+                current,
+            )) {
+                .present => {
+                    try registerContext(result, io, environment, options, current);
+                    return;
+                },
+                .blocked => return,
+                .preparation => try requireWorkspaceForMissingOwner(result, io, options, current),
+            }
         }
         const coverage = try existingCoverage(
             result,
@@ -216,29 +271,22 @@ fn runPlan(
             options,
             plan,
             bindings,
-            &associations,
-            current.value,
+            associations,
+            current,
             retired,
         );
         discover_archives = coverage.discover_archives;
         if (coverage.covered) {
-            try registerContext(result, io, environment, options, current.value);
+            try registerContext(result, io, environment, options, current);
+            try result.put(
+                "source_coverage",
+                if (options.context.workspace != null) "checked" else "not_checked",
+            );
             return;
         }
     }
     if (!options.ensure) return error.OwnerPreparationRequired;
-    const slot = try preparation.selectedSlot(&plan.storage_plan.?);
-    if (selected == null and try initializeNewOwner(
-        result,
-        io,
-        environment,
-        options,
-        plan,
-        bindings,
-        &associations,
-        slot.relative_path,
-        retired,
-    )) return;
+    _ = try preparation.selectedSlot(&plan.storage_plan.?);
     try prepare(
         result,
         io,
@@ -246,7 +294,7 @@ fn runPlan(
         options,
         plan,
         bindings,
-        if (selected) |value| value.value else null,
+        selected,
         retired,
         discover_archives,
     );
@@ -272,8 +320,6 @@ fn resolveOwnerContext(
     };
 }
 
-// Read readiness belongs to the selected canonical owner. Source-family coverage
-// is a preparation/write obligation and must not revoke an already valid snapshot.
 fn admitRead(
     result: *Result,
     io: std.Io,
@@ -302,6 +348,136 @@ fn admitRead(
     if (health.slots[0].error_code) |failure| return result.block(failure);
     if (health.slots[0].state == .missing) return error.OwnerPreparationRequired;
     if (!health.healthy) return error.OwnerHistoryUnhealthy;
+}
+
+const OwnerReadiness = enum { present, preparation, blocked };
+
+fn admitPresentOwner(
+    result: *Result,
+    io: std.Io,
+    options: Options,
+    plan: *const compiled.PlanSet,
+    bindings: *const parameters.Bindings,
+    associations: *const host.workspace.Associations,
+    selected: host.ContextValue,
+) !OwnerReadiness {
+    const allocator = result.arena.allocator();
+    try result.setContext(selected);
+    try result.put("source_coverage", "not_checked");
+    try pending.checkPendingContext(
+        allocator,
+        io,
+        associations,
+        options.context.catalog_root,
+        selected,
+    );
+    var waited = false;
+    for (0..writer_attempts_max) |attempt| {
+        var health = try inspect(allocator, io, plan, bindings, selected);
+        defer health.deinit(allocator);
+        if (busyHealth(health)) |failure| {
+            if (attempt == writer_attempts_max - 1) return blockedReadiness(result, failure);
+            try waitForWriter(io, if (waited) 1 else 0);
+            waited = true;
+            continue;
+        }
+        if (health.preparation_error) |failure| {
+            if (!std.mem.eql(u8, failure, "TransactionRecoveryRequired"))
+                return blockedReadiness(result, failure);
+        }
+        if (health.pending_transactions != 0 or health.preparation_pending) {
+            if (attempt == writer_attempts_max - 1) return error.TransactionRecoveryRequired;
+            recoverSelectedOwner(result, io, selected) catch |err| {
+                if (err != error.LockBusy and err != error.EventStoreBusy) return err;
+                try waitForWriter(io, if (waited) 1 else 0);
+                waited = true;
+            };
+            continue;
+        }
+        if (health.slots[0].state == .missing and health.slots[0].error_code == null)
+            return .preparation;
+        if (health.slots[0].error_code) |failure| {
+            if (std.mem.eql(u8, failure, "StoreBindingWithoutSlot")) return .preparation;
+            try result.put("owner_health", health);
+            return blockedReadiness(result, failure);
+        }
+        try result.put("owner_health", health);
+        if (!health.healthy) return error.OwnerHistoryUnhealthy;
+        return .present;
+    }
+    unreachable;
+}
+
+fn busyHealth(health: doctor.Result) ?[]const u8 {
+    const failures = [_]?[]const u8{ health.preparation_error, health.slots[0].error_code };
+    for (failures) |failure| if (failure) |code| {
+        if (std.mem.eql(u8, code, "LockBusy") or std.mem.eql(u8, code, "EventStoreBusy"))
+            return code;
+    };
+    return null;
+}
+
+fn recoverSelectedOwner(result: *Result, io: std.Io, selected: host.ContextValue) !void {
+    const allocator = result.arena.allocator();
+    const control = try storage_root.checkedRoot(
+        allocator,
+        io,
+        selected.store_root,
+        selected.store_id,
+    );
+    defer control.close(io);
+    var scope = storage_root.Scope.init(.anchored(io, control));
+    const transaction = @import("ledger_v1_core").transaction;
+    var budget: storage_root.ReadBudget = .{
+        .max_bytes = history_limits.max_read_bytes,
+        .max_files = history_limits.max_files * 16,
+    };
+    scope.fs.read_budget = &budget;
+    var created = false;
+    const guard = try durable.acquireCasAdvisoryLockObserved(
+        scope.fs,
+        allocator,
+        ".preparation",
+        &created,
+    );
+    defer guard.close(io);
+    if (created) {
+        transaction.markStorageMutated(&scope);
+        try result.observeMutation(true);
+    }
+    const recovered = transaction.recoverRepositoryTransactions(
+        &scope,
+        allocator,
+        ".",
+    ) catch |err| {
+        try result.observeMutation(scope.mutation_state);
+        return err;
+    };
+    if (recovered) transaction.markStorageMutated(&scope);
+    try result.observeMutation(scope.mutation_state);
+    try recheckTarget(allocator, io, selected, control);
+}
+
+fn requireWorkspaceForMissingOwner(
+    result: *Result,
+    io: std.Io,
+    options: Options,
+    selected: host.ContextValue,
+) !void {
+    if (options.context.workspace != null) return;
+    var catalog = try host.catalog.read(result.arena.allocator(), io, options.context.catalog_root);
+    defer catalog.deinit();
+    for (catalog.value.aliases.map.keys(), catalog.value.aliases.map.values()) |alias, id| {
+        if (std.mem.eql(u8, id, selected.store_id) and
+            (std.mem.startsWith(u8, alias, "workspace:") or
+                std.mem.startsWith(u8, alias, "git-common-dir:")))
+            return error.OwnerPreparationRequiresWorkspace;
+    }
+}
+
+fn blockedReadiness(result: *Result, failure: []const u8) !OwnerReadiness {
+    try result.block(failure);
+    return .blocked;
 }
 
 const Coverage = struct {
@@ -347,6 +523,7 @@ fn existingCoverage(
     const present = health.slots[0].state != .missing;
     const covered = if (present)
         try localCovered(
+            result,
             allocator,
             io,
             environment,
@@ -357,6 +534,7 @@ fn existingCoverage(
         )
     else
         try missingCovered(
+            result,
             allocator,
             io,
             environment,
@@ -372,7 +550,37 @@ fn existingCoverage(
     };
 }
 
+fn discoverSources(
+    result: *Result,
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    environment: *const std.process.Environ.Map,
+    workspace: ?[]const u8,
+    selected: ?host.ContextValue,
+    slot: []const u8,
+    retired: []const []const u8,
+    archives: bool,
+) !discovery.Sources {
+    var diagnostic: discovery.Diagnostic = .{};
+    defer diagnostic.deinit(allocator);
+    return discovery.discoverObserved(
+        allocator,
+        io,
+        environment,
+        workspace,
+        selected,
+        slot,
+        retired,
+        archives,
+        &diagnostic,
+    ) catch |err| {
+        if (diagnostic.source_root != null) try result.put("source_failure", diagnostic);
+        return err;
+    };
+}
+
 fn missingCovered(
+    result: *Result,
     allocator: std.mem.Allocator,
     io: std.Io,
     environment: *const std.process.Environ.Map,
@@ -382,7 +590,8 @@ fn missingCovered(
     bindings: *const parameters.Bindings,
     retired: []const []const u8,
 ) !bool {
-    var sources = try discovery.discover(
+    var sources = try discoverSources(
+        result,
         allocator,
         io,
         environment,
@@ -407,6 +616,7 @@ fn missingCovered(
         return true;
     }
     return coverSources(
+        result,
         allocator,
         io,
         environment,
@@ -418,73 +628,6 @@ fn missingCovered(
         false,
         true,
     );
-}
-
-fn initializeNewOwner(
-    result: *Result,
-    io: std.Io,
-    environment: *const std.process.Environ.Map,
-    options: Options,
-    plan: *const compiled.PlanSet,
-    bindings: *const parameters.Bindings,
-    associations: *const host.workspace.Associations,
-    slot: []const u8,
-    retired: []const []const u8,
-) !bool {
-    const allocator = result.arena.allocator();
-    var sources = try discovery.discover(
-        allocator,
-        io,
-        environment,
-        options.context.workspace,
-        null,
-        slot,
-        retired,
-        false,
-    );
-    defer sources.deinit();
-    if (!try genuinelyNew(
-        allocator,
-        io,
-        associations,
-        options.context.catalog_root,
-        sources.trees,
-        retired,
-    )) return false;
-    if (sources.sources.len != 0 and !options.confirm_no_writers)
-        return error.PreparationRequiresQuiescence;
-    var initialize_options = options.context;
-    initialize_options.legacy_paths = retired;
-    try result.put("storage_mutated", @as(?bool, null));
-    var initialized = host.initialize(allocator, io, environment, initialize_options) catch |err|
-        switch (err) {
-            error.PendingInitializationRequiresPreparation => return false,
-            else => return err,
-        };
-    defer initialized.deinit();
-    const coverage = try existingCoverage(
-        result,
-        io,
-        environment,
-        options,
-        plan,
-        bindings,
-        associations,
-        initialized.value,
-        retired,
-    );
-    if (!coverage.covered) try prepareSelected(
-        result,
-        io,
-        environment,
-        options,
-        plan,
-        bindings,
-        initialized.value,
-        if (coverage.discover_archives) retired else &.{},
-        coverage.discover_archives,
-    );
-    return true;
 }
 
 fn registerContext(
@@ -578,6 +721,7 @@ fn inspect(
 }
 
 fn localCovered(
+    result: *Result,
     allocator: std.mem.Allocator,
     io: std.Io,
     environment: *const std.process.Environ.Map,
@@ -587,7 +731,8 @@ fn localCovered(
     confirm_no_writers: bool,
 ) !bool {
     const root = selected.workspace_root orelse return true;
-    var sources = try discovery.discover(
+    var sources = try discoverSources(
+        result,
         allocator,
         io,
         environment,
@@ -612,6 +757,7 @@ fn localCovered(
         return true;
     }
     return coverSources(
+        result,
         allocator,
         io,
         environment,
@@ -626,6 +772,7 @@ fn localCovered(
 }
 
 fn coverSources(
+    result: *Result,
     allocator: std.mem.Allocator,
     io: std.Io,
     environment: *const std.process.Environ.Map,
@@ -644,6 +791,45 @@ fn coverSources(
         selected.store_id,
     );
     defer target_dir.close(io);
+    var coordination = try SourceCoordination.acquire(
+        result,
+        io,
+        plan,
+        sources.sources,
+        target_dir,
+        confirm_no_writers,
+    );
+    defer coordination.deinit();
+    return coverCoordinatedSources(
+        allocator,
+        io,
+        environment,
+        selected,
+        plan,
+        bindings,
+        sources,
+        confirm_no_writers,
+        target_present,
+        discover_archives,
+        target_dir,
+        &coordination,
+    );
+}
+
+fn coverCoordinatedSources(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    environment: *const std.process.Environ.Map,
+    selected: host.ContextValue,
+    plan: *const compiled.PlanSet,
+    bindings: *const parameters.Bindings,
+    sources: *const discovery.Sources,
+    confirm_no_writers: bool,
+    target_present: bool,
+    discover_archives: bool,
+    target_dir: std.Io.Dir,
+    coordination: *const SourceCoordination,
+) !bool {
     var budget: storage_root.ReadBudget = .{
         .max_bytes = history_limits.max_read_bytes,
         .max_files = history_limits.max_files * 16,
@@ -691,9 +877,216 @@ fn coverSources(
         controls,
         discover_archives,
     );
+    try coordination.revalidate();
     try recheckTarget(allocator, io, selected, target_dir);
     return covered;
 }
+
+const SourceCoordination = struct {
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    held: std.ArrayList(Held) = .empty,
+
+    const Held = struct {
+        source: preparation.Source,
+        root: std.Io.Dir,
+        control: std.Io.Dir,
+        locks: durable.CasReadLockPair,
+    };
+
+    fn deinit(self: *SourceCoordination) void {
+        for (self.held.items) |*held| {
+            held.locks.deinit();
+            held.control.close(self.io);
+            held.root.close(self.io);
+        }
+        self.held.deinit(self.allocator);
+    }
+
+    fn acquire(
+        result: *Result,
+        io: std.Io,
+        plan: *const compiled.PlanSet,
+        sources: []const preparation.Source,
+        target: ?std.Io.Dir,
+        confirmed: bool,
+    ) !SourceCoordination {
+        for (0..writer_attempts_max) |attempt| {
+            if (acquireOnce(result, io, plan, sources, target, confirmed)) |guards| {
+                _ = result.value.object.swapRemove("source_failure");
+                return guards;
+            } else |err| {
+                if ((err != error.LockBusy and err != error.EventStoreBusy) or
+                    attempt == writer_attempts_max - 1) return err;
+                try waitForWriter(io, attempt);
+            }
+        }
+        unreachable;
+    }
+
+    fn acquireOnce(
+        result: *Result,
+        io: std.Io,
+        plan: *const compiled.PlanSet,
+        sources: []const preparation.Source,
+        target: ?std.Io.Dir,
+        confirmed: bool,
+    ) !SourceCoordination {
+        var guards: SourceCoordination = .{ .allocator = result.arena.allocator(), .io = io };
+        errdefer guards.deinit();
+        if (confirmed or plan.storage_plan.?.slots[0].layout == .segmented) return guards;
+        for (sources) |source| {
+            if (source.archive) continue;
+            if (target) |target_control| {
+                if (try openCoverageSource(guards.allocator, io, source)) |source_control| {
+                    defer source_control.close(io);
+                    if (try durable.sameDirectoryObject(io, source_control, target_control))
+                        continue;
+                }
+            }
+            try guards.held.ensureUnusedCapacity(guards.allocator, 1);
+            var mutated = false;
+            const held = guards.acquireSource(source, plan, &mutated) catch |err| {
+                try observeSourceMutation(result, mutated);
+                try result.put("source_failure", .{
+                    .source_root = source.root,
+                    .owner = plan.definition_plan.id,
+                    .error_code = @errorName(err),
+                });
+                return err;
+            };
+            guards.held.appendAssumeCapacity(held);
+            try observeSourceMutation(result, mutated);
+        }
+        return guards;
+    }
+
+    fn observeSourceMutation(result: *Result, mutated: bool) !void {
+        if (!mutated) return;
+        try result.observeMutation(true);
+        try result.put("source_coordination_mutated", true);
+        try result.put("source_coordination_scope", "selected-owner-advisory-locks");
+    }
+
+    fn acquireSource(
+        self: *SourceCoordination,
+        source: preparation.Source,
+        plan: *const compiled.PlanSet,
+        mutated: *bool,
+    ) !Held {
+        const io = self.io;
+        const allocator = self.allocator;
+        const root = try host.catalog.openDirectory(io, source.root, false);
+        errdefer root.close(io);
+        var control = try openCoverageSource(allocator, io, source);
+        if (control == null) {
+            const fs = durable.Fs.anchored(io, root);
+            try durable.ensureDirectoryPathNoSymlinksObserved(fs, ".ledger", mutated);
+            control = try root.openDir(io, ".ledger", .{ .follow_symlinks = false });
+        }
+        const directory = control.?;
+        errdefer directory.close(io);
+        var scope = storage_root.Scope.init(.anchored(io, directory));
+        const slot = plan.storage_plan.?.slots[0].relative_path;
+        var paths = try @import("ledger_v1_core").segmented_event_log.Paths.init(
+            &scope,
+            allocator,
+            ".",
+            slot,
+        );
+        defer paths.deinit(allocator);
+        try durable.ensureNoPendingTransactions(scope.fs, allocator, ".transactions");
+        var initial = try durable.acquireCasReadLockPair(
+            scope.fs,
+            allocator,
+            slot,
+            paths.legacy_binding,
+        );
+        defer initial.deinit();
+        const incomplete = initial.count != 2;
+        if (incomplete)
+            try self.establishAbsentLocks(scope.fs, directory, slot, &paths, mutated);
+        var locks = try durable.acquireCasReadLockPair(
+            scope.fs,
+            allocator,
+            slot,
+            paths.legacy_binding,
+        );
+        errdefer locks.deinit();
+        if (locks.count != 2) return error.PreparationRequiresQuiescence;
+        try durable.ensureNoPendingTransactions(scope.fs, allocator, ".transactions");
+        if (incomplete and !try selectedAbsent(io, scope.fs, directory, &paths))
+            return error.SourceChangedDuringPreparation;
+        const held: Held = .{
+            .source = source,
+            .root = root,
+            .control = directory,
+            .locks = locks,
+        };
+        try self.revalidateOne(held);
+        return held;
+    }
+
+    fn establishAbsentLocks(
+        self: *const SourceCoordination,
+        fs: durable.Fs,
+        directory: std.Io.Dir,
+        slot: []const u8,
+        paths: *const @import("ledger_v1_core").segmented_event_log.Paths,
+        mutated: *bool,
+    ) !void {
+        const io = self.io;
+        const allocator = self.allocator;
+        if (!try selectedAbsent(io, fs, directory, paths)) {
+            const event_exists = try host.catalog.existsAt(io, directory, slot);
+            const binding_exists = try host.catalog.existsAt(io, directory, paths.legacy_binding);
+            if (binding_exists and !event_exists) return error.StoreBindingWithoutSlot;
+            if (event_exists and !binding_exists) return error.StoreSlotWithoutBinding;
+            if (try host.catalog.existsAt(io, directory, paths.manifest))
+                return error.SegmentedLocalCoverageRequiresMigration;
+            return error.PreparationRequiresQuiescence;
+        }
+        for ([_][]const u8{ slot, paths.legacy_binding }) |path| {
+            if (try durable.casAdvisoryLockExists(fs, allocator, path)) continue;
+            try durable.ensureDirectoryPathNoSymlinksObserved(
+                fs,
+                std.fs.path.dirname(path) orelse ".",
+                mutated,
+            );
+            const lock = try durable.acquireCasAdvisoryLockObserved(fs, allocator, path, mutated);
+            lock.close(io);
+        }
+    }
+
+    fn selectedAbsent(
+        io: std.Io,
+        fs: durable.Fs,
+        directory: std.Io.Dir,
+        paths: *const @import("ledger_v1_core").segmented_event_log.Paths,
+    ) !bool {
+        for ([_][]const u8{ paths.legacy_event, paths.legacy_binding, paths.manifest }) |path| {
+            try durable.rejectSymlinkComponents(fs, path);
+            if (try host.catalog.existsAt(io, directory, path)) return false;
+        }
+        return true;
+    }
+
+    fn revalidate(self: *const SourceCoordination) !void {
+        for (self.held.items) |held| try self.revalidateOne(held);
+    }
+
+    fn revalidateOne(self: *const SourceCoordination, held: Held) !void {
+        const root = try host.catalog.openDirectory(self.io, held.source.root, false);
+        defer root.close(self.io);
+        if (!try durable.sameDirectoryObject(self.io, held.root, root))
+            return error.SourceChangedDuringPreparation;
+        const control = (try openCoverageSource(self.allocator, self.io, held.source)) orelse
+            return error.SourceChangedDuringPreparation;
+        defer control.close(self.io);
+        if (!try durable.sameDirectoryObject(self.io, held.control, control))
+            return error.SourceChangedDuringPreparation;
+    }
+};
 
 fn recheckTarget(
     allocator: std.mem.Allocator,
@@ -855,7 +1248,6 @@ fn requireSegmentedSourcesAbsent(
     confirm_no_writers: bool,
     discover_archives: bool,
 ) !void {
-    const durable = @import("durable_store");
     const controls = try allocator.alloc(?std.Io.Dir, sources.sources.len);
     defer allocator.free(controls);
     @memset(controls, null);
@@ -913,27 +1305,6 @@ fn requireSegmentedSourcesAbsent(
     );
 }
 
-fn genuinelyNew(
-    allocator: std.mem.Allocator,
-    io: std.Io,
-    associations: *const host.workspace.Associations,
-    home: []const u8,
-    trees: []const []const u8,
-    retired: []const []const u8,
-) !bool {
-    const root = associations.workspace_root orelse return false;
-    const controls = try pending.controlsPath(allocator, root, associations.git_common_dir, home);
-    const registration = try std.fs.path.join(allocator, &.{ controls, "registration.json" });
-    if (try host.catalog.exists(io, registration)) return false;
-    for (trees) |tree| if (try host.workspace.hasLegacyHistory(
-        allocator,
-        io,
-        tree,
-        retired,
-    )) return false;
-    return true;
-}
-
 fn prepare(
     result: *Result,
     io: std.Io,
@@ -949,6 +1320,18 @@ fn prepare(
     var target: ?pending.Target = null;
     defer if (target) |*value| value.deinit();
     const selected = existing orelse blk: {
+        var sources = try discoverSources(
+            result,
+            allocator,
+            io,
+            environment,
+            options.context.workspace,
+            null,
+            plan.storage_plan.?.slots[0].relative_path,
+            retired,
+            false,
+        );
+        defer sources.deinit();
         try result.put("storage_mutated", @as(?bool, null));
         target = try pending.prepareTarget(allocator, io, environment, options.context, true);
         break :blk target.?.context.value;
@@ -979,7 +1362,8 @@ fn prepareSelected(
 ) !void {
     const allocator = result.arena.allocator();
     try result.setContext(selected);
-    var sources = try discovery.discover(
+    var sources = try discoverSources(
+        result,
         allocator,
         io,
         environment,
@@ -990,12 +1374,7 @@ fn prepareSelected(
         discover_archives,
     );
     defer sources.deinit();
-    if (options.repair_archive) {
-        const archived = for (sources.sources) |source| {
-            if (source.archive) break true;
-        } else false;
-        if (!archived) return error.ArchiveRepairRequiresArchiveEvidence;
-    }
+    if (options.repair_archive) try requireArchiveEvidence(sources.sources);
     const control = try storage_root.checkedRoot(
         allocator,
         io,
@@ -1003,6 +1382,15 @@ fn prepareSelected(
         selected.store_id,
     );
     defer control.close(io);
+    var coordination = try SourceCoordination.acquire(
+        result,
+        io,
+        plan,
+        sources.sources,
+        control,
+        options.confirm_no_writers,
+    );
+    defer coordination.deinit();
     try prepareNative(
         result,
         io,
@@ -1017,7 +1405,17 @@ fn prepareSelected(
     if (options.context.workspace) |workspace| {
         try recheckPreparedTrees(allocator, io, environment, workspace, selected, sources.trees);
     }
+    try coordination.revalidate();
     try registerContext(result, io, environment, options, selected);
+    try result.put(
+        "source_coverage",
+        if (options.context.workspace != null) "checked" else "not_checked",
+    );
+}
+
+fn requireArchiveEvidence(sources: []const preparation.Source) !void {
+    for (sources) |source| if (source.archive) return;
+    return error.ArchiveRepairRequiresArchiveEvidence;
 }
 
 fn prepareNative(
@@ -1055,14 +1453,14 @@ fn prepareNative(
         confirm_no_writers,
         restore_bound_history,
     ) catch |err| {
-        if (!selected.storage_mutated) try result.put("storage_mutated", scope.mutation_state);
+        if (!selected.storage_mutated) try result.observeMutation(scope.mutation_state);
         return err;
     };
     defer prepared.deinit(allocator);
     prepared.store_id = selected.store_id;
     prepared.store_root = selected.store_root;
     try result.put("preparation", prepared);
-    if (!selected.storage_mutated) try result.put("storage_mutated", prepared.storage_mutated);
+    if (!selected.storage_mutated) try result.observeMutation(prepared.storage_mutated);
     if (!std.mem.eql(u8, prepared.outcome, "covered") and
         !std.mem.eql(u8, prepared.outcome, "prepared") and
         !std.mem.eql(u8, prepared.outcome, "empty"))
@@ -1097,7 +1495,7 @@ fn prepareWaiting(
     confirm_no_writers: bool,
     restore_bound_history: bool,
 ) !preparation.Result {
-    for (0..301) |attempt| {
+    for (0..writer_attempts_max) |attempt| {
         var result = try preparation.execute(
             scope,
             selection,
@@ -1118,16 +1516,20 @@ fn prepareWaiting(
             u8,
             result.outcome,
             "busy",
-        ) or result.storage_mutated != false or attempt == 300) return result;
+        ) or result.storage_mutated != false or attempt == writer_attempts_max - 1) return result;
         result.deinit(allocator);
-        if (attempt == 0) {
-            var writer = std.Io.File.stderr().writer(scope.fs.io, &.{});
-            try writer.interface.writeAll("Waiting for active Ledger writer\n");
-            try writer.interface.flush();
-        }
-        try std.Io.sleep(scope.fs.io, .fromMilliseconds(100), .awake);
+        try waitForWriter(scope.fs.io, attempt);
     }
     unreachable;
+}
+
+fn waitForWriter(io: std.Io, attempt: usize) !void {
+    if (attempt == 0) {
+        var writer = std.Io.File.stderr().writer(io, &.{});
+        try writer.interface.writeAll("Waiting for active Ledger writer\n");
+        try writer.interface.flush();
+    }
+    try std.Io.sleep(io, .fromMilliseconds(writer_retry_delay_ms), .awake);
 }
 
 const OwnerAssociationInterleaving = struct {
@@ -1194,7 +1596,7 @@ const OwnerAssociationInterleaving = struct {
     }
 };
 
-test "owner empty source requires quiescence before allocation and on repeated coverage" {
+test "empty owner establishes native source custody and keeps canonical progress independent" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
     var temporary = try host.workspace.testPlainDirectory();
@@ -1206,42 +1608,58 @@ test "owner empty source requires quiescence before allocation and on repeated c
     try testOwnerInputs(temporary.dir);
     var environment = std.process.Environ.Map.init(allocator);
     defer environment.deinit();
-    var options: Options = .{
-        .context = .{
-            .catalog_root = try std.fs.path.join(owned, &.{ root, "home" }),
-            .workspace = try std.fs.path.join(owned, &.{ root, "workspace" }),
-        },
-        .definition = try std.fs.path.join(owned, &.{ root, "definition.json" }),
-        .manifest = try std.fs.path.join(owned, &.{ root, "migration.json" }),
-        .ensure = true,
-    };
-    try expectOwnerError(io, &environment, options, "PreparationRequiresQuiescence");
-    try std.testing.expect(!try host.catalog.existsAt(io, temporary.dir, "home"));
-    try std.testing.expect(!try host.catalog.existsAt(io, temporary.dir, "workspace/.ledger"));
-    options.confirm_no_writers = true;
+    var options = try testOwnerOptions(owned, root);
+    options.ensure = true;
     var initialized = try execute(allocator, io, &environment, options);
     defer initialized.deinit();
     try std.testing.expectEqual(@as(u8, 0), initialized.exit_code);
+    try std.testing.expect(initialized.value.object.get("storage_mutated").?.bool);
+    try std.testing.expect(initialized.value.object.get("source_coordination_mutated").?.bool);
+    try std.testing.expectEqualStrings(
+        "checked",
+        initialized.value.object.get("source_coverage").?.string,
+    );
     const id = initialized.value.object.get("store_id").?.string;
     const target = initialized.value.object.get("store_root").?.string;
-    for ([_]bool{ false, true }) |present| {
-        if (present) try testAppendOwner(&environment, options.definition, target);
-        options.confirm_no_writers = false;
-        try expectOwnerError(io, &environment, options, "PreparationRequiresQuiescence");
-        options.confirm_no_writers = true;
-        var repeated = try execute(allocator, io, &environment, options);
-        defer repeated.deinit();
-        try std.testing.expectEqual(@as(u8, 0), repeated.exit_code);
-        try std.testing.expectEqualStrings(id, repeated.value.object.get("store_id").?.string);
-        try std.testing.expect(!repeated.value.object.get("storage_mutated").?.bool);
+    try std.testing.expect(!try host.catalog.existsAt(
+        io,
+        temporary.dir,
+        "workspace/.ledger/example/events.jsonl",
+    ));
+    var empty = try execute(allocator, io, &environment, options);
+    defer empty.deinit();
+    try std.testing.expectEqual(@as(u8, 0), empty.exit_code);
+    try std.testing.expectEqualStrings(id, empty.value.object.get("store_id").?.string);
+    try std.testing.expect(!empty.value.object.get("storage_mutated").?.bool);
+    try testAppendOwner(&environment, options.definition, target);
+    try temporary.dir.deleteTree(io, "workspace/.ledger");
+    for ([_]bool{ false, true }) |by_id| {
+        var current = options;
+        if (by_id) {
+            current.context.workspace = null;
+            current.context.store_id = id;
+        }
+        var selected = try execute(allocator, io, &environment, current);
+        defer selected.deinit();
+        try std.testing.expectEqual(@as(u8, 0), selected.exit_code);
+        try std.testing.expectEqualStrings(id, selected.value.object.get("store_id").?.string);
+        try std.testing.expectEqualStrings(
+            "not_checked",
+            selected.value.object.get("source_coverage").?.string,
+        );
+        try std.testing.expect(!selected.value.object.get("storage_mutated").?.bool);
+        try std.testing.expect(!try host.catalog.existsAt(io, temporary.dir, "workspace/.ledger"));
     }
-    options.ensure = false;
-    options.confirm_no_writers = false;
-    var readable = try execute(allocator, io, &environment, options);
-    defer readable.deinit();
-    try std.testing.expectEqual(@as(u8, 0), readable.exit_code);
-    try std.testing.expect(!readable.value.object.get("storage_mutated").?.bool);
-    try std.testing.expect(!try host.catalog.existsAt(io, temporary.dir, "workspace/.ledger"));
+    options.reconcile = true;
+    var reconciled = try execute(allocator, io, &environment, options);
+    defer reconciled.deinit();
+    try std.testing.expectEqual(@as(u8, 0), reconciled.exit_code);
+    try std.testing.expectEqualStrings(id, reconciled.value.object.get("store_id").?.string);
+    try std.testing.expectEqualStrings(
+        "checked",
+        reconciled.value.object.get("source_coverage").?.string,
+    );
+    try std.testing.expect(reconciled.value.object.get("storage_mutated").?.bool);
 }
 
 test "segmented owner absence needs quiescence or all existing publication guards" {
@@ -1303,6 +1721,153 @@ test "segmented owner absence needs quiescence or all existing publication guard
     try std.testing.expect(!protected.value.object.get("storage_mutated").?.bool);
     try control.writeFile(io, .{ .sub_path = paths.manifest, .data = "present" });
     try expectOwnerError(io, &environment, options, "SegmentedLocalCoverageRequiresMigration");
+}
+
+test "empty source coordination excludes participating writers through held custody" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var temporary = try host.workspace.testPlainDirectory();
+    defer temporary.cleanup();
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const owned = arena.allocator();
+    const root = try temporary.dir.realPathFileAlloc(io, ".", owned);
+    try testOwnerInputs(temporary.dir);
+    var environment = std.process.Environ.Map.init(allocator);
+    defer environment.deinit();
+    const options = try testOwnerOptions(owned, root);
+    var scope = storage_root.Scope.init(.init(io, std.Io.Dir.cwd()));
+    var plan = try cli.loadDefinitionWithCache(
+        &scope,
+        allocator,
+        &environment,
+        options.definition,
+        .{ .kind = .doctor },
+        false,
+    );
+    defer plan.deinit(allocator);
+    var result: Result = .{
+        .arena = std.heap.ArenaAllocator.init(allocator),
+        .value = .{ .object = .{} },
+    };
+    defer result.deinit();
+    try result.put("storage_mutated", false);
+    {
+        var guards = try SourceCoordination.acquire(
+            &result,
+            io,
+            &plan,
+            &.{.{ .root = options.context.workspace.? }},
+            null,
+            false,
+        );
+        defer guards.deinit();
+        try std.testing.expect(result.value.object.get("storage_mutated").?.bool);
+        try std.testing.expect(result.value.object.get("source_coordination_mutated").?.bool);
+        const control = guards.held.items[0].control;
+        var source_scope = storage_root.Scope.init(.anchored(io, control));
+        const slot = plan.storage_plan.?.slots[0].relative_path;
+        const binding = try @import("ledger_v1_core").custody.bindingPathAlloc(
+            &source_scope,
+            allocator,
+            ".",
+            slot,
+        );
+        defer allocator.free(binding);
+        for ([_][]const u8{ slot, binding }) |path| {
+            try std.testing.expect(!try host.catalog.existsAt(io, control, path));
+            try std.testing.expectError(
+                error.LockBusy,
+                durable.acquireCasAdvisoryLock(source_scope.fs, allocator, path),
+            );
+        }
+        try guards.revalidate();
+    }
+    const control = try temporary.dir.openDir(io, "workspace/.ledger", .{});
+    defer control.close(io);
+    const lock = try durable.acquireCasAdvisoryLock(
+        .anchored(io, control),
+        allocator,
+        plan.storage_plan.?.slots[0].relative_path,
+    );
+    lock.close(io);
+}
+
+test "owner preparation keeps incomplete historic coordination and source failures explicit" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var temporary = try host.workspace.testPlainDirectory();
+    defer temporary.cleanup();
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const owned = arena.allocator();
+    const root = try temporary.dir.realPathFileAlloc(io, ".", owned);
+    try testOwnerInputs(temporary.dir);
+    var environment = std.process.Environ.Map.init(allocator);
+    defer environment.deinit();
+    var options = try testOwnerOptions(owned, root);
+    options.ensure = true;
+    var selected = try host.initialize(allocator, io, &environment, options.context);
+    defer selected.deinit();
+    try testAppendOwner(&environment, options.definition, options.context.workspace.?);
+    const source = try temporary.dir.openDir(io, "workspace/.ledger", .{});
+    defer source.close(io);
+    const advisory = "example/events.jsonl.cas.lock.advisory";
+    try source.deleteFile(io, advisory);
+    try expectOwnerError(io, &environment, options, "PreparationRequiresQuiescence");
+    try std.testing.expect(!try host.catalog.existsAt(io, source, advisory));
+    try source.createDirPath(io, ".transactions/dtx-first");
+    try expectOwnerError(io, &environment, options, "TransactionRecoveryRequired");
+    try source.deleteDir(io, ".transactions/dtx-first");
+    try source.deleteFile(io, "example/events.jsonl");
+    var failed = try execute(allocator, io, &environment, options);
+    defer failed.deinit();
+    try std.testing.expectEqual(@as(u8, 3), failed.exit_code);
+    try std.testing.expectEqualStrings(
+        "StoreBindingWithoutSlot",
+        failed.value.object.get("error_code").?.string,
+    );
+    try expectSourceFailure(&failed, options.context.workspace.?);
+    try std.testing.expect(!failed.value.object.get("storage_mutated").?.bool);
+    try temporary.dir.createDir(io, "empty", .default_dir);
+    const empty_root = try std.fs.path.join(owned, &.{ root, "empty" });
+    var scope = storage_root.Scope.init(.init(io, std.Io.Dir.cwd()));
+    var plan = try cli.loadDefinitionWithCache(
+        &scope,
+        allocator,
+        &environment,
+        options.definition,
+        .{ .kind = .doctor },
+        false,
+    );
+    defer plan.deinit(allocator);
+    var observed: Result = .{
+        .arena = std.heap.ArenaAllocator.init(allocator),
+        .value = .{ .object = .{} },
+    };
+    defer observed.deinit();
+    try observed.put("storage_mutated", false);
+    try std.testing.expectError(error.StoreBindingWithoutSlot, SourceCoordination.acquire(
+        &observed,
+        io,
+        &plan,
+        &.{
+            .{ .root = empty_root },
+            .{ .root = options.context.workspace.? },
+        },
+        null,
+        false,
+    ));
+    try std.testing.expect(observed.value.object.get("storage_mutated").?.bool);
+    try std.testing.expect(observed.value.object.get("source_coordination_mutated").?.bool);
+    try expectSourceFailure(&observed, options.context.workspace.?);
+}
+
+fn expectSourceFailure(result: *const Result, root: []const u8) !void {
+    try std.testing.expectEqualStrings(
+        root,
+        result.value.object.get("source_failure").?.object.get("source_root").?.string,
+    );
 }
 
 fn testSegmentedDefinition(allocator: std.mem.Allocator, directory: std.Io.Dir) !void {

@@ -327,6 +327,35 @@ blocked '' context --catalog-root "$registration/invalid-home" --workspace "$reg
 test ! -e "$registration/invalid-home/catalog.json"
 cp "$registration/registration.saved" "$registration/repo/.git/ledger-store.json"
 
+printf '%s\n' 'host CLI: equivalent managed target paths do not become source locks'
+alias_owner="$scratch/alias-owner"
+make_repo "$alias_owner/repo"
+git -C "$alias_owner/repo" worktree add -q --detach "$alias_owner/source"
+capture "$alias_owner/source" alias-source 7
+alias_id=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+mkdir -p "$alias_owner/repo/.ledger"
+"$json" -n --arg id "$alias_id" \
+  '{schema:"ledger-storage-root/v1",store_id:$id}' >"$alias_owner/repo/.ledger-root.json"
+cp "$alias_owner/repo/.ledger-root.json" "$scratch/alias-marker.saved"
+"$json" -n --arg id "$alias_id" --arg root "$alias_owner/repo/" \
+  '{schema:"ledger-repository-registration/v1",store_id:$id,store_root:$root}' \
+  >"$alias_owner/repo/.git/ledger-store.json"
+context --catalog-root "$alias_owner/home" \
+  --import-registration "$alias_owner/repo/.git/ledger-store.json"
+test "$("$json" -r '.store_root' "$scratch/result.json")" -ef "$alias_owner/repo"
+test ! -e "$alias_owner/repo/.ledger/example/events.jsonl"
+snapshot "$alias_owner/source/.ledger" >"$scratch/alias-source-before.snapshot"
+project --repo "$alias_owner/source" >"$scratch/alias-source-projection.json"
+context --catalog-root "$alias_owner/home" --workspace "$alias_owner/source" \
+  --ensure-owner --definition "$definition" --owner-manifest "$manifest"
+test "$("$json" -r '.store_id' "$scratch/result.json")" = "$alias_id"
+test "$("$json" -r '.store_root' "$scratch/result.json")" -ef "$alias_owner/repo"
+cmp "$scratch/alias-marker.saved" "$alias_owner/repo/.ledger-root.json"
+project --store-root "$alias_owner/repo/" --store-id "$alias_id" >"$scratch/alias-target-projection.json"
+cmp "$scratch/alias-source-projection.json" "$scratch/alias-target-projection.json"
+snapshot "$alias_owner/source/.ledger" >"$scratch/alias-source-after.snapshot"
+cmp "$scratch/alias-source-before.snapshot" "$scratch/alias-source-after.snapshot"
+
 printf '%s\n' 'host CLI: cold adoption copies complete native history'
 cold="$scratch/cold"
 make_repo "$cold/repo"
@@ -383,8 +412,20 @@ snapshot "$owner" >"$scratch/before.snapshot"
 context --catalog-root "$owner/home" --workspace "$owner/prefix" \
   --definition "$definition" --owner-manifest "$manifest" --read-only
 assert_json '.source_coverage == "not_checked" and .owner_health.healthy and .authority_granted == false'
+snapshot "$owner" >"$scratch/after.snapshot"
+cmp "$scratch/before.snapshot" "$scratch/after.snapshot"
+snapshot "$owner_root" >"$scratch/native-before.snapshot"
+context --catalog-root "$owner/home" --workspace "$owner/prefix" --definition "$definition" \
+  --owner-manifest "$manifest" --ensure-owner
+assert_json '.source_coverage == "not_checked" and .owner_health.healthy and .storage_mutated == true'
+snapshot "$owner_root" >"$scratch/native-after.snapshot"
+cmp "$scratch/native-before.snapshot" "$scratch/native-after.snapshot"
+snapshot "$owner" >"$scratch/before.snapshot"
+context --catalog-root "$owner/home" --workspace "$owner/prefix" --definition "$definition" \
+  --owner-manifest "$manifest" --ensure-owner
+assert_json '.source_coverage == "not_checked" and .owner_health.healthy and .storage_mutated == false'
 blocked PreparationRequiresQuiescence context --catalog-root "$owner/home" \
-  --workspace "$owner/prefix" --definition "$definition" --owner-manifest "$manifest" --ensure-owner
+  --workspace "$owner/prefix" --definition "$definition" --owner-manifest "$manifest" --reconcile-owner
 snapshot "$owner" >"$scratch/after.snapshot"
 cmp "$scratch/before.snapshot" "$scratch/after.snapshot"
 while IFS= read -r advisory; do
@@ -413,7 +454,7 @@ snapshot "$owner_root" >"$scratch/after.snapshot"
 cmp "$scratch/before.snapshot" "$scratch/after.snapshot"
 cp "$owner_root/.ledger/example/events.jsonl" "$scratch/retained-events.jsonl"
 blocked '' context --catalog-root "$owner/home" --workspace "$owner/prefix" --definition "$definition" \
-  --owner-manifest "$manifest" --ensure-owner --confirm-no-legacy-writers
+  --owner-manifest "$manifest" --reconcile-owner --confirm-no-legacy-writers
 cmp "$scratch/retained-events.jsonl" "$owner_root/.ledger/example/events.jsonl"
 
 mv "$owner/prefix" "$owner/prefix-unavailable"
@@ -425,8 +466,15 @@ workspace_revision=$("$json" -r '.owner_health.slots[0].revision' "$scratch/resu
 context --catalog-root "$owner/home" --store-id "$owner_id" \
   --definition "$definition" --owner-manifest "$manifest" --read-only
 test "$("$json" -r '.owner_health.slots[0].revision' "$scratch/result.json")" = "$workspace_revision"
+context --catalog-root "$owner/home" --workspace "$owner/repo" \
+  --definition "$definition" --owner-manifest "$manifest" --ensure-owner
+assert_json '.source_coverage == "not_checked" and .owner_health.healthy and .storage_mutated == false'
+test "$("$json" -r '.owner_health.slots[0].revision' "$scratch/result.json")" = "$workspace_revision"
 blocked UnavailableWorktree context --catalog-root "$owner/home" --workspace "$owner/repo" \
-  --definition "$definition" --owner-manifest "$manifest" --ensure-owner --confirm-no-legacy-writers
+  --definition "$definition" --owner-manifest "$manifest" --reconcile-owner --confirm-no-legacy-writers
+"$json" -e --arg source "$owner/prefix" \
+  '.source_failure.source_root == $source and .source_failure.error_code == "UnavailableWorktree"' \
+  "$scratch/result.json" >/dev/null
 snapshot "$owner_root" >"$scratch/after.snapshot"
 cmp "$scratch/before.snapshot" "$scratch/after.snapshot"
 mv "$owner/prefix-unavailable" "$owner/prefix"
@@ -452,7 +500,7 @@ mkdir -p "$segmented_root/legacy-archive/broken"
 printf '%s\n' 'malformed archive must not be read' >"$segmented_root/legacy-archive/broken/manifest.json"
 snapshot "$segmented/home" >"$scratch/before.snapshot"
 blocked PreparationRequiresQuiescence context --catalog-root "$segmented/home" \
-  --workspace "$segmented/work" --ensure-owner --definition "$segmented/owner/definition.json" \
+  --workspace "$segmented/work" --reconcile-owner --definition "$segmented/owner/definition.json" \
   --owner-manifest "$segmented/owner/migration.json"
 context --catalog-root "$segmented/home" --workspace "$segmented/work" --read-only \
   --definition "$segmented/owner/definition.json" --owner-manifest "$segmented/owner/migration.json"

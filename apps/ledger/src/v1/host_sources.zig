@@ -28,6 +28,16 @@ pub const Sources = struct {
     }
 };
 
+pub const Diagnostic = struct {
+    source_root: ?[]const u8 = null,
+    error_code: ?[]const u8 = null,
+
+    pub fn deinit(self: *Diagnostic, allocator: std.mem.Allocator) void {
+        if (self.source_root) |root| allocator.free(root);
+        self.* = .{};
+    }
+};
+
 const Marker = struct { schema: []const u8, store_id: []const u8 };
 const max_sources = 128;
 
@@ -47,19 +57,34 @@ pub fn treesForTarget(
     selected: []const u8,
     target: ?host.ContextValue,
 ) !Trees {
+    return treesForTargetObserved(allocator, io, environment, selected, target, null);
+}
+
+pub fn treesForTargetObserved(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    environment: *const std.process.Environ.Map,
+    selected: []const u8,
+    target: ?host.ContextValue,
+    diagnostic: ?*Diagnostic,
+) !Trees {
+    if (diagnostic) |value| value.deinit(allocator);
     var arena = std.heap.ArenaAllocator.init(allocator);
     errdefer arena.deinit();
     const owned = arena.allocator();
-    const selected_dir = try catalog.openDirectory(io, selected, false);
+    const selected_dir = catalog.openDirectory(io, selected, false) catch |err|
+        return diagnosticError(allocator, diagnostic, selected, err);
     defer selected_dir.close(io);
-    const canonical = try selected_dir.realPathFileAlloc(io, ".", owned);
-    try admitSelectedRoot(allocator, io, selected_dir, canonical, target);
-    const paths = try workspace.gitOrPlain(
+    const canonical = selected_dir.realPathFileAlloc(io, ".", owned) catch |err|
+        return diagnosticError(allocator, diagnostic, selected, err);
+    admitSelectedRoot(allocator, io, selected_dir, canonical, target) catch |err|
+        return diagnosticError(allocator, diagnostic, canonical, err);
+    const paths = workspace.gitOrPlain(
         owned,
         io,
         environment,
         canonical,
-    );
+    ) catch |err| return diagnosticError(allocator, diagnostic, canonical, err);
     var result: Trees = .{
         .arena = arena,
         .roots = undefined,
@@ -70,16 +95,19 @@ pub fn treesForTarget(
     if (paths) |git| {
         result.workspace_root = git.root;
         result.git_common_dir = git.common;
-        const root_dir = try catalog.openDirectory(io, git.root, false);
+        const root_dir = catalog.openDirectory(io, git.root, false) catch |err|
+            return diagnosticError(allocator, diagnostic, git.root, err);
         defer root_dir.close(io);
-        try admitSelectedRoot(allocator, io, root_dir, git.root, target);
-        try appendGitTrees(owned, io, environment, git, &found);
+        admitSelectedRoot(allocator, io, root_dir, git.root, target) catch |err|
+            return diagnosticError(allocator, diagnostic, git.root, err);
+        try appendGitTrees(owned, allocator, io, environment, git, &found, diagnostic);
     } else {
         try found.append(owned, canonical);
     }
     for (found.items) |root| {
         const control = try std.fs.path.join(owned, &.{ root, ".ledger" });
-        _ = try noSymlinks(io, control);
+        _ = noSymlinks(io, control) catch |err|
+            return diagnosticError(allocator, diagnostic, root, err);
     }
     std.mem.sort([]const u8, found.items, {}, lessString);
     result.roots = try found.toOwnedSlice(owned);
@@ -96,17 +124,32 @@ fn admitSelectedRoot(
 ) !void {
     if (!try catalog.existsAt(io, directory, ".ledger-root.json")) return;
     const current = target orelse return error.ManagedRootRequiresRegistration;
-    if (!std.mem.eql(u8, path, current.store_root)) return error.ManagedRootRequiresRegistration;
     const control = try catalog.checkedRoot(allocator, io, path, current.store_id);
-    control.close(io);
+    defer control.close(io);
+    if (!try targetOwnsControl(allocator, io, target, control))
+        return error.ManagedRootRequiresRegistration;
+}
+
+fn targetOwnsControl(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    target: ?host.ContextValue,
+    source: std.Io.Dir,
+) !bool {
+    const current = target orelse return false;
+    const control = try catalog.checkedRoot(allocator, io, current.store_root, current.store_id);
+    defer control.close(io);
+    return @import("durable_store").sameDirectoryObject(io, control, source);
 }
 
 fn appendGitTrees(
     owned: std.mem.Allocator,
+    allocator: std.mem.Allocator,
     io: std.Io,
     environment: *const std.process.Environ.Map,
     git: workspace.GitPaths,
     found: *std.ArrayList([]const u8),
+    diagnostic: ?*Diagnostic,
 ) !void {
     const output = try workspace.git(
         owned,
@@ -120,16 +163,19 @@ fn appendGitTrees(
         if (!std.mem.startsWith(u8, field, "worktree ")) continue;
         if (found.items.len == max_sources) return error.WorkspaceDiscoveryBoundExceeded;
         const path = field["worktree ".len..];
-        const dir = catalog.openDirectory(io, path, false) catch |err| switch (err) {
-            error.FileNotFound => return error.UnavailableWorktree,
-            else => return err,
-        };
+        const dir = catalog.openDirectory(io, path, false) catch |err|
+            return diagnosticError(allocator, diagnostic, path, switch (err) {
+                error.FileNotFound => error.UnavailableWorktree,
+                else => err,
+            });
         defer dir.close(io);
-        const canonical = try dir.realPathFileAlloc(io, ".", owned);
-        const verified = try workspace.verifiedGit(owned, io, environment, canonical);
+        const canonical = dir.realPathFileAlloc(io, ".", owned) catch |err|
+            return diagnosticError(allocator, diagnostic, path, err);
+        const verified = workspace.verifiedGit(owned, io, environment, canonical) catch |err|
+            return diagnosticError(allocator, diagnostic, path, err);
         if (!std.mem.eql(u8, verified.root, canonical) or
             !std.mem.eql(u8, verified.common, git.common))
-            return error.WorktreeGitIdentityChanged;
+            return diagnosticError(allocator, diagnostic, path, error.WorktreeGitIdentityChanged);
         try found.append(owned, canonical);
     }
     if (found.items.len == 0) return error.IncompleteWorkspaceDiscovery;
@@ -145,6 +191,31 @@ pub fn discover(
     retired: []const []const u8,
     discover_archives: bool,
 ) !Sources {
+    return discoverObserved(
+        allocator,
+        io,
+        environment,
+        selected,
+        target,
+        slot,
+        retired,
+        discover_archives,
+        null,
+    );
+}
+
+pub fn discoverObserved(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    environment: *const std.process.Environ.Map,
+    selected: ?[]const u8,
+    target: ?host.ContextValue,
+    slot: []const u8,
+    retired: []const []const u8,
+    discover_archives: bool,
+    diagnostic: ?*Diagnostic,
+) !Sources {
+    if (diagnostic) |value| value.deinit(allocator);
     try legacy.relative(slot);
     for (retired) |path| try legacy.relative(path);
     var arena = std.heap.ArenaAllocator.init(allocator);
@@ -152,7 +223,14 @@ pub fn discover(
     const owned = arena.allocator();
     var roots: []const []const u8 = &.{};
     if (selected) |path| {
-        var discovered = try treesForTarget(allocator, io, environment, path, target);
+        var discovered = try treesForTargetObserved(
+            allocator,
+            io,
+            environment,
+            path,
+            target,
+            diagnostic,
+        );
         defer discovered.deinit();
         const copied = try owned.alloc([]const u8, discovered.roots.len);
         for (discovered.roots, copied) |root, *copy| copy.* = try owned.dupe(u8, root);
@@ -165,18 +243,7 @@ pub fn discover(
             if (try existsWithoutFollowing(io, full))
                 return error.RetiredSourceRequiresOwnerImporter;
         }
-        if (target) |current| if (std.mem.eql(u8, current.store_root, root)) continue;
-        const marker_path = try std.fs.path.join(owned, &.{ root, ".ledger-root.json" });
-        var source: preparation.Source = .{ .root = root };
-        if (try existsWithoutFollowing(io, marker_path)) {
-            const marker = try catalog.readJson(Marker, allocator, io, marker_path, 4096);
-            defer marker.deinit();
-            if (!std.mem.eql(u8, marker.value.schema, "ledger-storage-root/v1"))
-                return error.InvalidSourceRootIdentity;
-            const checked = try catalog.checkedRoot(allocator, io, root, marker.value.store_id);
-            checked.close(io);
-            source.store_id = try owned.dupe(u8, marker.value.store_id);
-        }
+        const source = try sourceForRoot(allocator, owned, io, root, target) orelse continue;
         try result.append(owned, source);
     }
     if (target) |current| {
@@ -192,6 +259,50 @@ pub fn discover(
     }
     const source_slice = try result.toOwnedSlice(owned);
     return .{ .arena = arena, .trees = roots, .sources = source_slice };
+}
+
+fn sourceForRoot(
+    allocator: std.mem.Allocator,
+    owned: std.mem.Allocator,
+    io: std.Io,
+    root: []const u8,
+    target: ?host.ContextValue,
+) !?preparation.Source {
+    const marker_path = try std.fs.path.join(owned, &.{ root, ".ledger-root.json" });
+    var source: preparation.Source = .{ .root = root };
+    var control: ?std.Io.Dir = null;
+    defer if (control) |directory| directory.close(io);
+    if (try existsWithoutFollowing(io, marker_path)) {
+        const marker = try catalog.readJson(Marker, allocator, io, marker_path, 4096);
+        defer marker.deinit();
+        if (!std.mem.eql(u8, marker.value.schema, "ledger-storage-root/v1"))
+            return error.InvalidSourceRootIdentity;
+        control = try catalog.checkedRoot(allocator, io, root, marker.value.store_id);
+        source.store_id = try owned.dupe(u8, marker.value.store_id);
+    } else if (target != null) {
+        const path = try std.fs.path.join(owned, &.{ root, ".ledger" });
+        control = catalog.openDirectory(io, path, false) catch |err| switch (err) {
+            error.FileNotFound => null,
+            else => return err,
+        };
+    }
+    if (control) |directory| {
+        if (try targetOwnsControl(allocator, io, target, directory)) return null;
+    }
+    return source;
+}
+
+fn diagnosticError(
+    allocator: std.mem.Allocator,
+    diagnostic: ?*Diagnostic,
+    root: []const u8,
+    err: anyerror,
+) anyerror {
+    const value = diagnostic orelse return err;
+    const copied = allocator.dupe(u8, root) catch return error.OutOfMemory;
+    value.deinit(allocator);
+    value.* = .{ .source_root = copied, .error_code = @errorName(err) };
+    return err;
 }
 
 fn appendArchives(
@@ -501,6 +612,167 @@ test "host sources reject broken Git and preserve sibling identity" {
     try std.testing.expectError(
         error.UnavailableWorktree,
         trees(allocator, io, &environment, root),
+    );
+    try testMissingSourceDiagnostic(allocator, io, &environment, root, linked);
+}
+
+fn testMissingSourceDiagnostic(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    environment: *const std.process.Environ.Map,
+    root: []const u8,
+    linked: []const u8,
+) !void {
+    var diagnostic: Diagnostic = .{};
+    defer diagnostic.deinit(allocator);
+    try std.testing.expectError(
+        error.UnavailableWorktree,
+        discoverObserved(
+            allocator,
+            io,
+            environment,
+            root,
+            null,
+            "owner/events.jsonl",
+            &.{},
+            false,
+            &diagnostic,
+        ),
+    );
+    try std.testing.expectEqualStrings(linked, diagnostic.source_root.?);
+    try std.testing.expectEqualStrings("UnavailableWorktree", diagnostic.error_code.?);
+    try std.testing.expect(!try catalog.exists(io, linked));
+    const registered = try workspace.git(
+        allocator,
+        io,
+        environment,
+        root,
+        &.{ "worktree", "list", "--porcelain", "-z" },
+    );
+    defer allocator.free(registered);
+    try std.testing.expect(std.mem.indexOf(u8, registered, linked) != null);
+    var empty = try discoverObserved(
+        allocator,
+        io,
+        environment,
+        null,
+        null,
+        "owner/events.jsonl",
+        &.{},
+        false,
+        &diagnostic,
+    );
+    defer empty.deinit();
+    try std.testing.expect(diagnostic.source_root == null and diagnostic.error_code == null);
+}
+
+test "host sources exclude the physical target and retain independently copied identities" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const root = try tmp.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(root);
+    var environment = std.process.Environ.Map.init(allocator);
+    defer environment.deinit();
+    try testInitializeGitFamily(root, tmp.dir, &environment);
+    const linked = try std.fs.path.join(allocator, &.{ root, "linked" });
+    defer allocator.free(linked);
+    try testGit(&environment, root, &.{ "worktree", "add", "--detach", linked });
+    const marker = "{\"schema\":\"ledger-storage-root/v1\"," ++
+        "\"store_id\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"}";
+    try testWrite(root, ".ledger-root.json", marker);
+    try tmp.dir.createDir(io, ".ledger", .fromMode(0o700));
+    const alias = try std.fmt.allocPrint(allocator, "{s}/", .{root});
+    defer allocator.free(alias);
+    var target = try host.context(
+        allocator,
+        alias,
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        null,
+        null,
+        false,
+        true,
+    );
+    defer target.deinit();
+    var discovered = try discover(
+        allocator,
+        io,
+        &environment,
+        linked,
+        target.value,
+        "owner/events.jsonl",
+        &.{},
+        false,
+    );
+    defer discovered.deinit();
+    try std.testing.expectEqual(@as(usize, 2), discovered.trees.len);
+    try std.testing.expectEqualStrings(root, discovered.trees[0]);
+    try std.testing.expectEqual(@as(usize, 1), discovered.sources.len);
+    try std.testing.expectEqualStrings(linked, discovered.sources[0].root);
+    try std.testing.expect(!try catalog.existsAt(io, tmp.dir, ".ledger/owner/events.jsonl"));
+    try testCopiedSourceIdentity(allocator, io, &environment, root, linked, target.value, marker);
+    try testSourceMarkerFailures(allocator, io, &environment, root, linked, target.value);
+}
+
+fn testCopiedSourceIdentity(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    environment: *const std.process.Environ.Map,
+    root: []const u8,
+    linked: []const u8,
+    target: host.ContextValue,
+    marker: []const u8,
+) !void {
+    try testWrite(linked, ".ledger-root.json", marker);
+    try testWrite(linked, ".ledger/owner/events.jsonl", "copied evidence\n");
+    var copied = try discover(
+        allocator,
+        io,
+        environment,
+        root,
+        target,
+        "owner/events.jsonl",
+        &.{},
+        false,
+    );
+    defer copied.deinit();
+    try std.testing.expectEqual(@as(usize, 2), copied.trees.len);
+    try std.testing.expectEqual(@as(usize, 1), copied.sources.len);
+    try std.testing.expectEqualStrings(linked, copied.sources[0].root);
+    try std.testing.expectEqualStrings(target.store_id, copied.sources[0].store_id.?);
+    try std.testing.expectError(
+        error.ManagedRootRequiresRegistration,
+        treesForTarget(allocator, io, environment, linked, target),
+    );
+}
+
+fn testSourceMarkerFailures(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    environment: *const std.process.Environ.Map,
+    root: []const u8,
+    linked: []const u8,
+    target: host.ContextValue,
+) !void {
+    try testWrite(
+        linked,
+        ".ledger-root.json",
+        "{\"schema\":\"wrong\",\"store_id\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"}",
+    );
+    try std.testing.expectError(
+        error.InvalidSourceRootIdentity,
+        discover(allocator, io, environment, root, target, "owner/events.jsonl", &.{}, false),
+    );
+    try testWrite(
+        root,
+        ".ledger-root.json",
+        "{\"schema\":\"ledger-storage-root/v1\"," ++
+            "\"store_id\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\"}",
+    );
+    try std.testing.expectError(
+        error.StorageRootIdentityMismatch,
+        discover(allocator, io, environment, root, target, "owner/events.jsonl", &.{}, false),
     );
 }
 
