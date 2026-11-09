@@ -70,7 +70,9 @@ The envelope also includes `seq_version` and a `selection` receipt with absolute
 root; `archive_root` records the additional default Codex archive discovery
 root and is null for an explicit root. `root_explicit` distinguishes default
 discovery from an explicit root selector. An
-external-only observation has no physical selection. `selection_digest` hashes
+external-only observation has no physical selection. Selection paths and the
+session ID must be valid UTF-8; otherwise the observation fails with
+`ObservationSelectionNotUtf8` before any corpus is read. `selection_digest` hashes
 these resolved values with a versioned, length-framed encoding. Equivalent
 `.`/`..` paths and time-zone spellings have the same selection identity; a
 different window does not reuse the identity merely because it visited the same
@@ -79,8 +81,11 @@ files. Definition-owned exclusions remain declared parameters and are bound by
 
 `context.as_of_ms` is the single observation instant used by every trace parser
 to assess freshness. `ongoing_threshold_secs` records the policy, and
-`source_metadata_digest` binds the ordered paths and exact nanosecond mtimes
-observed for trace discovery and parsing. Keep this context alongside corpus
+`source_metadata_digest` binds the ordered paths and exact nanosecond mtimes of
+the trace sessions whose state the observation evaluated: every admitted session
+and, for streaming lineage, every discovered session, because its session relation
+includes them. Files skipped by selection on other strategies cannot affect the
+result and are not bound. Keep this context alongside corpus
 identity: identical session content can have different current liveness. The
 metadata digest distinguishes those inputs; it does not store a replayable
 filesystem snapshot or prove that a multi-file read was atomic. Trace corpus
@@ -95,24 +100,41 @@ semantic analysis. The owning definition or analyst must assess that question.
 The former `contaminated` boolean is absent from v2.
 
 `bounds.max_input_bytes` applies to aggregate decoded JSONL admitted for parsing.
+Every strategy decides selection from a session's discovery prefix before charging
+the file against that bound, so a file the selectors skip cannot exhaust it.
 Plain-only streaming lineage execution reserves discovered file sizes before
-prefetch and checks the aggregate again when consuming results. A corpus with
-compressed files is parsed sequentially against the remaining decoded budget;
-compressed disk sizes are never substituted for decoded reservations. A growing
-plain file that exceeds its reservation fails with
-`ObservationInputByteBoundExceeded`; a failed read never yields a partial success.
-Discovery has a separate 256 MiB decoded-byte allowance. `stats.files_opened` counts source
+prefetch; compressed disk sizes are never substituted for decoded reservations.
+The unreserved remainder of the bound is spare: a session that grows after
+discovery may read into it, and results are admitted in order only while the
+admitted decoded bytes plus the still-unconsumed reservations fit the bound. A
+corpus with compressed files is parsed sequentially, and each file may read the
+decoded budget that is neither admitted nor reserved by a later file. Growth
+beyond the spare fails with `ObservationInputByteBoundExceeded`; a failed read
+never yields a partial success. Each discovery read (a session identity or
+selection prefix) is limited to 1 MiB of decoded bytes per file. Discovery has no
+separate fixed total: it is bounded by that per-file limit and the native
+candidate limit of 1,000,000 session files. `stats.files_opened` counts source
 file opens, including discovery reopens; `discovery_files_opened` and
 `discovery_bytes_read` identify that additional work. `corpus_bytes_read` and
 `discovery_bytes_read` count decoded source bytes, and `bytes_read` is their sum.
 These are not compressed disk-I/O measurements.
 `physical_passes` counts relation execution passes, so one pass does not imply
-that lineage discovery performed no additional I/O.
+that lineage discovery performed no additional I/O. `bounds.max_output_bytes`
+covers the entire rendered result, including the v2 envelope and its absolute
+selection paths; definitions with tight output bounds may need more headroom than
+under v1.
 
 Shared graph inputs remain intact until all their consuming stages have run.
 Filtering, folding, and membership joins may reuse storage only for an exclusively
-owned final consumer. Comparisons between two integers preserve signed 64-bit
-precision, including values above `2^53`.
+owned final consumer. Numeric equality and ordering are exact for integers and
+for integers compared with floats, including values above `2^53`, so `distinct`,
+sorting, and joins do not depend on row order. Signed zeros compare and hash
+equal; NaN never equals a value and does not abort ordering. Sessions without an
+identity, such as an empty rollout, do not participate in lineage joins. A
+lineage definition whose projection reads a scan the streaming strategy cannot
+seed runs on the materialized-graph strategy. Graph projections that pass through
+`limit` or `top_k` report the definition-bounded limitation, as linear projections
+do.
 
 Single-source graphs with a native `top-k` prefix stream physical selection,
 filters, and row-local derivations through the native runner. Only the retained

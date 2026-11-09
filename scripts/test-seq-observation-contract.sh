@@ -3,6 +3,7 @@ set -euo pipefail
 trap 'printf "observation contract check failed at line %s\n" "$LINENO" >&2' ERR
 
 binary=$1
+repo_root=$(pwd -P)
 message_definition=apps/seq/src/v1/fixtures/message-observation.json
 lineage_definition=apps/seq/src/v1/fixtures/lineage-observation.json
 rollout=apps/seq/src/v1/fixtures/rollout.jsonl
@@ -18,7 +19,7 @@ within=$("$binary" observe --definition "$work/message.json" --projection rows \
 outside=$("$binary" observe --definition "$work/message.json" --projection rows \
   --path "$rollout" --since 2026-07-26T10:00:03Z --param needle=failure --format json)
 jq -e --arg version "$(tr -d '[:space:]' <apps/seq/VERSION)" \
-  --arg path "$PWD/$rollout" '
+  --arg path "$repo_root/$rollout" '
   .schema == "seq-observation-result/v2" and .seq_version == $version and
   .selection.path == $path and .selection.root == null and
   .selection.root_explicit == false and .selection.since_ms != null and
@@ -37,7 +38,7 @@ printf '%s\n' "$within" "$outside" | jq -se '
   (.[0].data.rows | length) == 1 and (.[1].data.rows | length) == 0' >/dev/null
 
 equivalent=$("$binary" observe --definition "$work/message.json" --projection rows \
-  --path "$PWD/apps/seq/src/v1/fixtures/../fixtures/rollout.jsonl" \
+  --path "$repo_root/apps/seq/src/v1/fixtures/../fixtures/rollout.jsonl" \
   --since 2026-07-26T03:00:02-07:00 --param needle=failure --format json)
 printf '%s\n' "$within" "$equivalent" | jq -se '
   .[0].selection == .[1].selection and
@@ -213,3 +214,47 @@ if unsupported=$("$binary" observe --definition "$message_definition" \
   exit 1
 fi
 jq -e '.code == "UnsupportedSessionFormat"' <<<"$unsupported" >/dev/null
+
+mkdir -p "$work/linear-root"
+cp "$rollout" "$work/linear-root/inside.jsonl"
+{
+  jq -c 'if .type == "session_meta" then
+    .payload.id = "fixture-other" | .payload.cwd = "/other" else . end' "$rollout"
+  for _ in 1 2 3 4; do jq -c 'select(.type != "session_meta")' "$rollout"; done
+} >"$work/linear-root/other.jsonl"
+inside_bytes=$(wc -c <"$work/linear-root/inside.jsonl")
+jq --argjson bound "$((inside_bytes + 1))" '.bounds.max_input_bytes = $bound' \
+  "$work/message.json" >"$work/linear-bound.json"
+linear_repo=$("$binary" observe --definition "$work/linear-bound.json" --projection rows \
+  --root "$work/linear-root" --repo /repo --param needle=failure --format json)
+jq -e --argjson bytes "$inside_bytes" '.corpus.files == 1 and
+  .stats.corpus_bytes_read == $bytes and .stats.discovery_files_opened == 1 and
+  .stats.files_opened == 2' <<<"$linear_repo" >/dev/null
+
+mkdir -p "$work/aborted-root"
+cp "$rollout" "$work/aborted-root/one.jsonl"
+: >"$work/aborted-root/aborted.jsonl"
+aborted_lineage=$("$binary" observe --definition "$lineage_definition" --projection rows \
+  --root "$work/aborted-root" --format json)
+jq -e '(.data.rows | length) == 1' <<<"$aborted_lineage" >/dev/null
+
+extra_scan_definition=apps/seq/src/v1/fixtures/lineage-extra-scan.json
+extra_plan=$("$binary" explain --definition "$extra_scan_definition" --projection rows --format json)
+jq -e '.strategy.kind == "materialized-graph"' <<<"$extra_plan" >/dev/null
+extra_scan=$("$binary" observe --definition "$extra_scan_definition" --projection rows \
+  --root "$work/aborted-root" --format json)
+jq -e '(.data.rows | length) == 1' <<<"$extra_scan" >/dev/null
+
+jq '.requires.operators += ["limit"] |
+  .pipeline += [{op:"limit", input:"owned_rows", as:"bounded_rows", limit:1}] |
+  .projections.rows.relation = "bounded_rows"' "$lineage_definition" >"$work/lineage-limit.json"
+bounded=$("$binary" observe --definition "$work/lineage-limit.json" --projection rows \
+  --root "$work/aborted-root" --format json)
+jq -e '.limitations | any(contains("definition-bounded"))' <<<"$bounded" >/dev/null
+
+if not_utf8=$("$binary" observe --definition "$work/message.json" --projection rows \
+  --path "$rollout" --repo $'/srv/caf\xe9' --param needle=failure --format json 2>&1); then
+  echo "observation accepted a selection that cannot be rendered as UTF-8" >&2
+  exit 1
+fi
+jq -e '.code == "ObservationSelectionNotUtf8"' <<<"$not_utf8" >/dev/null

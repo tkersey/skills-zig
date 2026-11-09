@@ -2,7 +2,8 @@ const std = @import("std");
 const definition_core = @import("definition_core");
 const plan = @import("plan.zig");
 const seq_time = @import("seq_time");
-const Value = @import("value.zig").Value;
+const value_module = @import("value.zig");
+const Value = value_module.Value;
 
 pub const RuntimeSelectors = struct {
     path: ?[]const u8 = null,
@@ -766,8 +767,7 @@ pub fn truthy(value: Value) bool {
 
 pub fn valuesEqual(a: Value, b: Value, ignore_case: bool) bool {
     if (a == .null or b == .null) return a == .null and b == .null;
-    if (a == .integer and b == .integer) return a.integer == b.integer;
-    if (valueFloat(a)) |left| if (valueFloat(b)) |right| return left == right;
+    if (numericOrder(a, b)) |order| return order == .eq and !isNan(a) and !isNan(b);
     if (valueText(a)) |left| if (valueText(b)) |right| {
         return if (ignore_case)
             std.ascii.eqlIgnoreCase(left, right)
@@ -784,10 +784,7 @@ pub fn valuesEqual(a: Value, b: Value, ignore_case: bool) bool {
 }
 
 pub fn compareValues(a: Value, b: Value) std.math.Order {
-    if (a == .integer and b == .integer) return std.math.order(a.integer, b.integer);
-    if (valueFloat(a)) |left| if (valueFloat(b)) |right| {
-        return std.math.order(left, right);
-    };
+    if (numericOrder(a, b)) |order| return order;
     if (valueText(a)) |left| if (valueText(b)) |right| {
         return std.mem.order(u8, left, right);
     };
@@ -798,6 +795,31 @@ pub fn compareValues(a: Value, b: Value) std.math.Order {
         },
         else => .eq,
     };
+}
+
+fn numericOrder(a: Value, b: Value) ?std.math.Order {
+    return switch (a) {
+        .integer => |left| switch (b) {
+            .integer => |right| std.math.order(left, right),
+            .float => |right| integerFloatOrder(left, right),
+            else => null,
+        },
+        .float => |left| switch (b) {
+            .integer => |right| integerFloatOrder(right, left).invert(),
+            .float => |right| value_module.compareFloat(left, right),
+            else => null,
+        },
+        else => null,
+    };
+}
+
+fn integerFloatOrder(integer: i64, float: f64) std.math.Order {
+    if (std.math.isNan(float)) return .eq;
+    return value_module.compareIntegerFloat(integer, float);
+}
+
+fn isNan(value: Value) bool {
+    return value == .float and std.math.isNan(value.float);
 }
 
 pub fn valueFloat(value: Value) ?f64 {

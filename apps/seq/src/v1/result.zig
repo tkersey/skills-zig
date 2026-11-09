@@ -15,6 +15,16 @@ pub const Selection = struct {
     since_ms: ?i64 = null,
     until_ms: ?i64 = null,
 
+    pub fn validateText(self: Selection) !void {
+        inline for (.{ "path", "root", "archive_root", "session_id", "repo" }) |field| {
+            if (@field(self, field)) |value| {
+                if (!std.unicode.utf8ValidateSlice(value)) {
+                    return error.ObservationSelectionNotUtf8;
+                }
+            }
+        }
+    }
+
     pub fn digest(self: Selection) [71]u8 {
         var hasher = std.crypto.hash.sha2.Sha256.init(.{});
         hasher.update("seq-observation-selection/v2\x00");
@@ -726,6 +736,15 @@ test "selection identity retains every resolved selector and default-root proven
     var explicit = base;
     explicit.root_explicit = true;
     try std.testing.expect(!std.mem.eql(u8, &base.digest(), &explicit.digest()));
+}
+
+test "selection text must be UTF-8 before any corpus is read" {
+    try (Selection{ .path = "/sessions/one.jsonl", .root = "/sessions" }).validateText();
+    inline for (.{ "path", "root", "archive_root", "session_id", "repo" }) |field| {
+        var selection = Selection{};
+        @field(selection, field) = "/caf\xe9";
+        try std.testing.expectError(error.ObservationSelectionNotUtf8, selection.validateText());
+    }
 }
 
 test "observation result fails before emitting beyond the declared byte bound" {

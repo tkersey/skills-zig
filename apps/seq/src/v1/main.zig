@@ -7,7 +7,6 @@ const durable_store = @import("durable_store");
 const Version = std.mem.trim(u8, app_meta.version, " \t\r\n");
 const source_adapter_version = "seq-source-adapter-set/v3";
 const max_output_cells: usize = 4_000_000;
-const max_discovery_bytes: usize = 256 * 1024 * 1024;
 const ongoing_threshold_secs: i64 = 60;
 
 const Help =
@@ -92,12 +91,17 @@ const ObserveArgs = struct {
         };
     }
 
-    fn traceOptions(self: *const ObserveArgs, max_input_bytes: usize) seq.trace_adapter.Options {
+    fn freshnessOptions(self: *const ObserveArgs) seq.trace_adapter.Options {
         return .{
-            .max_input_bytes = max_input_bytes,
             .ongoing_threshold_secs = ongoing_threshold_secs,
             .as_of_ns = @as(i128, self.as_of_ms) * std.time.ns_per_ms,
         };
+    }
+
+    fn traceOptions(self: *const ObserveArgs, max_input_bytes: usize) seq.trace_adapter.Options {
+        var options = self.freshnessOptions();
+        options.max_input_bytes = max_input_bytes;
+        return options;
     }
     fn deinit(self: *ObserveArgs, allocator: std.mem.Allocator) void {
         allocator.free(self.input_specs);
@@ -465,7 +469,12 @@ fn emitGraphObservation(
         bindings,
         &graph,
         elapsedNanoseconds(io, execution_start),
-        graph.projection_bounded,
+        graph.projection_bounded or try seq.relation_graph.projectionMayTruncate(
+            allocator,
+            &context.definition_plan,
+            &context.native_plan,
+            args.projection,
+        ),
     );
 }
 
@@ -791,6 +800,7 @@ fn runObserve(
             null;
         defer if (archive_root) |root| allocator.free(root);
         args.resolved_archive_root = archive_root;
+        try args.selection().validateText();
         return emitGraphObservation(
             io,
             dir,
@@ -832,6 +842,7 @@ fn emitLinearObservation(
         null;
     defer if (archive_root) |root| allocator.free(root);
     args.resolved_archive_root = archive_root;
+    try args.selection().validateText();
     return emitObservation(
         io,
         dir,
@@ -1436,10 +1447,10 @@ const StreamingParseTask = struct {
     allocator: std.mem.Allocator = std.heap.smp_allocator,
     path: []const u8,
     relation: seq.physical.Relation,
-    max_input_bytes: usize,
+    options: seq.trace_adapter.Options,
+    reserved_bytes: usize,
     compressed: bool = false,
     session_seed_row: ?usize = null,
-    as_of_ns: i128 = 0,
     repo: ?[]const u8,
     selected: ?seq.trace_adapter.SelectedParse = null,
     failure: ?anyerror = null,
@@ -1451,11 +1462,7 @@ const StreamingParseTask = struct {
             self.allocator,
             &.{self.relation},
             self.path,
-            .{
-                .max_input_bytes = self.max_input_bytes,
-                .ongoing_threshold_secs = ongoing_threshold_secs,
-                .as_of_ns = self.as_of_ns,
-            },
+            self.options,
             .{ .repo = self.repo },
         ) catch |err| {
             self.failure = err;
@@ -1500,7 +1507,7 @@ const DiscoveredSessions = struct {
                     dir,
                     allocator,
                     path,
-                    args.traceOptions(max_discovery_bytes - result.identity_bytes),
+                    args.freshnessOptions(),
                     args.selectors.repo,
                 ),
             };
@@ -1510,9 +1517,6 @@ const DiscoveredSessions = struct {
                 result.identity_bytes,
                 item.identity.bytes_read,
             );
-            if (result.identity_bytes > max_discovery_bytes) {
-                return error.ObservationDiscoveryByteBoundExceeded;
-            }
             try indexDiscoveredSession(&result.indices, item.*, index);
         }
         try result.orderByDepth(allocator, max_depth);
@@ -1628,18 +1632,55 @@ fn createStreamingParseTasks(
             .dir = graph.dir,
             .path = path,
             .relation = graph.plans.native_plan.stages[schedule.scan_stage].operation.scan.relation,
-            .max_input_bytes = if (compressed)
+            .options = graph.args.traceOptions(if (compressed)
                 graph.plans.definition_plan.bounds.max_input_bytes
             else
-                item.identity.file_size,
+                item.identity.file_size),
+            .reserved_bytes = if (compressed) 0 else item.identity.file_size,
             .compressed = compressed,
             .session_seed_row = row,
-            .as_of_ns = @as(i128, graph.args.as_of_ms) * std.time.ns_per_ms,
             .repo = graph.args.selectors.repo,
         });
     }
+    const spare_bytes = graph.plans.definition_plan.bounds.max_input_bytes - reserved_bytes;
+    for (tasks.items) |*task| {
+        if (!task.compressed) task.options.max_input_bytes = task.reserved_bytes + spare_bytes;
+    }
     return tasks.toOwnedSlice(graph.allocator);
 }
+
+const StreamingReservations = struct {
+    bound: usize = 0,
+    unconsumed: usize = 0,
+
+    fn init(bound: usize, tasks: []const StreamingParseTask) StreamingReservations {
+        var unconsumed: usize = 0;
+        for (tasks) |task| unconsumed += task.reserved_bytes;
+        std.debug.assert(unconsumed <= bound);
+        return .{ .bound = bound, .unconsumed = unconsumed };
+    }
+
+    fn readLimit(
+        self: *const StreamingReservations,
+        metrics: *const PhysicalMetrics,
+        reserved_bytes: usize,
+    ) usize {
+        std.debug.assert(reserved_bytes <= self.unconsumed);
+        std.debug.assert(metrics.corpus_bytes <= self.bound - self.unconsumed);
+        return self.bound - metrics.corpus_bytes - (self.unconsumed - reserved_bytes);
+    }
+
+    fn admit(
+        self: *StreamingReservations,
+        metrics: *PhysicalMetrics,
+        reserved_bytes: usize,
+        actual_bytes: usize,
+    ) !void {
+        std.debug.assert(reserved_bytes <= self.unconsumed);
+        self.unconsumed -= reserved_bytes;
+        try recordCorpusBytes(metrics, actual_bytes, self.bound - self.unconsumed);
+    }
+};
 
 const StreamingGraphState = struct {
     graph: *const GraphObservationContext,
@@ -1647,6 +1688,7 @@ const StreamingGraphState = struct {
     metrics: PhysicalMetrics = .{},
     digest_set: CorpusSetHasher = .{},
     interner: seq.trace_adapter.ValueInterner = .{},
+    reservations: StreamingReservations = .{},
     source_rows: usize = 0,
     materialized_rows: usize,
     session_seed: ?*seq.relation_graph.ScanInput = null,
@@ -1677,13 +1719,13 @@ const StreamingGraphState = struct {
         task.selected = null;
         defer if (selected.parsed) |*parsed| parsed.deinit(task.allocator);
         try recordTraceRead(&self.metrics, selected);
+        try self.reservations.admit(
+            &self.metrics,
+            task.reserved_bytes,
+            if (selected.parsed) |parsed| parsed.metrics.bytes_read else 0,
+        );
         const parsed = if (selected.parsed) |*value| value else return;
         try self.metrics.admitAdapter(seq.trace_adapter.adapterId(&parsed.trace));
-        try recordCorpusBytes(
-            &self.metrics,
-            parsed.metrics.bytes_read,
-            self.graph.plans.definition_plan.bounds.max_input_bytes,
-        );
         try admitTraceSession(&self.metrics, parsed);
         if (self.usage_column) |column| {
             const seed = self.session_seed orelse return error.ObservationPhysicalParseMissing;
@@ -1774,9 +1816,10 @@ fn runStreamingParseTasks(
     defer for (tasks) |*task| task.deinit();
     for (tasks) |task| if (task.compressed) {
         for (tasks) |*sequential| {
-            const remaining = state.graph.plans.definition_plan.bounds.max_input_bytes -|
-                state.metrics.corpus_bytes;
-            sequential.max_input_bytes = @min(sequential.max_input_bytes, remaining);
+            sequential.options.max_input_bytes = state.reservations.readLimit(
+                &state.metrics,
+                sequential.reserved_bytes,
+            );
             sequential.run();
             if (sequential.failure) |failure| return failure;
             try state.consume(sequential, reducer);
@@ -1805,6 +1848,15 @@ fn runStreamingParseTasks(
         }
         try state.consume(task, reducer);
     }
+}
+
+fn tokenUsageColumn(context: *const seq.compiled_plan.PlanSet, session_stage: u16) ?usize {
+    const session_scan = context.native_plan.stages[session_stage].operation.scan;
+    for (session_scan.field_indices, 0..) |field, column| {
+        const name = seq.physical.Relation.sessions.fields()[field].name;
+        if (std.mem.eql(u8, name, "token_usage_observation_count")) return column;
+    }
+    return null;
 }
 
 fn executeStreamingGraphObservation(
@@ -1864,16 +1916,13 @@ fn executeStreamingGraphObservation(
         .schedule = schedule,
         .materialized_rows = lineage_graph.materialized_rows,
         .session_seed = &session_seed[0],
+        .usage_column = tokenUsageColumn(context, session_seed[0].stage_index),
     };
-    const session_scan = context.native_plan.stages[session_seed[0].stage_index].operation.scan;
-    for (session_scan.field_indices, 0..) |field, column| {
-        const name = seq.physical.Relation.sessions.fields()[field].name;
-        if (std.mem.eql(u8, name, "token_usage_observation_count")) state.usage_column = column;
-    }
     try state.recordDiscovery(&discovered, paths.items);
     defer state.interner.deinit(graph.table_allocator);
     const tasks = try createStreamingParseTasks(&graph, schedule, &discovered, paths.items);
     defer allocator.free(tasks);
+    state.reservations = .init(context.definition_plan.bounds.max_input_bytes, tasks);
     try runStreamingParseTasks(&state, tasks, &reducer);
     return state.finish(&reducer, &session_seed[0]);
 }
@@ -2452,9 +2501,6 @@ fn recordTraceRead(metrics: *PhysicalMetrics, selected: seq.trace_adapter.Select
 fn recordDiscoveryBytes(metrics: *PhysicalMetrics, bytes: usize) !void {
     metrics.discovery_bytes = std.math.add(usize, metrics.discovery_bytes, bytes) catch
         return error.ObservationMetricOverflow;
-    if (metrics.discovery_bytes > max_discovery_bytes) {
-        return error.ObservationDiscoveryByteBoundExceeded;
-    }
     metrics.bytes_read = std.math.add(
         usize,
         metrics.bytes_read,
@@ -3771,7 +3817,8 @@ test "failed first parse joins and releases prefetched successful results" {
             .allocator = allocator,
             .path = missing,
             .relation = .sessions,
-            .max_input_bytes = 4096,
+            .options = .{ .max_input_bytes = 4096, .as_of_ns = 0 },
+            .reserved_bytes = 4096,
             .repo = null,
         },
         .{
@@ -3780,7 +3827,8 @@ test "failed first parse joins and releases prefetched successful results" {
             .allocator = allocator,
             .path = path,
             .relation = .sessions,
-            .max_input_bytes = 4096,
+            .options = .{ .max_input_bytes = 4096, .as_of_ns = 0 },
+            .reserved_bytes = 4096,
             .repo = null,
         },
     };
@@ -3793,6 +3841,66 @@ test "failed first parse joins and releases prefetched successful results" {
     );
     try std.testing.expect(tasks[1].failure == null);
     for (tasks) |task| try std.testing.expect(task.selected == null);
+}
+
+test "streaming reservations let growth borrow only unreserved budget" {
+    var metrics = PhysicalMetrics{};
+    var reservations = StreamingReservations{ .bound = 25, .unconsumed = 20 };
+    try reservations.admit(&metrics, 10, 14);
+    try reservations.admit(&metrics, 10, 11);
+    try std.testing.expectEqual(25, metrics.corpus_bytes);
+    try std.testing.expectEqual(0, reservations.unconsumed);
+    var held_metrics = PhysicalMetrics{};
+    var held = StreamingReservations{ .bound = 25, .unconsumed = 20 };
+    try std.testing.expectError(
+        error.ObservationInputByteBoundExceeded,
+        held.admit(&held_metrics, 10, 16),
+    );
+    var skipped_metrics = PhysicalMetrics{};
+    var skipped = StreamingReservations{ .bound = 25, .unconsumed = 20 };
+    try skipped.admit(&skipped_metrics, 10, 0);
+    try skipped.admit(&skipped_metrics, 10, 25);
+    try std.testing.expectEqual(25, skipped_metrics.corpus_bytes);
+    var sequential_metrics = PhysicalMetrics{};
+    var sequential = StreamingReservations{ .bound = 30, .unconsumed = 20 };
+    try std.testing.expectEqual(20, sequential.readLimit(&sequential_metrics, 10));
+    try sequential.admit(&sequential_metrics, 10, 12);
+    try std.testing.expectEqual(18, sequential.readLimit(&sequential_metrics, 10));
+    try std.testing.expectEqual(8, sequential.readLimit(&sequential_metrics, 0));
+}
+
+fn runGrownTask(path: []const u8, reserved: usize, spare: usize) !StreamingParseTask {
+    var task = StreamingParseTask{
+        .io = std.testing.io,
+        .dir = std.Io.Dir.cwd(),
+        .allocator = std.testing.allocator,
+        .path = path,
+        .relation = .sessions,
+        .options = .{ .max_input_bytes = reserved + spare, .as_of_ns = 0 },
+        .reserved_bytes = reserved,
+        .repo = null,
+    };
+    task.run();
+    return task;
+}
+
+test "a session that grows after discovery reads into spare budget on the production path" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const source = "{\"type\":\"session_meta\",\"payload\":{\"id\":\"growing\"}}\n" ++
+        "{\"type\":\"event_msg\",\"payload\":{\"type\":\"token_count\",\"info\":null}}\n";
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "growing.jsonl", .data = source });
+    const path = try tmp.dir.realPathFileAlloc(std.testing.io, "growing.jsonl", allocator);
+    defer allocator.free(path);
+    const discovered = source.len - 20;
+    var within = try runGrownTask(path, discovered, 20);
+    defer within.deinit();
+    try std.testing.expect(within.failure == null);
+    try std.testing.expectEqual(source.len, within.selected.?.parsed.?.metrics.bytes_read);
+    var beyond = try runGrownTask(path, discovered, 19);
+    defer beyond.deinit();
+    try std.testing.expectEqual(error.ObservationInputByteBoundExceeded, beyond.failure.?);
 }
 
 fn exerciseRetainedGraphResultFailure(allocator: std.mem.Allocator) !void {

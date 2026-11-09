@@ -9,11 +9,14 @@ const plan = @import("plan.zig");
 const seq_time = @import("seq_time");
 const structured = @import("structured.zig");
 
+pub const max_discovery_prefix_bytes: usize = 1024 * 1024;
+
 pub const Options = struct {
     ongoing_threshold_secs: i64 = 60,
     as_of_ns: ?i128 = null,
     structured_limits: structured.Limits = .{},
     max_input_bytes: usize = 64 * 1024 * 1024 * 1024,
+    discovery_prefix_limit: usize = max_discovery_prefix_bytes,
 };
 
 pub const SessionSelection = struct {
@@ -66,16 +69,16 @@ pub fn discoverSessionIdentity(
     defer file.close(io);
     const stat = try file.stat(io);
     var raw = file.reader(io, &.{});
-    var input = try SessionInput.init(allocator, path, &raw.interface, options.max_input_bytes);
-    defer input.deinit(allocator);
-    var bounded_reader = input.reader().limited(
-        .limited(options.max_input_bytes +| 1),
-        &.{},
+    var input = try SessionInput.init(
+        allocator,
+        path,
+        &raw.interface,
+        options.discovery_prefix_limit,
     );
-    const prefix = readSummaryPrefixAlloc(allocator, &bounded_reader.interface) catch |err|
+    defer input.deinit(allocator);
+    const prefix = readDiscoveryPrefixAlloc(allocator, input.reader(), options) catch |err|
         return input.sourceError(err);
     defer allocator.free(prefix);
-    if (prefix.len > options.max_input_bytes) return error.ObservationDiscoveryByteBoundExceeded;
     var reader = std.Io.Reader.fixed(prefix);
     var summary = try trace_core.parseSessionSummaryTraceReader(
         io,
@@ -179,90 +182,37 @@ pub fn parseFileSelected(
         .external => return error.ObservationRequiresExternalInput,
     };
     if (!supported(relation)) return error.UnsupportedTracePhysicalRelation;
-    if (selection) |selected| {
-        if (!canonicalPathPassesSessionSelection(path, selected)) {
-            return skippedSelection(false, 0);
-        }
-    }
-
-    const file = try openTraceFile(io, dir, path);
-    defer file.close(io);
-    const stat = try file.stat(io);
-    if (!trace_core.SessionInput.isCompressed(path) and stat.size > options.max_input_bytes) {
-        return error.ObservationInputByteBoundExceeded;
-    }
-    var raw = file.reader(io, &.{});
-    var input = try SessionInput.init(allocator, path, &raw.interface, options.max_input_bytes);
-    defer input.deinit(allocator);
-    var bounded_reader = input.reader().limited(
-        .limited(options.max_input_bytes +| 1),
-        &.{},
-    );
-    return parseSelectedProgramReader(
-        io,
-        allocator,
-        program,
-        relation,
-        path,
-        stat.mtime.nanoseconds,
-        &bounded_reader.interface,
-        options,
-        selection,
-    ) catch |err| return input.sourceError(err);
+    return parseAdmittedFile(io, dir, allocator, path, options, selection, ProgramParser{
+        .program = program,
+        .relation = relation,
+    });
 }
 
-fn parseSelectedProgramReader(
-    io: std.Io,
-    allocator: std.mem.Allocator,
+const ProgramParser = struct {
     program: *const execution.Program,
     relation: physical.Relation,
-    path: []const u8,
-    source_mtime_ns: i128,
-    source_reader: *std.Io.Reader,
-    options: Options,
-    selection: ?SessionSelection,
-) !SelectedParse {
-    const prefix = try readSelectionPrefixAlloc(
-        allocator,
-        source_reader,
-        selection,
-    );
-    defer allocator.free(prefix);
-    const preselection = if (selection) |selected|
-        try preselectSession(
+
+    fn parse(
+        self: ProgramParser,
+        io: std.Io,
+        allocator: std.mem.Allocator,
+        path: []const u8,
+        reader: *std.Io.Reader,
+        source_mtime_ns: i128,
+        options: Options,
+    ) !ParsedTrace {
+        return parseSelectedReader(
             io,
             allocator,
-            path,
-            source_mtime_ns,
-            options,
-            selected,
-            prefix,
-        )
-    else
-        Preselection{};
-    if (!preselection.passes) {
-        return skippedSelection(true, preselection.bytes_read);
-    }
-    var replay_reader = PrefixReader.init(prefix, source_reader);
-    const reader = if (selection != null)
-        &replay_reader.interface
-    else
-        source_reader;
-    return .{
-        .parsed = try parseSelectedReader(
-            io,
-            allocator,
-            program,
-            relation,
+            self.program,
+            self.relation,
             path,
             source_mtime_ns,
             reader,
             options,
-        ),
-        .discovery_bytes_read = 0,
-        .file_opened = true,
-    };
-}
+        );
+    }
+};
 
 pub fn parseRelationsFileSelected(
     io: std.Io,
@@ -277,6 +227,44 @@ pub fn parseRelationsFileSelected(
     for (relations) |relation| if (!supported(relation)) {
         return error.UnsupportedTracePhysicalRelation;
     };
+    return parseAdmittedFile(io, dir, allocator, path, options, selection, RelationsParser{
+        .relations = relations,
+    });
+}
+
+const RelationsParser = struct {
+    relations: []const physical.Relation,
+
+    fn parse(
+        self: RelationsParser,
+        io: std.Io,
+        allocator: std.mem.Allocator,
+        path: []const u8,
+        reader: *std.Io.Reader,
+        source_mtime_ns: i128,
+        options: Options,
+    ) !ParsedTrace {
+        return parseSelectedRelations(
+            io,
+            allocator,
+            path,
+            reader,
+            source_mtime_ns,
+            self.relations,
+            options,
+        );
+    }
+};
+
+fn parseAdmittedFile(
+    io: std.Io,
+    dir: std.Io.Dir,
+    allocator: std.mem.Allocator,
+    path: []const u8,
+    options: Options,
+    selection: ?SessionSelection,
+    parser: anytype,
+) !SelectedParse {
     if (selection) |selected| {
         if (!canonicalPathPassesSessionSelection(path, selected)) {
             return skippedSelection(false, 0);
@@ -285,21 +273,37 @@ pub fn parseRelationsFileSelected(
     const file = try openTraceFile(io, dir, path);
     defer file.close(io);
     const stat = try file.stat(io);
-    if (!trace_core.SessionInput.isCompressed(path) and stat.size > options.max_input_bytes) {
-        return error.ObservationInputByteBoundExceeded;
-    }
     var raw = file.reader(io, &.{});
-    var input = try SessionInput.init(allocator, path, &raw.interface, options.max_input_bytes);
-    defer input.deinit(allocator);
-    var bounded_reader = input.reader().limited(
-        .limited(options.max_input_bytes +| 1),
-        &.{},
-    );
-    const prefix = readSelectionPrefixAlloc(
+    var input = try SessionInput.init(
         allocator,
-        &bounded_reader.interface,
+        path,
+        &raw.interface,
+        @max(options.max_input_bytes, options.discovery_prefix_limit),
+    );
+    defer input.deinit(allocator);
+    return admitSelectedInput(
+        io,
+        allocator,
+        path,
+        stat,
+        input.reader(),
+        options,
         selection,
+        parser,
     ) catch |err| return input.sourceError(err);
+}
+
+fn admitSelectedInput(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    path: []const u8,
+    stat: std.Io.File.Stat,
+    source: *std.Io.Reader,
+    options: Options,
+    selection: ?SessionSelection,
+    parser: anytype,
+) !SelectedParse {
+    const prefix = try readSelectionPrefixAlloc(allocator, source, selection, options);
     defer allocator.free(prefix);
     const preselection = if (selection) |selected|
         try preselectSession(
@@ -316,20 +320,26 @@ pub fn parseRelationsFileSelected(
     if (!preselection.passes) {
         return skippedSelection(true, preselection.bytes_read);
     }
-    var replay_reader = PrefixReader.init(prefix, &bounded_reader.interface);
-    const reader = if (selection != null)
-        &replay_reader.interface
-    else
-        &bounded_reader.interface;
-    return parseSelectedRelations(
-        io,
-        allocator,
-        path,
-        reader,
-        stat.mtime.nanoseconds,
-        relations,
-        options,
-    ) catch |err| return input.sourceError(err);
+    if (!SessionInput.isCompressed(path) and stat.size > options.max_input_bytes) {
+        return error.ObservationInputByteBoundExceeded;
+    }
+    var remainder = source.limited(
+        .limited((options.max_input_bytes +| 1) -| prefix.len),
+        &.{},
+    );
+    var replay_reader = PrefixReader.init(prefix, &remainder.interface);
+    return .{
+        .parsed = try parser.parse(
+            io,
+            allocator,
+            path,
+            &replay_reader.interface,
+            stat.mtime.nanoseconds,
+            options,
+        ),
+        .discovery_bytes_read = 0,
+        .file_opened = true,
+    };
 }
 
 fn parseSelectedRelations(
@@ -340,7 +350,7 @@ fn parseSelectedRelations(
     modified_at: i128,
     relations: []const physical.Relation,
     options: Options,
-) !SelectedParse {
+) !ParsedTrace {
     var metrics = trace_core.StreamMetrics{};
     var corpus_hasher = CorpusHasher{};
     var trace = try trace_core.parseSessionTraceReaderWithVisitorMetrics(
@@ -359,14 +369,10 @@ fn parseSelectedRelations(
         return error.ObservationInputByteBoundExceeded;
     }
     return .{
-        .parsed = .{
-            .trace = trace,
-            .metrics = metrics,
-            .corpus_digest = corpus_hasher.digest(),
-            .source_mtime_ns = modified_at,
-        },
-        .discovery_bytes_read = 0,
-        .file_opened = true,
+        .trace = trace,
+        .metrics = metrics,
+        .corpus_digest = corpus_hasher.digest(),
+        .source_mtime_ns = modified_at,
     };
 }
 
@@ -387,7 +393,7 @@ test "source growth beyond a reservation fails after at most one extra byte" {
     try std.testing.expectEqual(reserved + 1, reader.seek);
 }
 
-test "identity discovery obeys its remaining byte allowance" {
+test "identity discovery obeys its per-file prefix limit" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     try tmp.dir.writeFile(std.testing.io, .{
@@ -401,9 +407,119 @@ test "identity discovery obeys its remaining byte allowance" {
             tmp.dir,
             std.testing.allocator,
             "session.jsonl",
-            .{ .max_input_bytes = 8 },
+            .{ .discovery_prefix_limit = 8 },
             null,
         ),
+    );
+    var identity = try discoverSessionIdentity(
+        std.testing.io,
+        tmp.dir,
+        std.testing.allocator,
+        "session.jsonl",
+        .{ .max_input_bytes = 8 },
+        null,
+    );
+    defer identity.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("discovery", identity.session_id.?);
+}
+
+fn writeRepoSession(dir: std.Io.Dir, name: []const u8, cwd: []const u8) !void {
+    var data: std.ArrayList(u8) = .empty;
+    defer data.deinit(std.testing.allocator);
+    try data.print(
+        std.testing.allocator,
+        "{{\"type\":\"session_meta\",\"payload\":{{\"id\":\"{s}\",\"cwd\":\"{s}\"}}}}\n",
+        .{ name, cwd },
+    );
+    for (0..8) |_| try data.appendSlice(
+        std.testing.allocator,
+        "{\"type\":\"event_msg\",\"payload\":{\"type\":\"token_count\",\"info\":null}}\n",
+    );
+    try dir.writeFile(std.testing.io, .{ .sub_path = name, .data = data.items });
+}
+
+test "selection skips an oversized non-matching session before charging the corpus bound" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try writeRepoSession(tmp.dir, "other.jsonl", "/other");
+    try writeRepoSession(tmp.dir, "inside.jsonl", "/repo/app");
+    const options: Options = .{ .max_input_bytes = 64, .as_of_ns = 0 };
+    const selection: SessionSelection = .{ .repo = "/repo" };
+    const other_path = try tmp.dir.realPathFileAlloc(
+        std.testing.io,
+        "other.jsonl",
+        std.testing.allocator,
+    );
+    defer std.testing.allocator.free(other_path);
+    const skipped = try parseRelationsFileSelected(
+        std.testing.io,
+        std.Io.Dir.cwd(),
+        std.testing.allocator,
+        &.{.sessions},
+        other_path,
+        options,
+        selection,
+    );
+    try std.testing.expect(skipped.parsed == null);
+    try std.testing.expect(skipped.file_opened);
+    try std.testing.expect(skipped.discovery_bytes_read > 0);
+    const inside_path = try tmp.dir.realPathFileAlloc(
+        std.testing.io,
+        "inside.jsonl",
+        std.testing.allocator,
+    );
+    defer std.testing.allocator.free(inside_path);
+    try std.testing.expectError(
+        error.ObservationInputByteBoundExceeded,
+        parseRelationsFileSelected(
+            std.testing.io,
+            std.Io.Dir.cwd(),
+            std.testing.allocator,
+            &.{.sessions},
+            inside_path,
+            options,
+            selection,
+        ),
+    );
+    var admitted = try parseRelationsFileSelected(
+        std.testing.io,
+        std.Io.Dir.cwd(),
+        std.testing.allocator,
+        &.{.sessions},
+        inside_path,
+        .{ .as_of_ns = 0 },
+        selection,
+    );
+    defer if (admitted.parsed) |*parsed| parsed.deinit(std.testing.allocator);
+    const stat = try tmp.dir.statFile(std.testing.io, "inside.jsonl", .{});
+    try std.testing.expectEqual(stat.size, admitted.parsed.?.metrics.bytes_read);
+    try std.testing.expectEqual(@as(usize, 0), admitted.discovery_bytes_read);
+}
+
+fn discoverLineageIdentity(allocator: std.mem.Allocator, dir: std.Io.Dir) !void {
+    var identity = try discoverSessionIdentity(
+        std.testing.io,
+        dir,
+        allocator,
+        "child.jsonl",
+        .{},
+        null,
+    );
+    identity.deinit(allocator);
+}
+
+test "identity discovery releases copies on every allocation failure" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "child.jsonl",
+        .data = "{\"type\":\"session_meta\",\"payload\":" ++
+            "{\"id\":\"child\",\"parent_thread_id\":\"parent\"}}\n",
+    });
+    try @import("test_support").checkAllAllocationFailures(
+        std.testing.allocator,
+        discoverLineageIdentity,
+        .{tmp.dir},
     );
 }
 
@@ -497,11 +613,26 @@ fn readSelectionPrefixAlloc(
     allocator: std.mem.Allocator,
     reader: *std.Io.Reader,
     selection: ?SessionSelection,
+    options: Options,
 ) ![]u8 {
     if (selection != null and requiresSummaryPreselection(selection.?)) {
-        return readSummaryPrefixAlloc(allocator, reader);
+        return readDiscoveryPrefixAlloc(allocator, reader, options);
     }
     return allocator.alloc(u8, 0);
+}
+
+fn readDiscoveryPrefixAlloc(
+    allocator: std.mem.Allocator,
+    source: *std.Io.Reader,
+    options: Options,
+) ![]u8 {
+    var bounded_reader = source.limited(.limited(options.discovery_prefix_limit +| 1), &.{});
+    const prefix = try readSummaryPrefixAlloc(allocator, &bounded_reader.interface);
+    if (prefix.len > options.discovery_prefix_limit) {
+        allocator.free(prefix);
+        return error.ObservationDiscoveryByteBoundExceeded;
+    }
+    return prefix;
 }
 
 fn readSummaryPrefixAlloc(

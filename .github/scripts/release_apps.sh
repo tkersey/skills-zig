@@ -111,7 +111,7 @@ case "$mode" in
         scripts/guards/definition-core-domain.sh)
           mark_definition_consumers
           ;;
-        scripts/test-seq-cli.sh)
+        scripts/test-seq-cli.sh|scripts/test-seq-observation-contract.sh)
           mark_app seq
           ;;
         scripts/test-ledger-cli.sh)

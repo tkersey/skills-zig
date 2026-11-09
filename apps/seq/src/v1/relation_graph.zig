@@ -138,6 +138,14 @@ pub fn streamingLineagePlan(
             null,
             0,
         );
+        if (!try streamingSeedsCover(
+            allocator,
+            definition_plan,
+            native_plan,
+            native_plan.projections[projection_index].stage_index,
+            @intCast(stage_index),
+            graph_stage,
+        )) return null;
         return .{
             .scan_stage = scan_stage,
             .local_stage = local_stage,
@@ -146,6 +154,85 @@ pub fn streamingLineagePlan(
         };
     }
     return null;
+}
+
+fn streamingSeedsCover(
+    allocator: std.mem.Allocator,
+    definition_plan: *const definition.Plan,
+    native_plan: *const plan.Plan,
+    projection_stage: u16,
+    lineage_stage: u16,
+    graph_stage: u16,
+) !bool {
+    const count = native_plan.stages.len;
+    const graph_reachable = try allocator.alloc(bool, count);
+    defer allocator.free(graph_reachable);
+    @memset(graph_reachable, false);
+    try markReachable(
+        allocator,
+        definition_plan,
+        native_plan,
+        graph_stage,
+        graph_reachable,
+        &.{},
+        0,
+    );
+    var seeded_scan: ?usize = null;
+    for (native_plan.stages, graph_reachable, 0..) |stage, reached, index| {
+        if (!reached or stage.operation != .scan) continue;
+        if (seeded_scan != null or stage.operation.scan.relation != .sessions) return false;
+        seeded_scan = index;
+    }
+    var boundary = [_]ScanInput{.{
+        .stage_index = lineage_stage,
+        .table = .{ .values = &.{}, .width = 0 },
+    }};
+    const reachable = try allocator.alloc(bool, count);
+    defer allocator.free(reachable);
+    @memset(reachable, false);
+    try markReachable(
+        allocator,
+        definition_plan,
+        native_plan,
+        projection_stage,
+        reachable,
+        &boundary,
+        0,
+    );
+    for (native_plan.stages, reachable, 0..) |stage, reached, index| {
+        if (reached and stage.operation == .scan and index != seeded_scan) return false;
+    }
+    return true;
+}
+
+pub fn projectionMayTruncate(
+    allocator: std.mem.Allocator,
+    definition_plan: *const definition.Plan,
+    native_plan: *const plan.Plan,
+    projection_name: []const u8,
+) !bool {
+    const projection_index = findProjection(definition_plan, projection_name) orelse
+        return error.UnknownObservationProjection;
+    const reachable = try allocator.alloc(bool, native_plan.stages.len);
+    defer allocator.free(reachable);
+    @memset(reachable, false);
+    try markReachable(
+        allocator,
+        definition_plan,
+        native_plan,
+        native_plan.projections[projection_index].stage_index,
+        reachable,
+        &.{},
+        0,
+    );
+    for (native_plan.stages, reachable) |stage, reached| {
+        if (!reached) continue;
+        switch (stage.operation) {
+            .limit, .top_k => return true,
+            else => {},
+        }
+    }
+    return false;
 }
 
 const StageFrame = struct {
@@ -364,6 +451,7 @@ const GraphExecution = struct {
             break :blk found.table;
         } else blk: {
             const stage = self.native_plan.stages[index];
+            if (stage.operation == .scan) return error.ObservationInputNotExecuted;
             const first_index = self.native_plan.findStage(step.input_names[0]) orelse
                 return error.ObservationExternalGraphInputUnsupported;
             const input = self.tables[first_index] orelse return error.ObservationInputNotExecuted;
@@ -1785,7 +1873,7 @@ fn joinEqualityHash(
 
 fn hashValue(hash: *std.hash.Wyhash, value: execution.Value) void {
     if (valueFloat(value)) |number| {
-        const bits: u64 = @bitCast(number);
+        const bits: u64 = @bitCast(if (number == 0) @as(f64, 0) else number);
         hash.update(std.mem.asBytes(&bits));
         return;
     }
@@ -1840,8 +1928,9 @@ const LineageIndex = struct {
         };
         errdefer result.deinit(allocator);
         for (0..try rows.rowCount()) |row_index| {
-            const node = valueText(rows.row(row_index)[result.node_index]) orelse
-                return error.InvalidObservationLineageNode;
+            const value = rows.row(row_index)[result.node_index];
+            if (value == .null) continue;
+            const node = valueText(value) orelse return error.InvalidObservationLineageNode;
             const entry = try result.nodes.getOrPut(allocator, node);
             if (entry.found_existing) return error.DuplicateObservationLineageNode;
             entry.value_ptr.* = row_index;
@@ -3188,6 +3277,66 @@ fn exerciseSharedGraph(
     if (!owned) try std.testing.expectEqualDeep(expected, borrowed);
 }
 
+test "streaming lineage falls back when the projection reads an unseeded scan" {
+    const Case = struct { source: []const u8, streams: bool };
+    const cases = [_]Case{
+        .{ .source = @embedFile("fixtures/lineage-observation.json"), .streams = true },
+        .{ .source = @embedFile("fixtures/lineage-extra-scan.json"), .streams = false },
+    };
+    for (cases) |case| {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        try tmp.dir.writeFile(std.testing.io, .{
+            .sub_path = "definition.json",
+            .data = case.source,
+        });
+        var closure = try definition_core.closure.loadFromDir(
+            std.testing.io,
+            std.testing.allocator,
+            &tmp.dir,
+            "definition.json",
+            .{},
+        );
+        defer closure.deinit(std.testing.allocator);
+        var definition_plan = try definition.compile(
+            std.testing.allocator,
+            &closure,
+            "definition.json",
+        );
+        defer definition_plan.deinit(std.testing.allocator);
+        var native_plan = try plan.compile(std.testing.allocator, &definition_plan);
+        defer native_plan.deinit(std.testing.allocator);
+        const schedule = try streamingLineagePlan(
+            std.testing.allocator,
+            &definition_plan,
+            &native_plan,
+            "rows",
+        );
+        try std.testing.expectEqual(case.streams, schedule != null);
+        if (case.streams) continue;
+        var scans = [_]ScanInput{
+            .{
+                .stage_index = native_plan.findStage("session_rows").?,
+                .table = .{ .values = &.{}, .width = 2 },
+            },
+            .{
+                .stage_index = native_plan.findStage("owned_rows").?,
+                .table = .{ .values = &.{}, .width = 3 },
+            },
+        };
+        try std.testing.expectError(error.ObservationInputNotExecuted, executeTarget(
+            std.testing.allocator,
+            std.testing.allocator,
+            &definition_plan,
+            &native_plan,
+            &expression_test_bindings,
+            .{},
+            native_plan.findStage("joined_rows").?,
+            &scans,
+        ));
+    }
+}
+
 test "branching filters membership joins and folds preserve shared inputs and ownership" {
     const sources = [_][]const u8{
         @embedFile("fixtures/shared-filter.json"),
@@ -3254,6 +3403,76 @@ test "integer comparison and distinct preserve adjacent values beyond float prec
     );
     defer std.testing.allocator.free(distinct.values);
     try std.testing.expectEqualDeep(&[_]execution.Value{ low, high }, distinct.values);
+}
+
+fn distinctCount(values: []execution.Value) !usize {
+    var keys = [_]u16{0};
+    const distinct = try distinctTable(
+        std.testing.allocator,
+        .{ .values = values, .width = 1 },
+        .{ .field_indices = &keys },
+    );
+    defer std.testing.allocator.free(distinct.values);
+    return distinct.values.len;
+}
+
+test "mixed integer and float comparisons stay exact and transitive beyond float precision" {
+    const boundary: i64 = 9_007_199_254_740_992;
+    const low: execution.Value = .{ .integer = boundary };
+    const float_low: execution.Value = .{ .float = @floatFromInt(boundary) };
+    const high: execution.Value = .{ .integer = boundary + 1 };
+    try std.testing.expect(valuesEqual(low, float_low, false));
+    try std.testing.expect(!valuesEqual(high, float_low, false));
+    try std.testing.expect(!valuesEqual(float_low, high, false));
+    try std.testing.expectEqual(std.math.Order.eq, compareValues(low, float_low));
+    try std.testing.expectEqual(std.math.Order.lt, compareValues(float_low, high));
+    try std.testing.expectEqual(std.math.Order.gt, compareValues(high, float_low));
+    try std.testing.expectEqual(
+        std.math.Order.lt,
+        compareValues(.{ .integer = std.math.maxInt(i64) }, .{ .float = 9.3e18 }),
+    );
+    try std.testing.expectEqual(
+        std.math.Order.gt,
+        compareValues(.{ .integer = std.math.minInt(i64) }, .{ .float = -9.3e18 }),
+    );
+    const orders = [_][3]execution.Value{
+        .{ low, float_low, high },
+        .{ float_low, low, high },
+        .{ high, float_low, low },
+        .{ high, low, float_low },
+        .{ low, high, float_low },
+        .{ float_low, high, low },
+    };
+    var sort_keys = [_]plan.SortKey{
+        .{ .field_index = 0, .direction = .ascending, .nulls = .last },
+    };
+    for (orders) |order| {
+        var values = order;
+        try std.testing.expectEqual(@as(usize, 2), try distinctCount(&values));
+        const input = Table{ .values = &values, .width = 1 };
+        try std.testing.expect(hasTotalSortOrder(input, &sort_keys));
+        for ([_]usize{ 0, 1, 2, 3 }) |limit| try expectGraphTopK(input, &sort_keys, limit);
+    }
+}
+
+test "numeric equality and hashing agree for signed zero" {
+    var values = [_]execution.Value{
+        .{ .float = -0.0 },
+        .{ .integer = 0 },
+        .{ .float = 0.0 },
+    };
+    try std.testing.expectEqual(@as(usize, 1), try distinctCount(&values));
+}
+
+test "graph comparisons stay defined for NaN" {
+    const nan: execution.Value = .{ .float = std.math.nan(f64) };
+    try std.testing.expect(!valuesEqual(nan, nan, false));
+    try std.testing.expect(!valuesEqual(nan, .{ .integer = 1 }, false));
+    try std.testing.expect(!valuesEqual(.{ .integer = 1 }, nan, false));
+    try std.testing.expectEqual(std.math.Order.eq, compareValues(nan, .{ .integer = 1 }));
+    try std.testing.expectEqual(std.math.Order.eq, compareValues(.{ .float = 2 }, nan));
+    var values = [_]execution.Value{ nan, .{ .integer = 3 }, nan };
+    try std.testing.expectEqual(@as(usize, 3), try distinctCount(&values));
 }
 
 test "stage traversal checks depth before memoization and respects scan boundaries" {

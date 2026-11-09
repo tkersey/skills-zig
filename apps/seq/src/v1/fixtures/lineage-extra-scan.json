@@ -1,0 +1,167 @@
+{
+  "schema": "seq-observation-definition/v1",
+  "id": "example/message-lineage-extra-scan",
+  "requires": {
+    "abi": "seq-observation-abi/v1",
+    "operators": [
+      "filter",
+      "join",
+      "scan"
+    ]
+  },
+  "parameters": {},
+  "selectors": [
+    "path",
+    "root",
+    "repo"
+  ],
+  "relations": [
+    {
+      "name": "sessions",
+      "fields": [
+        "session_id",
+        "parent_session_id"
+      ]
+    },
+    {
+      "name": "messages",
+      "fields": [
+        "session_id",
+        "source_event_id",
+        "role"
+      ]
+    }
+  ],
+  "inputs": [],
+  "pipeline": [
+    {
+      "op": "scan",
+      "relation": "sessions",
+      "as": "session_rows"
+    },
+    {
+      "op": "scan",
+      "relation": "messages",
+      "as": "message_rows"
+    },
+    {
+      "op": "filter",
+      "input": "message_rows",
+      "as": "assistant_rows",
+      "where": [
+        {
+          "field": "role",
+          "op": "exact",
+          "value": "assistant"
+        }
+      ]
+    },
+    {
+      "op": "join",
+      "inputs": [
+        "assistant_rows",
+        "assistant_rows",
+        "session_rows"
+      ],
+      "as": "owned_rows",
+      "on": {
+        "kind": "anti",
+        "keys": [
+          {
+            "left": "source_event_id",
+            "right": "source_event_id"
+          }
+        ],
+        "lineage": {
+          "left": "session_id",
+          "right": "session_id",
+          "node": "session_id",
+          "parent": "parent_session_id"
+        }
+      },
+      "fields": [
+        {
+          "source": 0,
+          "field": "session_id",
+          "name": "session_id",
+          "type": "string",
+          "nullable": false
+        },
+        {
+          "source": 0,
+          "field": "role",
+          "name": "role",
+          "type": "string",
+          "nullable": true
+        },
+        {
+          "source": 0,
+          "field": "source_event_id",
+          "name": "source_event_id",
+          "type": "string",
+          "nullable": false
+        }
+      ]
+    },
+    {
+      "op": "scan",
+      "relation": "messages",
+      "as": "message_again"
+    },
+    {
+      "op": "join",
+      "inputs": [
+        "owned_rows",
+        "message_again"
+      ],
+      "as": "joined_rows",
+      "on": {
+        "kind": "inner",
+        "keys": [
+          {
+            "left": "source_event_id",
+            "right": "source_event_id"
+          }
+        ]
+      },
+      "fields": [
+        {
+          "source": 0,
+          "field": "session_id",
+          "name": "session_id",
+          "type": "string",
+          "nullable": false
+        },
+        {
+          "source": 1,
+          "field": "role",
+          "name": "role",
+          "type": "string",
+          "nullable": true
+        }
+      ]
+    }
+  ],
+  "projections": {
+    "rows": {
+      "relation": "joined_rows",
+      "schema": "example-message-lineage-extra-scan/v1",
+      "fields": [
+        "session_id",
+        "role"
+      ],
+      "renderers": [
+        "json"
+      ]
+    }
+  },
+  "bounds": {
+    "max_rows": 100,
+    "max_output_bytes": 4096,
+    "max_fold_states": 4,
+    "max_input_bytes": 1048576,
+    "max_graph_depth": 8,
+    "max_graph_nodes": 100,
+    "max_diagnostics": 8
+  }
+}

@@ -5,7 +5,10 @@ const definition = @import("definition.zig");
 const plan = @import("plan.zig");
 const physical = @import("physical.zig");
 
-pub const Value = @import("value.zig").Value;
+const value_module = @import("value.zig");
+pub const Value = value_module.Value;
+const compareFloat = value_module.compareFloat;
+const compareIntegerFloat = value_module.compareIntegerFloat;
 const expressions = @import("expressions.zig");
 
 pub const Rows = struct {
@@ -1823,25 +1826,6 @@ fn compareValues(left: Value, right: Value) std.math.Order {
         },
         .null => if (right == .null) .eq else .lt,
     };
-}
-
-fn compareFloat(left: f64, right: f64) std.math.Order {
-    if (left < right) return .lt;
-    if (left > right) return .gt;
-    return .eq;
-}
-
-fn compareIntegerFloat(left: i64, right: f64) std.math.Order {
-    const integer_min: f64 = -9_223_372_036_854_775_808.0;
-    const integer_limit: f64 = 9_223_372_036_854_775_808.0;
-    if (right < integer_min) return .gt;
-    if (right >= integer_limit) return .lt;
-    const truncated: i64 = @intFromFloat(right);
-    const integer_order = std.math.order(left, truncated);
-    if (integer_order != .eq) return integer_order;
-    if (right > 0 and right != @trunc(right)) return .lt;
-    if (right < 0 and right != @trunc(right)) return .gt;
-    return .eq;
 }
 
 fn compareValueTags(left: Value, right: Value) std.math.Order {
