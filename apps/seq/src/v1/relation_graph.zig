@@ -74,7 +74,7 @@ pub fn boundedNativePrefix(
     while (depth < 256 and depth <= definition_plan.bounds.max_graph_depth) : (depth += 1) {
         const stage = &native_plan.stages[current];
         switch (stage.operation) {
-            .scan => return target,
+            .scan => |scan| return if (scan.relation == .sessions) null else target,
             .filter, .project, .alias, .limit => {},
             .top_k => target = current,
             .generic => |generic| if (generic.operator != .derive) return null,
@@ -120,26 +120,21 @@ pub fn streamingLineagePlan(
             try definition_core.json.field(root, "on"),
         );
         const lineage = try definition_core.json.object(on.get("lineage") orelse continue);
-        if (!try followsHistoryParent(lineage)) return null;
         const step = definition_plan.steps[stage_index];
-        if (step.input_names.len != 3 or
-            !std.mem.eql(u8, step.input_names[0], step.input_names[1]))
-        {
-            return error.ObservationStreamingLineageShapeUnsupported;
-        }
+        if (!try reducerSupportsJoin(on, lineage, step)) return null;
         const local_stage = native_plan.findStage(step.input_names[0]) orelse
             return error.ObservationExternalGraphInputUnsupported;
         const graph_stage = native_plan.findStage(step.input_names[2]) orelse
             return error.ObservationExternalGraphInputUnsupported;
+        const fields = try configArray(root, "fields");
+        if (!joinProjectsLeft(fields, native_plan.stages[local_stage].schema)) return null;
         if (!try carriesSessionColumns(allocator, native_plan, graph_stage)) return null;
-        const scan_stage = try partitionScanRoot(
+        const scan_stage = try streamablePartitionRoot(
             allocator,
             definition_plan,
             native_plan,
             local_stage,
-            null,
-            0,
-        );
+        ) orelse return null;
         if (!try streamingSeedsCover(
             allocator,
             definition_plan,
@@ -209,16 +204,17 @@ fn carriesSessionColumns(
     var current = graph_stage;
     for (0..native_plan.stages.len) |_| {
         const stage = native_plan.stages[current];
+        if (readsParsedSessionColumn(native_plan, stage)) return false;
         switch (stage.operation) {
             .scan => return true,
-            .filter, .project, .alias, .limit, .sort, .top_k, .distinct => {},
+            .filter, .project, .alias, .sort => {},
             .generic => |generic| {
                 if (generic.operator != .derive) return false;
                 if (!try derivePreservesSessionColumns(allocator, generic.canonical_config)) {
                     return false;
                 }
             },
-            .aggregate => return false,
+            .limit, .top_k, .distinct, .aggregate => return false,
         }
         current = switch (stage.source orelse return false) {
             .stage => |index| index,
@@ -226,6 +222,26 @@ fn carriesSessionColumns(
         };
     }
     return false;
+}
+
+fn readsParsedSessionColumn(native_plan: *const plan.Plan, stage: plan.Stage) bool {
+    const name = "token_usage_observation_count";
+    const input = switch (stage.source orelse return false) {
+        .stage => |index| native_plan.stages[index],
+        .external => return false,
+    };
+    const column = input.schema.find(name) orelse return false;
+    return switch (stage.operation) {
+        .filter => |filter| for (filter.predicates) |predicate| {
+            if (predicate.field_index == column) break true;
+        } else false,
+        .generic => |generic| std.mem.indexOf(
+            u8,
+            generic.canonical_config,
+            "\"" ++ name ++ "\"",
+        ) != null,
+        else => false,
+    };
 }
 
 fn derivePreservesSessionColumns(allocator: std.mem.Allocator, config: []const u8) !bool {
@@ -267,10 +283,64 @@ fn seedsSessionFields(field_indices: []const u16) bool {
     return true;
 }
 
-fn followsHistoryParent(lineage: std.json.ObjectMap) !bool {
-    const node = try definition_core.json.requiredString(lineage, "node");
+fn reducerSupportsJoin(
+    on: std.json.ObjectMap,
+    lineage: std.json.ObjectMap,
+    step: definition.Step,
+) !bool {
+    if (step.input_names.len != 3) return false;
+    if (!std.mem.eql(u8, step.input_names[0], step.input_names[1])) return false;
+    const kind = try definition_core.json.string(on.get("kind") orelse return false);
+    if (!std.mem.eql(u8, kind, "anti")) return false;
+    return try followsSessionLineage(lineage) and try streamableJoinKeys(on);
+}
+
+fn streamableJoinKeys(on: std.json.ObjectMap) !bool {
+    const keys = try definition_core.json.array(try definition_core.json.field(on, "keys"));
+    for (keys.items) |item| {
+        const key = try definition_core.json.object(item);
+        if (!try equalityKey(key)) return false;
+        const left = try definition_core.json.requiredString(key, "left");
+        const right = try definition_core.json.requiredString(key, "right");
+        if (!std.mem.eql(u8, left, right)) return false;
+    }
+    return true;
+}
+
+fn equalityKey(key: std.json.ObjectMap) !bool {
+    const op = key.get("op") orelse return true;
+    return std.mem.eql(u8, try definition_core.json.string(op), "eq");
+}
+
+fn streamablePartitionRoot(
+    allocator: std.mem.Allocator,
+    definition_plan: *const definition.Plan,
+    native_plan: *const plan.Plan,
+    local_stage: u16,
+) !?u16 {
+    return partitionScanRoot(
+        allocator,
+        definition_plan,
+        native_plan,
+        local_stage,
+        null,
+        0,
+    ) catch |err| switch (err) {
+        error.ObservationPartitionOperatorUnsupported,
+        error.ObservationPartitionLayoutMissing,
+        error.ObservationPartitionPrefixHasMultipleScans,
+        => return null,
+        else => return err,
+    };
+}
+
+fn followsSessionLineage(lineage: std.json.ObjectMap) !bool {
+    inline for (.{ "node", "left", "right" }) |key| {
+        const value = try definition_core.json.requiredString(lineage, key);
+        if (!std.mem.eql(u8, value, "session_id")) return false;
+    }
     const parent = try definition_core.json.requiredString(lineage, "parent");
-    return std.mem.eql(u8, node, "session_id") and std.mem.eql(u8, parent, "parent_session_id");
+    return std.mem.eql(u8, parent, "parent_session_id");
 }
 
 fn streamingSeedsCover(
@@ -385,7 +455,7 @@ fn partitionScanRoot(
                 count -= 1;
                 continue;
             }
-            try validatePartitionOperator(stage);
+            try validatePartitionOperator(allocator, native_plan, stage);
         }
         const step = definition_plan.steps[frame.stage_index];
         if (step.input_names.len == 0) return error.ObservationPartitionLayoutMissing;
@@ -413,15 +483,86 @@ fn validatePartitionScan(stage: plan.Stage, stage_index: u16, expected: ?u16) !v
     };
 }
 
-fn validatePartitionOperator(stage: plan.Stage) !void {
-    switch (stage.operation) {
-        .filter, .project, .alias, .distinct => {},
+fn validatePartitionOperator(
+    allocator: std.mem.Allocator,
+    native_plan: *const plan.Plan,
+    stage: plan.Stage,
+) !void {
+    const local = switch (stage.operation) {
+        .filter, .project, .alias => true,
+        .distinct => |distinct| keysSession(native_plan, stage, distinct.field_indices),
         .generic => |generic| switch (generic.operator) {
-            .derive, .ordered_fold, .join => {},
-            else => return error.ObservationPartitionOperatorUnsupported,
+            .derive, .ordered_fold, .join => try keepsPartition(allocator, generic),
+            else => false,
         },
-        else => return error.ObservationPartitionOperatorUnsupported,
+        else => false,
+    };
+    if (!local) return error.ObservationPartitionOperatorUnsupported;
+}
+
+fn keysSession(native_plan: *const plan.Plan, stage: plan.Stage, field_indices: []const u16) bool {
+    const input = switch (stage.source orelse return false) {
+        .stage => |index| native_plan.stages[index],
+        .external => return false,
+    };
+    const column = input.schema.find("session_id") orelse return false;
+    return std.mem.indexOfScalar(u16, field_indices, column) != null;
+}
+
+fn keepsPartition(allocator: std.mem.Allocator, generic: plan.Generic) !bool {
+    var parsed = try parseConfig(allocator, generic.canonical_config);
+    defer parsed.deinit();
+    const root = try definition_core.json.object(parsed.value);
+    const outputs = switch (generic.operator) {
+        .ordered_fold => outputs: {
+            if (!try namesSession(try configArray(root, "keys"))) return false;
+            break :outputs try configArray(root, "emit");
+        },
+        .join => outputs: {
+            const on = try definition_core.json.object(try definition_core.json.field(root, "on"));
+            if (!try pairsSession(try configArray(on, "keys"))) return false;
+            break :outputs try configArray(root, "fields");
+        },
+        else => try configArray(root, "fields"),
+    };
+    for (outputs.items) |item| {
+        const field = try definition_core.json.object(item);
+        const name = try definition_core.json.requiredString(field, "name");
+        if (!std.mem.eql(u8, name, "session_id")) continue;
+        if (!try copiesSession(generic.operator, field)) return false;
     }
+    return true;
+}
+
+fn namesSession(keys: std.json.Array) !bool {
+    for (keys.items) |item| {
+        if (std.mem.eql(u8, try definition_core.json.string(item), "session_id")) return true;
+    }
+    return false;
+}
+
+fn pairsSession(keys: std.json.Array) !bool {
+    for (keys.items) |item| {
+        const key = try definition_core.json.object(item);
+        if (!try equalityKey(key)) continue;
+        const left = try definition_core.json.requiredString(key, "left");
+        const right = try definition_core.json.requiredString(key, "right");
+        if (std.mem.eql(u8, left, "session_id") and std.mem.eql(u8, right, "session_id")) {
+            return true;
+        }
+    }
+    return false;
+}
+
+fn copiesSession(operator: definition.Operator, field: std.json.ObjectMap) !bool {
+    if (operator == .join) {
+        const source = try definition_core.json.requiredString(field, "field");
+        return std.mem.eql(u8, source, "session_id");
+    }
+    const expr = try definition_core.json.object(try definition_core.json.field(field, "expr"));
+    if (expr.count() != 1) return false;
+    const copied = try definition_core.json.string(expr.get("field") orelse return false);
+    return std.mem.eql(u8, copied, "session_id");
 }
 
 pub fn requiredScanStages(
@@ -3017,11 +3158,11 @@ test "streaming lineage lowering is selected from non-token topology" {
         \\        "lineage":{"left":"session_id","right":"session_id","node":"session_id","parent":"parent_session_id"}},
         \\      "fields":[
         \\        {"source":0,"field":"session_id","name":"session_id","type":"string","nullable":false},
-        \\        {"source":0,"field":"source_event_id","name":"source_event_id","type":"string","nullable":false},
-        \\        {"source":0,"field":"role","name":"role","type":"string","nullable":true}
+        \\        {"source":0,"field":"role","name":"role","type":"string","nullable":true},
+        \\        {"source":0,"field":"source_event_id","name":"source_event_id","type":"string","nullable":false}
         \\      ]}
         \\  ],
-        \\  "projections":{"rows":{"relation":"owned_rows","schema":"test/message-lineage/v1","fields":["session_id","source_event_id","role"],"renderers":["json"]}},
+        \\  "projections":{"rows":{"relation":"owned_rows","schema":"test/message-lineage/v1","fields":["session_id","role","source_event_id"],"renderers":["json"]}},
         \\  "bounds":{"max_rows":100,"max_output_bytes":4096,"max_fold_states":4,"max_input_bytes":1048576,"max_graph_depth":8,"max_graph_nodes":100,"max_diagnostics":8}
         \\}
     ;
@@ -3455,6 +3596,7 @@ test "streaming lineage falls back when the projection reads an unseeded scan" {
         .{ .source = @embedFile("fixtures/lineage-observation.json"), .streams = true },
         .{ .source = @embedFile("fixtures/lineage-control-parent.json"), .streams = false },
         .{ .source = @embedFile("fixtures/lineage-extra-scan.json"), .streams = false },
+        .{ .source = @embedFile("fixtures/lineage-token-filter.json"), .streams = false },
     };
     for (cases) |case| {
         var tmp = std.testing.tmpDir(.{});

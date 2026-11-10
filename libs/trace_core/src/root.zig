@@ -4486,7 +4486,9 @@ const WorkerGraphParser = struct {
         if (output == .array) {
             for (output.array.items) |item| {
                 const block = valueObject(item) orelse continue;
-                if (!std.mem.eql(u8, stringField(block, "type") orelse "", "text")) continue;
+                if (!oneOfString(stringField(block, "type") orelse "", &.{
+                    "text", "input_text", "output_text",
+                })) continue;
                 try applyOutputText(
                     allocator,
                     trace,
@@ -6059,6 +6061,32 @@ test "successful task-path spawn preserves unresolved thread identity" {
     try std.testing.expectEqual(@as(usize, 1), trace.graph_edges.items.len);
     try std.testing.expect(trace.graph_edges.items[0].worker_session_id == null);
     try std.testing.expectEqualStrings("/root/worker", trace.graph_edges.items[0].agent_path.?);
+}
+
+test "spawn results in text-like output blocks supply worker edges" {
+    const source =
+        \\{"type":"session_meta","payload":{"id":"parent"}}
+        \\{"type":"response_item","payload":{"type":"function_call","name":"spawn_agent","call_id":"input","arguments":"{}"}}
+        \\{"type":"response_item","payload":{"type":"function_call_output","call_id":"input","output":[{"type":"input_text","text":"{\"agent_id\":\"input-worker\"}"}]}}
+        \\{"type":"response_item","payload":{"type":"function_call","name":"spawn_agent","call_id":"output","arguments":"{}"}}
+        \\{"type":"response_item","payload":{"type":"function_call_output","call_id":"output","output":[{"type":"output_text","text":"{\"agent_id\":\"output-worker\"}"}]}}
+    ;
+    for ([_]bool{ false, true }) |spaced| {
+        var traces = try workerGraphTestTraces(source, spaced);
+        defer for (&traces) |*trace| trace.deinit(std.testing.allocator);
+        for (&traces) |*trace| {
+            try std.testing.expectEqual(@as(i64, 2), trace.session.spawned_worker_count);
+            try std.testing.expectEqual(@as(usize, 2), trace.graph_edges.items.len);
+            try std.testing.expectEqualDeep(
+                @as(?[]const u8, "input-worker"),
+                trace.graph_edges.items[0].worker_session_id,
+            );
+            try std.testing.expectEqualDeep(
+                @as(?[]const u8, "output-worker"),
+                trace.graph_edges.items[1].worker_session_id,
+            );
+        }
+    }
 }
 
 test "legacy worker metadata supplies a graph edge but fork ancestry alone does not" {

@@ -142,17 +142,33 @@ puts NaN after every number and kinds as text, numbers, then booleans; descendin
 order reverses both.
 Sessions without an
 identity, such as an empty rollout, do not participate in lineage joins and cannot be
-linked by reachability. A
-lineage definition whose projection reads a scan the streaming strategy cannot
-seed, or whose lineage join walks a parent other than `parent_session_id` from
-`session_id` as carried unchanged from the sessions relation, or whose sessions scan
-declares fields that discovery cannot seed (only identity, lineage, path, and token
-count fields are seeded), runs on the materialized-graph strategy over the whole root; with
-`--path` or `--session-id` such a definition fails with
+linked by reachability.
+
+A lineage definition streams (`partition-lineage-stream`) only when all of these hold:
+
+- its lineage join is an anti join whose left and right inputs are the same stage,
+  whose projection is that input unchanged, whose equality keys each pair a field
+  with itself, and whose lineage relates rows and nodes by `session_id` and walks
+  `parent_session_id`;
+- its local stages stay within one session: `distinct`, `ordered_fold`, and joins
+  are keyed by `session_id`, and a stage that outputs `session_id` copies it from
+  `session_id`;
+- its lineage graph input reaches the sessions scan through filters, projections,
+  aliases, sorts, and input-preserving derives that do not define `session_id` or
+  `parent_session_id`, without limiting, ranking, or deduplicating sessions, and
+  without filtering or deriving on the token count, which exists only after
+  parsing;
+- its projection reads no other scan, and the sessions scan declares only fields
+  discovery seeds (identity, lineage, path, and token count fields).
+
+Any other lineage definition runs on the materialized-graph strategy over the whole
+root; with `--path` or `--session-id` it fails with
 `ObservationStreamingLineageShapeUnsupported`, because only the streaming strategy
-reads the selection's lineage closure. A streaming lineage `--session-id` must
-match exactly one discovered session that passes `--repo`, or the observation
-fails with `SessionNotFound` or `AmbiguousSessionTarget`, as other strategies do. A `limit` or `top-k` count
+reads the selection's lineage closure. A streaming lineage `--session-id` that
+matches no discovered session passing `--repo` fails with `SessionNotFound`, as
+other strategies do. Streaming lineage indexes every discovered session, so a session
+id that appears twice under the root fails it with `DuplicateObservationLineageNode`.
+A `limit` or `top-k` count
 bound from a parameter must lie between 1 and `bounds.max_rows`, as a literal count
 must; other values fail with `InvalidObservationLimit` on every strategy. Every
 strategy checks that the parameters its filters and limits use are bound before it
@@ -170,6 +186,9 @@ filters, and row-local derivations through the native runner. Only the retained
 top-k rows enter the remaining graph. `seq explain` reports this as
 `bounded-native-prefix`. Adding excerpt derivations to a search therefore keeps
 its path/session/time selection and avoids retaining the entire matching corpus.
+A `sessions` scan never lowers to this prefix: the native runner summarizes
+sessions, while graph definitions read them with the full parser, so a graph over
+`sessions` runs on the materialized graph whether it ranks with `top-k` or `sort`.
 The native row, retained-byte, input-byte, output, and fold-state limits still apply
 (each `limit` in the prefix counts against `bounds.max_fold_states`), and each
 row's derived strings share a buffer of `bounds.max_output_bytes`; a row that exceeds
@@ -220,7 +239,9 @@ boundary; the boundary alone does not prove new consumption.
 `sessions.token_usage_observation_count` counts records asserting a total or
 last-usage tuple before replay removal. Observed zero and replayed assertions
 remain evidence; neutral records do not establish a usage baseline. Unsupported
-adapters expose this field as null.
+adapters expose this field as null, and so does a session that a streaming lineage
+run scoped by `--path` or `--session-id` leaves unparsed outside the selection's
+lineage closure.
 
 Worker edges preserve recorded control parents, successful spawn results, and
 started-worker events. Declarations and failed spawns do not establish workers.

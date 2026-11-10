@@ -1990,7 +1990,7 @@ fn executeStreamingGraphObservation(
         .session_seed = &session_seed[0],
         .usage_column = tokenUsageColumn(context, session_seed[0].stage_index),
     };
-    if (args.selectors.session_id) |wanted| try requireUniqueSession(&discovered, wanted);
+    if (args.selectors.session_id) |wanted| try requireDiscoveredSession(&discovered, wanted);
     try state.recordDiscovery(&discovered, paths.items);
     defer state.interner.deinit(graph.table_allocator);
     const tasks = try createStreamingParseTasks(&graph, schedule, &discovered, paths.items);
@@ -2000,15 +2000,13 @@ fn executeStreamingGraphObservation(
     return state.finish(&reducer, &session_seed[0]);
 }
 
-fn requireUniqueSession(discovered: *const DiscoveredSessions, wanted: []const u8) !void {
-    var matches: usize = 0;
+fn requireDiscoveredSession(discovered: *const DiscoveredSessions, wanted: []const u8) !void {
     for (discovered.items) |item| {
         if (!item.identity.repo_matches) continue;
         const actual = item.identity.session_id orelse continue;
-        if (std.mem.eql(u8, actual, wanted)) matches += 1;
+        if (std.mem.eql(u8, actual, wanted)) return;
     }
-    if (matches == 0) return error.SessionNotFound;
-    if (matches != 1) return error.AmbiguousSessionTarget;
+    return error.SessionNotFound;
 }
 
 fn sessionSelectionClosure(

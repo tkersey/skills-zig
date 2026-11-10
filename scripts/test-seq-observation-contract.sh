@@ -525,3 +525,113 @@ model_rows=$("$binary" observe --definition "$model_definition" --projection row
   --root "$work/aborted-root" --format json)
 jq -e '.data.rows == [{"session_id":"fixture-session","model":"gpt-test"}]' \
   <<<"$model_rows" >/dev/null
+
+token_definition=apps/seq/src/v1/fixtures/lineage-token-filter.json
+token_plan=$("$binary" explain --definition "$token_definition" --projection rows --format json)
+jq -e '.strategy.kind == "materialized-graph"' <<<"$token_plan" >/dev/null
+mkdir -p "$work/fork-root"
+cp "$rollout" "$work/fork-root/parent.jsonl"
+jq -c 'if .type == "session_meta" then
+  .payload.id = "fixture-child" | .payload.forked_from_id = "fixture-session" else . end' \
+  "$rollout" >"$work/fork-root/child.jsonl"
+jq '(.pipeline[] | select(.op == "join") | .on.keys) = [{left: "role", right: "role"}]' \
+  "$token_definition" >"$work/token-role.json"
+token_rows=$("$binary" observe --definition "$work/token-role.json" --projection rows \
+  --root "$work/fork-root" --format json)
+jq -e '[.data.rows[].session_id] == ["fixture-session"]' <<<"$token_rows" >/dev/null
+
+jq '.requires.operators += ["limit"] |
+  .pipeline = [.pipeline[0], {op:"limit", input:"session_rows", as:"first_session", limit:1}] +
+    .pipeline[1:] |
+  (.pipeline[] | select(.op == "join") | .inputs[2]) = "first_session" |
+  (.pipeline[] | select(.op == "join") | .on.keys) = [{left: "role", right: "role"}]' \
+  "$lineage_definition" >"$work/limited-lineage.json"
+limited_plan=$("$binary" explain --definition "$work/limited-lineage.json" --projection rows \
+  --format json)
+jq -e '.strategy.kind == "materialized-graph"' <<<"$limited_plan" >/dev/null
+limited_rows=$("$binary" observe --definition "$work/limited-lineage.json" --projection rows \
+  --root "$work/fork-root" --format json)
+jq -e '[.data.rows[].session_id] == ["fixture-session"]' <<<"$limited_rows" >/dev/null
+
+jq '(.pipeline[] | select(.op == "join") | .on.lineage.right) = "role"' \
+  "$lineage_definition" >"$work/role-lineage.json"
+role_plan=$("$binary" explain --definition "$work/role-lineage.json" --projection rows \
+  --format json)
+jq -e '.strategy.kind == "materialized-graph"' <<<"$role_plan" >/dev/null
+
+mkdir -p "$work/duplicate-root"
+cp "$rollout" "$work/duplicate-root/a.jsonl"
+cp "$rollout" "$work/duplicate-root/b.jsonl"
+if duplicate=$("$binary" observe --definition "$lineage_definition" --projection rows \
+  --root "$work/duplicate-root" --format json); then
+  echo "streaming lineage accepted a duplicated session id" >&2
+  exit 1
+fi
+jq -e '.code == "DuplicateObservationLineageNode"' <<<"$duplicate" >/dev/null
+
+legacy_rollout=libs/trace_core/testdata/old_2025_08_root_meta.jsonl
+for shape in top-k sort-limit; do
+  jq '.relations = [{name: "sessions",
+      fields: ["session_id", "turn_count", "status_reason", "start_time"]}] |
+    .pipeline[0].relation = "sessions" |
+    .pipeline[1].fields = [{name: "label", type: "string", nullable: true,
+      expr: {field: "session_id"}}] |
+    (.pipeline[] | select(.op == "top-k" or .op == "sort") | .by) =
+      [{field: "start_time", direction: "desc", nulls: "last"}] |
+    .pipeline[-1].fields = ["session_id", "turn_count", "status_reason"] |
+    .projections.rows.fields = ["session_id", "turn_count", "status_reason"]' \
+    "$work/null-$shape.json" >"$work/turns-$shape.json"
+  turns_plan=$("$binary" explain --definition "$work/turns-$shape.json" --projection rows \
+    --format json)
+  jq -e '.strategy.kind == "materialized-graph"' <<<"$turns_plan" >/dev/null
+  turns_rows=$("$binary" observe --definition "$work/turns-$shape.json" --projection rows \
+    --path "$legacy_rollout" --format json)
+  jq -e '.data.rows == [{"session_id":"old-session","turn_count":2,
+    "status_reason":"synthetic_message_boundary"}]' <<<"$turns_rows" >/dev/null
+done
+
+jq '(.pipeline[] | select(.op == "join") | .on.keys) = [{left: "source_event_id", right: "role"}]' \
+  "$lineage_definition" >"$work/asymmetric-lineage.json"
+asymmetric_plan=$("$binary" explain --definition "$work/asymmetric-lineage.json" \
+  --projection rows --format json)
+jq -e '.strategy.kind == "materialized-graph"' <<<"$asymmetric_plan" >/dev/null
+
+mkdir -p "$work/two-roots"
+cp "$rollout" "$work/two-roots/one.jsonl"
+jq -c 'if .type == "session_meta" then .payload.id = "fixture-two" else . end' \
+  "$rollout" >"$work/two-roots/two.jsonl"
+jq '(.pipeline[] | select(.op == "join") | .on.kind) = "semi"' \
+  "$lineage_definition" >"$work/semi-lineage.json"
+jq '.requires.operators += ["sort"] |
+  .pipeline = .pipeline[0:3] + [{op: "sort", input: "assistant_rows", as: "sorted_rows",
+    by: [{field: "source_event_id", direction: "asc"}]}] + .pipeline[3:] |
+  (.pipeline[] | select(.op == "join") | .inputs) = ["sorted_rows", "sorted_rows", "session_rows"]' \
+  "$lineage_definition" >"$work/sorted-lineage.json"
+jq '.requires.operators += ["distinct"] |
+  .pipeline = .pipeline[0:3] + [{op: "distinct", input: "assistant_rows", as: "first_roles",
+    keys: ["role"]}] + .pipeline[3:] |
+  (.pipeline[] | select(.op == "join") | .inputs) = ["first_roles", "first_roles", "session_rows"] |
+  (.pipeline[] | select(.op == "join") | .on.keys) = [{left: "role", right: "role"}]' \
+  "$lineage_definition" >"$work/role-distinct-lineage.json"
+for shape in semi-lineage sorted-lineage role-distinct-lineage; do
+  shape_plan=$("$binary" explain --definition "$work/$shape.json" --projection rows --format json)
+  jq -e '.strategy.kind == "materialized-graph"' <<<"$shape_plan" >/dev/null
+  "$binary" observe --definition "$work/$shape.json" --projection rows \
+    --root "$work/two-roots" --format json >"$work/$shape-rows.json"
+done
+jq -e '[.data.rows[].session_id] == ["fixture-session"]' \
+  "$work/role-distinct-lineage-rows.json" >/dev/null
+jq '(.pipeline[] | select(.op == "distinct") | .keys) = ["session_id", "role"]' \
+  "$work/role-distinct-lineage.json" >"$work/session-distinct-lineage.json"
+session_distinct_plan=$("$binary" explain --definition "$work/session-distinct-lineage.json" \
+  --projection rows --format json)
+jq -e '.strategy.kind == "partition-lineage-stream"' <<<"$session_distinct_plan" >/dev/null
+jq '(.pipeline[] | select(.op == "join") | .fields) |= [.[0], .[2], .[1]] |
+  .projections.rows.fields = ["session_id", "source_event_id", "role"]' \
+  "$lineage_definition" >"$work/reordered-lineage.json"
+reordered_plan=$("$binary" explain --definition "$work/reordered-lineage.json" --projection rows \
+  --format json)
+jq -e '.strategy.kind == "materialized-graph"' <<<"$reordered_plan" >/dev/null
+reordered_rows=$("$binary" observe --definition "$work/reordered-lineage.json" --projection rows \
+  --root "$work/two-roots" --format json)
+jq -e '(.data.rows | length) == 2' <<<"$reordered_rows" >/dev/null
