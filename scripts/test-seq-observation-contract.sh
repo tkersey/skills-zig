@@ -631,7 +631,87 @@ jq '(.pipeline[] | select(.op == "join") | .fields) |= [.[0], .[2], .[1]] |
   "$lineage_definition" >"$work/reordered-lineage.json"
 reordered_plan=$("$binary" explain --definition "$work/reordered-lineage.json" --projection rows \
   --format json)
-jq -e '.strategy.kind == "materialized-graph"' <<<"$reordered_plan" >/dev/null
-reordered_rows=$("$binary" observe --definition "$work/reordered-lineage.json" --projection rows \
-  --root "$work/two-roots" --format json)
-jq -e '(.data.rows | length) == 2' <<<"$reordered_rows" >/dev/null
+jq -e '.strategy.kind == "partition-lineage-stream"' <<<"$reordered_plan" >/dev/null
+jq '(.pipeline[] | select(.op == "join") | .fields) |= [.[0], .[2]] |
+  .projections.rows.fields = ["session_id", "source_event_id"]' \
+  "$lineage_definition" >"$work/subset-lineage.json"
+for shape in reordered-lineage subset-lineage; do
+  jq '.relations[0].fields += ["model"]' "$work/$shape.json" >"$work/$shape-materialized.json"
+  streamed=$("$binary" observe --definition "$work/$shape.json" --projection rows \
+    --root "$work/fork-root" --format json)
+  materialized=$("$binary" observe --definition "$work/$shape-materialized.json" \
+    --projection rows --root "$work/fork-root" --format json)
+  printf '%s\n' "$streamed" "$materialized" | jq -se '
+    .[0].data.rows == .[1].data.rows and (.[0].data.rows | length) == 2' >/dev/null
+done
+
+post_limit_plan=$("$binary" explain --definition "$work/lineage-limit.json" --projection rows \
+  --format json)
+jq -e '.strategy.kind == "partition-lineage-stream"' <<<"$post_limit_plan" >/dev/null
+post_limit_rows=$("$binary" observe --definition "$work/lineage-limit.json" --projection rows \
+  --root "$work/fork-root" --format json)
+jq -e '[.data.rows[].session_id] == ["fixture-child"]' <<<"$post_limit_rows" >/dev/null
+ordered_rows=$("$binary" observe --definition "$lineage_definition" --projection rows \
+  --root "$work/fork-root" --format json)
+jq -e '[.data.rows[].session_id] == ["fixture-child", "fixture-session"]' \
+  <<<"$ordered_rows" >/dev/null
+
+jq '.requires.operators += ["ordered-fold"] |
+  .pipeline = .pipeline[0:3] + [{op: "ordered-fold", input: "assistant_rows", as: "folded_rows",
+    keys: ["session_id"], order_by: [{field: "source_event_id", direction: "asc"}],
+    state: [], transitions: [],
+    emit: [{name: "session_id", type: "string", nullable: false, expr: {field: "session_id"}},
+      {name: "role", type: "string", nullable: true, expr: {field: "role"}},
+      {name: "source_event_id", type: "string", nullable: false,
+        expr: {field: "source_event_id"}}]}] + .pipeline[3:] |
+  (.pipeline[] | select(.op == "join") | .inputs) = ["folded_rows", "folded_rows", "session_rows"]' \
+  "$lineage_definition" >"$work/folded-lineage.json"
+jq '(.pipeline[] | select(.op == "join") | .on.left_true) = "missing_flag"' \
+  "$lineage_definition" >"$work/flagged-lineage.json"
+for shape in folded-lineage flagged-lineage; do
+  shape_plan=$("$binary" explain --definition "$work/$shape.json" --projection rows --format json)
+  jq -e '.strategy.kind == "materialized-graph"' <<<"$shape_plan" >/dev/null
+  "$binary" observe --definition "$work/$shape.json" --projection rows \
+    --root "$work/two-roots" --format json >/dev/null
+done
+jq '(.pipeline[] | select(.op == "join") | .on.keys) = []' \
+  "$lineage_definition" >"$work/keyless-lineage.json"
+keyless_plan=$("$binary" explain --definition "$work/keyless-lineage.json" --projection rows \
+  --format json)
+jq -e '.strategy.kind == "materialized-graph"' <<<"$keyless_plan" >/dev/null
+if keyless=$("$binary" observe --definition "$work/keyless-lineage.json" --projection rows \
+  --root "$work/two-roots" --format json); then
+  echo "lineage observation accepted a join without equality keys" >&2
+  exit 1
+fi
+jq -e '.code == "ObservationJoinRequiresEqualityKey"' <<<"$keyless" >/dev/null
+jq '(.pipeline[] | select(.op == "join") | .on.keys) = [{left: "missing_key", right: "missing_key"}]' \
+  "$lineage_definition" >"$work/unknown-key-lineage.json"
+unknown_key_plan=$("$binary" explain --definition "$work/unknown-key-lineage.json" \
+  --projection rows --format json)
+jq -e '.strategy.kind == "materialized-graph"' <<<"$unknown_key_plan" >/dev/null
+"$binary" observe --definition "$work/unknown-key-lineage.json" --projection rows \
+  --root "$work/two-roots" --format json >/dev/null
+jq '.relations[0].fields += ["model"]' "$lineage_definition" >"$work/materialized-lineage.json"
+materialized_rows=$("$binary" observe --definition "$work/materialized-lineage.json" \
+  --projection rows --root "$work/fork-root" --format json)
+printf '%s\n' "$ordered_rows" "$materialized_rows" | jq -se '
+  .[0].corpus.digest == .[1].corpus.digest and
+  ([.[0].data.rows[].session_id] == [.[1].data.rows[].session_id])' >/dev/null
+jq '.requires.operators += ["derive"] |
+  .pipeline = .pipeline[0:3] + [{op: "derive", input: "assistant_rows", as: "literal_rows",
+    preserve_input: false,
+    fields: [{name: "session_id", type: "string", nullable: false, expr: "fixed"},
+      {name: "role", type: "string", nullable: true, expr: {field: "role"}},
+      {name: "source_event_id", type: "string", nullable: false,
+        expr: {field: "source_event_id"}}]}] + .pipeline[3:] |
+  (.pipeline[] | select(.op == "join") | .inputs) = ["literal_rows", "literal_rows", "session_rows"]' \
+  "$lineage_definition" >"$work/literal-lineage.json"
+literal_plan=$("$binary" explain --definition "$work/literal-lineage.json" --projection rows \
+  --format json)
+jq -e '.strategy.kind == "materialized-graph"' <<<"$literal_plan" >/dev/null
+jq '(.pipeline[] | select(.op == "join") | .on.keys[0].nulls_equal) = "yes"' \
+  "$lineage_definition" >"$work/nulls-text-lineage.json"
+nulls_text_plan=$("$binary" explain --definition "$work/nulls-text-lineage.json" \
+  --projection rows --format json)
+jq -e '.strategy.kind == "materialized-graph"' <<<"$nulls_text_plan" >/dev/null

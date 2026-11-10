@@ -1522,6 +1522,7 @@ const StreamingParseTask = struct {
     reserved_bytes: usize,
     compressed: bool = false,
     session_seed_row: ?usize = null,
+    path_index: usize = 0,
     repo: ?[]const u8,
     selected: ?seq.trace_adapter.SelectedParse = null,
     failure: ?anyerror = null,
@@ -1710,14 +1711,20 @@ fn createStreamingParseTasks(
             .reserved_bytes = if (compressed) 0 else item.identity.file_size,
             .compressed = compressed,
             .session_seed_row = row,
+            .path_index = item.path_index,
             .repo = graph.args.selectors.repo,
         });
     }
-    const spare_bytes = graph.plans.definition_plan.bounds.max_input_bytes - reserved_bytes;
-    for (tasks.items) |*task| {
+    const bound = graph.plans.definition_plan.bounds.max_input_bytes;
+    shareSpareBudget(tasks.items, bound, reserved_bytes);
+    return tasks.toOwnedSlice(graph.allocator);
+}
+
+fn shareSpareBudget(tasks: []StreamingParseTask, bound: usize, reserved_bytes: usize) void {
+    const spare_bytes = bound - reserved_bytes;
+    for (tasks) |*task| {
         if (!task.compressed) task.options.max_input_bytes = task.reserved_bytes + spare_bytes;
     }
-    return tasks.toOwnedSlice(graph.allocator);
 }
 
 const StreamingReservations = struct {
@@ -1764,6 +1771,20 @@ const StreamingGraphState = struct {
     materialized_rows: usize,
     session_seed: ?*seq.relation_graph.ScanInput = null,
     usage_column: ?usize = null,
+    output_paths: std.ArrayList(usize) = .empty,
+    corpus_entries: std.ArrayList(CorpusEntry) = .empty,
+
+    const CorpusEntry = struct {
+        path_index: usize,
+        path: []const u8,
+        digest: [71]u8,
+    };
+
+    fn deinit(self: *StreamingGraphState) void {
+        self.interner.deinit(self.graph.table_allocator);
+        self.output_paths.deinit(self.graph.allocator);
+        self.corpus_entries.deinit(self.graph.allocator);
+    }
 
     fn recordDiscovery(
         self: *StreamingGraphState,
@@ -1809,13 +1830,18 @@ const StreamingGraphState = struct {
             else
                 .{ .integer = parsed.trace.session.token_usage_observation_count };
         }
-        self.digest_set.add(task.path, &parsed.corpus_digest);
-        try self.appendPartition(parsed, reducer);
+        try self.corpus_entries.append(self.graph.allocator, .{
+            .path_index = task.path_index,
+            .path = task.path,
+            .digest = parsed.corpus_digest,
+        });
+        try self.appendPartition(parsed, task.path_index, reducer);
     }
 
     fn appendPartition(
         self: *StreamingGraphState,
         parsed: *const seq.trace_adapter.ParsedTrace,
+        path_index: usize,
         reducer: *seq.relation_graph.StreamingLineageReducer,
     ) !void {
         const graph = self.graph;
@@ -1844,16 +1870,30 @@ const StreamingGraphState = struct {
             self.materialized_rows,
             local.materialized_rows,
         );
+        const before = reducer.rowCount();
         try reducer.appendPartition(local.table);
+        const kept = reducer.rowCount() - before;
+        try self.output_paths.appendNTimes(self.graph.allocator, path_index, kept);
     }
 
     fn finish(
         self: *StreamingGraphState,
         reducer: *seq.relation_graph.StreamingLineageReducer,
         session_seed: *seq.relation_graph.ScanInput,
+        discovered: *const DiscoveredSessions,
     ) !ObservationExecution {
         const graph = self.graph;
-        const owned = try reducer.finish();
+        std.mem.sort(CorpusEntry, self.corpus_entries.items, {}, corpusEntryLessThan);
+        for (self.corpus_entries.items) |entry| self.digest_set.add(entry.path, &entry.digest);
+        try orderSessionSeed(graph, session_seed, discovered);
+        const unordered = try reducer.finish();
+        defer graph.table_allocator.free(unordered.values);
+        const owned = try pathOrderedRows(
+            graph.allocator,
+            graph.table_allocator,
+            unordered,
+            self.output_paths.items,
+        );
         var scans = [_]seq.relation_graph.ScanInput{
             session_seed.*,
             .{
@@ -1992,12 +2032,66 @@ fn executeStreamingGraphObservation(
     };
     if (args.selectors.session_id) |wanted| try requireDiscoveredSession(&discovered, wanted);
     try state.recordDiscovery(&discovered, paths.items);
-    defer state.interner.deinit(graph.table_allocator);
+    defer state.deinit();
     const tasks = try createStreamingParseTasks(&graph, schedule, &discovered, paths.items);
     defer allocator.free(tasks);
     state.reservations = .init(context.definition_plan.bounds.max_input_bytes, tasks);
     try runStreamingParseTasks(&state, tasks, &reducer);
-    return state.finish(&reducer, &session_seed[0]);
+    return state.finish(&reducer, &session_seed[0], &discovered);
+}
+
+fn orderSessionSeed(
+    graph: *const GraphObservationContext,
+    seed: *seq.relation_graph.ScanInput,
+    discovered: *const DiscoveredSessions,
+) !void {
+    var paths: std.ArrayList(usize) = .empty;
+    defer paths.deinit(graph.allocator);
+    for (discovered.items) |item| {
+        if (item.identity.repo_matches) try paths.append(graph.allocator, item.path_index);
+    }
+    const ordered = try pathOrderedRows(
+        graph.allocator,
+        graph.table_allocator,
+        seed.table,
+        paths.items,
+    );
+    if (seed.owned) graph.table_allocator.free(seed.allocation orelse seed.table.values);
+    seed.table = ordered;
+    seed.allocation = ordered.values;
+    seed.owned = true;
+}
+
+fn pathOrderedRows(
+    scratch: std.mem.Allocator,
+    allocator: std.mem.Allocator,
+    table: seq.relation_graph.Table,
+    paths: []const usize,
+) !seq.relation_graph.Table {
+    const rows = try table.rowCount();
+    std.debug.assert(rows == paths.len);
+    const order = try scratch.alloc(usize, rows);
+    defer scratch.free(order);
+    for (order, 0..) |*slot, index| slot.* = index;
+    std.mem.sort(usize, order, paths, pathOrderLessThan);
+    const values = try allocator.alloc(seq.execution.Value, table.values.len);
+    for (order, 0..) |source, target| {
+        @memcpy(values[target * table.width ..][0..table.width], table.row(source));
+    }
+    return .{ .values = values, .width = table.width };
+}
+
+fn corpusEntryLessThan(
+    _: void,
+    left: StreamingGraphState.CorpusEntry,
+    right: StreamingGraphState.CorpusEntry,
+) bool {
+    return left.path_index < right.path_index;
+}
+
+fn pathOrderLessThan(paths: []const usize, left: usize, right: usize) bool {
+    if (paths[left] != paths[right]) return paths[left] < paths[right];
+    return left < right;
 }
 
 fn requireDiscoveredSession(discovered: *const DiscoveredSessions, wanted: []const u8) !void {
@@ -3971,18 +4065,19 @@ test "streaming reservations let growth borrow only unreserved budget" {
 }
 
 fn runGrownTask(path: []const u8, reserved: usize, spare: usize) !StreamingParseTask {
-    var task = StreamingParseTask{
+    var tasks = [_]StreamingParseTask{.{
         .io = std.testing.io,
         .dir = std.Io.Dir.cwd(),
         .allocator = std.testing.allocator,
         .path = path,
         .relation = .sessions,
-        .options = .{ .max_input_bytes = reserved + spare, .as_of_ns = 0 },
+        .options = .{ .max_input_bytes = reserved, .as_of_ns = 0 },
         .reserved_bytes = reserved,
         .repo = null,
-    };
-    task.run();
-    return task;
+    }};
+    shareSpareBudget(&tasks, reserved + spare, reserved);
+    tasks[0].run();
+    return tasks[0];
 }
 
 test "a session that grows after discovery reads into spare budget on the production path" {

@@ -147,12 +147,13 @@ linked by reachability.
 A lineage definition streams (`partition-lineage-stream`) only when all of these hold:
 
 - its lineage join is an anti join whose left and right inputs are the same stage,
-  whose projection is that input unchanged, whose equality keys each pair a field
-  with itself, and whose lineage relates rows and nodes by `session_id` and walks
+  whose projection takes only fields of that input, whose one or more equality keys each
+  pair a field of that input with itself, whose `left_true` and `right_true` flags
+  name fields of that input, and whose lineage relates rows and nodes by `session_id` and walks
   `parent_session_id`;
-- its local stages stay within one session: `distinct`, `ordered_fold`, and joins
-  are keyed by `session_id`, and a stage that outputs `session_id` copies it from
-  `session_id`;
+- its local stages stay within one session: they include no `ordered_fold`,
+  `distinct` and joins are keyed by `session_id`, and a stage that outputs
+  `session_id` copies it from `session_id`;
 - its lineage graph input reaches the sessions scan through filters, projections,
   aliases, sorts, and input-preserving derives that do not define `session_id` or
   `parent_session_id`, without limiting, ranking, or deduplicating sessions, and
@@ -160,6 +161,11 @@ A lineage definition streams (`partition-lineage-stream`) only when all of these
   parsing;
 - its projection reads no other scan, and the sessions scan declares only fields
   discovery seeds (identity, lineage, path, and token count fields).
+
+Streaming reads sessions in lineage-depth order but hands the stages after the
+lineage join its rows and sessions in source-path order, as the materialized graph
+reads them, so row order, order-dependent stages, and the corpus digest agree across
+strategies.
 
 Any other lineage definition runs on the materialized-graph strategy over the whole
 root; with `--path` or `--session-id` it fails with
