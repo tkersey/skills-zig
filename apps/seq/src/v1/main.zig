@@ -3,7 +3,6 @@ const app_meta = @import("app_meta");
 const definition_core = @import("definition_core");
 const seq = @import("seq_v1_core");
 const durable_store = @import("durable_store");
-const gist = @import("gist.zig");
 
 const Version = std.mem.trim(u8, app_meta.version, " \t\r\n");
 const source_adapter_version = "seq-source-adapter-set/v4";
@@ -29,10 +28,6 @@ const Help =
     \\    [--format json]
     \\  seq explain --definition <file> --projection <name>
     \\    [--param <name>=<value>]... [--format json|text]
-    \\
-    \\transport commands:
-    \\  seq gist create --input <request.json> [--format json]
-    \\  seq gist read --gist <id|url> [--revision <40-hex-sha>] [--format json]
     \\
     \\physical commands:
     \\  sessions
@@ -184,17 +179,6 @@ fn runSubcommand(
     }
     if (std.mem.eql(u8, command_name, "definition")) {
         return runDefinitionCommand(io, dir, allocator, environment, argv);
-    }
-    if (std.mem.eql(u8, command_name, "gist")) {
-        var document: std.Io.Writer.Allocating = .init(allocator);
-        defer document.deinit();
-        var diagnostic: gist.Diagnostics = .{};
-        gist.run(io, dir, allocator, environment, argv, &document.writer, &diagnostic) catch |err| {
-            try emitGistError(io, allocator, err, &diagnostic);
-            return 2;
-        };
-        try writeStdout(io, document.written());
-        return 0;
     }
     if (std.mem.eql(u8, command_name, "observe")) {
         if (isOnlyHelp(argv)) {
@@ -3380,7 +3364,7 @@ fn emitCapabilities(io: std.Io, argv: []const []const u8) !u8 {
             "\"opencode-prompt-history-jsonl/v1\"," ++
             "\"immutable-relation-json/v1\"]," ++
             "\"source_encodings\":[\"jsonl\",\"jsonl.zst\"]," ++
-            "\"transports\":[\"github-gist/v1\"],\"operators\":[",
+            "\"operators\":[",
         .{ Version, seq.definition.abi },
     );
     var first = true;
@@ -3402,7 +3386,6 @@ fn emitCapabilities(io: std.Io, argv: []const []const u8) !u8 {
             "\"seq-command-error/v1\"," ++
             "\"seq-definition-check-result/v1\"," ++
             "\"seq-definition-description/v1\"," ++
-            "\"seq-gist/v1\"," ++
             "\"seq-index-result/v1\"," ++
             "\"seq-observation-plan/v1\"," ++
             "\"seq-observation-result/v2\"]}}\n",
@@ -3439,36 +3422,6 @@ fn emitCommandError(io: std.Io, err: anyerror) !void {
     stdout_writer.interface.writeAll(
         ",\"authority_granted\":false}\n",
     ) catch |write_err| return stdout_writer.err orelse write_err;
-}
-
-fn emitGistError(
-    io: std.Io,
-    allocator: std.mem.Allocator,
-    err: anyerror,
-    diagnostic: *const gist.Diagnostics,
-) !void {
-    var document: std.Io.Writer.Allocating = .init(allocator);
-    defer document.deinit();
-    const writer = &document.writer;
-    try writer.writeAll("{\"schema\":\"seq-command-error/v1\",\"code\":");
-    try writeString(writer, @errorName(err));
-    try writer.print(
-        ",\"authority_granted\":false,\"attempted_create\":{},\"gist_id\":",
-        .{diagnostic.attempted_create},
-    );
-    if (diagnostic.gistId()) |id| {
-        try writeString(writer, id);
-    } else {
-        try writer.writeAll("null");
-    }
-    try writer.writeAll(",\"revision\":");
-    if (diagnostic.revision) |revision| {
-        try writeString(writer, &revision);
-    } else {
-        try writer.writeAll("null");
-    }
-    try writer.writeAll("}\n");
-    try writeStdout(io, document.written());
 }
 
 fn emitSourceError(
@@ -3598,10 +3551,6 @@ fn isHostSequenceOperand(raw: []const u8) bool {
     const offset: usize = if (raw[0] == '+' or raw[0] == '-') 1 else 0;
     if (offset == raw.len) return false;
     return std.ascii.isDigit(raw[offset]) or raw[offset] == '.';
-}
-
-test {
-    _ = gist;
 }
 
 test "final command surface contains no skill or artifact commands" {

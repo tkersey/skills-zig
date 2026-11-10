@@ -2,6 +2,7 @@
 set -euo pipefail
 
 binary=$1
+bash scripts/test-ledger-gist.sh "$binary"
 preparation_probe=${2:?preparation interruption probe binary is required}
 test -x "$preparation_probe"
 definition=apps/ledger/src/v1/fixtures/record-definition.json

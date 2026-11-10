@@ -69,6 +69,10 @@ const Help =
     \\    --resource <path> --lock-id <id> --fencing-token <u64>
     \\    [--confirm-no-legacy-writers] [--format json|text]
     \\
+    \\transport commands:
+    \\  ledger gist create --input <request.json> [--format json]
+    \\  ledger gist read --gist <id|url> [--revision <40-hex-sha>] [--format json]
+    \\
     \\metadata commands:
     \\  ledger capabilities [--format json|text]
     \\  ledger version
@@ -2589,6 +2593,7 @@ fn writeCapabilityTail(writer: *std.Io.Writer) !void {
     try writer.writeAll(
         "],\"codecs\":[\"json\",\"jsonl\",\"text\"]," ++
             "\"storage_adapters\":[\"pure\",\"addressed-document\",\"event-log\"]," ++
+            "\"transports\":[\"github-gist/v1\"]," ++
             "\"features\":{\"bounded_checkpoint_replay_v1\":true," ++
             "\"full_history_doctor_v1\":true," ++
             "\"segmented_event_log_v1\":true," ++
@@ -2613,6 +2618,7 @@ fn writeCapabilityTail(writer: *std.Io.Writer) !void {
             "\"result_schemas\":[\"ledger-capabilities/v1\"," ++
             "\"ledger-command-error/v1\"," ++
             "\"ledger-storage-root-error/v1\"," ++
+            "\"ledger-gist/v1\",\"ledger-gist-error/v1\"," ++
             "\"ledger-workspace-context/v1\",\"ledger-workspace-context-error/v1\"," ++
             "\"ledger-personal-store-list/v1\",\"ledger-custody-migration/v2\"," ++
             "\"ledger-definition-check-result/v1\"," ++

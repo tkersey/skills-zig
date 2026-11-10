@@ -3,7 +3,7 @@ set -euo pipefail
 
 binary=$1
 bash scripts/test-seq-observation-contract.sh "$binary"
-bash scripts/test-seq-claude-gist.sh "$binary"
+bash scripts/test-seq-claude.sh "$binary"
 message_definition=apps/seq/src/v1/fixtures/message-observation.json
 external_definition=apps/seq/src/v1/fixtures/external-observation.json
 external_facts=apps/seq/src/v1/fixtures/external-facts.json

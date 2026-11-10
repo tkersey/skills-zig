@@ -3,7 +3,7 @@ set -euo pipefail
 
 binary=$1
 fixture=libs/trace_core/src/fixtures/claude-session.jsonl
-work=$(mktemp -d "${TMPDIR:-/tmp}/seq-claude-gist.XXXXXX")
+work=$(mktemp -d "${TMPDIR:-/tmp}/seq-claude.XXXXXX")
 trap 'test -n "${work:-}" && rm -rf -- "$work"' EXIT
 export SEQ_CACHE_DIR="$work/cache"
 mkdir -p "$work/main" "$work/child" "$work/warning"
@@ -11,8 +11,13 @@ cp "$fixture" "$work/main/session.jsonl"
 
 capabilities=$("$binary" capabilities --format json)
 jq -e '(.source_adapters | index("claude-session-jsonl/v1")) != null and
-  (.transports | index("github-gist/v1")) != null and
-  (.result_schemas | index("seq-gist/v1")) != null' <<<"$capabilities" >/dev/null
+  ((.transports // []) | index("github-gist/v1")) == null and
+  (.result_schemas | index("seq-gist/v1")) == null' <<<"$capabilities" >/dev/null
+if removed_gist=$("$binary" gist read --gist abcde --format json); then
+  exit 1
+fi
+jq -e '.schema == "seq-command-error/v1" and .code == "UnknownCommand"' \
+  <<<"$removed_gist" >/dev/null
 
 sessions=$("$binary" sessions --root "$work/main" --repo /project --format json)
 jq -e 'length == 1 and (.[0] | .session_id == "session-a" and
@@ -94,21 +99,6 @@ jq -se 'length == 1 and (.[0] | .schema == "seq-command-error/v1" and
   .code == "PhysicalSourceWarningsPresent" and .warning_count > 0)' \
   "$work/warning.json" >/dev/null
 
-gist_help=$("$binary" gist --help)
-grep -Fq 'seq gist create' <<<"$gist_help"
-grep -Fq 'seq gist read' <<<"$gist_help"
-if bad_ref=$("$binary" gist read --gist https://example.com/abcde --format json); then
-  exit 1
-fi
-jq -e '.schema == "seq-command-error/v1" and .code == "InvalidGistUrl" and
-  .attempted_create == false and .gist_id == null and .revision == null' <<<"$bad_ref" >/dev/null
-if no_token=$(env -u SEQ_GITHUB_TOKEN -u GH_TOKEN -u GITHUB_TOKEN \
-  "$binary" gist create --input "$work/missing.json" --format json); then
-  exit 1
-fi
-jq -e '.schema == "seq-command-error/v1" and .code == "GistTokenRequired" and
-  .attempted_create == false and .authority_granted == false' <<<"$no_token" >/dev/null
-
 opencode=apps/seq/src/v1/fixtures/opencode/prompt-history.jsonl
 opencode_identity=$("$binary" query --path "$opencode" \
   --spec '{"dataset":"sessions","select":["session_id","native_session_id","agent_id"],"format":"json"}')
@@ -123,4 +113,4 @@ for rows in "$opencode_events" "$opencode_messages"; do
     <<<"$rows" >/dev/null
 done
 
-printf '%s\n' 'Seq Claude and gist smoke tests passed'
+printf '%s\n' 'Seq Claude smoke tests passed'

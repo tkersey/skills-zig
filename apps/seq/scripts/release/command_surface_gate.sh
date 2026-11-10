@@ -9,7 +9,7 @@ if [[ ! -x "$bin_path" ]]; then
   exit 1
 fi
 
-expected=$'definition check\ndefinition describe\nobserve\nexplain\ngist create\ngist read\nsessions\nturns\nsession-detail\ntool-lifecycle\nsession-graph\ntail\nfind-session\ndatasets\ndataset-schema\nquery\nindex\ncapabilities\nversion'
+expected=$'definition check\ndefinition describe\nobserve\nexplain\nsessions\nturns\nsession-detail\ntool-lifecycle\nsession-graph\ntail\nfind-session\ndatasets\ndataset-schema\nquery\nindex\ncapabilities\nversion'
 help_output=$("$bin_path" --help)
 actual=$(
   awk '
@@ -19,7 +19,7 @@ actual=$(
       line = substr($0, 3)
       sub(/^seq /, "", line)
       count = split(line, words, /[[:space:]]+/)
-      if ((words[1] == "definition" || words[1] == "gist") && count >= 2) {
+      if (words[1] == "definition" && count >= 2) {
         print words[1] " " words[2]
       } else {
         print words[1]
@@ -49,7 +49,6 @@ jq -e --arg version "$version" \
     (.observation_abis | index("seq-observation-abi/v1")) != null and
     (.source_adapters | type == "array" and length > 0) and
     (.source_adapters | index("claude-session-jsonl/v1")) != null and
-    (.transports | index("github-gist/v1")) != null and
     (.operators | type == "array" and length > 0) and
     (.renderers | type == "array" and length > 0) and
     .cache_format != null and
@@ -59,7 +58,6 @@ jq -e --arg version "$version" \
       "seq-command-error/v1",
       "seq-definition-check-result/v1",
       "seq-definition-description/v1",
-      "seq-gist/v1",
       "seq-index-result/v1",
       "seq-observation-plan/v1",
       "seq-observation-result/v2"

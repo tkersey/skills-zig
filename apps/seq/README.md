@@ -8,8 +8,7 @@ facts + provenance + corpus scope + limitations + uncertainty
 ```
 
 Seq observations do not validate durable artifacts or grant action, repair,
-review, publication, or closure authority. Native gist transport carries out
-separately authorized reads and publication of explicitly supplied text files.
+review, publication, or closure authority.
 
 ## Install
 
@@ -26,51 +25,6 @@ zig build test -Doptimize=fast
 ```
 
 The binary is written to `zig-out/bin/seq`.
-
-## Gist transport
-
-`github-gist/v1` in `seq capabilities` identifies native transport support.
-Create a secret gist from explicitly selected text files:
-
-```json
-{
-  "description": "Selected project context",
-  "files": {
-    "context.md": {"content": "# Context\nThe prepared, reviewed context goes here.\n"}
-  }
-}
-```
-
-```bash
-seq gist create --input request.json --format json
-seq gist read --gist <id-or-url> --revision <40-hex-sha> --format json
-```
-
-Creation requires a token from `SEQ_GITHUB_TOKEN`, then `GH_TOKEN`, then
-`GITHUB_TOKEN`; reading can be anonymous. Keep tokens out of request files.
-Seq uses the GitHub API directly, without another transport executable.
-Creation always sends `public:false` and rejects other request fields. Secret
-gists are unlisted: anyone with the URL can read them. Seq transports supplied
-bytes; the caller chooses their audience and assesses whether they may be shared.
-
-A `seq-gist/v1` result carries `gist_id`, `revision`, `url`, `revision_url`,
-`public`, `description`, and a `files` map with complete text. A successful create
-has read its immutable revision back and compared visibility, description, file
-names, and every file's bytes with the request. Keep the revision with the URL.
-A read without `--revision` resolves the current revision once, then fetches it
-by SHA. Reading does not run commands, install files, or restore native sessions.
-
-The transport admits at most 16 files, 256 KiB per file, 1 MiB of decoded text,
-and 8 MiB of JSON. It rejects unsafe filenames, invalid UTF-8, truncated responses,
-and file-size disagreements. It does not follow redirects or remote `raw_url`
-values. Requests have a 30-second deadline; failure emits one structured error
-without partial file contents or server response bodies.
-
-Publication may have happened even when verification fails. An ambiguous POST
-returns `GistCreateOutcomeUnknown`; a known creation whose contents could not be
-verified returns `GistCreatedButUnverified`. Errors retain `attempted_create` and
-any safely known `gist_id` and `revision`. No create request is retried
-automatically. Inspect the known gist or the account before deciding to retry.
 
 ## Observe
 

@@ -11,8 +11,8 @@ pub const max_json_bytes = 8 * 1024 * 1024;
 pub const request_timeout_ms = 30_000;
 
 pub const help =
-    \\seq gist create --input <request.json> [--format json]
-    \\seq gist read --gist <id|url> [--revision <40-hex-sha>] [--format json]
+    \\ledger gist create --input <request.json> [--format json]
+    \\ledger gist read --gist <id|url> [--revision <40-hex-sha>] [--format json]
     \\
     \\Create accepts {"description":"...","files":{"handoff.md":{"content":"..."}}}.
     \\Only those fields are accepted. Creation always sets public=false and
@@ -24,7 +24,7 @@ pub const help =
     \\Limits: 16 files, 256 KiB per file, 1 MiB total text, 8 MiB JSON.
     \\Truncated or unsupported contents fail; remote URLs are never followed.
     \\
-    \\Authentication: SEQ_GITHUB_TOKEN, then GH_TOKEN, then GITHUB_TOKEN.
+    \\Authentication: LEDGER_GITHUB_TOKEN, then GH_TOKEN, then GITHUB_TOKEN.
     \\Creation requires a token with permission to create gists. Reading can
     \\be anonymous. Requests use the GitHub API directly.
     \\A failed create can have published a gist. Never retry an uncertain
@@ -206,7 +206,7 @@ pub fn parseCreate(allocator: Allocator, bytes: []const u8) !std.json.Parsed(Cre
 }
 
 fn tokenFromEnvironment(environment: *const std.process.Environ.Map) !?[]const u8 {
-    const token = environment.get("SEQ_GITHUB_TOKEN") orelse
+    const token = environment.get("LEDGER_GITHUB_TOKEN") orelse
         environment.get("GH_TOKEN") orelse environment.get("GITHUB_TOKEN") orelse return null;
     try validateToken(token);
     return token;
@@ -215,6 +215,41 @@ fn tokenFromEnvironment(environment: *const std.process.Environ.Map) !?[]const u
 fn validateToken(token: []const u8) !void {
     if (token.len == 0 or token.len > 4096) return error.InvalidGistToken;
     for (token) |byte| if (byte <= 0x20 or byte >= 0x7f) return error.InvalidGistToken;
+}
+
+pub fn runCommand(
+    io: Io,
+    dir: Io.Dir,
+    allocator: Allocator,
+    environment: *const std.process.Environ.Map,
+    args: []const []const u8,
+    output: *Writer,
+) !u8 {
+    var document: Writer.Allocating = .init(allocator);
+    defer document.deinit();
+    var diagnostics: Diagnostics = .{};
+    run(io, dir, allocator, environment, args, &document.writer, &diagnostics) catch |err| {
+        var failure: Writer.Allocating = .init(allocator);
+        defer failure.deinit();
+        try writeError(&failure.writer, err, &diagnostics);
+        try output.writeAll(failure.written());
+        return 2;
+    };
+    try output.writeAll(document.written());
+    return 0;
+}
+
+fn writeError(output: *Writer, err: anyerror, diagnostics: *const Diagnostics) !void {
+    const revision: ?[]const u8 = if (diagnostics.revision) |*value| value else null;
+    try std.json.Stringify.value(.{
+        .schema = "ledger-gist-error/v1",
+        .@"error" = @errorName(err),
+        .authority_granted = false,
+        .attempted_create = diagnostics.attempted_create,
+        .gist_id = diagnostics.gistId(),
+        .revision = revision,
+    }, .{}, output);
+    try output.writeByte('\n');
 }
 
 pub fn run(
@@ -384,7 +419,7 @@ const Document = struct {
         });
         defer allocator.free(revision_url);
         try std.json.Stringify.value(.{
-            .schema = "seq-gist/v1",
+            .schema = "ledger-gist/v1",
             .gist_id = value.id,
             .revision = &self.revision,
             .url = url,
@@ -628,7 +663,7 @@ const Job = struct {
             .keep_alive = false,
             .headers = .{
                 .authorization = if (bearer) |value| .{ .override = value } else .omit,
-                .user_agent = .{ .override = "seq" },
+                .user_agent = .{ .override = "ledger" },
                 .content_type = if (payload == null) .omit else .{ .override = "application/json" },
                 .accept_encoding = .omit,
             },
@@ -770,14 +805,24 @@ test "gist credentials retain explicit precedence and cannot inject headers" {
     var environment: std.process.Environ.Map = .init(std.testing.allocator);
     defer environment.deinit();
     try std.testing.expectEqual(null, try tokenFromEnvironment(&environment));
+    try environment.put("SEQ_GITHUB_TOKEN", "ignored-seq-token");
+    try std.testing.expectEqual(null, try tokenFromEnvironment(&environment));
     try environment.put("GITHUB_TOKEN", "synthetic-third");
+    try std.testing.expectEqualStrings(
+        "synthetic-third",
+        (try tokenFromEnvironment(&environment)).?,
+    );
     try environment.put("GH_TOKEN", "synthetic-second");
-    try environment.put("SEQ_GITHUB_TOKEN", "synthetic-first");
+    try std.testing.expectEqualStrings(
+        "synthetic-second",
+        (try tokenFromEnvironment(&environment)).?,
+    );
+    try environment.put("LEDGER_GITHUB_TOKEN", "synthetic-first");
     try std.testing.expectEqualStrings(
         "synthetic-first",
         (try tokenFromEnvironment(&environment)).?,
     );
-    try environment.put("SEQ_GITHUB_TOKEN", "bad\r\nX-Leak: injected");
+    try environment.put("LEDGER_GITHUB_TOKEN", "bad\r\nX-Leak: injected");
     try std.testing.expectError(error.InvalidGistToken, tokenFromEnvironment(&environment));
 }
 
@@ -862,6 +907,10 @@ test "gist create verifies secret content with an immutable read before success"
     try document.write(allocator, &output.writer);
     var decoded = try std.json.parseFromSlice(std.json.Value, allocator, output.written(), .{});
     defer decoded.deinit();
+    try std.testing.expectEqualStrings(
+        "ledger-gist/v1",
+        decoded.value.object.get("schema").?.string,
+    );
     try std.testing.expectEqualStrings(
         test_revision,
         decoded.value.object.get("revision").?.string,
@@ -1153,7 +1202,7 @@ test "gist command stages no output or network publication for rejected input" {
     });
     var environment: std.process.Environ.Map = .init(allocator);
     defer environment.deinit();
-    try environment.put("SEQ_GITHUB_TOKEN", "synthetic-token");
+    try environment.put("LEDGER_GITHUB_TOKEN", "synthetic-token");
     var output: Writer.Allocating = .init(allocator);
     defer output.deinit();
     var diagnostics: Diagnostics = .{};
@@ -1168,6 +1217,58 @@ test "gist command stages no output or network publication for rejected input" {
     ));
     try std.testing.expectEqual(@as(usize, 0), output.written().len);
     try std.testing.expect(!diagnostics.attempted_create);
+}
+
+test "gist command errors distinguish transport from local storage" {
+    const allocator = std.testing.allocator;
+    var environment: std.process.Environ.Map = .init(allocator);
+    defer environment.deinit();
+    var output: Writer.Allocating = .init(allocator);
+    defer output.deinit();
+    try std.testing.expectEqual(@as(u8, 2), try runCommand(
+        std.testing.io,
+        Io.Dir.cwd(),
+        allocator,
+        &environment,
+        &.{ "create", "--input", "not-read.json" },
+        &output.writer,
+    ));
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, output.written(), .{});
+    defer parsed.deinit();
+    const object = parsed.value.object;
+    try std.testing.expectEqualStrings("ledger-gist-error/v1", object.get("schema").?.string);
+    try std.testing.expectEqualStrings("GistTokenRequired", object.get("error").?.string);
+    try std.testing.expect(!object.get("authority_granted").?.bool);
+    try std.testing.expect(!object.get("attempted_create").?.bool);
+    try std.testing.expect(object.get("gist_id").? == .null);
+    try std.testing.expect(object.get("revision").? == .null);
+    try std.testing.expect(!object.contains("storage_mutated"));
+}
+
+test "gist error documents preserve creation outcomes and recovery identifiers" {
+    const allocator = std.testing.allocator;
+    for ([_]anyerror{ error.GistCreateOutcomeUnknown, error.GistCreatedButUnverified }) |err| {
+        var diagnostics: Diagnostics = .{ .attempted_create = true };
+        const acknowledged = err == error.GistCreatedButUnverified;
+        if (acknowledged) diagnostics.remember(test_id, test_revision);
+        var output: Writer.Allocating = .init(allocator);
+        defer output.deinit();
+        try writeError(&output.writer, err, &diagnostics);
+        var parsed = try std.json.parseFromSlice(std.json.Value, allocator, output.written(), .{});
+        defer parsed.deinit();
+        const object = parsed.value.object;
+        try std.testing.expectEqualStrings("ledger-gist-error/v1", object.get("schema").?.string);
+        try std.testing.expectEqualStrings(@errorName(err), object.get("error").?.string);
+        try std.testing.expect(object.get("attempted_create").?.bool);
+        try std.testing.expect(!object.contains("storage_mutated"));
+        if (acknowledged) {
+            try std.testing.expectEqualStrings(test_id, object.get("gist_id").?.string);
+            try std.testing.expectEqualStrings(test_revision, object.get("revision").?.string);
+        } else {
+            try std.testing.expect(object.get("gist_id").? == .null);
+            try std.testing.expect(object.get("revision").? == .null);
+        }
+    }
 }
 
 test "native HTTP anonymous read omits credentials and still pins a revision" {
