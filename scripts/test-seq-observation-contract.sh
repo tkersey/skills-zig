@@ -666,32 +666,43 @@ jq '.requires.operators += ["ordered-fold"] |
         expr: {field: "source_event_id"}}]}] + .pipeline[3:] |
   (.pipeline[] | select(.op == "join") | .inputs) = ["folded_rows", "folded_rows", "session_rows"]' \
   "$lineage_definition" >"$work/folded-lineage.json"
-jq '(.pipeline[] | select(.op == "join") | .on.left_true) = "missing_flag"' \
-  "$lineage_definition" >"$work/flagged-lineage.json"
-for shape in folded-lineage flagged-lineage; do
-  shape_plan=$("$binary" explain --definition "$work/$shape.json" --projection rows --format json)
-  jq -e '.strategy.kind == "materialized-graph"' <<<"$shape_plan" >/dev/null
-  "$binary" observe --definition "$work/$shape.json" --projection rows \
-    --root "$work/two-roots" --format json >/dev/null
-done
-jq '(.pipeline[] | select(.op == "join") | .on.keys) = []' \
-  "$lineage_definition" >"$work/keyless-lineage.json"
-keyless_plan=$("$binary" explain --definition "$work/keyless-lineage.json" --projection rows \
+folded_plan=$("$binary" explain --definition "$work/folded-lineage.json" --projection rows \
   --format json)
-jq -e '.strategy.kind == "materialized-graph"' <<<"$keyless_plan" >/dev/null
-if keyless=$("$binary" observe --definition "$work/keyless-lineage.json" --projection rows \
-  --root "$work/two-roots" --format json); then
-  echo "lineage observation accepted a join without equality keys" >&2
-  exit 1
-fi
-jq -e '.code == "ObservationJoinRequiresEqualityKey"' <<<"$keyless" >/dev/null
-jq '(.pipeline[] | select(.op == "join") | .on.keys) = [{left: "missing_key", right: "missing_key"}]' \
-  "$lineage_definition" >"$work/unknown-key-lineage.json"
-unknown_key_plan=$("$binary" explain --definition "$work/unknown-key-lineage.json" \
-  --projection rows --format json)
-jq -e '.strategy.kind == "materialized-graph"' <<<"$unknown_key_plan" >/dev/null
-"$binary" observe --definition "$work/unknown-key-lineage.json" --projection rows \
+jq -e '.strategy.kind == "materialized-graph"' <<<"$folded_plan" >/dev/null
+"$binary" observe --definition "$work/folded-lineage.json" --projection rows \
   --root "$work/two-roots" --format json >/dev/null
+reject_join() {
+  local shape=$1 code=$2 failure
+  if failure=$("$binary" explain --definition "$work/$shape.json" --projection rows \
+    --format json); then
+    echo "malformed join was planned: $shape" >&2
+    exit 1
+  fi
+  jq -e --arg code "$code" '.code == $code' <<<"$failure" >/dev/null
+  if failure=$("$binary" observe --definition "$work/$shape.json" --projection rows \
+    --root "$work/two-roots" --format json); then
+    echo "malformed join was observed: $shape" >&2
+    exit 1
+  fi
+  jq -e --arg code "$code" '.code == $code' <<<"$failure" >/dev/null
+}
+malformed_join() {
+  jq "(.pipeline[] | select(.op == \"join\")) |= ($2)" "$lineage_definition" >"$work/$1.json"
+  reject_join "$1" "$3"
+}
+malformed_join flagged-lineage '.on.left_true = "missing_flag"' UnknownObservationJoinField
+malformed_join string-flag-lineage '.on.left_true = "role"' ObservationJoinFlagRequiresBoolean
+malformed_join keyless-lineage '.on.keys = []' ObservationJoinRequiresEqualityKey
+malformed_join unknown-key-lineage '.on.keys = [{left: "missing_key", right: "missing_key"}]' \
+  UnknownObservationJoinField
+malformed_join unknown-op-lineage '.on.keys += [{left: "role", right: "role", op: "ne"}]' \
+  ObservationJoinOperatorUnsupported
+malformed_join unknown-kind-lineage '.on.kind = "outer"' ObservationJoinKindUnsupported
+malformed_join unknown-node-lineage '.on.lineage.node = "missing_node"' \
+  UnknownObservationLineageField
+jq '(.relations[] | select(.name == "sessions") | .fields) = ["session_id"]' \
+  "$lineage_definition" >"$work/parentless-lineage.json"
+reject_join parentless-lineage UnknownObservationLineageField
 jq '.relations[0].fields += ["model"]' "$lineage_definition" >"$work/materialized-lineage.json"
 materialized_rows=$("$binary" observe --definition "$work/materialized-lineage.json" \
   --projection rows --root "$work/fork-root" --format json)
@@ -710,8 +721,46 @@ jq '.requires.operators += ["derive"] |
 literal_plan=$("$binary" explain --definition "$work/literal-lineage.json" --projection rows \
   --format json)
 jq -e '.strategy.kind == "materialized-graph"' <<<"$literal_plan" >/dev/null
-jq '(.pipeline[] | select(.op == "join") | .on.keys[0].nulls_equal) = "yes"' \
-  "$lineage_definition" >"$work/nulls-text-lineage.json"
-nulls_text_plan=$("$binary" explain --definition "$work/nulls-text-lineage.json" \
+malformed_join nulls-text-lineage '.on.keys[0].nulls_equal = "yes"' ExpectedBoolean
+malformed_join bool-flag-lineage '.on.left_true = true' ExpectedString
+malformed_join unknown-output-lineage '.fields[1].field = "missing_field"' \
+  UnknownObservationJoinField
+malformed_join far-source-lineage '.fields[1].source = 2' ObservationJoinSourceUnsupported
+malformed_join right-output-lineage '.fields[1].source = 1' ObservationMembershipJoinProjectsRight
+
+jq '(.pipeline[] | select(.op == "join") | .inputs) = ["assistant_rows", "session_rows"]' \
+  "$lineage_definition" >"$work/two-input-lineage.json"
+second_lineage='.pipeline += [{op: "join", inputs: $inputs, as: "second_rows",
+    on: {kind: "anti", keys: [{left: "source_event_id", right: "source_event_id"}],
+      lineage: {left: "session_id", right: "session_id", node: "session_id",
+        parent: "parent_session_id"}},
+    fields: [{source: 0, field: "session_id", name: "session_id", type: "string",
+      nullable: false}]}] |
+  .projections.rows = {relation: "second_rows", schema: "example/second/v1",
+    fields: ["session_id"], renderers: ["json"]}'
+jq --argjson inputs '["owned_rows", "owned_rows"]' \
+  '(.pipeline[] | select(.op == "join") | .on.kind) = "semi" | '"$second_lineage" \
+  "$lineage_definition" >"$work/second-lineage.json"
+jq --argjson inputs '["owned_rows", "session_rows"]' "$second_lineage" \
+  "$lineage_definition" >"$work/streamed-second-lineage.json"
+jq --argjson inputs '["owned_rows", "owned_rows", "session_rows", "session_rows"]' \
+  "$second_lineage" "$lineage_definition" >"$work/four-input-lineage.json"
+for shape in two-input-lineage second-lineage streamed-second-lineage four-input-lineage; do
+  reject_join "$shape" ObservationLineageInputMissing
+done
+jq '.pipeline = .pipeline[0:3] + [{op: "join", inputs: ["assistant_rows", "assistant_rows"],
+    as: "paired_rows",
+    on: {kind: "inner", keys: [{left: "source_event_id", right: "source_event_id"},
+      {left: "session_id", right: "session_id"}]},
+    fields: [{source: 1, field: "session_id", name: "session_id", type: "string", nullable: true},
+      {source: 0, field: "role", name: "role", type: "string", nullable: true},
+      {source: 0, field: "source_event_id", name: "source_event_id", type: "string",
+        nullable: false}]}] + .pipeline[3:] |
+  (.pipeline[] | select(.as == "owned_rows") | .inputs) = ["paired_rows", "paired_rows", "session_rows"]' \
+  "$lineage_definition" >"$work/right-session-lineage.json"
+right_session_plan=$("$binary" explain --definition "$work/right-session-lineage.json" \
   --projection rows --format json)
-jq -e '.strategy.kind == "materialized-graph"' <<<"$nulls_text_plan" >/dev/null
+jq -e '.strategy.kind == "materialized-graph"' <<<"$right_session_plan" >/dev/null
+jq '(.pipeline[] | select(.as == "paired_rows") | .on.keys[0].right) = "missing_key"' \
+  "$work/right-session-lineage.json" >"$work/local-key-lineage.json"
+reject_join local-key-lineage UnknownObservationJoinField

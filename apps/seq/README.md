@@ -144,16 +144,22 @@ Sessions without an
 identity, such as an empty rollout, do not participate in lineage joins and cannot be
 linked by reachability.
 
+Every join a projection reaches is checked against its inputs before a strategy is
+chosen, and every strategy runs that one checked form. A key, flag, output, or lineage
+field that names no field of its input, an output `source` other than 0 or 1, a semi
+or anti join that projects its right input, a flag on a non-boolean field, an unknown
+`kind` or key `op`, a non-boolean `nulls_equal`, a join without an equality key, and a
+lineage join without exactly three inputs fail before any corpus is read.
+
 A lineage definition streams (`partition-lineage-stream`) only when all of these hold:
 
 - its lineage join is an anti join whose left and right inputs are the same stage,
-  whose projection takes only fields of that input, whose one or more equality keys each
-  pair a field of that input with itself, whose `left_true` and `right_true` flags
-  name fields of that input, and whose lineage relates rows and nodes by `session_id` and walks
-  `parent_session_id`;
+  whose projection takes only fields of that input, whose keys are all equality keys
+  that pair a field of that input with itself, and whose lineage relates rows and
+  nodes by `session_id` and walks `parent_session_id`;
 - its local stages stay within one session: they include no `ordered_fold`,
   `distinct` and joins are keyed by `session_id`, and a stage that outputs
-  `session_id` copies it from `session_id`;
+  `session_id` copies it from `session_id`, a join from its left input;
 - its lineage graph input reaches the sessions scan through filters, projections,
   aliases, sorts, and input-preserving derives that do not define `session_id` or
   `parent_session_id`, without limiting, ranking, or deduplicating sessions, and
@@ -165,7 +171,9 @@ A lineage definition streams (`partition-lineage-stream`) only when all of these
 Streaming reads sessions in lineage-depth order but hands the stages after the
 lineage join its rows and sessions in source-path order, as the materialized graph
 reads them, so row order, order-dependent stages, and the corpus digest agree across
-strategies.
+strategies. Rows of session files without an identity form their own partitions,
+so a session-keyed local `distinct` or join keeps them apart where the materialized
+graph groups their null `session_id` values.
 
 Any other lineage definition runs on the materialized-graph strategy over the whole
 root; with `--path` or `--session-id` it fails with

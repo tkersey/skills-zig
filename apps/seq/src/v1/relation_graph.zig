@@ -109,33 +109,26 @@ pub fn streamingLineagePlan(
         &.{},
         0,
     );
+    try requireValidJoins(allocator, definition_plan, native_plan, reachable);
     for (native_plan.stages, 0..) |stage, stage_index| {
         if (!reachable[stage_index] or stage.operation != .generic) continue;
         const generic = stage.operation.generic;
         if (generic.operator != .join) continue;
-        var parsed = try parseConfig(allocator, generic.canonical_config);
-        defer parsed.deinit();
-        const root = try definition_core.json.object(parsed.value);
-        const on = try definition_core.json.object(
-            try definition_core.json.field(root, "on"),
+        var spec = try compileJoin(
+            allocator,
+            native_plan,
+            definition_plan.steps[stage_index],
+            generic.canonical_config,
         );
-        const lineage = try definition_core.json.object(on.get("lineage") orelse continue);
-        const step = definition_plan.steps[stage_index];
-        if (step.input_names.len != 3) return error.ObservationLineageInputMissing;
-        if (!try reducerSupportsJoin(on, lineage, step)) return null;
-        const local_stage = native_plan.findStage(step.input_names[0]) orelse
-            return error.ObservationExternalGraphInputUnsupported;
-        const graph_stage = native_plan.findStage(step.input_names[2]) orelse
-            return error.ObservationExternalGraphInputUnsupported;
-        const local_schema = native_plan.stages[local_stage].schema;
-        if (!projectsLeftInput(try configArray(root, "fields"), local_schema)) return null;
-        if (!try joinFieldsExist(on, local_schema)) return null;
-        if (!try carriesSessionColumns(allocator, native_plan, graph_stage)) return null;
+        defer spec.deinit(allocator);
+        const lineage = spec.lineage orelse continue;
+        if (!streamableLineageJoin(native_plan, &spec)) return null;
+        if (!try carriesSessionColumns(allocator, native_plan, lineage.graph_stage)) return null;
         const scan_stage = try streamablePartitionRoot(
             allocator,
             definition_plan,
             native_plan,
-            local_stage,
+            spec.left_stage,
         ) orelse return null;
         if (!try streamingSeedsCover(
             allocator,
@@ -143,13 +136,13 @@ pub fn streamingLineagePlan(
             native_plan,
             native_plan.projections[projection_index].stage_index,
             @intCast(stage_index),
-            graph_stage,
+            lineage.graph_stage,
         )) return null;
         return .{
             .scan_stage = scan_stage,
-            .local_stage = local_stage,
+            .local_stage = spec.left_stage,
             .lineage_stage = @intCast(stage_index),
-            .graph_stage = graph_stage,
+            .graph_stage = lineage.graph_stage,
         };
     }
     return null;
@@ -285,49 +278,41 @@ fn seedsSessionFields(field_indices: []const u16) bool {
     return true;
 }
 
-fn reducerSupportsJoin(
-    on: std.json.ObjectMap,
-    lineage: std.json.ObjectMap,
-    step: definition.Step,
-) !bool {
-    std.debug.assert(step.input_names.len == 3);
-    if (!std.mem.eql(u8, step.input_names[0], step.input_names[1])) return false;
-    const kind = try definition_core.json.string(on.get("kind") orelse return false);
-    if (!std.mem.eql(u8, kind, "anti")) return false;
-    return try followsSessionLineage(lineage) and try streamableJoinKeys(on);
+fn requireValidJoins(
+    allocator: std.mem.Allocator,
+    definition_plan: *const definition.Plan,
+    native_plan: *const plan.Plan,
+    reachable: []const bool,
+) !void {
+    for (native_plan.stages, reachable, 0..) |stage, reached, stage_index| {
+        if (!reached or stage.operation != .generic) continue;
+        if (stage.operation.generic.operator != .join) continue;
+        var spec = try compileJoin(
+            allocator,
+            native_plan,
+            definition_plan.steps[stage_index],
+            stage.operation.generic.canonical_config,
+        );
+        spec.deinit(allocator);
+    }
 }
 
-fn streamableJoinKeys(on: std.json.ObjectMap) !bool {
-    const keys = try definition_core.json.array(try definition_core.json.field(on, "keys"));
-    if (keys.items.len == 0) return false;
-    for (keys.items) |item| {
-        const key = try definition_core.json.object(item);
-        if (!try equalityKey(key)) return false;
-        const left = try definition_core.json.requiredString(key, "left");
-        const right = try definition_core.json.requiredString(key, "right");
-        if (!std.mem.eql(u8, left, right)) return false;
+fn streamableLineageJoin(native_plan: *const plan.Plan, spec: *const JoinSpec) bool {
+    const lineage = spec.lineage orelse return false;
+    if (spec.kind != .anti or spec.left_stage != spec.right_stage) return false;
+    for (spec.keys) |key| {
+        if (key.op != .eq or key.left != key.right) return false;
     }
-    return true;
+    const local = native_plan.stages[spec.left_stage].schema;
+    const graph = native_plan.stages[lineage.graph_stage].schema;
+    return columnNamed(local, lineage.left, "session_id") and
+        columnNamed(local, lineage.right, "session_id") and
+        columnNamed(graph, lineage.node, "session_id") and
+        columnNamed(graph, lineage.parent, "parent_session_id");
 }
 
-fn joinFieldsExist(on: std.json.ObjectMap, schema: plan.Schema) !bool {
-    inline for (.{ "left_true", "right_true" }) |key| {
-        if (on.get(key)) |raw| {
-            if (schema.find(try definition_core.json.string(raw)) == null) return false;
-        }
-    }
-    const keys = try definition_core.json.array(try definition_core.json.field(on, "keys"));
-    for (keys.items) |item| {
-        const key = try definition_core.json.object(item);
-        if (schema.find(try definition_core.json.requiredString(key, "left")) == null) return false;
-        if (key.get("nulls_equal")) |raw| if (raw != .bool) return false;
-    }
-    return true;
-}
-
-fn equalityKey(key: std.json.ObjectMap) !bool {
-    const op = key.get("op") orelse return true;
-    return std.mem.eql(u8, try definition_core.json.string(op), "eq");
+fn columnNamed(schema: plan.Schema, column: u16, name: []const u8) bool {
+    return std.mem.eql(u8, schema.columns[column].name, name);
 }
 
 fn streamablePartitionRoot(
@@ -350,15 +335,6 @@ fn streamablePartitionRoot(
         => return null,
         else => return err,
     };
-}
-
-fn followsSessionLineage(lineage: std.json.ObjectMap) !bool {
-    inline for (.{ "node", "left", "right" }) |key| {
-        const value = try definition_core.json.requiredString(lineage, key);
-        if (!std.mem.eql(u8, value, "session_id")) return false;
-    }
-    const parent = try definition_core.json.requiredString(lineage, "parent");
-    return std.mem.eql(u8, parent, "parent_session_id");
 }
 
 fn streamingSeedsCover(
@@ -473,7 +449,12 @@ fn partitionScanRoot(
                 count -= 1;
                 continue;
             }
-            try validatePartitionOperator(allocator, native_plan, stage);
+            try validatePartitionOperator(
+                allocator,
+                definition_plan,
+                native_plan,
+                frame.stage_index,
+            );
         }
         const step = definition_plan.steps[frame.stage_index];
         if (step.input_names.len == 0) return error.ObservationPartitionLayoutMissing;
@@ -503,14 +484,17 @@ fn validatePartitionScan(stage: plan.Stage, stage_index: u16, expected: ?u16) !v
 
 fn validatePartitionOperator(
     allocator: std.mem.Allocator,
+    definition_plan: *const definition.Plan,
     native_plan: *const plan.Plan,
-    stage: plan.Stage,
+    stage_index: u16,
 ) !void {
+    const stage = native_plan.stages[stage_index];
     const local = switch (stage.operation) {
         .filter, .project, .alias => true,
         .distinct => |distinct| keysSession(native_plan, stage, distinct.field_indices),
         .generic => |generic| switch (generic.operator) {
-            .derive, .join => try keepsPartition(allocator, generic),
+            .derive => try derivesSessionLocally(allocator, generic.canonical_config),
+            .join => try joinsSessionLocally(allocator, definition_plan, native_plan, stage_index),
             else => false,
         },
         else => false,
@@ -527,43 +511,20 @@ fn keysSession(native_plan: *const plan.Plan, stage: plan.Stage, field_indices: 
     return std.mem.indexOfScalar(u16, field_indices, column) != null;
 }
 
-fn keepsPartition(allocator: std.mem.Allocator, generic: plan.Generic) !bool {
-    var parsed = try parseConfig(allocator, generic.canonical_config);
+fn derivesSessionLocally(allocator: std.mem.Allocator, config: []const u8) !bool {
+    var parsed = try parseConfig(allocator, config);
     defer parsed.deinit();
     const root = try definition_core.json.object(parsed.value);
-    if (generic.operator == .join) {
-        const on = try definition_core.json.object(try definition_core.json.field(root, "on"));
-        if (!try pairsSession(try configArray(on, "keys"))) return false;
-    }
-    const outputs = try configArray(root, "fields");
-    for (outputs.items) |item| {
+    for ((try configArray(root, "fields")).items) |item| {
         const field = try definition_core.json.object(item);
         const name = try definition_core.json.requiredString(field, "name");
         if (!std.mem.eql(u8, name, "session_id")) continue;
-        if (!try copiesSession(generic.operator, field)) return false;
+        if (!copiesSessionExpression(try definition_core.json.field(field, "expr"))) return false;
     }
     return true;
 }
 
-fn pairsSession(keys: std.json.Array) !bool {
-    for (keys.items) |item| {
-        const key = try definition_core.json.object(item);
-        if (!try equalityKey(key)) continue;
-        const left = try definition_core.json.requiredString(key, "left");
-        const right = try definition_core.json.requiredString(key, "right");
-        if (std.mem.eql(u8, left, "session_id") and std.mem.eql(u8, right, "session_id")) {
-            return true;
-        }
-    }
-    return false;
-}
-
-fn copiesSession(operator: definition.Operator, field: std.json.ObjectMap) !bool {
-    if (operator == .join) {
-        const source = try definition_core.json.requiredString(field, "field");
-        return std.mem.eql(u8, source, "session_id");
-    }
-    const raw = try definition_core.json.field(field, "expr");
+fn copiesSessionExpression(raw: std.json.Value) bool {
     const expr = switch (raw) {
         .object => |object| object,
         else => return false,
@@ -571,6 +532,35 @@ fn copiesSession(operator: definition.Operator, field: std.json.ObjectMap) !bool
     if (expr.count() != 1) return false;
     const copied = expr.get("field") orelse return false;
     return copied == .string and std.mem.eql(u8, copied.string, "session_id");
+}
+
+fn joinsSessionLocally(
+    allocator: std.mem.Allocator,
+    definition_plan: *const definition.Plan,
+    native_plan: *const plan.Plan,
+    stage_index: u16,
+) !bool {
+    const stage = native_plan.stages[stage_index];
+    var spec = try compileJoin(
+        allocator,
+        native_plan,
+        definition_plan.steps[stage_index],
+        stage.operation.generic.canonical_config,
+    );
+    defer spec.deinit(allocator);
+    const left_session = native_plan.stages[spec.left_stage].schema.find("session_id") orelse
+        return false;
+    const right_session = native_plan.stages[spec.right_stage].schema.find("session_id") orelse
+        return false;
+    const paired = for (spec.keys) |key| {
+        if (key.op == .eq and key.left == left_session and key.right == right_session) break true;
+    } else false;
+    if (!paired) return false;
+    for (spec.outputs, stage.schema.columns) |output, column| {
+        if (!std.mem.eql(u8, column.name, "session_id")) continue;
+        if (output.side != .left or output.column != left_session) return false;
+    }
+    return true;
 }
 
 pub fn requiredScanStages(
@@ -1623,20 +1613,15 @@ const JoinContext = struct {
     allocator: std.mem.Allocator,
     left: Table,
     right: Table,
-    left_schema: plan.Schema,
-    right_schema: plan.Schema,
+    spec: *const JoinSpec,
     output_width: usize,
-    on: std.json.ObjectMap,
-    keys: std.json.Array,
-    fields: std.json.Array,
-    kind: []const u8,
     lineage: ?*LineageIndex,
     index: *const JoinIndex,
     max_rows: usize,
 
     fn first(self: *const JoinContext, row: []const execution.Value) ?usize {
-        if (!joinRequiredTrue(self.left_schema, row, self.on, "left_true")) return null;
-        const hash = joinEqualityHash(self.left_schema, row, self.keys, true) orelse return null;
+        if (!joinFlagEnabled(self.spec.left_true, row)) return null;
+        const hash = joinEqualityHash(self.spec.keys, row, .left) orelse return null;
         return self.index.first(hash);
     }
 
@@ -1645,9 +1630,7 @@ const JoinContext = struct {
         left: []const execution.Value,
         right: []const execution.Value,
     ) !bool {
-        if (!joinKeysMatch(self.left_schema, left, self.right_schema, right, self.keys)) {
-            return false;
-        }
+        if (!joinKeysMatch(self.spec.keys, left, right)) return false;
         if (self.lineage) |lineage| return lineage.matches(left, right);
         return true;
     }
@@ -1664,7 +1647,7 @@ const JoinContext = struct {
                 matched = true;
                 break;
             }
-            keep[left_index] = if (std.mem.eql(u8, self.kind, "anti")) !matched else matched;
+            keep[left_index] = if (self.spec.kind == .anti) !matched else matched;
         }
         const copy_output = !input_is_exclusive or self.left.values.ptr == self.right.values.ptr;
         var retained: usize = 0;
@@ -1689,10 +1672,8 @@ const JoinContext = struct {
         return .{ .values = output[0 .. kept * self.left.width], .width = self.left.width };
     }
 
-    fn materialize(self: *const JoinContext, membership_join: bool) !Table {
-        if (membership_join and !joinProjectsOnlyLeft(self.fields)) {
-            return error.ObservationMembershipJoinProjectsRight;
-        }
+    fn materialize(self: *const JoinContext) !Table {
+        const membership_join = self.spec.membership();
         var values: std.ArrayList(execution.Value) = .empty;
         errdefer values.deinit(self.allocator);
         for (0..try self.left.rowCount()) |left_index| {
@@ -1704,36 +1685,22 @@ const JoinContext = struct {
                 if (!try self.matches(row, right)) continue;
                 matched = true;
                 if (membership_join) break;
-                try self.append(&values, row, right);
+                try appendJoinOutputs(self.allocator, &values, self.spec.outputs, row, right);
                 if (values.items.len / self.output_width > self.max_rows) {
                     return error.ObservationRowBoundExceeded;
                 }
             }
-            if (membership_join) {
-                const retain = if (std.mem.eql(u8, self.kind, "anti")) !matched else matched;
-                if (retain) try self.append(&values, row, null);
-            } else if (!matched and std.mem.eql(u8, self.kind, "left")) {
-                try self.append(&values, row, null);
+            const keeps_left_row = switch (self.spec.kind) {
+                .anti => !matched,
+                .semi => matched,
+                .left => !matched,
+                .inner => false,
+            };
+            if (keeps_left_row) {
+                try appendJoinOutputs(self.allocator, &values, self.spec.outputs, row, null);
             }
         }
         return .{ .values = try values.toOwnedSlice(self.allocator), .width = self.output_width };
-    }
-
-    fn append(
-        self: *const JoinContext,
-        values: *std.ArrayList(execution.Value),
-        left: []const execution.Value,
-        right: ?[]const execution.Value,
-    ) !void {
-        try appendJoinRow(
-            self.allocator,
-            values,
-            self.fields,
-            self.left_schema,
-            left,
-            self.right_schema,
-            right,
-        );
     }
 };
 
@@ -1747,227 +1714,329 @@ fn joinTable(
     bounds: definition.Bounds,
     input_is_exclusive: bool,
 ) !Table {
-    if (step.input_names.len < 2 or step.input_names.len > 3) {
-        return error.InvalidPipelineInputCount;
-    }
-    const left_index = native_plan.findStage(step.input_names[0]) orelse
-        return error.ObservationExternalGraphInputUnsupported;
-    const right_index = native_plan.findStage(step.input_names[1]) orelse
-        return error.ObservationExternalGraphInputUnsupported;
-    const left = tables[left_index] orelse return error.ObservationInputNotExecuted;
-    const right = tables[right_index] orelse return error.ObservationInputNotExecuted;
-    var parsed = try parseConfig(allocator, config);
-    defer parsed.deinit();
-    const root = try definition_core.json.object(parsed.value);
-    const on = try definition_core.json.object(try definition_core.json.field(root, "on"));
-    const keys = try definition_core.json.array(try definition_core.json.field(on, "keys"));
-    const kind = if (on.get("kind")) |raw| try definition_core.json.string(raw) else "inner";
-    const fields = try definition_core.json.array(try definition_core.json.field(root, "fields"));
-    var lineage = try initJoinLineage(
+    var spec = try compileJoin(allocator, native_plan, step, config);
+    defer spec.deinit(allocator);
+    const left = tables[spec.left_stage] orelse return error.ObservationInputNotExecuted;
+    const right = tables[spec.right_stage] orelse return error.ObservationInputNotExecuted;
+    var lineage = if (spec.lineage) |columns| try LineageIndex.init(
         allocator,
-        native_plan,
-        step,
-        tables,
-        on,
-        left_index,
-        right_index,
+        tables[columns.graph_stage] orelse return error.ObservationInputNotExecuted,
+        columns,
         bounds.max_graph_depth,
-    );
+    ) else null;
     defer if (lineage) |*index| index.deinit(allocator);
     var index = try JoinIndex.init(allocator, try right.rowCount());
     defer index.deinit(allocator);
-    try populateJoinIndex(
-        allocator,
-        &index,
-        right,
-        native_plan.stages[right_index].schema,
-        on,
-        keys,
-    );
+    try populateJoinIndex(allocator, &index, right, &spec);
     const context: JoinContext = .{
         .allocator = allocator,
         .left = left,
         .right = right,
-        .left_schema = native_plan.stages[left_index].schema,
-        .right_schema = native_plan.stages[right_index].schema,
+        .spec = &spec,
         .output_width = output_schema.columns.len,
-        .on = on,
-        .keys = keys,
-        .fields = fields,
-        .kind = kind,
         .lineage = if (lineage) |*value| value else null,
         .index = &index,
         .max_rows = bounds.max_rows,
     };
-    const membership_join = std.mem.eql(u8, kind, "semi") or std.mem.eql(u8, kind, "anti");
-    if (membership_join and joinProjectsLeft(fields, context.left_schema)) {
+    if (spec.membership() and spec.projectsLeftColumns(left.width)) {
         return context.membership(input_is_exclusive);
     }
-    return context.materialize(membership_join);
+    return context.materialize();
 }
 
-fn initJoinLineage(
+const JoinKind = enum { inner, left, semi, anti };
+
+const JoinOperator = enum { eq, lt, le, gt, ge };
+
+const JoinSide = enum { left, right };
+
+const JoinKey = struct {
+    left: u16,
+    right: u16,
+    op: JoinOperator,
+    nulls_equal: bool,
+};
+
+const JoinOutput = struct {
+    side: JoinSide,
+    column: u16,
+};
+
+const JoinLineage = struct {
+    graph_stage: u16,
+    node: u16,
+    parent: u16,
+    left: u16,
+    right: u16,
+};
+
+const JoinSpec = struct {
+    kind: JoinKind,
+    left_stage: u16,
+    right_stage: u16,
+    keys: []JoinKey,
+    left_true: ?u16,
+    right_true: ?u16,
+    lineage: ?JoinLineage,
+    outputs: []JoinOutput,
+
+    fn deinit(self: *JoinSpec, allocator: std.mem.Allocator) void {
+        allocator.free(self.keys);
+        allocator.free(self.outputs);
+        self.* = undefined;
+    }
+
+    fn membership(self: *const JoinSpec) bool {
+        return self.kind == .semi or self.kind == .anti;
+    }
+
+    fn projectsLeftColumns(self: *const JoinSpec, width: usize) bool {
+        if (self.outputs.len != width) return false;
+        for (self.outputs, 0..) |output, column| {
+            if (output.side != .left or output.column != column) return false;
+        }
+        return true;
+    }
+};
+
+fn compileJoin(
     allocator: std.mem.Allocator,
     native_plan: *const plan.Plan,
     step: definition.Step,
-    tables: []const ?Table,
-    on: std.json.ObjectMap,
-    left_index: u16,
-    right_index: u16,
-    max_depth: usize,
-) !?LineageIndex {
-    const raw = on.get("lineage") orelse return null;
-    if (step.input_names.len != 3) return error.ObservationLineageInputMissing;
-    const graph_index = native_plan.findStage(step.input_names[2]) orelse
-        return error.ObservationExternalGraphInputUnsupported;
-    const graph = tables[graph_index] orelse return error.ObservationInputNotExecuted;
-    return try LineageIndex.init(
+    config: []const u8,
+) !JoinSpec {
+    var parsed = try parseConfig(allocator, config);
+    defer parsed.deinit();
+    const root = try definition_core.json.object(parsed.value);
+    const on = try definition_core.json.object(try definition_core.json.field(root, "on"));
+    const lineage = on.get("lineage");
+    if (lineage != null and step.input_names.len != 3) {
+        return error.ObservationLineageInputMissing;
+    }
+    if (step.input_names.len < 2 or step.input_names.len > 3) {
+        return error.InvalidPipelineInputCount;
+    }
+    const left_stage = try joinInputStage(native_plan, step, 0);
+    const right_stage = try joinInputStage(native_plan, step, 1);
+    const left = native_plan.stages[left_stage].schema;
+    const right = native_plan.stages[right_stage].schema;
+    const kind = if (on.get("kind")) |raw|
+        std.meta.stringToEnum(JoinKind, try definition_core.json.string(raw)) orelse
+            return error.ObservationJoinKindUnsupported
+    else
+        JoinKind.inner;
+    const left_true = try compileJoinFlag(on, "left_true", left);
+    const right_true = try compileJoinFlag(on, "right_true", right);
+    const keys = try compileJoinKeys(allocator, try configArray(on, "keys"), left, right);
+    errdefer allocator.free(keys);
+    const outputs = try compileJoinOutputs(
         allocator,
-        graph,
-        native_plan.stages[graph_index].schema,
-        try definition_core.json.object(raw),
-        native_plan.stages[left_index].schema,
-        native_plan.stages[right_index].schema,
-        max_depth,
+        try configArray(root, "fields"),
+        left,
+        right,
+        kind,
     );
+    errdefer allocator.free(outputs);
+    return .{
+        .kind = kind,
+        .left_stage = left_stage,
+        .right_stage = right_stage,
+        .keys = keys,
+        .left_true = left_true,
+        .right_true = right_true,
+        .lineage = if (lineage) |raw|
+            try compileJoinLineage(native_plan, step, try definition_core.json.object(raw))
+        else
+            null,
+        .outputs = outputs,
+    };
+}
+
+fn joinInputStage(native_plan: *const plan.Plan, step: definition.Step, input: usize) !u16 {
+    return native_plan.findStage(step.input_names[input]) orelse
+        error.ObservationExternalGraphInputUnsupported;
+}
+
+fn compileJoinFlag(on: std.json.ObjectMap, name: []const u8, schema: plan.Schema) !?u16 {
+    const raw = on.get(name) orelse return null;
+    const column = schema.find(try definition_core.json.string(raw)) orelse
+        return error.UnknownObservationJoinField;
+    if (schema.columns[column].kind != .boolean) return error.ObservationJoinFlagRequiresBoolean;
+    return column;
+}
+
+fn compileJoinKeys(
+    allocator: std.mem.Allocator,
+    keys: std.json.Array,
+    left: plan.Schema,
+    right: plan.Schema,
+) ![]JoinKey {
+    const compiled = try allocator.alloc(JoinKey, keys.items.len);
+    errdefer allocator.free(compiled);
+    var equality_keys: usize = 0;
+    for (keys.items, compiled) |item, *key| {
+        const object = try definition_core.json.object(item);
+        const op = if (object.get("op")) |raw|
+            std.meta.stringToEnum(JoinOperator, try definition_core.json.string(raw)) orelse
+                return error.ObservationJoinOperatorUnsupported
+        else
+            JoinOperator.eq;
+        key.* = .{
+            .left = left.find(try definition_core.json.requiredString(object, "left")) orelse
+                return error.UnknownObservationJoinField,
+            .right = right.find(try definition_core.json.requiredString(object, "right")) orelse
+                return error.UnknownObservationJoinField,
+            .op = op,
+            .nulls_equal = if (object.get("nulls_equal")) |raw|
+                try definition_core.json.boolean(raw)
+            else
+                false,
+        };
+        if (op == .eq) equality_keys += 1;
+    }
+    if (equality_keys == 0) return error.ObservationJoinRequiresEqualityKey;
+    return compiled;
+}
+
+fn compileJoinOutputs(
+    allocator: std.mem.Allocator,
+    fields: std.json.Array,
+    left: plan.Schema,
+    right: plan.Schema,
+    kind: JoinKind,
+) ![]JoinOutput {
+    const outputs = try allocator.alloc(JoinOutput, fields.items.len);
+    errdefer allocator.free(outputs);
+    for (fields.items, outputs) |item, *output| {
+        const field = try definition_core.json.object(item);
+        const source = try definition_core.json.unsigned(
+            try definition_core.json.field(field, "source"),
+        );
+        const side: JoinSide = switch (source) {
+            0 => .left,
+            1 => .right,
+            else => return error.ObservationJoinSourceUnsupported,
+        };
+        if (side == .right and (kind == .semi or kind == .anti)) {
+            return error.ObservationMembershipJoinProjectsRight;
+        }
+        const schema = if (side == .left) left else right;
+        output.* = .{
+            .side = side,
+            .column = schema.find(try definition_core.json.requiredString(field, "field")) orelse
+                return error.UnknownObservationJoinField,
+        };
+    }
+    return outputs;
+}
+
+fn compileJoinLineage(
+    native_plan: *const plan.Plan,
+    step: definition.Step,
+    config: std.json.ObjectMap,
+) !JoinLineage {
+    const graph_stage = try joinInputStage(native_plan, step, 2);
+    const graph = native_plan.stages[graph_stage].schema;
+    const left = native_plan.stages[try joinInputStage(native_plan, step, 0)].schema;
+    const right = native_plan.stages[try joinInputStage(native_plan, step, 1)].schema;
+    return .{
+        .graph_stage = graph_stage,
+        .node = try lineageColumn(graph, config, "node"),
+        .parent = try lineageColumn(graph, config, "parent"),
+        .left = try lineageColumn(left, config, "left"),
+        .right = try lineageColumn(right, config, "right"),
+    };
+}
+
+fn lineageColumn(schema: plan.Schema, config: std.json.ObjectMap, name: []const u8) !u16 {
+    return schema.find(try definition_core.json.requiredString(config, name)) orelse
+        error.UnknownObservationLineageField;
 }
 
 fn populateJoinIndex(
     allocator: std.mem.Allocator,
     index: *JoinIndex,
     right: Table,
-    schema: plan.Schema,
-    on: std.json.ObjectMap,
-    keys: std.json.Array,
+    spec: *const JoinSpec,
 ) !void {
-    var equality_keys: usize = 0;
-    for (keys.items) |item| {
-        const key = try definition_core.json.object(item);
-        const op = if (key.get("op")) |raw| try definition_core.json.string(raw) else "eq";
-        if (std.mem.eql(u8, op, "eq")) equality_keys += 1;
-    }
-    if (equality_keys == 0) return error.ObservationJoinRequiresEqualityKey;
     for (0..try right.rowCount()) |row_index| {
         const row = right.row(row_index);
-        if (!joinRequiredTrue(schema, row, on, "right_true")) continue;
-        const hash = joinEqualityHash(schema, row, keys, false) orelse continue;
+        if (!joinFlagEnabled(spec.right_true, row)) continue;
+        const hash = joinEqualityHash(spec.keys, row, .right) orelse continue;
         try index.add(allocator, hash, row_index);
     }
 }
 
-fn joinProjectsOnlyLeft(fields: std.json.Array) bool {
-    for (fields.items) |item| {
-        const field = definition_core.json.object(item) catch return false;
-        const source = definition_core.json.unsigned(
-            definition_core.json.field(field, "source") catch return false,
-        ) catch return false;
-        if (source != 0) return false;
-    }
-    return true;
+fn joinFlagEnabled(column: ?u16, row: []const execution.Value) bool {
+    const index = column orelse return true;
+    return switch (row[index]) {
+        .boolean => |flag| flag,
+        else => false,
+    };
 }
 
-fn leftProjection(
-    allocator: std.mem.Allocator,
-    fields: std.json.Array,
-    schema: plan.Schema,
-) ![]u16 {
-    const projection = try allocator.alloc(u16, fields.items.len);
-    errdefer allocator.free(projection);
-    for (fields.items, projection) |item, *column| {
-        const field = try definition_core.json.object(item);
-        const raw_source = try definition_core.json.field(field, "source");
-        if (try definition_core.json.unsigned(raw_source) != 0) {
-            return error.ObservationStreamingLineageProjectionUnsupported;
+fn joinEqualityHash(keys: []const JoinKey, row: []const execution.Value, side: JoinSide) ?u64 {
+    var hash = std.hash.Wyhash.init(0);
+    for (keys) |key| {
+        if (key.op != .eq) continue;
+        const value = row[if (side == .left) key.left else key.right];
+        if (value == .null and !key.nulls_equal) return null;
+        hashValue(&hash, value);
+    }
+    return hash.final();
+}
+
+fn joinKeysMatch(
+    keys: []const JoinKey,
+    left: []const execution.Value,
+    right: []const execution.Value,
+) bool {
+    for (keys) |key| {
+        const left_value = left[key.left];
+        const right_value = right[key.right];
+        if (left_value == .null or right_value == .null) {
+            if (key.nulls_equal and left_value == .null and right_value == .null) continue;
+            return false;
         }
-        const name = try definition_core.json.requiredString(field, "field");
-        column.* = schema.find(name) orelse return error.UnknownObservationJoinField;
-    }
-    return projection;
-}
-
-fn projectsLeftInput(fields: std.json.Array, schema: plan.Schema) bool {
-    if (fields.items.len == 0 or !joinProjectsOnlyLeft(fields)) return false;
-    for (fields.items) |item| {
-        const field = definition_core.json.object(item) catch return false;
-        const name = definition_core.json.requiredString(field, "field") catch return false;
-        if (schema.find(name) == null) return false;
-    }
-    return true;
-}
-
-fn joinProjectsLeft(fields: std.json.Array, schema: plan.Schema) bool {
-    if (fields.items.len != schema.columns.len) return false;
-    for (fields.items, 0..) |item, index| {
-        const field = definition_core.json.object(item) catch return false;
-        const source = definition_core.json.unsigned(
-            definition_core.json.field(field, "source") catch return false,
-        ) catch return false;
-        if (source != 0) return false;
-        const name = definition_core.json.requiredString(field, "field") catch return false;
-        if (!std.mem.eql(u8, name, schema.columns[index].name)) return false;
-    }
-    return true;
-}
-
-const CompiledJoinKey = struct {
-    left: u16,
-    right: u16,
-    nulls_equal: bool,
-};
-
-fn joinTrueFieldIndex(on: std.json.ObjectMap, schema: plan.Schema, key: []const u8) !?u16 {
-    const raw = on.get(key) orelse return null;
-    return schema.find(try definition_core.json.string(raw)) orelse
-        error.UnknownObservationJoinField;
-}
-
-fn compileStreamingJoinKeys(
-    allocator: std.mem.Allocator,
-    on: std.json.ObjectMap,
-    left_schema: plan.Schema,
-) ![]CompiledJoinKey {
-    const raw_keys = try definition_core.json.array(try definition_core.json.field(on, "keys"));
-    const keys = try allocator.alloc(CompiledJoinKey, raw_keys.items.len);
-    errdefer allocator.free(keys);
-    for (raw_keys.items, 0..) |item, index| {
-        const key = try definition_core.json.object(item);
-        const op = if (key.get("op")) |raw|
-            try definition_core.json.string(raw)
-        else
-            "eq";
-        if (!std.mem.eql(u8, op, "eq")) {
-            return error.ObservationStreamingLineageKeyUnsupported;
-        }
-        keys[index] = .{
-            .left = left_schema.find(
-                try definition_core.json.requiredString(key, "left"),
-            ) orelse return error.UnknownObservationJoinField,
-            .right = left_schema.find(
-                try definition_core.json.requiredString(key, "right"),
-            ) orelse return error.UnknownObservationJoinField,
-            .nulls_equal = if (key.get("nulls_equal")) |raw|
-                try definition_core.json.boolean(raw)
-            else
-                false,
+        const matched = switch (key.op) {
+            .eq => valuesEqual(left_value, right_value, false),
+            .lt => value_module.holds(left_value, right_value, .lt),
+            .le => value_module.holds(left_value, right_value, .le),
+            .gt => value_module.holds(left_value, right_value, .gt),
+            .ge => value_module.holds(left_value, right_value, .ge),
         };
+        if (!matched) return false;
     }
-    return keys;
+    return true;
+}
+
+fn appendJoinOutputs(
+    allocator: std.mem.Allocator,
+    output: *std.ArrayList(execution.Value),
+    outputs: []const JoinOutput,
+    left: []const execution.Value,
+    right: ?[]const execution.Value,
+) !void {
+    for (outputs) |field| {
+        try output.append(allocator, switch (field.side) {
+            .left => left[field.column],
+            .right => if (right) |row| row[field.column] else .null,
+        });
+    }
 }
 
 pub const StreamingLineageReducer = struct {
     allocator: std.mem.Allocator,
-    left_schema: plan.Schema,
-    output_width: usize,
-    projection: []u16,
-    keys: []CompiledJoinKey,
+    spec: JoinSpec,
+    width: usize,
     lineage: LineageIndex,
     heads: std.AutoHashMapUnmanaged(u64, usize) = .{},
     next: std.ArrayList(usize) = .empty,
     output: std.ArrayList(execution.Value) = .empty,
-    left_true_index: ?u16,
-    right_true_index: ?u16,
     max_rows: usize,
     max_retained_bytes: usize,
+
+    const no_owner = std.math.maxInt(usize);
 
     pub fn init(
         allocator: std.mem.Allocator,
@@ -1983,49 +2052,29 @@ pub const StreamingLineageReducer = struct {
             else => return error.ObservationStreamingLineageShapeUnsupported,
         };
         if (generic.operator != .join) return error.ObservationStreamingLineageShapeUnsupported;
-        var parsed = try parseConfig(allocator, generic.canonical_config);
-        defer parsed.deinit();
-        const root = try definition_core.json.object(parsed.value);
-        const on = try definition_core.json.object(
-            try definition_core.json.field(root, "on"),
+        var spec = try compileJoin(
+            allocator,
+            native_plan,
+            definition_plan.steps[schedule.lineage_stage],
+            generic.canonical_config,
         );
-        const kind = try definition_core.json.requiredString(on, "kind");
-        if (!std.mem.eql(u8, kind, "anti")) {
+        errdefer spec.deinit(allocator);
+        if (!streamableLineageJoin(native_plan, &spec)) {
             return error.ObservationStreamingLineageShapeUnsupported;
         }
-        const fields = try definition_core.json.array(
-            try definition_core.json.field(root, "fields"),
-        );
-        const left_schema = native_plan.stages[schedule.local_stage].schema;
-        const projection = try leftProjection(allocator, fields, left_schema);
-        errdefer allocator.free(projection);
-        const keys = try compileStreamingJoinKeys(allocator, on, left_schema);
-        errdefer allocator.free(keys);
-        const lineage_config = try definition_core.json.object(
-            on.get("lineage") orelse return error.ObservationLineageInputMissing,
-        );
         var lineage = try LineageIndex.init(
             allocator,
             graph,
-            native_plan.stages[schedule.graph_stage].schema,
-            lineage_config,
-            left_schema,
-            left_schema,
+            spec.lineage.?,
             definition_plan.bounds.max_graph_depth,
         );
         errdefer lineage.deinit(allocator);
-        const left_true = try joinTrueFieldIndex(on, left_schema, "left_true");
-        const right_true = try joinTrueFieldIndex(on, left_schema, "right_true");
-        std.debug.assert(stage.schema.columns.len == projection.len);
+        std.debug.assert(stage.schema.columns.len == spec.outputs.len);
         return .{
             .allocator = allocator,
-            .left_schema = left_schema,
-            .output_width = left_schema.columns.len,
-            .projection = projection,
-            .keys = keys,
+            .spec = spec,
+            .width = native_plan.stages[spec.left_stage].schema.columns.len,
             .lineage = lineage,
-            .left_true_index = left_true,
-            .right_true_index = right_true,
             .max_rows = definition_plan.bounds.max_rows,
             .max_retained_bytes = max_retained_bytes,
         };
@@ -2033,8 +2082,7 @@ pub const StreamingLineageReducer = struct {
 
     pub fn deinit(self: *StreamingLineageReducer) void {
         self.lineage.deinit(self.allocator);
-        self.allocator.free(self.projection);
-        self.allocator.free(self.keys);
+        self.spec.deinit(self.allocator);
         self.heads.deinit(self.allocator);
         self.next.deinit(self.allocator);
         self.output.deinit(self.allocator);
@@ -2042,63 +2090,56 @@ pub const StreamingLineageReducer = struct {
     }
 
     pub fn appendPartition(self: *StreamingLineageReducer, rows: Table) !void {
-        if (rows.width != self.left_schema.columns.len) {
-            return error.InvalidObservationRows;
-        }
+        if (rows.width != self.width) return error.InvalidObservationRows;
         for (0..try rows.rowCount()) |row_index| {
             const row = rows.row(row_index);
-            const left_enabled = if (self.left_true_index) |index|
-                switch (row[index]) {
-                    .boolean => |flag| flag,
-                    else => false,
-                }
-            else
-                true;
-            const key_hash = self.keyHash(row) orelse {
-                try self.output.appendSlice(self.allocator, row);
-                try self.next.append(self.allocator, std.math.maxInt(usize));
-                try self.checkBounds();
+            const key_hash = joinEqualityHash(self.spec.keys, row, .left) orelse {
+                try self.retain(row, null);
                 continue;
             };
-            var matched_ancestor = false;
-            var candidate = if (left_enabled) self.heads.get(key_hash) else null;
-            while (candidate) |owner_index| {
-                const owner = self.ownerRow(owner_index);
-                if (self.keysMatch(row, owner) and
-                    try self.lineage.matches(row, owner))
-                {
-                    matched_ancestor = true;
-                    break;
-                }
-                const following = self.next.items[owner_index];
-                candidate = if (following == std.math.maxInt(usize)) null else following;
-            }
-            if (matched_ancestor) continue;
-            const right_enabled = if (self.right_true_index) |index|
-                switch (row[index]) {
-                    .boolean => |flag| flag,
-                    else => false,
-                }
-            else
-                true;
-            const output_index = self.output.items.len / self.output_width;
-            try self.output.appendSlice(self.allocator, row);
-            if (right_enabled) {
-                const entry = try self.heads.getOrPut(self.allocator, key_hash);
-                try self.next.append(
-                    self.allocator,
-                    if (entry.found_existing) entry.value_ptr.* else std.math.maxInt(usize),
-                );
-                entry.value_ptr.* = output_index;
-            } else try self.next.append(self.allocator, std.math.maxInt(usize));
-            try self.checkBounds();
+            if (joinFlagEnabled(self.spec.left_true, row) and
+                try self.ancestorMatches(row, key_hash)) continue;
+            const owner = joinFlagEnabled(self.spec.right_true, row);
+            try self.retain(row, if (owner) key_hash else null);
         }
     }
 
-    fn checkBounds(self: *const StreamingLineageReducer) !void {
-        if (self.output.items.len / self.output_width > self.max_rows) {
-            return error.ObservationRowBoundExceeded;
+    fn ancestorMatches(
+        self: *const StreamingLineageReducer,
+        row: []const execution.Value,
+        key_hash: u64,
+    ) !bool {
+        var candidate = self.heads.get(key_hash);
+        while (candidate) |owner_index| {
+            const owner = self.ownerRow(owner_index);
+            if (joinKeysMatch(self.spec.keys, row, owner) and
+                try self.lineage.matches(row, owner)) return true;
+            const following = self.next.items[owner_index];
+            candidate = if (following == no_owner) null else following;
         }
+        return false;
+    }
+
+    fn retain(
+        self: *StreamingLineageReducer,
+        row: []const execution.Value,
+        owner_hash: ?u64,
+    ) !void {
+        const output_index = self.rowCount();
+        try self.output.appendSlice(self.allocator, row);
+        if (owner_hash) |hash| {
+            const entry = try self.heads.getOrPut(self.allocator, hash);
+            try self.next.append(
+                self.allocator,
+                if (entry.found_existing) entry.value_ptr.* else no_owner,
+            );
+            entry.value_ptr.* = output_index;
+        } else try self.next.append(self.allocator, no_owner);
+        try self.checkBounds();
+    }
+
+    fn checkBounds(self: *const StreamingLineageReducer) !void {
+        if (self.rowCount() > self.max_rows) return error.ObservationRowBoundExceeded;
         const value_bytes = try std.math.mul(
             usize,
             self.output.items.len,
@@ -2111,68 +2152,32 @@ pub const StreamingLineageReducer = struct {
     }
 
     pub fn finish(self: *StreamingLineageReducer) !Table {
-        if (self.projectsIdentity()) {
+        if (self.spec.projectsLeftColumns(self.width)) {
             const values = try self.output.toOwnedSlice(self.allocator);
             self.output = .empty;
-            return .{ .values = values, .width = self.output_width };
+            return .{ .values = values, .width = self.width };
         }
         const rows = self.rowCount();
-        const width = self.projection.len;
+        const width = self.spec.outputs.len;
         const values = try self.allocator.alloc(
             execution.Value,
             try std.math.mul(usize, rows, width),
         );
         for (0..rows) |row_index| {
-            const row = self.output.items[row_index * self.output_width ..][0..self.output_width];
+            const row = self.ownerRow(row_index);
             const target = values[row_index * width ..][0..width];
-            for (self.projection, target) |column, *value| value.* = row[column];
+            for (self.spec.outputs, target) |output, *value| value.* = row[output.column];
         }
         self.output.clearAndFree(self.allocator);
         return .{ .values = values, .width = width };
     }
 
-    fn projectsIdentity(self: *const StreamingLineageReducer) bool {
-        if (self.projection.len != self.output_width) return false;
-        for (self.projection, 0..) |column, index| {
-            if (column != index) return false;
-        }
-        return true;
-    }
-
     pub fn rowCount(self: *const StreamingLineageReducer) usize {
-        return self.output.items.len / self.output_width;
+        return self.output.items.len / self.width;
     }
 
     fn ownerRow(self: *const StreamingLineageReducer, index: usize) []const execution.Value {
-        const width = self.left_schema.columns.len;
-        return self.output.items[index * width ..][0..width];
-    }
-
-    fn keyHash(self: *const StreamingLineageReducer, row: []const execution.Value) ?u64 {
-        var hasher = std.hash.Wyhash.init(0);
-        for (self.keys) |key| {
-            const value = row[key.left];
-            if (value == .null and !key.nulls_equal) return null;
-            hashValue(&hasher, value);
-        }
-        return hasher.final();
-    }
-
-    fn keysMatch(
-        self: *const StreamingLineageReducer,
-        left: []const execution.Value,
-        right: []const execution.Value,
-    ) bool {
-        for (self.keys) |key| {
-            if (left[key.left] == .null or right[key.right] == .null) {
-                if (key.nulls_equal and left[key.left] == .null and right[key.right] == .null) {
-                    continue;
-                }
-                return false;
-            }
-            if (!valuesEqual(left[key.left], right[key.right], false)) return false;
-        }
-        return true;
+        return self.output.items[index * self.width ..][0..self.width];
     }
 };
 
@@ -2214,53 +2219,6 @@ const JoinIndex = struct {
     }
 };
 
-fn joinRequiredTrue(
-    schema: plan.Schema,
-    row: []const execution.Value,
-    on: std.json.ObjectMap,
-    name: []const u8,
-) bool {
-    const raw = on.get(name) orelse return true;
-    const field = definition_core.json.string(raw) catch return false;
-    return switch (row[schema.find(field) orelse return false]) {
-        .boolean => |flag| flag,
-        else => false,
-    };
-}
-
-fn joinEqualityHash(
-    schema: plan.Schema,
-    row: []const execution.Value,
-    keys: std.json.Array,
-    left: bool,
-) ?u64 {
-    var hash = std.hash.Wyhash.init(0);
-    var count: usize = 0;
-    for (keys.items) |item| {
-        const key = definition_core.json.object(item) catch return null;
-        const op = if (key.get("op")) |raw|
-            definition_core.json.string(raw) catch return null
-        else
-            "eq";
-        if (!std.mem.eql(u8, op, "eq")) continue;
-        const name = definition_core.json.requiredString(
-            key,
-            if (left) "left" else "right",
-        ) catch return null;
-        const value = row[schema.find(name) orelse return null];
-        if (value == .null) {
-            const nulls_equal = if (key.get("nulls_equal")) |raw|
-                definition_core.json.boolean(raw) catch return null
-            else
-                false;
-            if (!nulls_equal) return null;
-        }
-        hashValue(&hash, value);
-        count += 1;
-    }
-    return if (count == 0) null else hash.final();
-}
-
 fn hashValue(hash: *std.hash.Wyhash, value: execution.Value) void {
     if (valueFloat(value)) |number| {
         const bits: u64 = @bitCast(if (number == 0) @as(f64, 0) else number);
@@ -2294,26 +2252,15 @@ const LineageIndex = struct {
     fn init(
         allocator: std.mem.Allocator,
         rows: Table,
-        graph_schema: plan.Schema,
-        config: std.json.ObjectMap,
-        left_schema: plan.Schema,
-        right_schema: plan.Schema,
+        columns: JoinLineage,
         max_depth: usize,
     ) !LineageIndex {
         var result = LineageIndex{
             .rows = rows,
-            .node_index = graph_schema.find(
-                try definition_core.json.requiredString(config, "node"),
-            ) orelse return error.UnknownObservationLineageField,
-            .parent_index = graph_schema.find(
-                try definition_core.json.requiredString(config, "parent"),
-            ) orelse return error.UnknownObservationLineageField,
-            .left_index = left_schema.find(
-                try definition_core.json.requiredString(config, "left"),
-            ) orelse return error.UnknownObservationLineageField,
-            .right_index = right_schema.find(
-                try definition_core.json.requiredString(config, "right"),
-            ) orelse return error.UnknownObservationLineageField,
+            .node_index = columns.node,
+            .parent_index = columns.parent,
+            .left_index = columns.left,
+            .right_index = columns.right,
             .max_depth = max_depth,
         };
         errdefer result.deinit(allocator);
@@ -2354,75 +2301,6 @@ const LineageIndex = struct {
         return false;
     }
 };
-
-fn joinKeysMatch(
-    left_schema: plan.Schema,
-    left: []const execution.Value,
-    right_schema: plan.Schema,
-    right: []const execution.Value,
-    keys: std.json.Array,
-) bool {
-    for (keys.items) |item| {
-        const key = definition_core.json.object(item) catch return false;
-        const left_name = definition_core.json.requiredString(key, "left") catch return false;
-        const right_name = definition_core.json.requiredString(key, "right") catch return false;
-        const left_index = left_schema.find(left_name) orelse return false;
-        const right_index = right_schema.find(right_name) orelse return false;
-        const nulls_equal = if (key.get("nulls_equal")) |raw|
-            definition_core.json.boolean(raw) catch return false
-        else
-            false;
-        if (left[left_index] == .null or right[right_index] == .null) {
-            if (nulls_equal and left[left_index] == .null and right[right_index] == .null) {
-                continue;
-            }
-            return false;
-        }
-        const op = if (key.get("op")) |raw|
-            definition_core.json.string(raw) catch return false
-        else
-            "eq";
-        const matched = if (std.mem.eql(u8, op, "eq"))
-            valuesEqual(left[left_index], right[right_index], false)
-        else if (std.mem.eql(u8, op, "lt"))
-            value_module.holds(left[left_index], right[right_index], .lt)
-        else if (std.mem.eql(u8, op, "le"))
-            value_module.holds(left[left_index], right[right_index], .le)
-        else if (std.mem.eql(u8, op, "gt"))
-            value_module.holds(left[left_index], right[right_index], .gt)
-        else if (std.mem.eql(u8, op, "ge"))
-            value_module.holds(left[left_index], right[right_index], .ge)
-        else
-            false;
-        if (!matched) return false;
-    }
-    return true;
-}
-
-fn appendJoinRow(
-    allocator: std.mem.Allocator,
-    output: *std.ArrayList(execution.Value),
-    fields: std.json.Array,
-    left_schema: plan.Schema,
-    left: []const execution.Value,
-    right_schema: plan.Schema,
-    right: ?[]const execution.Value,
-) !void {
-    for (fields.items) |item| {
-        const field = try definition_core.json.object(item);
-        const source = try definition_core.json.unsigned(
-            try definition_core.json.field(field, "source"),
-        );
-        const name = try definition_core.json.requiredString(field, "field");
-        const value: execution.Value = if (source == 0)
-            left[left_schema.find(name) orelse return error.UnknownObservationJoinField]
-        else if (source == 1 and right != null)
-            right.?[right_schema.find(name) orelse return error.UnknownObservationJoinField]
-        else
-            .null;
-        try output.append(allocator, value);
-    }
-}
 
 fn configArray(object: std.json.ObjectMap, name: []const u8) !std.json.Array {
     return definition_core.json.array(try definition_core.json.field(object, name));
@@ -2660,6 +2538,8 @@ fn reachabilityTable(
         if (entry.found_existing) return error.DuplicateObservationReachabilityNode;
         entry.value_ptr.* = index;
     }
+    const parents = try reachabilityParents(allocator, input, node_index, parent_index, &nodes);
+    defer allocator.free(parents);
     if (keys.get("mode")) |raw_mode| {
         const mode = try definition_core.json.string(raw_mode);
         if (std.mem.eql(u8, mode, "closure")) {
@@ -2670,9 +2550,8 @@ fn reachabilityTable(
                 output_schema,
                 fields,
                 node_index,
-                parent_index,
+                parents,
                 bounds,
-                &nodes,
             );
         }
         return error.UnknownObservationReachabilityMode;
@@ -2684,10 +2563,29 @@ fn reachabilityTable(
         output_schema,
         fields,
         keys,
-        parent_index,
+        parents,
         bounds,
-        &nodes,
     );
+}
+
+fn reachabilityParents(
+    allocator: std.mem.Allocator,
+    input: Table,
+    node_index: u16,
+    parent_index: u16,
+    nodes: *const std.StringHashMapUnmanaged(usize),
+) ![]?usize {
+    const parents = try allocator.alloc(?usize, try input.rowCount());
+    errdefer allocator.free(parents);
+    for (parents, 0..) |*parent, index| {
+        const row = input.row(index);
+        parent.* = null;
+        if (row[node_index] == .null or row[parent_index] == .null) continue;
+        const text = valueText(row[parent_index]) orelse
+            return error.InvalidObservationReachabilityNode;
+        parent.* = nodes.get(text);
+    }
+    return parents;
 }
 
 fn reachabilitySeeded(
@@ -2697,9 +2595,8 @@ fn reachabilitySeeded(
     output_schema: plan.Schema,
     fields: std.json.Array,
     keys: std.json.ObjectMap,
-    parent_index: u16,
+    parents: []const ?usize,
     bounds: definition.Bounds,
-    nodes: *const std.StringHashMapUnmanaged(usize),
 ) !Table {
     const count = try input.rowCount();
     const seed_index = input_schema.find(
@@ -2729,11 +2626,9 @@ fn reachabilitySeeded(
         },
         else => {},
     };
-    try expandReachability(
-        input,
-        parent_index,
+    expandReachability(
+        parents,
         bounds.max_graph_depth,
-        nodes,
         walk_ancestors,
         walk_descendants,
         reachable,
@@ -2751,39 +2646,27 @@ fn reachabilitySeeded(
 }
 
 fn expandReachability(
-    input: Table,
-    parent_index: u16,
+    parents: []const ?usize,
     max_depth: usize,
-    nodes: *const std.StringHashMapUnmanaged(usize),
     walk_ancestors: bool,
     walk_descendants: bool,
     reachable: []bool,
     depths: []i64,
-) !void {
-    const count = try input.rowCount();
+) void {
     var depth: usize = 0;
     while (depth < max_depth) : (depth += 1) {
         var changed = false;
-        for (0..count) |child_index| {
-            const parent = input.row(child_index)[parent_index];
-            if (parent == .null) continue;
-            const parent_text = valueText(parent) orelse
-                return error.InvalidObservationReachabilityNode;
-            if (nodes.get(parent_text)) |candidate_index| {
-                if (walk_ancestors and reachable[child_index] and
-                    !reachable[candidate_index])
-                {
-                    reachable[candidate_index] = true;
-                    depths[candidate_index] = depths[child_index] + 1;
-                    changed = true;
-                }
-                if (walk_descendants and reachable[candidate_index] and
-                    !reachable[child_index])
-                {
-                    reachable[child_index] = true;
-                    depths[child_index] = depths[candidate_index] + 1;
-                    changed = true;
-                }
+        for (parents, 0..) |parent, child_index| {
+            const candidate_index = parent orelse continue;
+            if (walk_ancestors and reachable[child_index] and !reachable[candidate_index]) {
+                reachable[candidate_index] = true;
+                depths[candidate_index] = depths[child_index] + 1;
+                changed = true;
+            }
+            if (walk_descendants and reachable[candidate_index] and !reachable[child_index]) {
+                reachable[child_index] = true;
+                depths[child_index] = depths[candidate_index] + 1;
+                changed = true;
             }
         }
         if (!changed) break;
@@ -2839,24 +2722,18 @@ fn reachabilityClosure(
     output_schema: plan.Schema,
     fields: std.json.Array,
     node_index: u16,
-    parent_index: u16,
+    parents: []const ?usize,
     bounds: definition.Bounds,
-    nodes: *const std.StringHashMapUnmanaged(usize),
 ) !Table {
     const count = try input.rowCount();
     var output: std.ArrayList(execution.Value) = .empty;
     errdefer output.deinit(allocator);
     for (0..count) |descendant_index| {
         const descendant = input.row(descendant_index);
-        var parent = descendant[parent_index];
+        var current = parents[descendant_index];
         var depth: usize = 1;
-        while (parent != .null) : (depth += 1) {
-            if (depth > bounds.max_graph_depth) {
-                return error.ObservationGraphDepthExceeded;
-            }
-            const parent_text = valueText(parent) orelse
-                return error.InvalidObservationReachabilityNode;
-            const found = nodes.get(parent_text) orelse break;
+        while (current) |found| : (depth += 1) {
+            if (depth > bounds.max_graph_depth) return error.ObservationGraphDepthExceeded;
             const ancestor = input.row(found);
             if (valuesEqual(
                 descendant[node_index],
@@ -2894,7 +2771,7 @@ fn reachabilityClosure(
             {
                 return error.ObservationGraphNodeBoundExceeded;
             }
-            parent = ancestor[parent_index];
+            current = parents[found];
         }
     }
     return .{
@@ -3066,33 +2943,16 @@ test "graph top-k releases its bounded index and output at every allocation fail
 }
 
 test "lineage ownership is strict and does not cross siblings" {
-    var graph_columns = [_]plan.Column{
-        .{ .name = @constCast("session_id"), .kind = .string, .nullable = false },
-        .{ .name = @constCast("parent_session_id"), .kind = .string, .nullable = true },
-    };
-    var event_columns = [_]plan.Column{
-        .{ .name = @constCast("session_id"), .kind = .string, .nullable = false },
-    };
     var graph_values = [_]execution.Value{
         .{ .string = "root" },       .null,
         .{ .string = "child-a" },    .{ .string = "root" },
         .{ .string = "child-b" },    .{ .string = "root" },
         .{ .string = "grandchild" }, .{ .string = "child-a" },
     };
-    var parsed = try parseConfig(
-        std.testing.allocator,
-        "{\"left\":\"session_id\",\"right\":\"session_id\"," ++
-            "\"node\":\"session_id\",\"parent\":\"parent_sessi" ++
-            "on_id\"}",
-    );
-    defer parsed.deinit();
     var index = try LineageIndex.init(
         std.testing.allocator,
         .{ .values = &graph_values, .width = 2 },
-        .{ .columns = &graph_columns },
-        try definition_core.json.object(parsed.value),
-        .{ .columns = &event_columns },
-        .{ .columns = &event_columns },
+        .{ .graph_stage = 0, .node = 0, .parent = 1, .left = 0, .right = 0 },
         8,
     );
     defer index.deinit(std.testing.allocator);
@@ -3107,23 +2967,20 @@ test "lineage ownership is strict and does not cross siblings" {
 }
 
 test "join equality hashes null-safe cumulative tuples consistently" {
-    var columns = [_]plan.Column{
-        .{ .name = @constCast("total"), .kind = .integer, .nullable = true },
-        .{ .name = @constCast("cached"), .kind = .integer, .nullable = true },
+    const keys = [_]JoinKey{
+        .{ .left = 0, .right = 0, .op = .eq, .nulls_equal = false },
+        .{ .left = 1, .right = 1, .op = .eq, .nulls_equal = true },
     };
-    var parsed = try parseConfig(
-        std.testing.allocator,
-        "[{\"left\":\"total\",\"right\":\"total\"},{\"left\":" ++
-            "\"cached\",\"right\":\"cached\",\"nulls_equal\":tr" ++
-            "ue}]",
-    );
-    defer parsed.deinit();
-    const keys = try definition_core.json.array(parsed.value);
     const row = [_]execution.Value{ .{ .integer = 42 }, .null };
+    try std.testing.expect(joinEqualityHash(&keys, &row, .left) != null);
     try std.testing.expectEqual(
-        joinEqualityHash(.{ .columns = &columns }, &row, keys, true),
-        joinEqualityHash(.{ .columns = &columns }, &row, keys, false),
+        joinEqualityHash(&keys, &row, .left),
+        joinEqualityHash(&keys, &row, .right),
     );
+    try std.testing.expect(joinKeysMatch(&keys, &row, &row));
+    const strict = [_]JoinKey{.{ .left = 1, .right = 1, .op = .eq, .nulls_equal = false }};
+    try std.testing.expect(joinEqualityHash(&strict, &row, .left) == null);
+    try std.testing.expect(!joinKeysMatch(&strict, &row, &row));
 }
 
 const lineage_eligibility_rows = [_]execution.Value{
@@ -3150,11 +3007,11 @@ const lineage_eligibility_rows = [_]execution.Value{
 };
 
 test "streaming lineage keeps right eligibility independent of left eligibility" {
-    var graph_columns = [_]plan.Column{
+    const graph_columns = [_]plan.Column{
         .{ .name = @constCast("node"), .kind = .string, .nullable = false },
         .{ .name = @constCast("parent"), .kind = .string, .nullable = true },
     };
-    var columns = [_]plan.Column{
+    const columns = [_]plan.Column{
         .{ .name = @constCast("node"), .kind = .string, .nullable = false },
         .{ .name = @constCast("key"), .kind = .integer, .nullable = false },
         .{ .name = @constCast("left"), .kind = .boolean, .nullable = false },
@@ -3165,32 +3022,39 @@ test "streaming lineage keeps right eligibility independent of left eligibility"
         .{ .string = "child" },      .{ .string = "root" },
         .{ .string = "grandchild" }, .{ .string = "child" },
     };
-    var parsed = try parseConfig(
-        std.testing.allocator,
-        "{\"left\":\"node\",\"right\":\"node\",\"node\":\"node\",\"parent\":\"parent\"}",
-    );
-    defer parsed.deinit();
-    const keys = try std.testing.allocator.alloc(CompiledJoinKey, 1);
-    keys[0] = .{ .left = 1, .right = 1, .nulls_equal = false };
-    const projection = try std.testing.allocator.alloc(u16, columns.len);
-    for (projection, 0..) |*column, index| column.* = @intCast(index);
+    const keys = try std.testing.allocator.alloc(JoinKey, 1);
+    keys[0] = .{ .left = 1, .right = 1, .op = .eq, .nulls_equal = false };
+    const outputs = std.testing.allocator.alloc(JoinOutput, columns.len) catch |err| {
+        std.testing.allocator.free(keys);
+        return err;
+    };
+    for (outputs, 0..) |*output, index| output.* = .{ .side = .left, .column = @intCast(index) };
+    const lineage: JoinLineage = .{
+        .graph_stage = 0,
+        .node = 0,
+        .parent = 1,
+        .left = 0,
+        .right = 0,
+    };
     var reducer: StreamingLineageReducer = .{
         .allocator = std.testing.allocator,
-        .left_schema = .{ .columns = &columns },
-        .output_width = columns.len,
-        .projection = projection,
-        .keys = keys,
+        .spec = .{
+            .kind = .anti,
+            .left_stage = 1,
+            .right_stage = 1,
+            .keys = keys,
+            .left_true = 2,
+            .right_true = 3,
+            .lineage = lineage,
+            .outputs = outputs,
+        },
+        .width = columns.len,
         .lineage = try LineageIndex.init(
             std.testing.allocator,
             .{ .values = &graph_values, .width = graph_columns.len },
-            .{ .columns = &graph_columns },
-            try definition_core.json.object(parsed.value),
-            .{ .columns = &columns },
-            .{ .columns = &columns },
+            lineage,
             8,
         ),
-        .left_true_index = 2,
-        .right_true_index = 3,
         .max_rows = 10,
         .max_retained_bytes = 4096,
     };
@@ -3878,7 +3742,7 @@ test "reachability skips identity-less nodes" {
     const input_schema = plan.Schema{ .columns = &input_columns };
     var values = [_]execution.Value{
         .{ .string = "root" },  .null,                 .{ .boolean = true },
-        .null,                  .null,                 .{ .boolean = false },
+        .null,                  .{ .string = "root" }, .{ .boolean = false },
         .{ .string = "child" }, .{ .string = "root" }, .{ .boolean = false },
     };
     const output = try reachabilityTable(
@@ -3897,6 +3761,65 @@ test "reachability skips identity-less nodes" {
         .null,                  .{ .boolean = false },
         .{ .string = "child" }, .{ .boolean = true },
     }, output.values);
+}
+
+test "reachability links no identity-less seed or descendant" {
+    var node_name = "node".*;
+    var parent_name = "parent".*;
+    var seed_name = "seed".*;
+    var reachable_name = "reachable".*;
+    var depth_name = "depth".*;
+    var input_columns = [_]plan.Column{
+        .{ .name = &node_name, .kind = .string, .nullable = true },
+        .{ .name = &parent_name, .kind = .string, .nullable = true },
+        .{ .name = &seed_name, .kind = .boolean, .nullable = false },
+    };
+    var seeded_columns = [_]plan.Column{
+        .{ .name = &node_name, .kind = .string, .nullable = true },
+        .{ .name = &reachable_name, .kind = .boolean, .nullable = false },
+    };
+    var closure_columns = [_]plan.Column{
+        .{ .name = &node_name, .kind = .string, .nullable = true },
+        .{ .name = &parent_name, .kind = .string, .nullable = true },
+        .{ .name = &depth_name, .kind = .integer, .nullable = false },
+    };
+    const input_schema = plan.Schema{ .columns = &input_columns };
+    var values = [_]execution.Value{
+        .{ .string = "root" },  .null,                  .{ .boolean = false },
+        .{ .string = "child" }, .{ .string = "root" },  .{ .boolean = false },
+        .null,                  .{ .string = "child" }, .{ .boolean = true },
+    };
+    const input: Table = .{ .values = &values, .width = 3 };
+    const seeded = try reachabilityTable(
+        std.testing.allocator,
+        input,
+        &input_schema,
+        .{ .columns = &seeded_columns },
+        \\{"keys":{"node":"node","parent":"parent","seed":"seed","direction":"ancestors"},
+        \\ "fields":[{"field":"node"},{"meta":"reachable"}]}
+    ,
+        graph_test_definition.bounds,
+    );
+    defer std.testing.allocator.free(seeded.values);
+    try std.testing.expectEqualDeep(&[_]execution.Value{
+        .{ .string = "root" },  .{ .boolean = false },
+        .{ .string = "child" }, .{ .boolean = false },
+        .null,                  .{ .boolean = true },
+    }, seeded.values);
+    const closure = try reachabilityTable(
+        std.testing.allocator,
+        input,
+        &input_schema,
+        .{ .columns = &closure_columns },
+        \\{"keys":{"node":"node","parent":"parent","mode":"closure"},
+        \\ "fields":[{"meta":"descendant"},{"meta":"ancestor"},{"meta":"depth"}]}
+    ,
+        graph_test_definition.bounds,
+    );
+    defer std.testing.allocator.free(closure.values);
+    try std.testing.expectEqualDeep(&[_]execution.Value{
+        .{ .string = "child" }, .{ .string = "root" }, .{ .integer = 1 },
+    }, closure.values);
 }
 
 test "graph sorting places nulls by position in both directions" {
