@@ -123,6 +123,8 @@ const session_fields = [_]Field{
     .{ .name = "forked_from_session_id", .kind = .string },
     .{ .name = "subagent_history_start_ordinal", .kind = .integer },
     .{ .name = "token_usage_observation_count", .kind = .integer },
+    .{ .name = "native_session_id", .kind = .string },
+    .{ .name = "agent_id", .kind = .string },
 };
 
 const source_event_fields = [_]Field{
@@ -140,6 +142,8 @@ const source_event_fields = [_]Field{
     .{ .name = "role", .kind = .string },
     .{ .name = "text", .kind = .string },
     .{ .name = "private", .kind = .boolean, .nullable = false },
+    .{ .name = "native_id", .kind = .string },
+    .{ .name = "native_parent_id", .kind = .string },
 };
 
 const turn_fields = [_]Field{
@@ -180,6 +184,8 @@ const message_fields = [_]Field{
     .{ .name = "source_event_id", .kind = .string, .nullable = false },
     .{ .name = "path", .kind = .string, .nullable = false },
     .{ .name = "private", .kind = .boolean, .nullable = false },
+    .{ .name = "native_id", .kind = .string },
+    .{ .name = "native_parent_id", .kind = .string },
 };
 
 const tool_invocation_fields = [_]Field{

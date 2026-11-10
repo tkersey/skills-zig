@@ -614,7 +614,7 @@ fn fillSession(
             13 => try usizeInteger(records),
             19, 21, 22, 27 => .{ .boolean = false },
             23 => .{ .integer = 0 },
-            2...7, 9...12, 14...18, 20, 24...26, 28...32 => .null,
+            2...7, 9...12, 14...18, 20, 24...26, 28...34 => .null,
             else => return error.InvalidOpenCodePhysicalFieldIndex,
         };
     }
@@ -648,6 +648,7 @@ fn fillSourceEvent(
             11 => .{ .string = "user" },
             12 => optionalString(input),
             13 => .{ .boolean = false },
+            14, 15 => .null,
             else => return error.InvalidOpenCodePhysicalFieldIndex,
         };
     }
@@ -672,6 +673,7 @@ fn fillMessage(
             5 => .null,
             7 => .{ .string = path },
             8 => .{ .boolean = false },
+            9, 10 => .null,
             else => return error.InvalidOpenCodePhysicalFieldIndex,
         };
     }

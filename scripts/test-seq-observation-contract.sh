@@ -189,10 +189,9 @@ jq -se 'length == 1 and (.[0] | .schema == "seq-command-error/v1" and
 mkdir -p "$work/claude"
 printf '%s\n' '{"type":"user","uuid":"u","sessionId":"claude","message":{"role":"user","content":"hello"}}' \
   >"$work/claude/transcript.jsonl"
-if unsupported=$("$binary" sessions --root "$work/claude" --format json); then
-  exit 1
-fi
-jq -e '.code == "UnsupportedSessionFormat"' <<<"$unsupported" >/dev/null
+claude=$("$binary" sessions --root "$work/claude" --format json)
+jq -e 'length == 1 and .[0].session_id == "claude" and
+  .[0].turn_count == 1 and .[0].total_tokens == null' <<<"$claude" >/dev/null
 
 mkdir -p "$work/failed-selection"
 printf '%s\n' 'not zstd' >"$work/failed-selection/a-invalid.jsonl.zst"
@@ -214,11 +213,10 @@ if failed_graph=$("$binary" session-graph --root "$work/failed-selection" --form
 fi
 jq -e '.code == "InvalidCompressedSession" and .message == "InvalidCompressedSession" and
   (.path | endswith("a-invalid.jsonl.zst"))' <<<"$failed_graph" >/dev/null
-if unsupported=$("$binary" observe --definition "$message_definition" \
-  --path "$work/claude/transcript.jsonl" --param needle=hello --projection rows --format json); then
-  exit 1
-fi
-jq -e '.code == "UnsupportedSessionFormat"' <<<"$unsupported" >/dev/null
+claude_observation=$("$binary" observe --definition "$message_definition" \
+  --path "$work/claude/transcript.jsonl" --param needle=hello --projection rows --format json)
+jq -e '(.data.rows | length) == 1 and .data.rows[0].text == "hello" and
+  .corpus.adapter == "claude-session-jsonl/v1"' <<<"$claude_observation" >/dev/null
 
 mkdir -p "$work/linear-root"
 cp "$rollout" "$work/linear-root/inside.jsonl"

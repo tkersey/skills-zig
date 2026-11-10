@@ -143,6 +143,7 @@ pub const ParsedTrace = struct {
 
 pub fn adapterId(trace: *const trace_core.CanonicalSessionTrace) []const u8 {
     return switch (trace.session.source_format) {
+        .claude_session_jsonl => "claude-session-jsonl/v1",
         .pi_session_jsonl => "pi-session-jsonl/v1",
         else => "codex-rollout-jsonl/v1",
     };
@@ -455,6 +456,96 @@ test "identity discovery admits a header that fits although the read passes the 
     );
 }
 
+fn claudeDiscoverySourceAlloc(allocator: std.mem.Allocator) ![]u8 {
+    const snapshot = "{\"type\":\"file-history-snapshot\",\"snapshot\":{\"messageId\":\"u\"}}";
+    const messages =
+        \\{"type":"user","uuid":"u","sessionId":"claude-discovered","cwd":"/project","message":{"role":"user","content":"Inspect"}}
+        \\{"type":"assistant","uuid":"a","parentUuid":"u","sessionId":"claude-discovered","message":{"role":"assistant","content":"Done","stop_reason":"end_turn"}}
+    ;
+    var source: std.ArrayList(u8) = .empty;
+    errdefer source.deinit(allocator);
+    try source.appendSlice(allocator, snapshot);
+    try source.appendNTimes(allocator, ' ', 16 * 1024 - snapshot.len - 1);
+    try source.appendSlice(allocator, "\n" ++ messages ++ "\n");
+    return source.toOwnedSlice(allocator);
+}
+
+test "Claude discovery reads identity after a metadata preamble within the prefix bound" {
+    const source = try claudeDiscoverySourceAlloc(std.testing.allocator);
+    defer std.testing.allocator.free(source);
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "claude.jsonl", .data = source });
+    var identity = try discoverSessionIdentity(
+        std.testing.io,
+        tmp.dir,
+        std.testing.allocator,
+        "claude.jsonl",
+        .{ .as_of_ns = 0 },
+        "/project",
+    );
+    defer identity.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("claude-discovered", identity.session_id.?);
+    try std.testing.expectEqual(source.len, identity.bytes_read);
+    try std.testing.expect(identity.repo_matches);
+    try std.testing.expectError(
+        error.ObservationDiscoveryByteBoundExceeded,
+        discoverSessionIdentity(
+            std.testing.io,
+            tmp.dir,
+            std.testing.allocator,
+            "claude.jsonl",
+            .{ .discovery_prefix_limit = 16 * 1024 },
+            null,
+        ),
+    );
+}
+
+test "Claude preselection replays a metadata preamble and preserves input accounting" {
+    const source = try claudeDiscoverySourceAlloc(std.testing.allocator);
+    defer std.testing.allocator.free(source);
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "claude.jsonl", .data = source });
+    var selected = try parseRelationsFileSelected(
+        std.testing.io,
+        tmp.dir,
+        std.testing.allocator,
+        &.{.source_events},
+        "claude.jsonl",
+        .{ .max_input_bytes = source.len, .as_of_ns = 0 },
+        .{ .session_id = "claude-discovered" },
+    );
+    defer if (selected.parsed) |*parsed| parsed.deinit(std.testing.allocator);
+    try std.testing.expect(selected.parsed != null);
+    try std.testing.expectEqual(source.len, selected.parsed.?.metrics.bytes_read);
+    try std.testing.expectEqual(@as(usize, 3), selected.parsed.?.trace.occurrences.items.len);
+    try std.testing.expectEqual(@as(usize, 0), selected.discovery_bytes_read);
+    try std.testing.expectError(
+        error.ObservationInputByteBoundExceeded,
+        parseRelationsFileSelected(
+            std.testing.io,
+            tmp.dir,
+            std.testing.allocator,
+            &.{.source_events},
+            "claude.jsonl",
+            .{ .max_input_bytes = source.len - 1, .as_of_ns = 0 },
+            .{ .session_id = "claude-discovered" },
+        ),
+    );
+    const skipped = try parseRelationsFileSelected(
+        std.testing.io,
+        tmp.dir,
+        std.testing.allocator,
+        &.{.source_events},
+        "claude.jsonl",
+        .{ .max_input_bytes = 8, .as_of_ns = 0 },
+        .{ .session_id = "different-session" },
+    );
+    try std.testing.expect(skipped.parsed == null);
+    try std.testing.expectEqual(source.len, skipped.discovery_bytes_read);
+}
+
 fn writeRepoSession(dir: std.Io.Dir, name: []const u8, cwd: []const u8) !void {
     var data: std.ArrayList(u8) = .empty;
     defer data.deinit(std.testing.allocator);
@@ -661,20 +752,27 @@ fn readDiscoveryPrefixAlloc(
     var prefix: std.ArrayList(u8) = .empty;
     errdefer prefix.deinit(allocator);
     var chunk: [16 * 1024]u8 = undefined;
-    while (true) { // tiger: event-loop -- bounded by newline, EOF, or the per-file prefix limit.
-        const read = try source.readSliceShort(&chunk);
-        if (read == 0) break;
-        const newline = std.mem.indexOfScalar(u8, chunk[0..read], '\n');
-        const line_bytes = prefix.items.len + if (newline) |index| index + 1 else read;
-        if (line_bytes > options.discovery_prefix_limit or
-            (newline == null and line_bytes == options.discovery_prefix_limit))
-        {
-            return error.ObservationDiscoveryByteBoundExceeded;
-        }
+    var discovery: trace_core.SessionDiscovery = .{};
+    var line_start: usize = 0;
+    while (prefix.items.len <= options.discovery_prefix_limit) {
+        var search = prefix.items.len;
+        const allowance = options.discovery_prefix_limit - prefix.items.len;
+        const read = try source.readSliceShort(chunk[0..@min(chunk.len, allowance +| 1)]);
+        if (read == 0) return prefix.toOwnedSlice(allocator);
         try prefix.appendSlice(allocator, chunk[0..read]);
-        if (newline != null) break;
+        while (std.mem.indexOfScalar(u8, prefix.items[search..], '\n')) |offset| {
+            const newline = search + offset;
+            if (newline + 1 > options.discovery_prefix_limit) {
+                return error.ObservationDiscoveryByteBoundExceeded;
+            }
+            if (try discovery.observe(allocator, prefix.items[line_start..newline])) {
+                return prefix.toOwnedSlice(allocator);
+            }
+            line_start = newline + 1;
+            search = line_start;
+        }
     }
-    return prefix.toOwnedSlice(allocator);
+    return error.ObservationDiscoveryByteBoundExceeded;
 }
 
 fn openTraceFile(io: std.Io, dir: std.Io.Dir, path: []const u8) !std.Io.File {
@@ -1926,6 +2024,8 @@ fn fillSourceEvent(
             11 => optionalString(occurrence.role),
             12 => optionalString(occurrence.text),
             13 => .{ .boolean = occurrence.private },
+            14 => optionalString(occurrence.native_id),
+            15 => optionalString(occurrence.native_parent_id),
             else => return error.InvalidTracePhysicalFieldIndex,
         };
     }
@@ -1973,10 +2073,13 @@ fn fillSession(
                 @intCast(value)
             else
                 null),
-            32 => if (session.source_format == .pi_session_jsonl)
+            32 => if (session.source_format == .pi_session_jsonl or
+                session.source_format == .claude_session_jsonl)
                 .null
             else
                 .{ .integer = session.token_usage_observation_count },
+            33 => optionalString(session.native_session_id),
+            34 => optionalString(session.agent_id),
             else => return error.InvalidTracePhysicalFieldIndex,
         };
     }
@@ -1999,6 +2102,8 @@ fn fillMessage(
             6 => .{ .string = occurrence.sourceEventId() },
             7 => .{ .string = session.path },
             8 => .{ .boolean = occurrence.private },
+            9 => optionalString(occurrence.native_id),
+            10 => optionalString(occurrence.native_parent_id),
             else => return error.InvalidTracePhysicalFieldIndex,
         };
     }

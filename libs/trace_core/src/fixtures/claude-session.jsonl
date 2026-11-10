@@ -1,0 +1,12 @@
+{"type":"file-history-snapshot","snapshot":{"messageId":"u1"}}
+{"type":"user","uuid":"u1","parentUuid":null,"sessionId":"session-a","cwd":"/project","version":"2.1.0","gitBranch":"main","timestamp":"2026-11-10T10:00:00Z","message":{"role":"user","content":"Investigate the failure"}}
+{"type":"assistant","uuid":"a1","parentUuid":"u1","sessionId":"session-a","message":{"role":"assistant","id":"request-1","model":"claude-test","content":[{"type":"thinking","thinking":"PRIVATE_THOUGHT","signature":"PRIVATE_SIGNATURE"},{"type":"redacted_thinking","data":"PRIVATE_REDACTED"},{"type":"text","text":"Checking the source"},{"type":"tool_use","id":"tool-1","name":"Bash","signature":"PRIVATE_TOOL_SIGNATURE","input":{"command":"run-check"}}],"usage":{"input_tokens":10,"output_tokens":4},"stop_reason":"tool_use"}}
+{"type":"assistant","uuid":"a2","parentUuid":"a1","sessionId":"session-a","message":{"role":"assistant","id":"request-1","content":[{"type":"tool_use","id":"tool-2","name":"Read","input":{"file_path":"src/main.zig"}}],"usage":{"input_tokens":10,"output_tokens":4}}}
+{"type":"user","uuid":"r1","parentUuid":"a1","sourceToolAssistantUUID":"a1","sessionId":"session-a","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"tool-1","is_error":false,"content":"checks passed"}]}}
+{"type":"user","uuid":"r2","parentUuid":"a2","sourceToolAssistantUUID":"a2","sessionId":"session-a","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"tool-2","is_error":true,"content":[{"type":"text","text":"file missing"}]}]}}
+{"type":"assistant","uuid":"a3","parentUuid":"r1","sessionId":"session-a","message":{"role":"assistant","content":[{"type":"text","text":"First conclusion"}],"stop_reason":"end_turn"}}
+{"type":"user","uuid":"u2","parentUuid":"a3","sessionId":"session-a","message":{"role":"user","content":"Continue the second task"}}
+{"type":"system","subtype":"compact_boundary","uuid":"c1","parentUuid":null,"logicalParentUuid":"u2","sessionId":"session-a","compactMetadata":{"trigger":"auto"}}
+{"type":"user","uuid":"s1","parentUuid":"c1","logicalParentUuid":"a1","sessionId":"session-a","isCompactSummary":true,"message":{"role":"user","content":"Context summary, not a new user request"}}
+{"type":"assistant","uuid":"a4","parentUuid":"s1","sessionId":"session-a","message":{"role":"assistant","content":"Second conclusion","stop_reason":"end_turn"}}
+{"type":"assistant","uuid":"a5","parentUuid":"u1","sessionId":"session-a","message":{"role":"assistant","content":"Alternative first conclusion","stop_reason":"end_turn"}}

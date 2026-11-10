@@ -7,6 +7,7 @@ pub const TraceFormat = enum {
     mid_payload_meta,
     old_2025_08_root_meta,
     pi_session_jsonl,
+    claude_session_jsonl,
     unknown,
 };
 
@@ -84,6 +85,8 @@ pub const RawTraceEvent = struct {
 
 pub const SessionRecord = struct {
     session_id: ?[]u8 = null,
+    native_session_id: ?[]u8 = null,
+    agent_id: ?[]u8 = null,
     path: []u8,
     source_format: TraceFormat = .unknown,
     date_group: ?[]u8 = null,
@@ -125,6 +128,8 @@ pub const SessionRecord = struct {
 
     pub fn deinit(self: *SessionRecord, allocator: std.mem.Allocator) void {
         freeOpt(allocator, self.session_id);
+        freeOpt(allocator, self.native_session_id);
+        freeOpt(allocator, self.agent_id);
         allocator.free(self.path);
         freeOpt(allocator, self.date_group);
         freeOpt(allocator, self.start_time);
@@ -302,6 +307,8 @@ pub const SessionGraphEdge = struct {
 
 pub const TraceOccurrence = struct {
     source_event_id: [71]u8,
+    native_id: ?[]u8 = null,
+    native_parent_id: ?[]u8 = null,
     line_number: usize,
     ordinal: usize,
     turn_index: ?i64 = null,
@@ -344,6 +351,8 @@ pub const TraceOccurrence = struct {
     }
 
     pub fn deinit(self: *TraceOccurrence, allocator: std.mem.Allocator) void {
+        freeOpt(allocator, self.native_id);
+        freeOpt(allocator, self.native_parent_id);
         allocator.free(self.entry_type);
         freeOpt(allocator, self.event_type);
         freeOpt(allocator, self.role);
@@ -513,7 +522,9 @@ pub fn parseRawTraceEvent(
     }
     event.event_type = try dupOpt(allocator, classification.event_type);
     event.timestamp = try dupOpt(allocator, bestTimestamp(root));
-    if (classification.format == .pi_session_jsonl) {
+    if (classification.format == .claude_session_jsonl) {
+        event.payload_json = try claudePayloadJsonAlloc(allocator, root);
+    } else if (classification.format == .pi_session_jsonl) {
         event.payload_json = try piPayloadJsonAlloc(allocator, root);
     } else if (root.get("payload")) |payload| {
         event.payload_json = try stringifyJsonValue(allocator, payload);
@@ -529,6 +540,16 @@ const RawEventClassification = struct {
 };
 
 fn classifyRawEvent(root: std.json.ObjectMap) RawEventClassification {
+    if (isClaudeRecord(root)) {
+        return .{
+            .entry_type = stringField(root, "type") orelse "unknown",
+            .event_type = if (objectField(root, "message")) |value|
+                stringField(value, "role")
+            else
+                stringField(root, "subtype"),
+            .format = .claude_session_jsonl,
+        };
+    }
     if (isPiStandaloneEntry(root)) {
         const message = objectField(root, "message");
         return .{
@@ -692,20 +713,24 @@ test "compressed file entry points preserve decoded evidence and input bounds" {
     try std.testing.expectEqualStrings("compressed", trace.session.session_id.?);
 }
 
-test "Claude transcript records fail instead of yielding empty Codex sessions" {
+test "Claude transcript preambles select the native reader" {
     const source = "{\"type\":\"file-history-snapshot\"}\n" ++
         "{\"type\":\"user\",\"sessionId\":\"claude\",\"uuid\":\"message-1\"," ++
         "\"message\":{\"role\":\"user\",\"content\":\"hello\"}}\n";
     inline for (.{ parseSessionTraceReader, parseSessionSummaryTraceReader }) |parse| {
         var reader: std.Io.Reader = .fixed(source);
-        try std.testing.expectError(error.UnsupportedSessionFormat, parse(
+        var trace = try parse(
             std.testing.io,
             std.testing.allocator,
             "claude.jsonl",
             &reader,
             0,
             .{},
-        ));
+        );
+        defer trace.deinit(std.testing.allocator);
+        try std.testing.expectEqual(TraceFormat.claude_session_jsonl, trace.session.source_format);
+        try std.testing.expectEqualStrings("claude", trace.session.session_id.?);
+        try std.testing.expectEqual(@as(i64, 1), trace.session.turn_count);
     }
 }
 
@@ -869,7 +894,9 @@ pub fn parseSessionTraceReaderWithVisitorMetrics(
     defer parser.workers.deinit(allocator);
     var pi_parser = PiParser.init(allocator, &trace, options, false);
     defer pi_parser.deinit();
-    var source_is_pi: ?bool = null;
+    var claude_parser = ClaudeParser.init(allocator, &trace, options, false);
+    defer claude_parser.deinit();
+    var source: SessionSource = .undetermined;
     var scratch = ParseScratch.init(allocator);
     defer scratch.deinit();
     var lines = try jsonl_stream.Stream.init(allocator, reader, .{});
@@ -886,19 +913,20 @@ pub fn parseSessionTraceReaderWithVisitorMetrics(
                 continue;
             },
         } orelse continue;
-        try rejectUnsupportedSource(root);
-        if (source_is_pi == null) source_is_pi = isPiSessionHeader(root);
+        try selectSessionSource(&source, root);
         const parsed_record = ParsedRecord.init(root, record.number, line);
-        if (source_is_pi.?) {
-            try pi_parser.apply(parsed_record);
-        } else {
-            try parser.apply(parsed_record);
+        switch (source) {
+            .pi => try pi_parser.apply(parsed_record),
+            .claude => try claude_parser.apply(parsed_record),
+            .codex, .generic, .undetermined => try parser.apply(parsed_record),
         }
     }
-    if (source_is_pi orelse false) {
-        try pi_parser.finish(io, source_mtime_ns);
-    } else {
-        try finalizeTrace(io, allocator, &trace, source_mtime_ns, options);
+    switch (source) {
+        .pi => try pi_parser.finish(io, source_mtime_ns),
+        .claude => try claude_parser.finish(io, source_mtime_ns),
+        .codex, .generic, .undetermined => {
+            try finalizeTrace(io, allocator, &trace, source_mtime_ns, options);
+        },
     }
     metrics.* = .{ .bytes_read = lines.bytes_read, .lines_seen = lines.line_number };
     return trace;
@@ -909,14 +937,1181 @@ fn isPiSessionHeader(root: std.json.ObjectMap) bool {
         stringField(root, "id") != null;
 }
 
-fn rejectUnsupportedSource(root: std.json.ObjectMap) !void {
-    if (stringField(root, "sessionId") != null and
-        stringField(root, "uuid") != null and
-        objectField(root, "message") != null and
-        oneOfString(stringField(root, "type") orelse "", &.{ "user", "assistant" }))
-    {
-        return error.UnsupportedSessionFormat;
+const SessionSource = enum { undetermined, generic, codex, pi, claude };
+
+fn selectSessionSource(source: *SessionSource, root: std.json.ObjectMap) !void {
+    const detected: SessionSource = if (isPiSessionHeader(root))
+        .pi
+    else if (isClaudeRecord(root))
+        .claude
+    else if (isCodexRecord(root))
+        .codex
+    else
+        .undetermined;
+    if (detected == .undetermined) {
+        if (source.* == .undetermined) source.* = .generic;
+        return;
     }
+    if (source.* == .generic and detected == .pi) return;
+    if (source.* == .undetermined or source.* == .generic) {
+        source.* = detected;
+    } else if (source.* != detected) {
+        return error.MixedSessionFormats;
+    }
+}
+
+fn isCodexRecord(root: std.json.ObjectMap) bool {
+    if (root.get("sessionId") != null or root.get("uuid") != null) return false;
+    if (root.get("record_type") != null) return true;
+    if (stringField(root, "type")) |kind| {
+        return oneOfString(kind, &.{
+            "session_meta", "turn_context", "response_item", "event_msg", "compacted",
+        });
+    }
+    return root.get("payload") != null or root.get("role") != null or
+        root.get("call_id") != null or root.get("encrypted_content") != null or
+        (root.get("id") != null and root.get("timestamp") != null);
+}
+
+fn isClaudeRecord(root: std.json.ObjectMap) bool {
+    const kind = stringField(root, "type") orelse return false;
+    if (std.mem.eql(u8, kind, "file-history-snapshot")) return true;
+    if (std.mem.eql(u8, kind, "summary") and root.get("leafUuid") != null) return true;
+    return stringField(root, "sessionId") != null and oneOfString(kind, &.{
+        "user", "assistant", "system", "progress", "queue-operation", "custom-title", "tag",
+    });
+}
+
+pub const SessionDiscovery = struct {
+    source: SessionSource = .undetermined,
+
+    pub fn observe(self: *SessionDiscovery, allocator: std.mem.Allocator, line: []const u8) !bool {
+        const trimmed = std.mem.trim(u8, line, " \t\r\n");
+        if (trimmed.len == 0) return false;
+        var scratch = ParseScratch.init(allocator);
+        defer scratch.deinit();
+        const root = scratch.parse(trimmed) catch |err| switch (err) {
+            error.OutOfMemory => return err,
+            else => return true,
+        } orelse return true;
+        try selectSessionSource(&self.source, root);
+        if (self.source != .claude) return true;
+        if (!oneOfString(stringField(root, "type") orelse "", &.{ "user", "assistant" })) {
+            return false;
+        }
+        return stringField(root, "sessionId") != null and objectField(root, "message") != null;
+    }
+};
+
+const ClaudeEntry = struct {
+    turn_index: ?usize,
+    digest: [32]u8,
+};
+
+const ClaudeTurnState = struct {
+    status: TurnStatus = .ongoing,
+    reason: []const u8 = "claude_request_incomplete",
+};
+
+const ClaudeParser = struct {
+    allocator: std.mem.Allocator,
+    trace: *CanonicalSessionTrace,
+    options: TraceParseOptions,
+    summary: bool,
+    entries: std.StringHashMapUnmanaged(ClaudeEntry) = .empty,
+    call_turns: std.StringHashMapUnmanaged(usize) = .empty,
+    states: std.ArrayList(ClaudeTurnState) = .empty,
+    last_turn: ?usize = null,
+    tool_lookup: ToolLookup,
+
+    fn init(
+        allocator: std.mem.Allocator,
+        trace: *CanonicalSessionTrace,
+        options: TraceParseOptions,
+        summary: bool,
+    ) ClaudeParser {
+        return .{
+            .allocator = allocator,
+            .trace = trace,
+            .options = options,
+            .summary = summary,
+            .tool_lookup = .{ .enabled = options.max_tools == null },
+        };
+    }
+
+    fn deinit(self: *ClaudeParser) void {
+        var keys = self.entries.keyIterator();
+        while (keys.next()) |key| self.allocator.free(key.*);
+        self.entries.deinit(self.allocator);
+        var calls = self.call_turns.keyIterator();
+        while (calls.next()) |key| self.allocator.free(key.*);
+        self.call_turns.deinit(self.allocator);
+        self.states.deinit(self.allocator);
+        self.tool_lookup.deinit(self.allocator);
+    }
+
+    fn apply(self: *ClaudeParser, record: ParsedRecord) !void {
+        if (self.options.include_token_events) return error.ClaudeCumulativeTokenEventsUnavailable;
+        try self.applyIdentity(record);
+        var digest: [32]u8 = undefined;
+        std.crypto.hash.sha2.Sha256.hash(record.line, &digest, .{});
+        if (stringField(record.root, "uuid")) |id| {
+            if (self.entries.get(id)) |previous| {
+                if (!std.mem.eql(u8, &digest, &previous.digest)) {
+                    try self.warn(record, "conflicting Claude UUID; replay skipped");
+                }
+                try self.appendOccurrence(record, previous.turn_index, true);
+                return;
+            }
+        }
+        var turn_index = try self.parentTurn(record);
+        if (objectField(record.root, "message")) |message| {
+            turn_index = try self.applyMessage(record, message, turn_index);
+        } else {
+            try self.applyMetadata(record, turn_index);
+        }
+        try self.remember(record, turn_index, digest);
+        if (turn_index != null) self.last_turn = turn_index;
+        try self.appendOccurrence(record, turn_index, false);
+    }
+
+    fn applyIdentity(self: *ClaudeParser, record: ParsedRecord) !void {
+        const session = &self.trace.session;
+        session.source_format = .claude_session_jsonl;
+        if (session.originator == null) {
+            try replaceOpt(self.allocator, &session.originator, "claude-code");
+        }
+        try applySessionTimestamp(self.allocator, session, record.timestamp);
+        if (stringField(record.root, "sessionId")) |id| {
+            if (session.native_session_id) |existing| {
+                if (!std.mem.eql(u8, id, existing)) return error.ClaudeSessionIdentityConflict;
+            } else {
+                try replaceOpt(self.allocator, &session.native_session_id, id);
+                try replaceOpt(self.allocator, &session.session_id, id);
+                try replaceOpt(self.allocator, &session.root_session_id, id);
+            }
+        }
+        if (stringField(record.root, "agentId")) |id| try self.applyAgentIdentity(id);
+        if (boolField(record.root, "isSidechain") orelse false) {
+            session.is_external_worker = true;
+            if (session.agent_id == null and objectField(record.root, "message") != null) {
+                return error.ClaudeAgentIdentityMissing;
+            }
+        }
+        const fields = .{
+            .{ "cwd", "cwd" },
+            .{ "gitBranch", "git_branch" },
+            .{ "version", "cli_version" },
+        };
+        inline for (fields) |names| {
+            if (stringField(record.root, names[0])) |value| {
+                try replaceOpt(self.allocator, &@field(session, names[1]), value);
+            }
+        }
+    }
+
+    fn applyAgentIdentity(self: *ClaudeParser, id: []const u8) !void {
+        const session = &self.trace.session;
+        if (session.agent_id) |existing| {
+            if (!std.mem.eql(u8, id, existing)) return error.ClaudeAgentIdentityConflict;
+            return;
+        }
+        if (self.states.items.len != 0) return error.ClaudeAgentIdentityConflict;
+        const parent = session.native_session_id orelse return error.ClaudeSessionIdentityMissing;
+        const qualified = try self.allocator.print("claude:{s}:agent:{s}", .{ parent, id });
+        defer self.allocator.free(qualified);
+        try replaceOpt(self.allocator, &session.agent_id, id);
+        try replaceOpt(self.allocator, &session.session_id, qualified);
+        session.is_external_worker = true;
+    }
+
+    fn parentTurn(self: *ClaudeParser, record: ParsedRecord) !?usize {
+        const parent = record.root.get("parentUuid") orelse .null;
+        if (parent == .string) {
+            if (self.entries.get(parent.string)) |entry| return entry.turn_index;
+        }
+        if (std.mem.eql(u8, record.root_type orelse "", "system") and
+            std.mem.eql(u8, stringField(record.root, "subtype") orelse "", "compact_boundary"))
+        {
+            if (stringField(record.root, "logicalParentUuid")) |logical| {
+                if (self.entries.get(logical)) |entry| return entry.turn_index;
+                try self.warn(record, "Claude compaction parent unavailable; ownership unknown");
+            }
+        }
+        if (stringField(record.root, "sourceToolAssistantUUID")) |source| {
+            if (self.entries.get(source)) |entry| return entry.turn_index;
+        }
+        if (objectField(record.root, "message")) |message| {
+            if (try self.resultTurn(message)) |index| return index;
+        }
+        if (parent == .null) return null;
+        try self.warn(record, "Claude parent unavailable; ancestry remains unknown");
+        return null;
+    }
+
+    fn resultTurn(self: *const ClaudeParser, message: std.json.ObjectMap) !?usize {
+        const content = message.get("content") orelse return null;
+        const parts = valueArray(content) orelse return null;
+        var matched: ?usize = null;
+        for (parts.items) |part| {
+            const block = valueObject(part) orelse continue;
+            if (!std.mem.eql(u8, stringField(block, "type") orelse "", "tool_result")) continue;
+            const id = stringField(block, "tool_use_id") orelse continue;
+            const index = self.call_turns.get(id) orelse continue;
+            if (matched) |previous| {
+                if (previous != index) return error.ClaudeToolResultTurnConflict;
+            }
+            matched = index;
+        }
+        return matched;
+    }
+
+    fn remember(
+        self: *ClaudeParser,
+        record: ParsedRecord,
+        turn_index: ?usize,
+        digest: [32]u8,
+    ) !void {
+        const id = stringField(record.root, "uuid") orelse return;
+        const owned = try self.allocator.dupe(u8, id);
+        errdefer self.allocator.free(owned);
+        try self.entries.put(self.allocator, owned, .{
+            .turn_index = turn_index,
+            .digest = digest,
+        });
+    }
+
+    fn newTurn(self: *ClaudeParser, record: ParsedRecord) !usize {
+        const index = self.states.items.len;
+        try self.states.append(self.allocator, .{});
+        if (self.summary) return index;
+        var current: ?usize = null;
+        const created = try startTurn(
+            self.allocator,
+            self.trace,
+            self.trace.session.path,
+            &current,
+            stringField(record.root, "uuid"),
+            record.timestamp,
+        );
+        std.debug.assert(created == index);
+        self.trace.turns.items[index].cwd = try dupOpt(self.allocator, self.trace.session.cwd);
+        return index;
+    }
+
+    fn applyMessage(
+        self: *ClaudeParser,
+        record: ParsedRecord,
+        message: std.json.ObjectMap,
+        parent: ?usize,
+    ) !?usize {
+        const role = stringField(message, "role") orelse record.root_type orelse "unknown";
+        if (!oneOfString(role, &.{ "user", "assistant" })) {
+            try self.warn(record, "unsupported Claude message role");
+            return parent;
+        }
+        if (stringField(record.root, "uuid") == null) {
+            try self.warn(record, "Claude message has no native UUID");
+        }
+        try self.checkContent(record, message);
+        const human = std.mem.eql(u8, role, "user") and !claudeContextMessage(record.root) and
+            !claudeHasBlock(message, "tool_result");
+        const result_turn = try self.resultTurn(message);
+        if (result_turn != null and parent != null and result_turn.? != parent.?) {
+            try self.warn(record, "Claude result ancestry conflicts with recorded tool ownership");
+        }
+        const index = if (human)
+            try self.newTurn(record)
+        else
+            result_turn orelse parent orelse try self.newTurn(record);
+        if (human and !self.summary and self.options.include_message_bodies) {
+            const text = try claudeTextAlloc(self.allocator, message);
+            defer self.allocator.free(text);
+            try attachUserMessage(self.allocator, &self.trace.turns.items[index], text);
+        }
+        if (std.mem.eql(u8, role, "assistant")) {
+            try self.applyAssistant(record, message, index);
+        } else if (!self.summary) {
+            try self.applyToolResults(record, message, index);
+        }
+        if (boolField(record.root, "isCompactSummary") orelse false) {
+            if (!self.summary) self.trace.turns.items[index].has_compaction = true;
+        }
+        return index;
+    }
+
+    fn checkContent(self: *ClaudeParser, record: ParsedRecord, message: std.json.ObjectMap) !void {
+        const content = message.get("content") orelse {
+            try self.warn(record, "Claude message content missing");
+            return;
+        };
+        if (content == .string) return;
+        if (content != .array) {
+            try self.warn(record, "unsupported Claude message content");
+            return;
+        }
+        for (content.array.items) |part| {
+            const block = valueObject(part) orelse {
+                try self.warn(record, "unsupported Claude block omitted from public payload");
+                continue;
+            };
+            const kind = stringField(block, "type") orelse "";
+            if (!claudePublicBlock(kind) and !claudePrivateBlock(kind)) {
+                try self.warn(record, "unsupported Claude block omitted from public payload");
+            }
+            if (std.mem.eql(u8, kind, "tool_result")) {
+                try self.checkToolResult(record, block);
+            }
+        }
+    }
+
+    fn checkToolResult(
+        self: *ClaudeParser,
+        record: ParsedRecord,
+        result: std.json.ObjectMap,
+    ) !void {
+        if (stringField(result, "tool_use_id") == null) {
+            try self.warn(record, "Claude tool result has no tool_use_id");
+        }
+        if (result.get("is_error") != null and boolField(result, "is_error") == null) {
+            try self.warn(record, "Claude tool result is_error is not boolean");
+        }
+        if (result.get("content")) |content| {
+            if (content != .string and content != .array) {
+                try self.warn(record, "unsupported Claude tool-result content");
+            }
+            if (content == .array) for (content.array.items) |part| {
+                const block = valueObject(part);
+                const kind = if (block) |value| stringField(value, "type") orelse "" else "";
+                if (!claudeResultBlock(kind) and !claudePrivateBlock(kind)) {
+                    try self.warn(record, "unsupported Claude result block omitted from payload");
+                }
+            };
+        }
+    }
+
+    fn applyMetadata(self: *ClaudeParser, record: ParsedRecord, turn_index: ?usize) !void {
+        const kind = record.root_type orelse "unknown";
+        if (std.mem.eql(u8, kind, "system") and
+            std.mem.eql(u8, stringField(record.root, "subtype") orelse "", "compact_boundary"))
+        {
+            if (turn_index) |index| {
+                if (!self.summary) self.trace.turns.items[index].has_compaction = true;
+            }
+        } else if (std.mem.eql(u8, kind, "custom-title")) {
+            if (stringField(record.root, "customTitle")) |title| {
+                try replaceOpt(self.allocator, &self.trace.session.thread_name, title);
+            }
+        } else if (oneOfString(kind, &.{ "user", "assistant" })) {
+            try self.warn(record, "Claude message envelope missing message object");
+        } else if (!oneOfString(kind, &.{
+            "system", "progress", "file-history-snapshot", "summary", "queue-operation", "tag",
+        })) {
+            try self.warn(record, "unsupported Claude record retained as physical evidence");
+        }
+    }
+
+    fn applyAssistant(
+        self: *ClaudeParser,
+        record: ParsedRecord,
+        message: std.json.ObjectMap,
+        index: usize,
+    ) !void {
+        if (stringField(message, "model")) |model| {
+            try replaceOpt(self.allocator, &self.trace.session.model, model);
+            if (!self.summary) {
+                try replaceOpt(self.allocator, &self.trace.turns.items[index].model, model);
+            }
+        }
+        const state = claudeAssistantStatus(stringField(message, "stop_reason") orelse "");
+        try self.setStatus(index, state, record.timestamp);
+        try self.rememberCalls(record, message, index);
+        if (self.summary) return;
+        if (self.options.include_message_bodies) {
+            const text = try claudeTextAlloc(self.allocator, message);
+            defer self.allocator.free(text);
+            if (text.len != 0) {
+                try attachAssistantMessage(
+                    self.allocator,
+                    &self.trace.turns.items[index],
+                    text,
+                    record.line_number,
+                );
+            }
+        }
+        const content = message.get("content") orelse return;
+        const parts = valueArray(content) orelse return;
+        for (parts.items) |part| {
+            const block = valueObject(part) orelse continue;
+            if (std.mem.eql(u8, stringField(block, "type") orelse "", "tool_use")) {
+                try self.declareTool(record, block, index);
+            }
+        }
+    }
+
+    fn rememberCalls(
+        self: *ClaudeParser,
+        record: ParsedRecord,
+        message: std.json.ObjectMap,
+        turn_index: usize,
+    ) !void {
+        const content = message.get("content") orelse return;
+        const parts = valueArray(content) orelse return;
+        for (parts.items) |part| {
+            const call = valueObject(part) orelse continue;
+            if (!std.mem.eql(u8, stringField(call, "type") orelse "", "tool_use")) continue;
+            const id = stringField(call, "id") orelse {
+                try self.warn(record, "Claude tool call has no ID");
+                continue;
+            };
+            if (self.call_turns.contains(id)) {
+                try self.warn(record, "duplicate Claude tool ID; later declaration not merged");
+                continue;
+            }
+            const owned = try self.allocator.dupe(u8, id);
+            errdefer self.allocator.free(owned);
+            try self.call_turns.put(self.allocator, owned, turn_index);
+        }
+    }
+
+    fn setStatus(
+        self: *ClaudeParser,
+        index: usize,
+        state: ClaudeTurnState,
+        timestamp: ?[]const u8,
+    ) !void {
+        self.states.items[index] = state;
+        if (self.summary) return;
+        const turn = &self.trace.turns.items[index];
+        turn.status = state.status;
+        try replaceOpt(self.allocator, &turn.status_reason, state.reason);
+        if (state.status == .ongoing) {
+            freeOpt(self.allocator, turn.completed_at);
+            turn.completed_at = null;
+        } else if (timestamp) |value| {
+            try replaceOpt(self.allocator, &turn.completed_at, value);
+        }
+    }
+
+    fn declareTool(
+        self: *ClaudeParser,
+        record: ParsedRecord,
+        block: std.json.ObjectMap,
+        turn_index: usize,
+    ) !void {
+        const id = stringField(block, "id") orelse return;
+        if (self.tool_lookup.find(self.trace, id) != null) return;
+        if (self.trace.omitted_tool_call_ids.contains(id)) return;
+        const name = stringField(block, "name") orelse "unknown";
+        var tool = try initToolRecord(self.allocator, self.trace, turn_index, id);
+        var owned = true;
+        errdefer if (owned) tool.deinit(self.allocator);
+        tool.started_at = try dupOpt(self.allocator, record.timestamp);
+        tool.tool_name = try self.allocator.dupe(u8, name);
+        tool.kind = if (std.mem.eql(u8, name, "Bash")) .exec_command else kindFromName(name);
+        tool.namespace = try namespaceFromName(self.allocator, name);
+        if (block.get("input")) |input| {
+            tool.arguments_json = try stringifyJsonValue(self.allocator, input);
+            if (tool.kind == .exec_command) {
+                try parseExecArgsIntoRecord(self.allocator, &tool, tool.arguments_json.?);
+            }
+        }
+        if (tool.cwd == null) tool.cwd = try dupOpt(self.allocator, self.trace.session.cwd);
+        tool.lifecycle_status = .declared;
+        tool.declared_line = @intCast(record.line_number);
+        try self.trace.tools.append(self.allocator, tool);
+        owned = false;
+        try self.tool_lookup.remember(self.allocator, self.trace);
+        self.trace.turns.items[turn_index].tool_count += 1;
+        try retainNewestTools(self.allocator, self.trace, self.options.max_tools);
+    }
+
+    fn applyToolResults(
+        self: *ClaudeParser,
+        record: ParsedRecord,
+        message: std.json.ObjectMap,
+        turn_index: usize,
+    ) !void {
+        const content = message.get("content") orelse return;
+        const parts = valueArray(content) orelse return;
+        for (parts.items, 0..) |part, index| {
+            const result = valueObject(part) orelse continue;
+            if (std.mem.eql(u8, stringField(result, "type") orelse "", "tool_result")) {
+                try self.applyToolResult(record, result, turn_index, index);
+            }
+        }
+    }
+
+    fn applyToolResult(
+        self: *ClaudeParser,
+        record: ParsedRecord,
+        result: std.json.ObjectMap,
+        turn_index: usize,
+        block_index: usize,
+    ) !void {
+        const id = stringField(result, "tool_use_id") orelse return;
+        const index = self.tool_lookup.find(self.trace, id) orelse blk: {
+            if (self.trace.omitted_tool_call_ids.contains(id)) return;
+            try inferToolRecord(
+                self.allocator,
+                self.trace,
+                &self.tool_lookup,
+                turn_index,
+                id,
+                record.timestamp,
+                self.options.max_tools,
+            );
+            break :blk self.tool_lookup.find(self.trace, id) orelse return;
+        };
+        const tool = &self.trace.tools.items[index];
+        if (record.timestamp) |timestamp| {
+            try replaceOpt(self.allocator, &tool.completed_at, timestamp);
+        }
+        tool.finalized_line = @intCast(record.line_number);
+        const failed = boolField(result, "is_error");
+        if (result.get("is_error") != null and failed == null) {
+            tool.lifecycle_status = .unknown;
+        } else {
+            tool.lifecycle_status = if (failed orelse false) .failed else .completed;
+        }
+        try self.resultOutput(record, result, block_index, tool);
+    }
+
+    fn resultOutput(
+        self: *ClaudeParser,
+        record: ParsedRecord,
+        result: std.json.ObjectMap,
+        block_index: usize,
+        tool: *ToolLifecycleRecord,
+    ) !void {
+        const output = try claudeTextAlloc(self.allocator, result);
+        defer self.allocator.free(output);
+        try replaceOpt(self.allocator, &tool.output_text, output);
+        if (!self.options.include_tool_output_parts) return;
+        const event_id = computeSourceEventId(
+            self.trace.session.path,
+            record.line_number,
+            self.trace.occurrences.items.len,
+        );
+        const source = ToolOutputSource{
+            .include_parts = true,
+            .source_event_id = if (self.options.include_occurrences) &event_id else null,
+            .line_number = record.line_number,
+            .timestamp = record.timestamp,
+        };
+        const content = result.get("content") orelse return;
+        if (content == .string) {
+            const pointer = try self.allocator.print(
+                "/message/content/{d}/content",
+                .{block_index},
+            );
+            defer self.allocator.free(pointer);
+            try appendToolOutputPart(self.allocator, tool, source, pointer, content.string, false);
+        } else if (content == .array) {
+            for (content.array.items, 0..) |part, index| {
+                const block = valueObject(part) orelse continue;
+                if (!std.mem.eql(u8, stringField(block, "type") orelse "", "text")) continue;
+                const text = stringField(block, "text") orelse continue;
+                const pointer = try self.allocator.print(
+                    "/message/content/{d}/content/{d}/text",
+                    .{ block_index, index },
+                );
+                defer self.allocator.free(pointer);
+                try appendToolOutputPart(self.allocator, tool, source, pointer, text, false);
+            }
+        }
+    }
+
+    fn appendOccurrence(
+        self: *ClaudeParser,
+        record: ParsedRecord,
+        turn_index: ?usize,
+        duplicate: bool,
+    ) !void {
+        if (self.summary or !self.options.include_occurrences) return;
+        const message = objectField(record.root, "message");
+        const role = if (message) |value| claudeMessageRole(record.root, value) else null;
+        var occurrence = try TraceOccurrence.init(
+            self.allocator,
+            self.trace.session.path,
+            record.line_number,
+            self.trace.occurrences.items.len,
+            if (turn_index) |index| @intCast(index + 1) else null,
+            record.root_type orelse "unknown",
+            stringField(record.root, "subtype"),
+            role,
+            null,
+            claudeMessageOnlyPrivate(record.root),
+        );
+        errdefer occurrence.deinit(self.allocator);
+        occurrence.format = .claude_session_jsonl;
+        occurrence.native_id = try dupOpt(self.allocator, stringField(record.root, "uuid"));
+        occurrence.native_parent_id = try dupOpt(
+            self.allocator,
+            stringField(record.root, "parentUuid"),
+        );
+        occurrence.timestamp = try dupOpt(self.allocator, record.timestamp);
+        if (message) |value| {
+            occurrence.text = try claudeTextAlloc(self.allocator, value);
+        } else if (std.mem.eql(u8, record.root_type orelse "", "summary")) {
+            occurrence.text = try dupOpt(self.allocator, stringField(record.root, "summary"));
+        }
+        occurrence.message_visible = !duplicate and !occurrence.private and
+            (if (role) |value| oneOfString(value, &.{ "user", "assistant" }) else false) and
+            (if (occurrence.text) |text| text.len != 0 else false);
+        if (self.options.include_occurrence_payloads) {
+            occurrence.payload_json = try claudePayloadJsonAlloc(self.allocator, record.root);
+        }
+        if (self.options.include_raw) {
+            occurrence.raw_json = try self.allocator.dupe(u8, record.line);
+        }
+        try self.trace.occurrences.append(self.allocator, occurrence);
+    }
+
+    fn finish(self: *ClaudeParser, io: std.Io, source_mtime_ns: i128) !void {
+        const as_of_ns = self.options.as_of_ns orelse nowRealtimeNs(io);
+        const fresh = @divTrunc(as_of_ns - source_mtime_ns, std.time.ns_per_s) <=
+            self.options.ongoing_threshold_secs;
+        for (self.states.items, 0..) |state, index| {
+            if (state.status != .ongoing) continue;
+            const active = self.last_turn != null and self.last_turn.? == index;
+            try self.setStatus(index, .{
+                .status = if (active and fresh) .ongoing else .aborted,
+                .reason = if (!active) "claude_inactive_branch" else if (fresh)
+                    "fresh_ongoing_turn"
+                else
+                    "stale_ongoing_file",
+            }, null);
+            if (active and fresh) self.trace.session.is_ongoing = true;
+        }
+        const reason = if (self.last_turn) |index| self.states.items[index].reason else "no_turns";
+        try replaceOpt(self.allocator, &self.trace.session.status_reason, reason);
+        self.trace.session.turn_count = @intCast(self.states.items.len);
+        for (self.trace.tools.items) |*tool| {
+            if (tool.lifecycle_status == .declared) tool.lifecycle_status = .unresolved;
+            try finishToolOutputParts(self.allocator, tool);
+        }
+    }
+
+    fn warn(self: *ClaudeParser, record: ParsedRecord, description: []const u8) !void {
+        const warning = try self.allocator.print(
+            "{s}:{d}: {s}",
+            .{ self.trace.session.path, record.line_number, description },
+        );
+        errdefer self.allocator.free(warning);
+        try self.trace.warnings.append(self.allocator, warning);
+    }
+};
+
+fn claudeContextMessage(root: std.json.ObjectMap) bool {
+    return (boolField(root, "isMeta") orelse false) or
+        (boolField(root, "isCompactSummary") orelse false);
+}
+
+fn claudeTextAlloc(allocator: std.mem.Allocator, message: std.json.ObjectMap) ![]u8 {
+    const content = message.get("content") orelse return allocator.alloc(u8, 0);
+    if (content == .string) return allocator.dupe(u8, content.string);
+    var text: std.ArrayList(u8) = .empty;
+    defer text.deinit(allocator);
+    if (content == .array) {
+        for (content.array.items) |part| {
+            const block = valueObject(part) orelse continue;
+            if (!std.mem.eql(u8, stringField(block, "type") orelse "", "text")) continue;
+            if (stringField(block, "text")) |value| try text.appendSlice(allocator, value);
+        }
+    }
+    return text.toOwnedSlice(allocator);
+}
+
+fn claudeHasBlock(message: std.json.ObjectMap, kind: []const u8) bool {
+    const content = message.get("content") orelse return false;
+    const parts = valueArray(content) orelse return false;
+    for (parts.items) |part| {
+        const block = valueObject(part) orelse continue;
+        if (std.mem.eql(u8, stringField(block, "type") orelse "", kind)) return true;
+    }
+    return false;
+}
+
+fn claudeMessageRole(root: std.json.ObjectMap, message: std.json.ObjectMap) ?[]const u8 {
+    if (claudeContextMessage(root)) return "context";
+    if (claudeHasBlock(message, "tool_result")) return "tool";
+    return stringField(message, "role") orelse stringField(root, "type");
+}
+
+fn claudePrivateBlock(kind: []const u8) bool {
+    return oneOfString(kind, &.{ "thinking", "redacted_thinking" });
+}
+
+fn claudePublicBlock(kind: []const u8) bool {
+    return claudeResultBlock(kind) or oneOfString(kind, &.{ "tool_use", "tool_result" });
+}
+
+fn claudeResultBlock(kind: []const u8) bool {
+    return oneOfString(kind, &.{ "text", "image", "document" });
+}
+
+fn claudeMessageOnlyPrivate(root: std.json.ObjectMap) bool {
+    const message = objectField(root, "message") orelse return false;
+    const content = message.get("content") orelse return false;
+    const parts = valueArray(content) orelse return false;
+    if (parts.items.len == 0) return false;
+    for (parts.items) |part| {
+        const block = valueObject(part) orelse return false;
+        if (!claudePrivateBlock(stringField(block, "type") orelse "")) return false;
+    }
+    return true;
+}
+
+const claude_envelope_fields = [_][]const u8{
+    "type",
+    "uuid",
+    "parentUuid",
+    "sessionId",
+    "timestamp",
+    "cwd",
+    "version",
+    "gitBranch",
+    "isSidechain",
+    "agentId",
+    "isMeta",
+    "isCompactSummary",
+    "subtype",
+    "compactMetadata",
+    "summary",
+    "leafUuid",
+    "logicalParentUuid",
+    "sourceToolAssistantUUID",
+    "customTitle",
+    "tag",
+};
+
+fn claudeBlockCopy(allocator: std.mem.Allocator, block: std.json.ObjectMap) !std.json.ObjectMap {
+    var public = try piObjectCopy(allocator, block);
+    const signatures = [_][]const u8{ "signature", "thinkingSignature", "thoughtSignature" };
+    for (signatures) |key| _ = public.orderedRemove(key);
+    return public;
+}
+
+fn claudeResultContent(allocator: std.mem.Allocator, content: std.json.Value) !std.json.Value {
+    if (content == .string) return content;
+    if (content != .array) return .null;
+    var parts = std.json.Array.init(allocator);
+    for (content.array.items) |part| {
+        const block = valueObject(part);
+        const keep = if (block) |value|
+            claudeResultBlock(stringField(value, "type") orelse "")
+        else
+            false;
+        try parts.append(if (keep)
+            .{ .object = try claudeBlockCopy(allocator, block.?) }
+        else
+            .null);
+    }
+    return .{ .array = parts };
+}
+
+fn claudePayloadJsonAlloc(allocator: std.mem.Allocator, root: std.json.ObjectMap) !?[]u8 {
+    if (claudeMessageOnlyPrivate(root)) return null;
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const temporary = arena.allocator();
+    var public_root: std.json.ObjectMap = .empty;
+    for (claude_envelope_fields) |key| {
+        if (root.get(key)) |value| try public_root.put(temporary, key, value);
+    }
+    const message = objectField(root, "message") orelse
+        return try stringifyJsonValue(allocator, .{ .object = public_root });
+    var public_message: std.json.ObjectMap = .empty;
+    for ([_][]const u8{ "role", "id", "model", "stop_reason", "usage", "content" }) |key| {
+        if (message.get(key)) |value| try public_message.put(temporary, key, value);
+    }
+    var parts = std.json.Array.init(temporary);
+    if (message.get("content")) |content| {
+        if (content == .array) {
+            for (content.array.items) |part| {
+                const block = valueObject(part);
+                const keep = if (block) |value|
+                    claudePublicBlock(stringField(value, "type") orelse "")
+                else
+                    false;
+                if (keep) {
+                    var public_block = try claudeBlockCopy(temporary, block.?);
+                    const kind = stringField(public_block, "type") orelse "";
+                    if (std.mem.eql(u8, kind, "tool_result")) {
+                        if (public_block.get("content")) |result| {
+                            const public = try claudeResultContent(temporary, result);
+                            try public_block.put(temporary, "content", public);
+                        }
+                    }
+                    try parts.append(.{ .object = public_block });
+                } else {
+                    try parts.append(.null);
+                }
+            }
+            try public_message.put(temporary, "content", .{ .array = parts });
+        } else if (content != .string) {
+            try public_message.put(temporary, "content", .null);
+        }
+    }
+    try public_root.put(temporary, "message", .{ .object = public_message });
+    return try stringifyJsonValue(allocator, .{ .object = public_root });
+}
+
+fn claudeAssistantStatus(reason: []const u8) ClaudeTurnState {
+    if (oneOfString(reason, &.{ "end_turn", "stop_sequence", "refusal" })) {
+        return .{ .status = .complete, .reason = "claude_end_turn" };
+    }
+    if (std.mem.eql(u8, reason, "max_tokens")) {
+        return .{ .status = .aborted, .reason = "claude_output_limit" };
+    }
+    return .{};
+}
+
+const claude_fixture = @embedFile("fixtures/claude-session.jsonl");
+fn parseClaudeFixture(allocator: std.mem.Allocator) !CanonicalSessionTrace {
+    return parseSessionTraceBytes(
+        std.testing.io,
+        allocator,
+        "claude.jsonl",
+        claude_fixture,
+        0,
+        .{ .as_of_ns = 0 },
+    );
+}
+
+test "Claude branches and parallel tool results preserve physical provenance" {
+    var trace = try parseClaudeFixture(std.testing.allocator);
+    defer trace.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 0), trace.warnings.items.len);
+    try std.testing.expectEqual(@as(i64, 2), trace.session.turn_count);
+    try std.testing.expectEqual(@as(usize, 12), trace.occurrences.items.len);
+    try std.testing.expectEqualStrings("u1", trace.turns.items[0].turn_id);
+    try std.testing.expectEqualStrings(
+        "Alternative first conclusion",
+        trace.turns.items[0].final_answer.?,
+    );
+    try std.testing.expectEqualStrings("Second conclusion", trace.turns.items[1].final_answer.?);
+    try std.testing.expect(trace.turns.items[1].has_compaction);
+    try std.testing.expectEqual(TurnStatus.complete, trace.turns.items[1].status);
+    try std.testing.expectEqual(@as(?i64, 2), trace.occurrences.items[8].turn_index);
+    try std.testing.expect(trace.occurrences.items[8].native_parent_id == null);
+    try std.testing.expectEqualStrings("context", trace.occurrences.items[9].role.?);
+    try std.testing.expect(!trace.occurrences.items[9].message_visible);
+    try std.testing.expectEqualStrings("a1", trace.occurrences.items[4].native_parent_id.?);
+    try std.testing.expectEqualStrings("r1", trace.occurrences.items[4].native_id.?);
+    try std.testing.expectEqualStrings("tool", trace.occurrences.items[4].role.?);
+    try std.testing.expect(!trace.occurrences.items[4].message_visible);
+    try std.testing.expectEqual(
+        ToolLifecycleStatus.completed,
+        trace.tools.items[0].lifecycle_status,
+    );
+    try std.testing.expectEqual(ToolLifecycleStatus.failed, trace.tools.items[1].lifecycle_status);
+    try std.testing.expectEqualStrings("run-check", trace.tools.items[0].command_text.?);
+    try std.testing.expectEqualStrings("file missing", trace.tools.items[1].output_text.?);
+    try std.testing.expect(trace.tools.items[0].exit_code == null);
+    try std.testing.expect(trace.session.input_tokens == null);
+    try std.testing.expect(trace.session.total_tokens == null);
+    try std.testing.expectEqual(@as(usize, 0), trace.graph_edges.items.len);
+}
+
+test "Claude summary parser agrees with full parser without retaining conversation" {
+    var full = try parseClaudeFixture(std.testing.allocator);
+    defer full.deinit(std.testing.allocator);
+    var reader: std.Io.Reader = .fixed(claude_fixture);
+    var summary = try parseSessionSummaryTraceReader(
+        std.testing.io,
+        std.testing.allocator,
+        "claude.jsonl",
+        &reader,
+        0,
+        .{ .as_of_ns = 0 },
+    );
+    defer summary.deinit(std.testing.allocator);
+    try std.testing.expectEqual(full.session.turn_count, summary.session.turn_count);
+    try std.testing.expectEqualStrings(full.session.session_id.?, summary.session.session_id.?);
+    try std.testing.expectEqualStrings(full.session.model.?, summary.session.model.?);
+    try std.testing.expectEqualStrings(
+        full.session.status_reason.?,
+        summary.session.status_reason.?,
+    );
+    try std.testing.expectEqual(full.session.is_ongoing, summary.session.is_ongoing);
+    try std.testing.expectEqual(@as(usize, 0), summary.turns.items.len);
+    try std.testing.expectEqual(@as(usize, 0), summary.occurrences.items.len);
+    try std.testing.expectEqual(@as(usize, 0), summary.tools.items.len);
+}
+
+test "Claude private blocks stay out of normal observations and raw remains explicit" {
+    var trace = try parseClaudeFixture(std.testing.allocator);
+    defer trace.deinit(std.testing.allocator);
+    const occurrence = trace.occurrences.items[2];
+    try std.testing.expectEqualStrings("Checking the source", occurrence.text.?);
+    try std.testing.expect(std.mem.indexOf(u8, occurrence.payload_json.?, "PRIVATE_") == null);
+    try std.testing.expect(occurrence.raw_json == null);
+    var raw = try parseSessionTraceBytes(
+        std.testing.io,
+        std.testing.allocator,
+        "claude.jsonl",
+        claude_fixture,
+        0,
+        .{ .as_of_ns = 0, .include_raw = true },
+    );
+    defer raw.deinit(std.testing.allocator);
+    const raw_text = raw.occurrences.items[2].raw_json.?;
+    try std.testing.expect(std.mem.indexOf(u8, raw_text, "PRIVATE_THOUGHT") != null);
+    const cumulative = parseSessionTraceBytes(
+        std.testing.io,
+        std.testing.allocator,
+        "claude.jsonl",
+        claude_fixture,
+        0,
+        .{ .include_token_events = true },
+    );
+    try std.testing.expectError(error.ClaudeCumulativeTokenEventsUnavailable, cumulative);
+}
+
+test "Claude child identity keeps native session and agent separate without a guessed spawn" {
+    const source =
+        \\{"type":"user","uuid":"u","parentUuid":null,"sessionId":"parent","agentId":"worker","isSidechain":true,"message":{"role":"user","content":"Inspect"}}
+        \\{"type":"assistant","uuid":"a","parentUuid":"u","sessionId":"parent","agentId":"worker","message":{"role":"assistant","content":"Done","stop_reason":"end_turn"}}
+    ;
+    var trace = try parseSessionTraceBytes(
+        std.testing.io,
+        std.testing.allocator,
+        "agent-worker.jsonl",
+        source,
+        0,
+        .{ .as_of_ns = 0 },
+    );
+    defer trace.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("claude:parent:agent:worker", trace.session.session_id.?);
+    try std.testing.expectEqualStrings("parent", trace.session.native_session_id.?);
+    try std.testing.expectEqualStrings("worker", trace.session.agent_id.?);
+    try std.testing.expectEqualStrings("parent", trace.session.root_session_id.?);
+    try std.testing.expect(trace.session.is_external_worker);
+    try std.testing.expect(trace.session.control_parent_session_id == null);
+    try std.testing.expectEqual(@as(usize, 0), trace.graph_edges.items.len);
+}
+
+test "Claude exact replay does not create another human turn" {
+    const entry =
+        \\{"type":"user","uuid":"u","parentUuid":null,"sessionId":"s","message":{"role":"user","content":"Run"}}
+    ;
+    var trace = try parseSessionTraceBytes(
+        std.testing.io,
+        std.testing.allocator,
+        "claude.jsonl",
+        entry ++ "\n" ++ entry,
+        0,
+        .{ .as_of_ns = 0 },
+    );
+    defer trace.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(i64, 1), trace.session.turn_count);
+    try std.testing.expectEqual(@as(usize, 2), trace.occurrences.items.len);
+    try std.testing.expect(trace.occurrences.items[0].message_visible);
+    try std.testing.expect(!trace.occurrences.items[1].message_visible);
+}
+
+test "Claude result ownership can recover a missing message parent" {
+    const source =
+        \\{"type":"user","uuid":"u","sessionId":"s","message":{"role":"user","content":"Inspect"}}
+        \\{"type":"assistant","uuid":"a","parentUuid":"u","sessionId":"s","message":{"role":"assistant","content":[{"type":"tool_use","id":"t","name":"Read","input":{}}]}}
+        \\{"type":"user","uuid":"r","parentUuid":"missing","sessionId":"s","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"t","content":"ok"}]}}
+    ;
+    inline for (.{ false, true }) |summary| {
+        var reader: std.Io.Reader = .fixed(source);
+        const parse = if (summary) parseSessionSummaryTraceReader else parseSessionTraceReader;
+        var trace = try parse(
+            std.testing.io,
+            std.testing.allocator,
+            "claude.jsonl",
+            &reader,
+            0,
+            .{ .as_of_ns = 0 },
+        );
+        defer trace.deinit(std.testing.allocator);
+        try std.testing.expectEqual(@as(i64, 1), trace.session.turn_count);
+        try std.testing.expectEqual(@as(usize, 0), trace.warnings.items.len);
+        if (!summary) {
+            try std.testing.expectEqual(@as(?i64, 1), trace.occurrences.items[2].turn_index);
+            const native_parent = trace.occurrences.items[2].native_parent_id.?;
+            try std.testing.expectEqualStrings("missing", native_parent);
+        }
+    }
+}
+
+test "Claude tool output pointers resolve inside the sanitized source payload" {
+    var trace = try parseClaudeFixture(std.testing.allocator);
+    defer trace.deinit(std.testing.allocator);
+    for (trace.tools.items, 0..) |tool, index| {
+        const occurrence = trace.occurrences.items[index + 4];
+        var parsed = try std.json.parseFromSlice(
+            std.json.Value,
+            std.testing.allocator,
+            tool.output_parts_json.?,
+            .{},
+        );
+        defer parsed.deinit();
+        const part = parsed.value.array.items[0].object;
+        try std.testing.expectEqualStrings(
+            occurrence.sourceEventId(),
+            part.get("source_event_id").?.string,
+        );
+        const expected = if (index == 0)
+            "/message/content/0/content"
+        else
+            "/message/content/0/content/0/text";
+        try std.testing.expectEqualStrings(expected, part.get("payload_pointer").?.string);
+        var payload = try std.json.parseFromSlice(
+            std.json.Value,
+            std.testing.allocator,
+            occurrence.payload_json.?,
+            .{},
+        );
+        defer payload.deinit();
+        const result = payload.value.object.get("message").?.object.get("content").?.array.items[0];
+        const content = result.object.get("content").?;
+        const text = if (content == .string)
+            content.string
+        else
+            content.array.items[0].object.get("text").?.string;
+        try std.testing.expectEqualStrings(text, part.get("text").?.string);
+    }
+}
+
+test "Claude unknown ancestry and unsupported blocks remain explicit" {
+    const source =
+        \\{"type":"assistant","uuid":"a","parentUuid":"unavailable","sessionId":"s","message":{"role":"assistant","content":[{"type":"output_text","text":"UNSUPPORTED_PRIVATE"},{"type":"text","text":"Known"}],"stop_reason":"end_turn"}}
+    ;
+    var trace = try parseSessionTraceBytes(
+        std.testing.io,
+        std.testing.allocator,
+        "claude.jsonl",
+        source,
+        0,
+        .{ .as_of_ns = 0 },
+    );
+    defer trace.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 2), trace.warnings.items.len);
+    try std.testing.expectEqualStrings("Known", trace.turns.items[0].final_answer.?);
+    try std.testing.expectEqualStrings("Known", trace.occurrences.items[0].text.?);
+    try std.testing.expect(trace.turns.items[0].user_message == null);
+    const payload = trace.occurrences.items[0].payload_json.?;
+    try std.testing.expect(std.mem.indexOf(u8, payload, "UNSUPPORTED_PRIVATE") == null);
+}
+
+test "Claude tool result content uses the public allowlist without shifting source pointers" {
+    const source =
+        \\{"type":"user","uuid":"u","sessionId":"s","message":{"role":"user","content":"Inspect"}}
+        \\{"type":"assistant","uuid":"a","parentUuid":"u","sessionId":"s","message":{"role":"assistant","content":[{"type":"tool_use","id":"t","name":"Read","input":{}}]}}
+        \\{"type":"user","uuid":"r","parentUuid":"a","sessionId":"s","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"t","content":[{"type":"thinking","thinking":"PRIVATE_THOUGHT"},{"type":"output_text","text":"PRIVATE_UNKNOWN"},{"type":"text","text":"Known","signature":"PRIVATE_SIGNATURE"}]}]}}
+    ;
+    inline for (.{ false, true }) |summary| {
+        var reader: std.Io.Reader = .fixed(source);
+        const parse = if (summary) parseSessionSummaryTraceReader else parseSessionTraceReader;
+        var trace = try parse(
+            std.testing.io,
+            std.testing.allocator,
+            "claude.jsonl",
+            &reader,
+            0,
+            .{ .as_of_ns = 0 },
+        );
+        defer trace.deinit(std.testing.allocator);
+        try std.testing.expectEqual(@as(usize, 1), trace.warnings.items.len);
+        if (!summary) {
+            try std.testing.expectEqualStrings("Known", trace.tools.items[0].output_text.?);
+            const payload = trace.occurrences.items[2].payload_json.?;
+            try std.testing.expect(std.mem.indexOf(u8, payload, "PRIVATE_") == null);
+            try std.testing.expect(std.mem.indexOf(u8, payload, "[null,null,") != null);
+            const parts = trace.tools.items[0].output_parts_json.?;
+            const pointer = "/message/content/0/content/2/text";
+            try std.testing.expect(std.mem.indexOf(u8, parts, pointer) != null);
+            try std.testing.expect(std.mem.indexOf(u8, parts, "PRIVATE_") == null);
+        }
+    }
+}
+
+test "Claude malformed tool result warnings agree in summary and full observations" {
+    const source =
+        \\{"type":"user","uuid":"u","sessionId":"s","message":{"role":"user","content":"Inspect"}}
+        \\{"type":"assistant","uuid":"a","parentUuid":"u","sessionId":"s","message":{"role":"assistant","content":[{"type":"tool_use","id":"t","name":"Read","input":{}}]}}
+        \\{"type":"user","uuid":"r","parentUuid":"a","sessionId":"s","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"t","is_error":"false","content":"ok"}]}}
+    ;
+    inline for (.{ false, true }) |summary| {
+        var reader: std.Io.Reader = .fixed(source);
+        const parse = if (summary) parseSessionSummaryTraceReader else parseSessionTraceReader;
+        var trace = try parse(
+            std.testing.io,
+            std.testing.allocator,
+            "claude.jsonl",
+            &reader,
+            0,
+            .{ .as_of_ns = 0 },
+        );
+        defer trace.deinit(std.testing.allocator);
+        try std.testing.expectEqual(@as(i64, 1), trace.session.turn_count);
+        try std.testing.expectEqual(@as(usize, 1), trace.warnings.items.len);
+        try std.testing.expectEqualStrings(
+            "claude.jsonl:3: Claude tool result is_error is not boolean",
+            trace.warnings.items[0],
+        );
+        if (!summary) {
+            try std.testing.expectEqual(
+                ToolLifecycleStatus.unknown,
+                trace.tools.items[0].lifecycle_status,
+            );
+        }
+    }
+}
+
+test "Claude parser rejects mixed native sessions and formats" {
+    const claude =
+        \\{"type":"user","uuid":"u","sessionId":"s","message":{"role":"user","content":"Run"}}
+    ;
+    const other =
+        \\{"type":"user","uuid":"v","sessionId":"other","message":{"role":"user","content":"Run"}}
+    ;
+    try std.testing.expectError(error.ClaudeSessionIdentityConflict, parseSessionTraceBytes(
+        std.testing.io,
+        std.testing.allocator,
+        "mixed.jsonl",
+        claude ++ "\n" ++ other,
+        0,
+        .{},
+    ));
+    try std.testing.expectError(error.MixedSessionFormats, parseSessionTraceBytes(
+        std.testing.io,
+        std.testing.allocator,
+        "mixed.jsonl",
+        "{\"type\":\"session_meta\",\"payload\":{\"id\":\"codex\"}}\n" ++ claude,
+        0,
+        .{},
+    ));
+}
+
+test "Claude full and summary ownership survives every allocation failure" {
+    try @import("test_support").checkAllAllocationFailures(
+        std.testing.allocator,
+        checkClaudeTraceAllocation,
+        .{},
+    );
+}
+
+fn checkClaudeTraceAllocation(allocator: std.mem.Allocator) !void {
+    var full = try parseClaudeFixture(allocator);
+    defer full.deinit(allocator);
+    var reader: std.Io.Reader = .fixed(claude_fixture);
+    var summary = try parseSessionSummaryTraceReader(
+        std.testing.io,
+        allocator,
+        "claude.jsonl",
+        &reader,
+        0,
+        .{ .as_of_ns = 0 },
+    );
+    defer summary.deinit(allocator);
+    try std.testing.expectEqualDeep(full.session, summary.session);
 }
 
 fn isPiStandaloneEntry(root: std.json.ObjectMap) bool {
@@ -2112,7 +3307,9 @@ pub fn parseSessionSummaryTraceReaderWithVisitorMetrics(
     defer parser.deinit();
     var pi_parser = PiParser.init(allocator, &trace, options, true);
     defer pi_parser.deinit();
-    var source_is_pi: ?bool = null;
+    var claude_parser = ClaudeParser.init(allocator, &trace, options, true);
+    defer claude_parser.deinit();
+    var source: SessionSource = .undetermined;
     var scratch = ParseScratch.init(allocator);
     defer scratch.deinit();
     var lines = try jsonl_stream.Stream.init(allocator, reader, .{});
@@ -2122,7 +3319,7 @@ pub fn parseSessionSummaryTraceReaderWithVisitorMetrics(
         try visit(context, record.bytes, record.number);
         const line = std.mem.trim(u8, record.bytes, " \t\r\n");
         if (line.len == 0) continue;
-        if (source_is_pi != null and !source_is_pi.?) {
+        if (source == .codex) {
             if (fastTimestampSlice(line)) |timestamp| {
                 try applySessionTimestamp(allocator, &trace.session, timestamp);
             }
@@ -2139,19 +3336,18 @@ pub fn parseSessionSummaryTraceReaderWithVisitorMetrics(
                 continue;
             },
         } orelse continue;
-        try rejectUnsupportedSource(root);
-        if (source_is_pi == null) source_is_pi = isPiSessionHeader(root);
+        try selectSessionSource(&source, root);
         const parsed_record = ParsedRecord.init(root, record.number, line);
-        if (source_is_pi.?) {
-            try pi_parser.apply(parsed_record);
-        } else {
-            try parser.apply(parsed_record);
+        switch (source) {
+            .pi => try pi_parser.apply(parsed_record),
+            .claude => try claude_parser.apply(parsed_record),
+            .codex, .generic, .undetermined => try parser.apply(parsed_record),
         }
     }
-    if (source_is_pi orelse false) {
-        try pi_parser.finish(io, source_mtime_ns);
-    } else {
-        try parser.finish(io, source_mtime_ns, options);
+    switch (source) {
+        .pi => try pi_parser.finish(io, source_mtime_ns),
+        .claude => try claude_parser.finish(io, source_mtime_ns),
+        .codex, .generic, .undetermined => try parser.finish(io, source_mtime_ns, options),
     }
     metrics.* = .{ .bytes_read = lines.bytes_read, .lines_seen = lines.line_number };
     return trace;
