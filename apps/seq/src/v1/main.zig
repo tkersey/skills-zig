@@ -1646,7 +1646,7 @@ fn createStreamingParseTasks(
     schedule: seq.relation_graph.StreamingLineagePlan,
     discovered: *const DiscoveredSessions,
     paths: []const []const u8,
-    reducer: *const seq.relation_graph.StreamingLineageReducer,
+    reducer: *seq.relation_graph.StreamingLineageReducer,
 ) ![]StreamingParseTask {
     var tasks: std.ArrayList(StreamingParseTask) = .empty;
     defer tasks.deinit(graph.allocator);
@@ -1703,7 +1703,7 @@ fn createStreamingParseTasks(
 
 fn scheduleParseTasks(
     allocator: std.mem.Allocator,
-    reducer: *const seq.relation_graph.StreamingLineageReducer,
+    reducer: *seq.relation_graph.StreamingLineageReducer,
     tasks: []const StreamingParseTask,
 ) ![]StreamingParseTask {
     const sessions = try allocator.alloc(?[]const u8, tasks.len);

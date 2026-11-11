@@ -181,10 +181,11 @@ A lineage definition streams (`partition-lineage-stream`) only when all of these
 - its projection reads no other scan, and the sessions scan declares only fields
   discovery seeds (identity, lineage, path, and token count fields).
 
-Streaming reduces each session after its ancestors in the lineage join's checked
-graph input, in order of their depth there, and fails with
-`ObservationStreamingPartitionOutOfOrder` rather than reduce a session before its
-parent. It hands the stages after the lineage join its rows and sessions in
+Streaming reduces each session after every session its rows can inherit from: its
+ancestors in the lineage join's checked graph input, and the session that its topmost
+ancestor there names as parent, which a filter on the graph input may leave out. It
+fails with `ObservationStreamingPartitionOutOfOrder` rather than reduce a session
+before one of those. It hands the stages after the lineage join its rows and sessions in
 source-path order, as the materialized graph reads them, so row order,
 order-dependent stages, and the corpus digest agree across strategies. When the rows
 reaching the lineage join come from a local `ordered_fold` through stages that keep

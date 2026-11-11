@@ -967,3 +967,53 @@ scoped_rows() {
 [ "$(scoped_rows --path "$scope_home/sessions/s.jsonl")" = '["s"]' ]
 [ "$(scoped_rows --session-id d3)" = '["d0","d3"]' ]
 [ "$(scoped_rows --path "$scope_home/sessions/deep3.jsonl")" = '["d0","d3"]' ]
+
+jq '(.pipeline[] | select(.op == "join") | .on.keys) = [{left: "role", right: "role"}] |
+  .pipeline = [.pipeline[0], {op: "filter", input: "session_rows", as: "child_session",
+      where: [{field: "session_id", op: "exact", value: "fixture-child"}]}] + .pipeline[1:] |
+  (.pipeline[] | select(.op == "join") | .inputs[2]) = "child_session"' \
+  "$lineage_definition" >"$work/filtered-lineage.json"
+filtered_plan=$("$binary" explain --definition "$work/filtered-lineage.json" --projection rows \
+  --format json)
+jq -e '.strategy.kind == "partition-lineage-stream"' <<<"$filtered_plan" >/dev/null
+filtered_rows=$("$binary" observe --definition "$work/filtered-lineage.json" --projection rows \
+  --root "$work/fork-root" --format json)
+jq -e '[.data.rows[].session_id] == ["fixture-session"]' <<<"$filtered_rows" >/dev/null
+
+jq '.relations[0].fields += ["parent_relation"] |
+  .pipeline = [.pipeline[0], {op: "filter", input: "session_rows", as: "fork_rows",
+      where: [{field: "parent_relation", op: "exact", value: "forked_from_id"}]}] +
+    .pipeline[1:] |
+  (.pipeline[] | select(.op == "join") | .inputs[2]) = "fork_rows"' \
+  "$lineage_definition" >"$work/event-fork-lineage.json"
+jq '(.pipeline[] | select(.op == "join") | .on.keys) = [{left: "role", right: "role"}]' \
+  "$work/event-fork-lineage.json" >"$work/role-fork-lineage.json"
+for keyed in role event; do
+  jq '.relations[0].fields += ["model"]' "$work/$keyed-fork-lineage.json" \
+    >"$work/$keyed-fork-materialized.json"
+  "$binary" explain --definition "$work/$keyed-fork-lineage.json" --projection rows \
+    --format json | jq -e '.strategy.kind == "partition-lineage-stream"' >/dev/null
+done
+for first in child parent; do
+  fork_order_root="$work/fork-order-$first"
+  mkdir -p "$fork_order_root"
+  child_file=a.jsonl
+  parent_file=b.jsonl
+  if [ "$first" = parent ]; then
+    child_file=b.jsonl
+    parent_file=a.jsonl
+  fi
+  order_session "$fork_order_root" "$parent_file" p "" /repo
+  order_session "$fork_order_root" "$child_file" c p /repo
+  for keyed in role event; do
+    fork_stream=$("$binary" observe --definition "$work/$keyed-fork-lineage.json" \
+      --projection rows --root "$fork_order_root" --format json)
+    fork_materialized=$("$binary" observe \
+      --definition "$work/$keyed-fork-materialized.json" --projection rows \
+      --root "$fork_order_root" --format json)
+    printf '%s\n' "$fork_stream" "$fork_materialized" | jq -se --arg keyed "$keyed" '
+      .[0].data.rows == .[1].data.rows and
+      (([.[1].data.rows[].session_id] | index("c")) == null) == ($keyed == "role")' \
+      >/dev/null
+  done
+done

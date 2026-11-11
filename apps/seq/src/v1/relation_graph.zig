@@ -2178,7 +2178,7 @@ pub const StreamingLineageReducer = struct {
     next: std.ArrayList(usize) = .empty,
     output: std.ArrayList(execution.Value) = .empty,
     ranks: std.ArrayList(usize) = .empty,
-    consumed: []bool,
+    partitions: std.StringHashMapUnmanaged(bool) = .{},
     max_rows: usize,
     max_retained_bytes: usize,
 
@@ -2215,15 +2215,12 @@ pub const StreamingLineageReducer = struct {
             definition_plan.bounds.max_graph_depth,
         );
         errdefer lineage.deinit(allocator);
-        const consumed = try allocator.alloc(bool, lineage.parents.len);
-        @memset(consumed, false);
         std.debug.assert(stage.schema.columns.len == spec.outputs.len);
         return .{
             .allocator = allocator,
             .spec = spec,
             .width = native_plan.stages[spec.left_stage].schema.columns.len,
             .lineage = lineage,
-            .consumed = consumed,
             .max_rows = definition_plan.bounds.max_rows,
             .max_retained_bytes = max_retained_bytes,
         };
@@ -2236,15 +2233,18 @@ pub const StreamingLineageReducer = struct {
         self.next.deinit(self.allocator);
         self.output.deinit(self.allocator);
         self.ranks.deinit(self.allocator);
-        self.allocator.free(self.consumed);
+        self.partitions.deinit(self.allocator);
         self.* = undefined;
     }
 
     pub fn scheduleSessions(
-        self: *const StreamingLineageReducer,
+        self: *StreamingLineageReducer,
         allocator: std.mem.Allocator,
         sessions: []const ?[]const u8,
     ) ![]usize {
+        for (sessions) |session| {
+            if (session) |id| try self.partitions.put(self.allocator, id, false);
+        }
         return self.lineage.scheduleSessions(allocator, sessions);
     }
 
@@ -2255,10 +2255,13 @@ pub const StreamingLineageReducer = struct {
         rows: Table,
     ) !void {
         if (rows.width != self.width) return error.InvalidObservationRows;
-        const node = self.lineage.sessionNode(session);
-        if (node) |index| if (self.lineage.parents[index]) |parent| {
-            if (!self.consumed[parent]) return error.ObservationStreamingPartitionOutOfOrder;
-        };
+        if (self.lineage.sessionNode(session)) |node| {
+            var walk = self.lineage.ancestorWalk(node);
+            while (walk.next()) |ancestor| {
+                const consumed = self.partitions.get(ancestor) orelse continue;
+                if (!consumed) return error.ObservationStreamingPartitionOutOfOrder;
+            }
+        }
         for (0..try rows.rowCount()) |row_index| {
             const row = rows.row(row_index);
             const key_hash = joinEqualityHash(self.spec.keys, row, .left) orelse {
@@ -2270,7 +2273,9 @@ pub const StreamingLineageReducer = struct {
             const owner = joinFlagEnabled(self.spec.right_true, row);
             try self.retain(row, if (owner) key_hash else null, rank);
         }
-        if (node) |index| self.consumed[index] = true;
+        if (session) |id| {
+            if (self.partitions.getPtr(id)) |consumed| consumed.* = true;
+        }
     }
 
     fn ancestorMatches(
@@ -2431,7 +2436,6 @@ const LineageIndex = struct {
     right_index: u16,
     nodes: std.StringHashMapUnmanaged(usize) = .{},
     parents: []?usize = &.{},
-    depths: []usize = &.{},
 
     fn init(
         allocator: std.mem.Allocator,
@@ -2462,15 +2466,37 @@ const LineageIndex = struct {
             &result.nodes,
             false,
         );
-        result.depths = try boundedAncestryDepths(allocator, result.parents, max_depth);
+        try requireBoundedAncestry(allocator, result.parents, max_depth);
         return result;
     }
 
     fn deinit(self: *LineageIndex, allocator: std.mem.Allocator) void {
         self.nodes.deinit(allocator);
         allocator.free(self.parents);
-        allocator.free(self.depths);
         self.* = undefined;
+    }
+
+    const AncestorWalk = struct {
+        index: *const LineageIndex,
+        current: ?usize,
+        remaining: usize,
+
+        fn next(self: *AncestorWalk) ?[]const u8 {
+            const node = self.current orelse return null;
+            if (self.remaining == 0) return null;
+            self.remaining -= 1;
+            const row = self.index.rows.row(node);
+            const parent = valueText(row[self.index.parent_index]) orelse {
+                self.current = null;
+                return null;
+            };
+            self.current = self.index.parents[node];
+            return parent;
+        }
+    };
+
+    fn ancestorWalk(self: *const LineageIndex, node: usize) AncestorWalk {
+        return .{ .index = self, .current = node, .remaining = self.parents.len };
     }
 
     fn sessionNode(self: *const LineageIndex, session: ?[]const u8) ?usize {
@@ -2482,14 +2508,16 @@ const LineageIndex = struct {
         allocator: std.mem.Allocator,
         sessions: []const ?[]const u8,
     ) ![]usize {
-        const depths = try allocator.alloc(usize, sessions.len);
-        defer allocator.free(depths);
-        for (depths, sessions) |*depth, session| {
-            depth.* = if (self.sessionNode(session)) |node| self.depths[node] else 0;
+        const levels = try allocator.alloc(usize, sessions.len);
+        defer allocator.free(levels);
+        for (levels, sessions) |*level, session| {
+            level.* = 0;
+            var walk = self.ancestorWalk(self.sessionNode(session) orelse continue);
+            while (walk.next()) |_| level.* += 1;
         }
         const order = try allocator.alloc(usize, sessions.len);
         for (order, 0..) |*slot, index| slot.* = index;
-        std.mem.sort(usize, order, depths, keyThenIndexLessThan);
+        std.mem.sort(usize, order, levels, keyThenIndexLessThan);
         return order;
     }
 
@@ -2500,14 +2528,11 @@ const LineageIndex = struct {
     ) bool {
         const descendant = valueText(left[self.left_index]) orelse return false;
         const ancestor = valueText(right[self.right_index]) orelse return false;
-        var current = self.nodes.get(descendant) orelse return false;
-        for (0..self.parents.len) |_| {
-            const parent = valueText(self.rows.row(current)[self.parent_index]) orelse
-                return false;
+        var walk = self.ancestorWalk(self.nodes.get(descendant) orelse return false);
+        while (walk.next()) |parent| {
             if (std.mem.eql(u8, parent, ancestor)) return true;
-            current = self.parents[current] orelse return false;
         }
-        unreachable;
+        return false;
     }
 };
 
@@ -2749,7 +2774,7 @@ fn reachabilityTable(
     }
     const parents = try parentLinks(allocator, input, node_index, parent_index, &nodes, true);
     defer allocator.free(parents);
-    allocator.free(try boundedAncestryDepths(allocator, parents, bounds.max_graph_depth));
+    try requireBoundedAncestry(allocator, parents, bounds.max_graph_depth);
     if (keys.get("mode")) |raw_mode| {
         const mode = try definition_core.json.string(raw_mode);
         if (std.mem.eql(u8, mode, "closure")) {
@@ -2801,13 +2826,13 @@ fn parentLinks(
     return parents;
 }
 
-fn boundedAncestryDepths(
+fn requireBoundedAncestry(
     allocator: std.mem.Allocator,
     parents: []const ?usize,
     max_depth: usize,
-) ![]usize {
+) !void {
     const depths = try allocator.alloc(usize, parents.len);
-    errdefer allocator.free(depths);
+    defer allocator.free(depths);
     const settled = try allocator.alloc(bool, parents.len);
     defer allocator.free(settled);
     const visiting = try allocator.alloc(bool, parents.len);
@@ -2835,7 +2860,6 @@ fn boundedAncestryDepths(
             settled[node] = true;
         }
     }
-    return depths;
 }
 
 fn reachabilitySeeded(
@@ -3224,13 +3248,13 @@ test "streaming schedule orders each session after its ancestors in the checked 
         8,
     );
     defer index.deinit(std.testing.allocator);
-    const sessions = [_]?[]const u8{ "child", "parent", "root", null, "unknown" };
+    const sessions = [_]?[]const u8{ "child", "parent", "root", null, "unknown", "outside" };
     const order = try index.scheduleSessions(std.testing.allocator, &sessions);
     defer std.testing.allocator.free(order);
-    try std.testing.expectEqualSlices(usize, &.{ 1, 2, 3, 4, 0 }, order);
+    try std.testing.expectEqualSlices(usize, &.{ 2, 3, 4, 5, 1, 0 }, order);
 }
 
-test "streaming partitions fail closed until their in-graph parent is consumed" {
+test "streaming partitions fail closed until every session they inherit from is consumed" {
     var graph_values = [_]execution.Value{
         .{ .string = "child" },  .{ .string = "parent" },
         .{ .string = "parent" }, .{ .string = "outside" },
@@ -3261,22 +3285,179 @@ test "streaming partitions fail closed until their in-graph parent is consumed" 
             lineage,
             8,
         ),
-        .consumed = try std.testing.allocator.alloc(bool, 2),
         .max_rows = 10,
         .max_retained_bytes = 4096,
     };
     defer reducer.deinit();
-    @memset(reducer.consumed, false);
+    const sessions = [_]?[]const u8{ "child", "parent", "outside" };
+    const order = try reducer.scheduleSessions(std.testing.allocator, &sessions);
+    defer std.testing.allocator.free(order);
+    try std.testing.expectEqualSlices(usize, &.{ 2, 1, 0 }, order);
     var none: [0]execution.Value = .{};
     const empty: Table = .{ .values = &none, .width = 1 };
     try std.testing.expectError(
         error.ObservationStreamingPartitionOutOfOrder,
-        reducer.appendPartition("child", 0, empty),
+        reducer.appendPartition("parent", 0, empty),
     );
-    try reducer.appendPartition("parent", 0, empty);
-    try reducer.appendPartition("child", 1, empty);
-    try reducer.appendPartition(null, 2, empty);
-    try reducer.appendPartition("unknown", 3, empty);
+    try reducer.appendPartition("outside", 0, empty);
+    try std.testing.expectError(
+        error.ObservationStreamingPartitionOutOfOrder,
+        reducer.appendPartition("child", 1, empty),
+    );
+    try reducer.appendPartition("parent", 1, empty);
+    try reducer.appendPartition("child", 2, empty);
+    try reducer.appendPartition(null, 3, empty);
+    try reducer.appendPartition("unknown", 4, empty);
+}
+
+const property_names = [_][]const u8{ "s0", "s1", "s2", "s3", "s4", "s5" };
+const property_width = 4;
+const property_lineage: JoinLineage = .{
+    .graph_stage = 0,
+    .node = 0,
+    .parent = 1,
+    .left = 0,
+    .right = 0,
+};
+
+const PropertyCase = struct {
+    graph: [property_names.len * 2]execution.Value = undefined,
+    graph_len: usize = 0,
+    rows: [property_names.len * 3 * property_width]execution.Value = undefined,
+    rows_len: usize = 0,
+    starts: [property_names.len + 1]usize = undefined,
+    sessions: [property_names.len]?[]const u8 = undefined,
+    partitions: usize = 0,
+
+    fn init(random: std.Random) PropertyCase {
+        var case: PropertyCase = .{};
+        var ranked: [property_names.len]usize = undefined;
+        for (&ranked, 0..) |*slot, index| slot.* = index;
+        random.shuffle(usize, &ranked);
+        var parents: [property_names.len]?usize = @splat(null);
+        for (ranked, 0..) |session, rank| {
+            if (rank == 0 or random.uintLessThan(u8, 10) >= 7) continue;
+            parents[session] = ranked[random.uintLessThan(usize, rank)];
+        }
+        for (property_names, parents) |name, parent| {
+            if (random.uintLessThan(u8, 10) < 7) {
+                case.graph[case.graph_len] = .{ .string = name };
+                case.graph[case.graph_len + 1] = if (parent) |found|
+                    .{ .string = property_names[found] }
+                else
+                    .null;
+                case.graph_len += 2;
+            }
+            if (random.uintLessThan(u8, 10) < 8) case.addPartition(random, name);
+        }
+        case.starts[case.partitions] = case.rows_len;
+        return case;
+    }
+
+    fn addPartition(case: *PropertyCase, random: std.Random, name: []const u8) void {
+        case.starts[case.partitions] = case.rows_len;
+        case.sessions[case.partitions] = name;
+        case.partitions += 1;
+        for (0..random.uintAtMost(usize, 3)) |_| {
+            const row = case.rows[case.rows_len..][0..property_width];
+            row.* = .{
+                .{ .string = name },
+                .{ .integer = random.intRangeAtMost(i64, 0, 1) },
+                .{ .boolean = random.boolean() },
+                .{ .boolean = random.boolean() },
+            };
+            case.rows_len += property_width;
+        }
+    }
+
+    fn graphTable(case: *PropertyCase) Table {
+        return .{ .values = case.graph[0..case.graph_len], .width = 2 };
+    }
+
+    fn partitionRows(case: *PropertyCase, partition: usize) Table {
+        const values = case.rows[case.starts[partition]..case.starts[partition + 1]];
+        return .{ .values = values, .width = property_width };
+    }
+};
+
+fn inheritsAnyOwner(
+    lineage: *const LineageIndex,
+    all: []const execution.Value,
+    left: []const execution.Value,
+) bool {
+    for (0..all.len / property_width) |right_index| {
+        const right = all[right_index * property_width ..][0..property_width];
+        if (!right[3].boolean or right[1].integer != left[1].integer) continue;
+        if (lineage.matches(left, right)) return true;
+    }
+    return false;
+}
+
+fn matcherAntiJoin(
+    allocator: std.mem.Allocator,
+    lineage: *const LineageIndex,
+    case: *const PropertyCase,
+) ![]execution.Value {
+    var kept: std.ArrayList(execution.Value) = .empty;
+    errdefer kept.deinit(allocator);
+    const all = case.rows[0..case.rows_len];
+    for (0..all.len / property_width) |left_index| {
+        const left = all[left_index * property_width ..][0..property_width];
+        if (left[2].boolean and inheritsAnyOwner(lineage, all, left)) continue;
+        try kept.appendSlice(allocator, left);
+    }
+    return kept.toOwnedSlice(allocator);
+}
+
+fn propertyReducer(allocator: std.mem.Allocator, case: *PropertyCase) !StreamingLineageReducer {
+    const keys = try allocator.alloc(JoinKey, 1);
+    errdefer allocator.free(keys);
+    keys[0] = .{ .left = 1, .right = 1, .comparison = .{ .eq = false } };
+    const outputs = try allocator.alloc(JoinOutput, property_width);
+    errdefer allocator.free(outputs);
+    for (outputs, 0..) |*output, index| output.* = .{ .side = .left, .column = @intCast(index) };
+    return .{
+        .allocator = allocator,
+        .spec = .{
+            .kind = .anti,
+            .left_stage = 1,
+            .right_stage = 1,
+            .keys = keys,
+            .left_true = 2,
+            .right_true = 3,
+            .lineage = property_lineage,
+            .outputs = outputs,
+        },
+        .width = property_width,
+        .lineage = try LineageIndex.init(allocator, case.graphTable(), property_lineage, 8),
+        .max_rows = 1000,
+        .max_retained_bytes = 1 << 20,
+    };
+}
+
+fn expectReducerMatchesAntiJoin(random: std.Random) !void {
+    const allocator = std.testing.allocator;
+    var case = PropertyCase.init(random);
+    var lineage = try LineageIndex.init(allocator, case.graphTable(), property_lineage, 8);
+    defer lineage.deinit(allocator);
+    const expected = try matcherAntiJoin(allocator, &lineage, &case);
+    defer allocator.free(expected);
+    var reducer = try propertyReducer(allocator, &case);
+    defer reducer.deinit();
+    const order = try reducer.scheduleSessions(allocator, case.sessions[0..case.partitions]);
+    defer allocator.free(order);
+    for (order) |partition| {
+        const rows = case.partitionRows(partition);
+        try reducer.appendPartition(case.sessions[partition], partition, rows);
+    }
+    const streamed = try reducer.finish();
+    defer allocator.free(streamed.values);
+    try std.testing.expectEqualDeep(expected, streamed.values);
+}
+
+test "streaming reducer equals the matcher anti join under its own schedule" {
+    var prng = std.Random.DefaultPrng.init(0x5eed_1ee7);
+    for (0..256) |_| try expectReducerMatchesAntiJoin(prng.random());
 }
 
 test "in-place row permutation follows every cycle" {
@@ -3390,12 +3571,10 @@ test "streaming lineage keeps right eligibility independent of left eligibility"
             lineage,
             8,
         ),
-        .consumed = try std.testing.allocator.alloc(bool, graph_values.len / graph_columns.len),
         .max_rows = 10,
         .max_retained_bytes = 4096,
     };
     defer reducer.deinit();
-    @memset(reducer.consumed, false);
     try reducer.appendPartition(null, 0, .{
         .values = @constCast(&lineage_eligibility_rows),
         .width = columns.len,
