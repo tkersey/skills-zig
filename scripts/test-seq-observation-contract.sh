@@ -892,3 +892,78 @@ late_materialized=$("$binary" observe --definition "$work/late-materialized.json
 printf '%s\n' "$late_stream" "$late_materialized" | jq -se '
   .[0].data.rows == .[1].data.rows and
   ([.[0].data.rows[].session_id] == ["fixture-session", null])' >/dev/null
+
+order_session() {
+  jq -c --arg id "$3" --arg parent "$4" --arg cwd "$5" '
+    if .type == "session_meta" then .payload.id = $id | .payload.cwd = $cwd |
+      (if $parent == "" then . else .payload.forked_from_id = $parent end) else . end' \
+    "$rollout" >"$1/$2"
+}
+jq '(.pipeline[] | select(.op == "join") | .on.keys) = [{left: "role", right: "role"}] |
+  .bounds.max_graph_depth = 2' "$lineage_definition" >"$work/role-order-lineage.json"
+jq '.bounds.max_graph_depth = 2' "$lineage_definition" >"$work/event-order-lineage.json"
+for keyed in role event; do
+  jq '.relations[0].fields += ["model"]' "$work/$keyed-order-lineage.json" \
+    >"$work/$keyed-order-materialized.json"
+done
+for shape in cycle chain self; do
+  for first in child parent; do
+    order_root="$work/order-$shape-$first"
+    mkdir -p "$order_root"
+    child_file=a.jsonl
+    parent_file=b.jsonl
+    if [ "$first" = parent ]; then
+      child_file=b.jsonl
+      parent_file=a.jsonl
+    fi
+    case "$shape" in
+      cycle)
+        order_session "$order_root" x1.jsonl x1 x2 /other
+        order_session "$order_root" x2.jsonl x2 x1 /other
+        order_session "$order_root" "$parent_file" p x1 /repo
+        ;;
+      chain)
+        order_session "$order_root" x0.jsonl x0 "" /repo
+        order_session "$order_root" x1.jsonl x1 x0 /other
+        order_session "$order_root" x2.jsonl x2 x1 /other
+        order_session "$order_root" "$parent_file" p x2 /repo
+        ;;
+      self)
+        order_session "$order_root" x1.jsonl x1 x1 /other
+        order_session "$order_root" "$parent_file" p x1 /repo
+        ;;
+    esac
+    order_session "$order_root" "$child_file" c p /repo
+    for keyed in role event; do
+      order_stream=$("$binary" observe --definition "$work/$keyed-order-lineage.json" \
+        --projection rows --root "$order_root" --repo /repo --format json)
+      order_materialized=$("$binary" observe \
+        --definition "$work/$keyed-order-materialized.json" --projection rows \
+        --root "$order_root" --repo /repo --format json)
+      printf '%s\n' "$order_stream" "$order_materialized" | jq -se --arg keyed "$keyed" '
+        .[0].data.rows == .[1].data.rows and
+        (([.[1].data.rows[].session_id] | index("c")) == null) == ($keyed == "role")' \
+        >/dev/null
+    done
+  done
+done
+
+scope_home="$work/scope-home"
+mkdir -p "$scope_home/sessions"
+order_session "$scope_home/sessions" s.jsonl s "" /repo
+order_session "$scope_home/sessions" q.jsonl q q /other
+order_session "$scope_home/sessions" deep0.jsonl d0 "" /repo
+order_session "$scope_home/sessions" deep1.jsonl d1 d0 /other
+order_session "$scope_home/sessions" deep2.jsonl d2 d1 /other
+order_session "$scope_home/sessions" deep3.jsonl d3 d2 /repo
+jq '.bounds.max_graph_depth = 2 | .selectors = ["path", "root", "session-id", "repo"]' \
+  "$lineage_definition" >"$work/scoped-order-lineage.json"
+scoped_rows() {
+  CODEX_HOME="$scope_home" "$binary" observe --definition "$work/scoped-order-lineage.json" \
+    --projection rows --repo /repo "$@" --format json | jq -c '[.data.rows[].session_id]'
+}
+[ "$(scoped_rows)" = '["d0","d3","s"]' ]
+[ "$(scoped_rows --session-id s)" = '["s"]' ]
+[ "$(scoped_rows --path "$scope_home/sessions/s.jsonl")" = '["s"]' ]
+[ "$(scoped_rows --session-id d3)" = '["d0","d3"]' ]
+[ "$(scoped_rows --path "$scope_home/sessions/deep3.jsonl")" = '["d0","d3"]' ]

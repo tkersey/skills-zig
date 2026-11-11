@@ -5064,7 +5064,8 @@ const PiVisitorProbe = struct {
 };
 
 test "Pi full and summary visitors preserve physical bytes and streaming metrics" {
-    const source = " \r\n" ++ pi_test_trace;
+    const header_end = comptime std.mem.indexOfScalar(u8, pi_test_trace, '\n').? + 1;
+    const source = pi_test_trace[0..header_end] ++ " \r\n" ++ pi_test_trace[header_end..];
     const allocator = std.testing.allocator;
     var full_reader = std.Io.Reader.fixed(source);
     var summary_reader = std.Io.Reader.fixed(source);
@@ -5096,12 +5097,14 @@ test "Pi full and summary visitors preserve physical bytes and streaming metrics
         &summary_metrics,
     );
     defer summary.deinit(allocator);
+    try std.testing.expectEqual(TraceFormat.pi_session_jsonl, full.session.source_format);
+    try std.testing.expectEqual(TraceFormat.pi_session_jsonl, summary.session.source_format);
     try std.testing.expectEqualDeep(full_metrics, summary_metrics);
     try std.testing.expectEqual(@as(usize, source.len), full_metrics.bytes_read);
     try std.testing.expectEqual(@as(usize, 15), full_metrics.lines_seen);
     try std.testing.expectEqual(@as(usize, source.len), full_probe.offset);
     try std.testing.expectEqual(@as(usize, source.len), summary_probe.offset);
-    try std.testing.expectEqual(@as(usize, 2), full.occurrences.items[0].line_number);
+    try std.testing.expectEqual(@as(usize, 1), full.occurrences.items[0].line_number);
     try std.testing.expectEqual(@as(usize, 0), full.occurrences.items[0].ordinal);
     const expected_id = computeSourceEventId("pi.jsonl", 6, 4);
     try std.testing.expectEqualStrings(&expected_id, full.occurrences.items[4].sourceEventId());

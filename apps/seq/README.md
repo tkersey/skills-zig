@@ -181,12 +181,15 @@ A lineage definition streams (`partition-lineage-stream`) only when all of these
 - its projection reads no other scan, and the sessions scan declares only fields
   discovery seeds (identity, lineage, path, and token count fields).
 
-Streaming reads sessions in lineage-depth order but hands the stages after the
-lineage join its rows and sessions in source-path order, as the materialized graph
-reads them, so row order, order-dependent stages, and the corpus digest agree across
-strategies. When the rows reaching the lineage join come from a local `ordered_fold`
-through stages that keep their order, they follow that fold's first sort key instead,
-session by session, as the materialized fold sorts them. Rows of session files
+Streaming reduces each session after its ancestors in the lineage join's checked
+graph input, in order of their depth there, and fails with
+`ObservationStreamingPartitionOutOfOrder` rather than reduce a session before its
+parent. It hands the stages after the lineage join its rows and sessions in
+source-path order, as the materialized graph reads them, so row order,
+order-dependent stages, and the corpus digest agree across strategies. When the rows
+reaching the lineage join come from a local `ordered_fold` through stages that keep
+their order, they follow that fold's first sort key instead, session by session, as
+the materialized fold sorts them. Rows of session files
 without an identity form their own partitions, so a session-keyed local `distinct`
 or join keeps them apart where the materialized graph groups their null `session_id`
 values, and such a fold sorts each file's rows alone and keeps those files in
@@ -195,10 +198,13 @@ source-path order where the materialized fold sorts all of their rows together.
 Any other lineage definition runs on the materialized-graph strategy over the whole
 root; with `--path` or `--session-id` it fails with
 `ObservationStreamingLineageShapeUnsupported`, because only the streaming strategy
-reads the selection's lineage closure. A streaming lineage `--session-id` that
-matches no discovered session passing `--repo` fails with `SessionNotFound`, as
-other strategies do. Streaming lineage indexes every discovered session, so a session
-id that appears twice under the root fails it with `DuplicateObservationLineageNode`.
+reads the selection's lineage closure. That closure follows control and history
+parents through every discovered session and never fails on its own: cycles and
+depth fail only through the lineage graph check, as unscoped runs do. A streaming
+lineage `--session-id` that matches no discovered session passing `--repo` fails with
+`SessionNotFound`, as other strategies do. Streaming lineage indexes every discovered
+session, so a session id that appears twice under the root fails it with
+`DuplicateObservationLineageNode`.
 A `limit` or `top-k` count
 bound from a parameter must lie between 1 and `bounds.max_rows`, as a literal count
 must; other values fail with `InvalidObservationLimit` on every strategy. Every

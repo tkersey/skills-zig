@@ -1507,9 +1507,6 @@ fn retainPrefixRows(
 const DiscoveredSession = struct {
     path_index: usize,
     identity: seq.trace_adapter.SessionIdentity,
-    depth: usize = 0,
-    visiting: bool = false,
-    resolved: bool = false,
 };
 
 const StreamingParseTask = struct {
@@ -1523,6 +1520,8 @@ const StreamingParseTask = struct {
     compressed: bool = false,
     session_seed_row: ?usize = null,
     path_index: usize = 0,
+    session: ?[]const u8 = null,
+    rank: usize = 0,
     repo: ?[]const u8,
     selected: ?seq.trace_adapter.SelectedParse = null,
     failure: ?anyerror = null,
@@ -1563,7 +1562,6 @@ const DiscoveredSessions = struct {
         dir: std.Io.Dir,
         allocator: std.mem.Allocator,
         paths: []const []const u8,
-        max_depth: usize,
         args: *const ObserveArgs,
     ) !DiscoveredSessions {
         var result: DiscoveredSessions = .{
@@ -1591,7 +1589,6 @@ const DiscoveredSessions = struct {
             );
             try indexDiscoveredSession(&result.indices, item.*, index);
         }
-        try result.orderByDepth(allocator, max_depth);
         return result;
     }
 
@@ -1600,19 +1597,6 @@ const DiscoveredSessions = struct {
         for (self.items[0..self.initialized_count]) |*item| item.identity.deinit(allocator);
         allocator.free(self.items);
         self.* = undefined;
-    }
-
-    fn orderByDepth(self: *DiscoveredSessions, allocator: std.mem.Allocator, limit: usize) !void {
-        const lineage_path = try allocator.alloc(usize, self.items.len);
-        defer allocator.free(lineage_path);
-        for (self.items, 0..) |_, index| {
-            _ = resolveSessionDepth(self.items, &self.indices, index, limit, lineage_path);
-        }
-        std.mem.sort(DiscoveredSession, self.items, {}, discoveredSessionLessThan);
-        self.indices.clearRetainingCapacity();
-        for (self.items, 0..) |item, index| {
-            if (item.identity.session_id) |session_id| try self.indices.put(session_id, index);
-        }
     }
 };
 
@@ -1662,6 +1646,7 @@ fn createStreamingParseTasks(
     schedule: seq.relation_graph.StreamingLineagePlan,
     discovered: *const DiscoveredSessions,
     paths: []const []const u8,
+    reducer: *const seq.relation_graph.StreamingLineageReducer,
 ) ![]StreamingParseTask {
     var tasks: std.ArrayList(StreamingParseTask) = .empty;
     defer tasks.deinit(graph.allocator);
@@ -1672,9 +1657,10 @@ fn createStreamingParseTasks(
         graph.args.selectors.session_id,
         graph.args.selectors.path,
         paths,
-        graph.plans.definition_plan.bounds.max_graph_depth,
     );
     defer graph.allocator.free(selected);
+    const ranks = try partitionRanks(graph.allocator, schedule.partition_order, discovered);
+    defer graph.allocator.free(ranks);
     var reserved_bytes: usize = 0;
     var seed_row: usize = 0;
     for (discovered.items, 0..) |item, index| {
@@ -1705,12 +1691,29 @@ fn createStreamingParseTasks(
             .compressed = compressed,
             .session_seed_row = row,
             .path_index = item.path_index,
+            .session = item.identity.session_id,
+            .rank = ranks[item.path_index],
             .repo = graph.args.selectors.repo,
         });
     }
     const bound = graph.plans.definition_plan.bounds.max_input_bytes;
     shareSpareBudget(tasks.items, bound, reserved_bytes);
-    return tasks.toOwnedSlice(graph.allocator);
+    return scheduleParseTasks(graph.allocator, reducer, tasks.items);
+}
+
+fn scheduleParseTasks(
+    allocator: std.mem.Allocator,
+    reducer: *const seq.relation_graph.StreamingLineageReducer,
+    tasks: []const StreamingParseTask,
+) ![]StreamingParseTask {
+    const sessions = try allocator.alloc(?[]const u8, tasks.len);
+    defer allocator.free(sessions);
+    for (sessions, tasks) |*session, task| session.* = task.session;
+    const order = try reducer.scheduleSessions(allocator, sessions);
+    defer allocator.free(order);
+    const scheduled = try allocator.alloc(StreamingParseTask, tasks.len);
+    for (scheduled, order) |*slot, index| slot.* = tasks[index];
+    return scheduled;
 }
 
 fn shareSpareBudget(tasks: []StreamingParseTask, bound: usize, reserved_bytes: usize) void {
@@ -1764,7 +1767,6 @@ const StreamingGraphState = struct {
     materialized_rows: usize,
     session_seed: ?*seq.relation_graph.ScanInput = null,
     usage_column: ?usize = null,
-    output_paths: std.ArrayList(usize) = .empty,
     corpus_entries: std.ArrayList(CorpusEntry) = .empty,
 
     const CorpusEntry = struct {
@@ -1775,7 +1777,6 @@ const StreamingGraphState = struct {
 
     fn deinit(self: *StreamingGraphState) void {
         self.interner.deinit(self.graph.table_allocator);
-        self.output_paths.deinit(self.graph.allocator);
         self.corpus_entries.deinit(self.graph.allocator);
     }
 
@@ -1810,7 +1811,13 @@ const StreamingGraphState = struct {
             task.reserved_bytes,
             if (selected.parsed) |parsed| parsed.metrics.bytes_read else 0,
         );
-        const parsed = if (selected.parsed) |*value| value else return;
+        const parsed = if (selected.parsed) |*value| value else {
+            var none: [0]seq.execution.Value = .{};
+            return reducer.appendPartition(task.session, task.rank, .{
+                .values = &none,
+                .width = reducer.width,
+            });
+        };
         try self.metrics.admitAdapter(seq.trace_adapter.adapterId(&parsed.trace));
         try admitTraceSession(&self.metrics, parsed);
         if (self.usage_column) |column| {
@@ -1828,13 +1835,13 @@ const StreamingGraphState = struct {
             .path = task.path,
             .digest = parsed.corpus_digest,
         });
-        try self.appendPartition(parsed, task.path_index, reducer);
+        try self.appendPartition(parsed, task, reducer);
     }
 
     fn appendPartition(
         self: *StreamingGraphState,
         parsed: *const seq.trace_adapter.ParsedTrace,
-        path_index: usize,
+        task: *const StreamingParseTask,
         reducer: *seq.relation_graph.StreamingLineageReducer,
     ) !void {
         const graph = self.graph;
@@ -1863,34 +1870,18 @@ const StreamingGraphState = struct {
             self.materialized_rows,
             local.materialized_rows,
         );
-        const before = reducer.rowCount();
-        try reducer.appendPartition(local.table);
-        const kept = reducer.rowCount() - before;
-        try self.output_paths.appendNTimes(self.graph.allocator, path_index, kept);
+        try reducer.appendPartition(task.session, task.rank, local.table);
     }
 
     fn finish(
         self: *StreamingGraphState,
         reducer: *seq.relation_graph.StreamingLineageReducer,
         session_seed: *seq.relation_graph.ScanInput,
-        discovered: *const DiscoveredSessions,
     ) !ObservationExecution {
         const graph = self.graph;
         std.mem.sort(CorpusEntry, self.corpus_entries.items, {}, corpusEntryLessThan);
         for (self.corpus_entries.items) |entry| self.digest_set.add(entry.path, &entry.digest);
-        try orderSessionSeed(graph, session_seed, discovered);
-        const unordered = try reducer.finish();
-        defer graph.table_allocator.free(unordered.values);
-        const order = self.schedule.partition_order;
-        const ranks = try partitionRanks(graph.allocator, order, discovered);
-        defer graph.allocator.free(ranks);
-        for (self.output_paths.items) |*path_index| path_index.* = ranks[path_index.*];
-        const owned = try pathOrderedRows(
-            graph.allocator,
-            graph.table_allocator,
-            unordered,
-            self.output_paths.items,
-        );
+        const owned = try reducer.finish();
         var scans = [_]seq.relation_graph.ScanInput{
             session_seed.*,
             .{
@@ -1992,14 +1983,7 @@ fn executeStreamingGraphObservation(
     };
     var paths = try resolveGraphPaths(allocator, io, dir, args, false);
     defer seq.native.freePaths(allocator, &paths);
-    var discovered = try DiscoveredSessions.init(
-        io,
-        dir,
-        allocator,
-        paths.items,
-        context.definition_plan.bounds.max_graph_depth,
-        args,
-    );
+    var discovered = try DiscoveredSessions.init(io, dir, allocator, paths.items, args);
     defer discovered.deinit(allocator);
     var session_seed = [_]seq.relation_graph.ScanInput{
         try buildSessionSeed(&graph, schedule, &discovered, paths.items),
@@ -2030,33 +2014,17 @@ fn executeStreamingGraphObservation(
     if (args.selectors.session_id) |wanted| try requireDiscoveredSession(&discovered, wanted);
     try state.recordDiscovery(&discovered, paths.items);
     defer state.deinit();
-    const tasks = try createStreamingParseTasks(&graph, schedule, &discovered, paths.items);
+    const tasks = try createStreamingParseTasks(
+        &graph,
+        schedule,
+        &discovered,
+        paths.items,
+        &reducer,
+    );
     defer allocator.free(tasks);
     state.reservations = .init(context.definition_plan.bounds.max_input_bytes, tasks);
     try runStreamingParseTasks(&state, tasks, &reducer);
-    return state.finish(&reducer, &session_seed[0], &discovered);
-}
-
-fn orderSessionSeed(
-    graph: *const GraphObservationContext,
-    seed: *seq.relation_graph.ScanInput,
-    discovered: *const DiscoveredSessions,
-) !void {
-    var paths: std.ArrayList(usize) = .empty;
-    defer paths.deinit(graph.allocator);
-    for (discovered.items) |item| {
-        if (item.identity.repo_matches) try paths.append(graph.allocator, item.path_index);
-    }
-    const ordered = try pathOrderedRows(
-        graph.allocator,
-        graph.table_allocator,
-        seed.table,
-        paths.items,
-    );
-    if (seed.owned) graph.table_allocator.free(seed.allocation orelse seed.table.values);
-    seed.table = ordered;
-    seed.allocation = ordered.values;
-    seed.owned = true;
+    return state.finish(&reducer, &session_seed[0]);
 }
 
 fn partitionRanks(
@@ -2073,36 +2041,12 @@ fn partitionRanks(
     return seq.relation_graph.rankPartitions(allocator, order, sessions);
 }
 
-fn pathOrderedRows(
-    scratch: std.mem.Allocator,
-    allocator: std.mem.Allocator,
-    table: seq.relation_graph.Table,
-    paths: []const usize,
-) !seq.relation_graph.Table {
-    const rows = try table.rowCount();
-    std.debug.assert(rows == paths.len);
-    const order = try scratch.alloc(usize, rows);
-    defer scratch.free(order);
-    for (order, 0..) |*slot, index| slot.* = index;
-    std.mem.sort(usize, order, paths, pathOrderLessThan);
-    const values = try allocator.alloc(seq.execution.Value, table.values.len);
-    for (order, 0..) |source, target| {
-        @memcpy(values[target * table.width ..][0..table.width], table.row(source));
-    }
-    return .{ .values = values, .width = table.width };
-}
-
 fn corpusEntryLessThan(
     _: void,
     left: StreamingGraphState.CorpusEntry,
     right: StreamingGraphState.CorpusEntry,
 ) bool {
     return left.path_index < right.path_index;
-}
-
-fn pathOrderLessThan(paths: []const usize, left: usize, right: usize) bool {
-    if (paths[left] != paths[right]) return paths[left] < paths[right];
-    return left < right;
 }
 
 fn requireDiscoveredSession(discovered: *const DiscoveredSessions, wanted: []const u8) !void {
@@ -2121,95 +2065,79 @@ fn sessionSelectionClosure(
     selected_session_id: ?[]const u8,
     selected_path: ?[]const u8,
     paths: []const []const u8,
-    max_depth: usize,
 ) ![]bool {
     const needed = try allocator.alloc(bool, sessions.len);
     errdefer allocator.free(needed);
     @memset(needed, selected_session_id == null and selected_path == null);
     if (selected_session_id == null and selected_path == null) return needed;
-    const seeds = try allocator.alloc(bool, sessions.len);
-    defer allocator.free(seeds);
-    const visited = try allocator.alloc(usize, sessions.len);
-    defer allocator.free(visited);
-    @memset(visited, 0);
-    for (sessions, 0..) |selected, selected_index| {
+    const scope = try allocator.alloc(SelectionScope, sessions.len);
+    defer allocator.free(scope);
+    for (sessions, scope) |session, *state| {
         const id_matches = if (selected_session_id) |wanted|
-            if (selected.identity.session_id) |actual| std.mem.eql(u8, wanted, actual) else false
+            if (session.identity.session_id) |actual| std.mem.eql(u8, wanted, actual) else false
         else
             false;
         const path_matches = if (selected_path) |wanted|
-            std.mem.eql(u8, wanted, paths[selected.path_index])
+            std.mem.eql(u8, wanted, paths[session.path_index])
         else
             false;
-        seeds[selected_index] = id_matches or path_matches;
+        state.* = if (id_matches or path_matches) .inside else .unknown;
     }
-    const counted = try allocator.alloc(bool, sessions.len);
-    defer allocator.free(counted);
-    for (sessions, 0..) |_, index| {
-        counted[index] = try scopeDescendsFromSeed(
-            sessions,
-            indices,
-            index,
-            seeds,
-            visited,
-            max_depth,
-        );
-    }
-    @memset(visited, 0);
-    for (counted, 0..) |include, index| {
-        if (include) try includeHistoryAncestors(
-            sessions,
-            indices,
-            index,
-            needed,
-            visited,
-            max_depth,
-        );
+    const walk = try allocator.alloc(usize, sessions.len);
+    defer allocator.free(walk);
+    for (0..sessions.len) |index| {
+        if (scopeDescendsFromSeed(sessions, indices, index, scope, walk)) {
+            includeHistoryAncestors(sessions, indices, index, needed);
+        }
     }
     return needed;
 }
 
+const SelectionScope = enum { unknown, visiting, inside, outside };
+
 fn scopeDescendsFromSeed(
     sessions: []const DiscoveredSession,
     indices: *const std.StringHashMap(usize),
-    descendant_index: usize,
-    seeds: []const bool,
-    visited: []usize,
-    max_depth: usize,
-) !bool {
-    var current = descendant_index;
-    var depth: usize = 0;
-    var selected = false;
-    while (depth <= max_depth) : (depth += 1) {
-        if (visited[current] == descendant_index + 1) return error.ObservationGraphCycle;
-        visited[current] = descendant_index + 1;
-        selected = selected or seeds[current];
+    start: usize,
+    scope: []SelectionScope,
+    walk: []usize,
+) bool {
+    var walked: usize = 0;
+    var verdict: SelectionScope = .outside;
+    var current = start;
+    for (0..sessions.len) |_| {
+        switch (scope[current]) {
+            .inside, .outside => |known| {
+                verdict = known;
+                break;
+            },
+            .visiting => break,
+            .unknown => {},
+        }
+        scope[current] = .visiting;
+        walk[walked] = current;
+        walked += 1;
         const identity = sessions[current].identity;
         const parent = identity.control_parent_session_id orelse
-            identity.parent_session_id orelse return selected;
-        current = indices.get(parent) orelse return selected;
-        if (depth >= max_depth) return error.ObservationGraphDepthExceeded;
+            identity.parent_session_id orelse break;
+        current = indices.get(parent) orelse break;
     }
-    return selected;
+    for (walk[0..walked]) |index| scope[index] = verdict;
+    return verdict == .inside;
 }
 
 fn includeHistoryAncestors(
     sessions: []const DiscoveredSession,
     indices: *const std.StringHashMap(usize),
-    descendant_index: usize,
+    start: usize,
     needed: []bool,
-    visited: []usize,
-    max_depth: usize,
-) !void {
-    var current = descendant_index;
-    var depth: usize = 0;
-    while (depth <= max_depth) : (depth += 1) {
-        if (visited[current] == descendant_index + 1) return error.ObservationGraphCycle;
-        visited[current] = descendant_index + 1;
+) void {
+    var current = start;
+    for (0..sessions.len) |_| {
+        if (needed[current]) return;
         needed[current] = true;
         const parent = sessions[current].identity.parent_session_id orelse return;
         current = indices.get(parent) orelse return;
-        if (depth >= max_depth) return error.ObservationGraphDepthExceeded;
     }
 }
 
@@ -2234,50 +2162,6 @@ fn indexDiscoveredSession(
         if (entry.found_existing) return error.DuplicateObservationLineageNode;
         entry.value_ptr.* = index;
     }
-}
-
-fn resolveSessionDepth(
-    sessions: []DiscoveredSession,
-    indices: *const std.StringHashMap(usize),
-    index: usize,
-    max_depth: usize,
-    path: []usize,
-) usize {
-    std.debug.assert(path.len >= sessions.len);
-    if (sessions[index].resolved) return sessions[index].depth;
-    var path_len: usize = 0;
-    defer for (path[0..path_len]) |visited| {
-        sessions[visited].visiting = false;
-    };
-    var current = index;
-    while (path_len < sessions.len) {
-        if (sessions[current].resolved or sessions[current].visiting) break;
-        path[path_len] = current;
-        path_len += 1;
-        sessions[current].visiting = true;
-        const parent = sessions[current].identity.parent_session_id orelse break;
-        current = indices.get(parent) orelse break;
-    }
-    var remaining = path_len;
-    while (remaining > 0) {
-        remaining -= 1;
-        const item = &sessions[path[remaining]];
-        const parent_index = if (item.identity.parent_session_id) |parent|
-            indices.get(parent)
-        else
-            null;
-        item.depth = if (parent_index) |parent| depth: {
-            if (!sessions[parent].resolved) break :depth max_depth +| 1;
-            break :depth @min(sessions[parent].depth +| 1, max_depth +| 1);
-        } else 0;
-        item.resolved = true;
-    }
-    return sessions[index].depth;
-}
-
-fn discoveredSessionLessThan(_: void, left: DiscoveredSession, right: DiscoveredSession) bool {
-    if (left.depth != right.depth) return left.depth < right.depth;
-    return left.path_index < right.path_index;
 }
 
 fn appendDiscoveredSession(
@@ -3750,20 +3634,17 @@ test "selected parser warnings qualify observation completeness" {
     );
 }
 
-const DepthFixture = struct {
+const SessionFixture = struct {
     sessions: []DiscoveredSession,
     names: [][20]u8,
-    path: []usize,
     indices: std.StringHashMap(usize),
 
-    fn init(count: usize) !DepthFixture {
+    fn init(count: usize) !SessionFixture {
         const allocator = std.testing.allocator;
         const sessions = try allocator.alloc(DiscoveredSession, count);
         errdefer allocator.free(sessions);
         const names = try allocator.alloc([20]u8, count);
         errdefer allocator.free(names);
-        const path = try allocator.alloc(usize, count);
-        errdefer allocator.free(path);
         var indices = std.StringHashMap(usize).init(allocator);
         errdefer indices.deinit();
         for (sessions, names, 0..) |*session, *name, index| {
@@ -3780,64 +3661,35 @@ const DepthFixture = struct {
                 session.identity.parent_session_id = sessions[index + 1].identity.session_id;
             }
         }
-        return .{ .sessions = sessions, .names = names, .path = path, .indices = indices };
+        return .{ .sessions = sessions, .names = names, .indices = indices };
     }
 
-    fn deinit(self: *DepthFixture) void {
+    fn deinit(self: *SessionFixture) void {
         self.indices.deinit();
-        std.testing.allocator.free(self.path);
         std.testing.allocator.free(self.names);
         std.testing.allocator.free(self.sessions);
     }
 
-    fn resolve(self: *DepthFixture, index: usize, limit: usize) usize {
-        return resolveSessionDepth(self.sessions, &self.indices, index, limit, self.path);
-    }
-
-    fn expectNoVisiting(self: *const DepthFixture) !void {
-        for (self.sessions) |session| try std.testing.expect(!session.visiting);
+    fn closure(
+        self: *const SessionFixture,
+        session_id: ?[]const u8,
+        path: ?[]const u8,
+        paths: []const []const u8,
+    ) ![]bool {
+        return sessionSelectionClosure(
+            std.testing.allocator,
+            self.sessions,
+            &self.indices,
+            session_id,
+            path,
+            paths,
+        );
     }
 };
 
-test "session depths resolve deepest-first without consuming the call stack" {
-    var fixture = try DepthFixture.init(16_384);
+test "duplicate discovered session ids stay rejected" {
+    var fixture = try SessionFixture.init(2);
     defer fixture.deinit();
-    try std.testing.expectEqual(16_383, fixture.resolve(0, 16_383));
-    for (fixture.sessions, 0..) |session, index| {
-        try std.testing.expect(session.resolved);
-        try std.testing.expectEqual(16_383 - index, session.depth);
-    }
-    try fixture.expectNoVisiting();
-}
-
-test "discovery depth orders sessions and caps chains beyond the graph depth bound" {
-    var fixture = try DepthFixture.init(16_384);
-    defer fixture.deinit();
-    try std.testing.expectEqual(257, fixture.resolve(0, 256));
-    for (fixture.sessions, 0..) |session, index| {
-        const depth = fixture.sessions.len - index - 1;
-        try std.testing.expect(session.resolved);
-        try std.testing.expectEqual(@min(depth, 257), session.depth);
-    }
-    try fixture.expectNoVisiting();
-}
-
-test "session depth below at and above the limit" {
-    var fixture = try DepthFixture.init(4);
-    defer fixture.deinit();
-    try std.testing.expectEqual(1, fixture.resolve(2, 2));
-    try std.testing.expectEqual(2, fixture.resolve(1, 2));
-    try std.testing.expectEqual(3, fixture.resolve(0, 2));
-    for (fixture.sessions) |session| try std.testing.expect(session.resolved);
-    try fixture.expectNoVisiting();
-}
-
-test "session missing parents start at zero and duplicate nodes stay rejected" {
-    var fixture = try DepthFixture.init(2);
-    defer fixture.deinit();
-    fixture.sessions[1].identity.parent_session_id = @constCast("absent");
-    try std.testing.expectEqual(1, fixture.resolve(0, 1));
-    try std.testing.expectEqual(0, fixture.sessions[1].depth);
     try std.testing.expectError(
         error.DuplicateObservationLineageNode,
         indexDiscoveredSession(&fixture.indices, fixture.sessions[0], 1),
@@ -3845,20 +3697,8 @@ test "session missing parents start at zero and duplicate nodes stay rejected" {
     try std.testing.expectEqual(0, fixture.indices.get("session-0").?);
 }
 
-test "discovery depth terminates on cycles and leaves failure to the lineage graph" {
-    var fixture = try DepthFixture.init(4);
-    defer fixture.deinit();
-    fixture.sessions[3].identity.parent_session_id = fixture.sessions[2].identity.session_id;
-    try std.testing.expectEqual(1, fixture.resolve(0, 0));
-    for (fixture.sessions) |session| {
-        try std.testing.expect(session.resolved);
-        try std.testing.expectEqual(@as(usize, 1), session.depth);
-    }
-    try fixture.expectNoVisiting();
-}
-
 test "selection follows worker control and reads every selected worker history ancestor" {
-    var fixture = try DepthFixture.init(6);
+    var fixture = try SessionFixture.init(6);
     defer fixture.deinit();
     for (fixture.sessions) |*session| session.identity.parent_session_id = null;
     fixture.sessions[1].identity.parent_session_id = fixture.sessions[3].identity.session_id;
@@ -3868,56 +3708,41 @@ test "selection follows worker control and reads every selected worker history a
     fixture.sessions[4].identity.parent_session_id = fixture.sessions[1].identity.session_id;
     fixture.sessions[5].identity.parent_session_id = fixture.sessions[2].identity.session_id;
     const paths: []const []const u8 = &.{ "x", "y", "child", "ancestor", "unrelated", "worker" };
-    const selected = try sessionSelectionClosure(
-        std.testing.allocator,
-        fixture.sessions,
-        &fixture.indices,
-        fixture.sessions[0].identity.session_id,
-        null,
-        paths,
-        4,
-    );
+    const selected = try fixture.closure(fixture.sessions[0].identity.session_id, null, paths);
     defer std.testing.allocator.free(selected);
     try std.testing.expectEqualSlices(bool, &.{ true, true, true, true, false, true }, selected);
-    const child = try sessionSelectionClosure(
-        std.testing.allocator,
-        fixture.sessions,
-        &fixture.indices,
-        null,
-        "child",
-        paths,
-        4,
-    );
+    const child = try fixture.closure(null, "child", paths);
     defer std.testing.allocator.free(child);
     try std.testing.expectEqualSlices(bool, &.{ false, true, true, true, false, true }, child);
-    try std.testing.expectError(error.ObservationGraphDepthExceeded, sessionSelectionClosure(
-        std.testing.allocator,
-        fixture.sessions,
-        &fixture.indices,
-        fixture.sessions[0].identity.session_id,
-        null,
-        paths,
-        1,
-    ));
 }
 
-test "selection rejects control cycles independently of history ancestry" {
-    var fixture = try DepthFixture.init(2);
+test "selection includes chains of any depth without the call stack" {
+    var fixture = try SessionFixture.init(16_384);
+    defer fixture.deinit();
+    const descendants = try fixture.closure("session-16383", null, &.{});
+    defer std.testing.allocator.free(descendants);
+    for (descendants) |needed| try std.testing.expect(needed);
+    const ancestors = try fixture.closure("session-0", null, &.{});
+    defer std.testing.allocator.free(ancestors);
+    for (ancestors) |needed| try std.testing.expect(needed);
+}
+
+test "selection walks terminate on control and history cycles without failing" {
+    var fixture = try SessionFixture.init(4);
     defer fixture.deinit();
     for (fixture.sessions) |*session| session.identity.parent_session_id = null;
     fixture.sessions[0].identity.control_parent_session_id =
         fixture.sessions[1].identity.session_id;
     fixture.sessions[1].identity.control_parent_session_id =
         fixture.sessions[0].identity.session_id;
-    try std.testing.expectError(error.ObservationGraphCycle, sessionSelectionClosure(
-        std.testing.allocator,
-        fixture.sessions,
-        &fixture.indices,
-        fixture.sessions[0].identity.session_id,
-        null,
-        &.{ "one", "two" },
-        2,
-    ));
+    fixture.sessions[2].identity.parent_session_id = fixture.sessions[3].identity.session_id;
+    fixture.sessions[3].identity.parent_session_id = fixture.sessions[2].identity.session_id;
+    const control = try fixture.closure(fixture.sessions[0].identity.session_id, null, &.{});
+    defer std.testing.allocator.free(control);
+    try std.testing.expectEqualSlices(bool, &.{ true, true, false, false }, control);
+    const history = try fixture.closure(fixture.sessions[2].identity.session_id, null, &.{});
+    defer std.testing.allocator.free(history);
+    try std.testing.expectEqualSlices(bool, &.{ false, false, true, true }, history);
 }
 
 test "discovery seed preserves lineage conflicts and leaves token coverage unknown" {
