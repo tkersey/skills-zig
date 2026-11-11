@@ -1606,7 +1606,7 @@ const DiscoveredSessions = struct {
         const lineage_path = try allocator.alloc(usize, self.items.len);
         defer allocator.free(lineage_path);
         for (self.items, 0..) |_, index| {
-            _ = try resolveSessionDepth(self.items, &self.indices, index, limit, lineage_path);
+            _ = resolveSessionDepth(self.items, &self.indices, index, limit, lineage_path);
         }
         std.mem.sort(DiscoveredSession, self.items, {}, discoveredSessionLessThan);
         self.indices.clearRetainingCapacity();
@@ -1622,14 +1622,7 @@ fn buildSessionSeed(
     discovered: *const DiscoveredSessions,
     paths: []const []const u8,
 ) !seq.relation_graph.ScanInput {
-    const stage = try findPartitionScanRoot(
-        graph.allocator,
-        &graph.plans.definition_plan,
-        &graph.plans.native_plan,
-        schedule.graph_stage,
-        .sessions,
-        0,
-    );
+    const stage = schedule.seed_stage;
     const scan = graph.plans.native_plan.stages[stage].operation.scan;
     var values: std.ArrayList(seq.execution.Value) = .empty;
     defer values.deinit(graph.table_allocator);
@@ -1888,6 +1881,10 @@ const StreamingGraphState = struct {
         try orderSessionSeed(graph, session_seed, discovered);
         const unordered = try reducer.finish();
         defer graph.table_allocator.free(unordered.values);
+        const order = self.schedule.partition_order;
+        const ranks = try partitionRanks(graph.allocator, order, discovered);
+        defer graph.allocator.free(ranks);
+        for (self.output_paths.items) |*path_index| path_index.* = ranks[path_index.*];
         const owned = try pathOrderedRows(
             graph.allocator,
             graph.table_allocator,
@@ -2062,6 +2059,20 @@ fn orderSessionSeed(
     seed.owned = true;
 }
 
+fn partitionRanks(
+    allocator: std.mem.Allocator,
+    order: seq.relation_graph.PartitionOrder,
+    discovered: *const DiscoveredSessions,
+) ![]usize {
+    var count: usize = 0;
+    for (discovered.items) |item| count = @max(count, item.path_index + 1);
+    const sessions = try allocator.alloc(?[]const u8, count);
+    defer allocator.free(sessions);
+    @memset(sessions, null);
+    for (discovered.items) |item| sessions[item.path_index] = item.identity.session_id;
+    return seq.relation_graph.rankPartitions(allocator, order, sessions);
+}
+
 fn pathOrderedRows(
     scratch: std.mem.Allocator,
     allocator: std.mem.Allocator,
@@ -2231,7 +2242,7 @@ fn resolveSessionDepth(
     index: usize,
     max_depth: usize,
     path: []usize,
-) !usize {
+) usize {
     std.debug.assert(path.len >= sessions.len);
     if (sessions[index].resolved) return sessions[index].depth;
     var path_len: usize = 0;
@@ -2239,32 +2250,26 @@ fn resolveSessionDepth(
         sessions[visited].visiting = false;
     };
     var current = index;
-    // A parent walk can visit each admitted session once before closing a cycle.
-    while (path_len <= sessions.len) {
-        if (sessions[current].resolved) break;
-        if (sessions[current].visiting) return error.ObservationGraphCycle;
-        std.debug.assert(path_len < sessions.len);
+    while (path_len < sessions.len) {
+        if (sessions[current].resolved or sessions[current].visiting) break;
         path[path_len] = current;
         path_len += 1;
         sessions[current].visiting = true;
         const parent = sessions[current].identity.parent_session_id orelse break;
         current = indices.get(parent) orelse break;
     }
-    // Unwind in the same order as the former DFS, including partial memoization
-    // on a depth failure. Cycle discovery therefore still precedes depth checks.
     var remaining = path_len;
     while (remaining > 0) {
         remaining -= 1;
         const item = &sessions[path[remaining]];
-        const depth = if (item.identity.parent_session_id) |parent|
-            if (indices.get(parent)) |parent_index|
-                try std.math.add(usize, sessions[parent_index].depth, 1)
-            else
-                0
+        const parent_index = if (item.identity.parent_session_id) |parent|
+            indices.get(parent)
         else
-            0;
-        if (depth > max_depth) return error.ObservationGraphDepthExceeded;
-        item.depth = depth;
+            null;
+        item.depth = if (parent_index) |parent| depth: {
+            if (!sessions[parent].resolved) break :depth max_depth +| 1;
+            break :depth @min(sessions[parent].depth +| 1, max_depth +| 1);
+        } else 0;
         item.resolved = true;
     }
     return sessions[index].depth;
@@ -2320,47 +2325,6 @@ fn appendDiscoveredSession(
             return error.ObservationSessionDiscoveryFieldUnsupported;
         try output.append(allocator, value);
     }
-}
-
-fn findPartitionScanRoot(
-    allocator: std.mem.Allocator,
-    definition_plan: *const seq.definition.Plan,
-    native_plan: *const seq.plan.Plan,
-    stage_index: u16,
-    relation: seq.physical.Relation,
-    depth: usize,
-) !u16 {
-    const max_depth = definition_plan.bounds.max_graph_depth;
-    if (depth > max_depth) return error.ObservationGraphDepthExceeded;
-    const Frame = struct { stage_index: u16, next_input: usize = 0 };
-    const frames = try allocator.alloc(Frame, max_depth - depth + 1);
-    defer allocator.free(frames);
-    frames[0] = .{ .stage_index = stage_index };
-    var count: usize = 1;
-    while (count > 0) {
-        const frame = &frames[count - 1];
-        const stage = native_plan.stages[frame.stage_index];
-        if (stage.operation == .scan) {
-            if (stage.operation.scan.relation == relation) return frame.stage_index;
-            if (count == 1) return error.ObservationPartitionPrefixHasMultipleScans;
-            count -= 1;
-            continue;
-        }
-        const inputs = definition_plan.steps[frame.stage_index].input_names;
-        if (frame.next_input == inputs.len) {
-            count -= 1;
-            continue;
-        }
-        const name = inputs[frame.next_input];
-        frame.next_input += 1;
-        const input = native_plan.findStage(name) orelse continue;
-        // This search deliberately skips unsuccessful prefixes in input order,
-        // including a nested prefix that exceeds the graph depth bound.
-        if (count == frames.len) continue;
-        frames[count] = .{ .stage_index = input };
-        count += 1;
-    }
-    return error.ObservationPhysicalScanMissing;
 }
 
 fn executeObservation(
@@ -3826,7 +3790,7 @@ const DepthFixture = struct {
         std.testing.allocator.free(self.sessions);
     }
 
-    fn resolve(self: *DepthFixture, index: usize, limit: usize) !usize {
+    fn resolve(self: *DepthFixture, index: usize, limit: usize) usize {
         return resolveSessionDepth(self.sessions, &self.indices, index, limit, self.path);
     }
 
@@ -3838,7 +3802,7 @@ const DepthFixture = struct {
 test "session depths resolve deepest-first without consuming the call stack" {
     var fixture = try DepthFixture.init(16_384);
     defer fixture.deinit();
-    try std.testing.expectEqual(16_383, try fixture.resolve(0, 16_383));
+    try std.testing.expectEqual(16_383, fixture.resolve(0, 16_383));
     for (fixture.sessions, 0..) |session, index| {
         try std.testing.expect(session.resolved);
         try std.testing.expectEqual(16_383 - index, session.depth);
@@ -3846,35 +3810,33 @@ test "session depths resolve deepest-first without consuming the call stack" {
     try fixture.expectNoVisiting();
 }
 
-test "oversized lineage preserves resolved suffix at the admitted graph depth limit" {
+test "discovery depth orders sessions and caps chains beyond the graph depth bound" {
     var fixture = try DepthFixture.init(16_384);
     defer fixture.deinit();
-    try std.testing.expectError(error.ObservationGraphDepthExceeded, fixture.resolve(0, 256));
+    try std.testing.expectEqual(257, fixture.resolve(0, 256));
     for (fixture.sessions, 0..) |session, index| {
         const depth = fixture.sessions.len - index - 1;
-        try std.testing.expectEqual(depth <= 256, session.resolved);
-        if (session.resolved) try std.testing.expectEqual(depth, session.depth);
+        try std.testing.expect(session.resolved);
+        try std.testing.expectEqual(@min(depth, 257), session.depth);
     }
     try fixture.expectNoVisiting();
 }
 
-test "session depth below at and above the limit preserves unwind state" {
+test "session depth below at and above the limit" {
     var fixture = try DepthFixture.init(4);
     defer fixture.deinit();
-    try std.testing.expectEqual(1, try fixture.resolve(2, 2));
-    try std.testing.expectEqual(2, try fixture.resolve(1, 2));
-    try std.testing.expectError(error.ObservationGraphDepthExceeded, fixture.resolve(0, 2));
-    try std.testing.expect(!fixture.sessions[0].resolved);
-    try std.testing.expect(fixture.sessions[1].resolved);
+    try std.testing.expectEqual(1, fixture.resolve(2, 2));
+    try std.testing.expectEqual(2, fixture.resolve(1, 2));
+    try std.testing.expectEqual(3, fixture.resolve(0, 2));
+    for (fixture.sessions) |session| try std.testing.expect(session.resolved);
     try fixture.expectNoVisiting();
-    try std.testing.expectEqual(3, try fixture.resolve(0, 3));
 }
 
 test "session missing parents start at zero and duplicate nodes stay rejected" {
     var fixture = try DepthFixture.init(2);
     defer fixture.deinit();
     fixture.sessions[1].identity.parent_session_id = @constCast("absent");
-    try std.testing.expectEqual(1, try fixture.resolve(0, 1));
+    try std.testing.expectEqual(1, fixture.resolve(0, 1));
     try std.testing.expectEqual(0, fixture.sessions[1].depth);
     try std.testing.expectError(
         error.DuplicateObservationLineageNode,
@@ -3883,16 +3845,15 @@ test "session missing parents start at zero and duplicate nodes stay rejected" {
     try std.testing.expectEqual(0, fixture.indices.get("session-0").?);
 }
 
-test "session cycles precede depth errors within the current discovery walk" {
+test "discovery depth terminates on cycles and leaves failure to the lineage graph" {
     var fixture = try DepthFixture.init(4);
     defer fixture.deinit();
     fixture.sessions[3].identity.parent_session_id = fixture.sessions[2].identity.session_id;
-    try std.testing.expectError(error.ObservationGraphCycle, fixture.resolve(0, 0));
-    for (fixture.sessions) |session| try std.testing.expect(!session.resolved);
-    try fixture.expectNoVisiting();
-    fixture.sessions[3].identity.parent_session_id = null;
-    try std.testing.expectError(error.ObservationGraphDepthExceeded, fixture.resolve(0, 0));
-    try std.testing.expect(fixture.sessions[3].resolved);
+    try std.testing.expectEqual(1, fixture.resolve(0, 0));
+    for (fixture.sessions) |session| {
+        try std.testing.expect(session.resolved);
+        try std.testing.expectEqual(@as(usize, 1), session.depth);
+    }
     try fixture.expectNoVisiting();
 }
 

@@ -46,7 +46,9 @@ seq observe \
 
 Native `--path` and `--session-id` select physical sources. An observation
 definition owns its semantic scope: a lineage definition can read ancestors
-and include descendants of that selection. Definitions may also declare
+and include descendants of that selection. `--repo` then filters each session in
+that scope, so a scoped streaming `--path` keeps descendants inside the repository
+even when the selected file's own session lies outside it. Definitions may also declare
 immutable external inputs:
 
 ```bash
@@ -100,12 +102,17 @@ semantic analysis. The owning definition or analyst must assess that question.
 The former `contaminated` boolean is absent from v2.
 
 `bounds.max_input_bytes` applies to aggregate decoded JSONL admitted for parsing.
-Every strategy decides selection from a session's discovery prefix before charging
-the file against that bound, so a file whose prefix places it outside the selectors
-cannot exhaust it. A prefix that omits a selected field, such as a legacy first line
-without `cwd` or a timestamp, cannot exclude its file, which is then read and
-charged. Linear and single-source strategies then drop that session when its parsed
-`cwd` or time fails the selectors; lineage and multi-scan graph scopes keep it.
+Every strategy decides selection from a session's discovery prefix, its first line,
+before charging the file against that bound, so a file whose prefix places it outside
+the selectors cannot exhaust it. Discovery identity comes from the same line, and later
+lines in the same read never decide selection. Every parser takes a session's identity
+and lineage fields from that line too: a `session_meta` or Pi session header on a later
+line establishes none (a Codex `session_meta` there adds a warning), so that file is a
+session without an identity on every strategy. A prefix that omits a selected field,
+such as a legacy first line without `cwd` or a timestamp, cannot exclude its file,
+which is then read and charged. Linear and single-source strategies then drop that
+session when its parsed `cwd` or time fails the selectors; lineage and multi-scan
+graph scopes keep it.
 Plain-only streaming lineage execution reserves discovered file sizes before
 prefetch; compressed disk sizes are never substituted for decoded reservations.
 The unreserved remainder of the bound is spare: a session that grows after
@@ -142,14 +149,19 @@ puts NaN after every number and kinds as text, numbers, then booleans; descendin
 order reverses both.
 Sessions without an
 identity, such as an empty rollout, do not participate in lineage joins and cannot be
-linked by reachability.
+linked by reachability. A lineage join or reachability checks its whole graph input
+before walking it: a parent cycle fails with `ObservationGraphCycle` and a node deeper
+than `bounds.max_graph_depth` parent links fails with `ObservationGraphDepthExceeded`,
+on every strategy; a node exactly at the bound is admitted.
 
 Every join a projection reaches is checked against its inputs before a strategy is
 chosen, and every strategy runs that one checked form. A key, flag, output, or lineage
-field that names no field of its input, an output `source` other than 0 or 1, a semi
-or anti join that projects its right input, a flag on a non-boolean field, an unknown
-`kind` or key `op`, a non-boolean `nulls_equal`, a join without an equality key, and a
-lineage join without exactly three inputs fail before any corpus is read.
+field that names no field of its input, an unknown key in a join's `on`, key, lineage,
+or output-field object, an output `source` other than 0 or 1, a semi or anti join that
+projects its right input, a flag on a non-boolean field, an unknown `kind` or key `op`,
+a non-boolean `nulls_equal`, `nulls_equal: true` on an ordering key, a join without an
+equality key, and a lineage join without exactly three inputs fail before any corpus is
+read. Ordering keys never match a null.
 
 A lineage definition streams (`partition-lineage-stream`) only when all of these hold:
 
@@ -157,9 +169,10 @@ A lineage definition streams (`partition-lineage-stream`) only when all of these
   whose projection takes only fields of that input, whose keys are all equality keys
   that pair a field of that input with itself, and whose lineage relates rows and
   nodes by `session_id` and walks `parent_session_id`;
-- its local stages stay within one session: they include no `ordered_fold`,
-  `distinct` and joins are keyed by `session_id`, and a stage that outputs
-  `session_id` copies it from `session_id`, a join from its left input;
+- its local stages stay within one session: an `ordered_fold` is keyed by
+  `session_id` and its `order_by` starts with `session_id`, `distinct` and joins
+  are keyed by `session_id`, and a stage that outputs `session_id` copies it from
+  `session_id`, a join from its left input;
 - its lineage graph input reaches the sessions scan through filters, projections,
   aliases, sorts, and input-preserving derives that do not define `session_id` or
   `parent_session_id`, without limiting, ranking, or deduplicating sessions, and
@@ -171,9 +184,13 @@ A lineage definition streams (`partition-lineage-stream`) only when all of these
 Streaming reads sessions in lineage-depth order but hands the stages after the
 lineage join its rows and sessions in source-path order, as the materialized graph
 reads them, so row order, order-dependent stages, and the corpus digest agree across
-strategies. Rows of session files without an identity form their own partitions,
-so a session-keyed local `distinct` or join keeps them apart where the materialized
-graph groups their null `session_id` values.
+strategies. When the rows reaching the lineage join come from a local `ordered_fold`
+through stages that keep their order, they follow that fold's first sort key instead,
+session by session, as the materialized fold sorts them. Rows of session files
+without an identity form their own partitions, so a session-keyed local `distinct`
+or join keeps them apart where the materialized graph groups their null `session_id`
+values, and such a fold sorts each file's rows alone and keeps those files in
+source-path order where the materialized fold sorts all of their rows together.
 
 Any other lineage definition runs on the materialized-graph strategy over the whole
 root; with `--path` or `--session-id` it fails with
@@ -263,8 +280,9 @@ Copied prefix events do not spawn new children. When a result provides only a
 task path, `agent_path` is present and `worker_session_id` remains null; no UUID
 is invented. `spawned_worker_count` counts distinct observed successful links,
 not attempted calls or a claim that every worker's transcript was available.
-On a declared fork, worker-creation records without a usable replay boundary or
-record ordinal remain unattributed and emit a warning. Primary metadata control
+On a declared fork, records that establish a worker without a usable replay boundary or
+record ordinal remain unattributed and emit a warning; declarations and failed spawns
+establish no worker and emit none. Primary metadata control
 links remain available independently of those creation records.
 
 Strict native row commands stage their bounded output before writing it.

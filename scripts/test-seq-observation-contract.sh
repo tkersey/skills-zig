@@ -764,3 +764,131 @@ jq -e '.strategy.kind == "materialized-graph"' <<<"$right_session_plan" >/dev/nu
 jq '(.pipeline[] | select(.as == "paired_rows") | .on.keys[0].right) = "missing_key"' \
   "$work/right-session-lineage.json" >"$work/local-key-lineage.json"
 reject_join local-key-lineage UnknownObservationJoinField
+
+malformed_join misspelled-lineage '.on.linage = .on.lineage | del(.on.lineage)' \
+  UnknownObservationJoinOption
+malformed_join unknown-key-option '.on.keys[0].nulls = true' UnknownObservationJoinOption
+malformed_join unknown-field-option '.fields[0].nulable = true' UnknownObservationJoinOption
+malformed_join ordering-nulls-lineage \
+  '.on.keys += [{left: "role", right: "role", op: "lt", nulls_equal: true}]' \
+  ObservationJoinNullsEqualRequiresEquality
+
+mkdir -p "$work/legacy-root"
+jq -c 'select(.type == "session_meta") | .payload |= del(.cwd)' "$rollout" >"$work/legacy-root/legacy.jsonl"
+printf '%s\n' '{"type":"turn_context","timestamp":"2026-07-26T10:00:01Z","payload":{"cwd":"/other"}}' \
+  >>"$work/legacy-root/legacy.jsonl"
+jq -c 'select(.type != "session_meta")' "$rollout" >>"$work/legacy-root/legacy.jsonl"
+legacy_rows=$("$binary" observe --definition "$lineage_definition" --projection rows \
+  --root "$work/legacy-root" --repo /repo --format json)
+jq -e '.corpus.files == 1 and (.data.rows | length) == 1' <<<"$legacy_rows" >/dev/null
+
+mkdir -p "$work/depth-root"
+cp "$rollout" "$work/depth-root/root.jsonl"
+jq -c 'if .type == "session_meta" then
+  .payload.id = "fixture-child" | .payload.forked_from_id = "fixture-session" else . end' \
+  "$rollout" >"$work/depth-root/child.jsonl"
+jq -c 'if .type == "session_meta" then
+  .payload.id = "fixture-grandchild" | .payload.forked_from_id = "fixture-child" else . end' \
+  "$rollout" >"$work/depth-root/grandchild.jsonl"
+jq '.bounds.max_graph_depth = 2' "$lineage_definition" >"$work/depth-stream.json"
+jq '.bounds.max_graph_depth = 2 | .relations[0].fields += ["model"]' "$lineage_definition" \
+  >"$work/depth-materialized.json"
+depth_stream=$("$binary" observe --definition "$work/depth-stream.json" --projection rows \
+  --root "$work/depth-root" --format json)
+depth_materialized=$("$binary" observe --definition "$work/depth-materialized.json" \
+  --projection rows --root "$work/depth-root" --format json)
+printf '%s\n' "$depth_stream" "$depth_materialized" | jq -se '
+  (.[0].data.rows | length) == 3 and
+  ([.[0].data.rows[].session_id] == [.[1].data.rows[].session_id])' >/dev/null
+mkdir -p "$work/self-root"
+jq -c 'if .type == "session_meta" then .payload.forked_from_id = "fixture-session" else . end' \
+  "$rollout" >"$work/self-root/self.jsonl"
+for shape in depth-stream depth-materialized; do
+  if self_cycle=$("$binary" observe --definition "$work/$shape.json" --projection rows \
+    --root "$work/self-root" --format json); then
+    echo "self-parented lineage was accepted: $shape" >&2
+    exit 1
+  fi
+  jq -e '.code == "ObservationGraphCycle"' <<<"$self_cycle" >/dev/null
+done
+
+jq 'def stage(i; o): {op: "filter", input: i, as: o,
+    where: [{field: "role", op: "exact", value: "assistant"}]};
+  .pipeline = [.pipeline[0], .pipeline[1],
+    stage("message_rows"; "a1"), stage("a1"; "a2"), stage("a2"; "a3"), stage("a3"; "a4"),
+    stage("a4"; "b1"), stage("b1"; "b2"), stage("b2"; "b3"), stage("b3"; "b4"),
+    {op: "join", inputs: ["a4", "b4"], as: "paired_rows",
+      on: {kind: "inner", keys: [{left: "session_id", right: "session_id"},
+        {left: "source_event_id", right: "source_event_id"}]},
+      fields: [{source: 0, field: "session_id", name: "session_id", type: "string",
+          nullable: false},
+        {source: 0, field: "role", name: "role", type: "string", nullable: true},
+        {source: 0, field: "source_event_id", name: "source_event_id", type: "string",
+          nullable: false}]},
+    ((.pipeline[] | select(.op == "join")) | .inputs = ["paired_rows", "paired_rows",
+      "session_rows"])]' "$lineage_definition" >"$work/dag-lineage.json"
+dag_plan=$("$binary" explain --definition "$work/dag-lineage.json" --projection rows \
+  --format json)
+jq -e '.strategy.kind == "partition-lineage-stream"' <<<"$dag_plan" >/dev/null
+"$binary" observe --definition "$work/dag-lineage.json" --projection rows \
+  --root "$work/two-roots" --format json >/dev/null
+
+mkdir -p "$work/failed-spawn-root"
+jq -c 'if .type == "session_meta" then
+  .payload.id = "fork-child" | .payload.forked_from_id = "fixture-session" else . end' \
+  "$rollout" >"$work/failed-spawn-root/fork.jsonl"
+printf '%s\n' '{"type":"event_msg","payload":{"type":"collab_agent_spawn_end","call_id":"failed","new_thread_id":null,"status":"not_found"}}' \
+  >>"$work/failed-spawn-root/fork.jsonl"
+"$binary" sessions --root "$work/failed-spawn-root" --format json >/dev/null
+
+mkdir -p "$work/session-order-root"
+jq -c 'if .type == "session_meta" then .payload.id = "zeta" else . end' "$rollout" \
+  >"$work/session-order-root/a.jsonl"
+jq -c 'if .type == "session_meta" then .payload.id = "alpha" else . end' "$rollout" \
+  >"$work/session-order-root/b.jsonl"
+for direction in asc desc; do
+  jq --arg direction "$direction" '.requires.operators += ["ordered-fold"] |
+    .pipeline = .pipeline[0:3] + [{op: "ordered-fold", input: "assistant_rows",
+      as: "folded_rows", keys: ["session_id"],
+      order_by: [{field: "session_id", direction: $direction},
+        {field: "source_event_id", direction: "asc"}],
+      state: [], transitions: [],
+      emit: [{name: "session_id", type: "string", nullable: false,
+          expr: {field: "session_id"}},
+        {name: "role", type: "string", nullable: true, expr: {field: "role"}},
+        {name: "source_event_id", type: "string", nullable: false,
+          expr: {field: "source_event_id"}}]}] + .pipeline[3:] |
+    (.pipeline[] | select(.op == "join") | .inputs) = ["folded_rows", "folded_rows",
+      "session_rows"]' "$lineage_definition" >"$work/session-fold-$direction.json"
+  jq '.relations[0].fields += ["model"]' "$work/session-fold-$direction.json" \
+    >"$work/session-fold-$direction-materialized.json"
+  fold_plan=$("$binary" explain --definition "$work/session-fold-$direction.json" \
+    --projection rows --format json)
+  jq -e '.strategy.kind == "partition-lineage-stream"' <<<"$fold_plan" >/dev/null
+  fold_stream=$("$binary" observe --definition "$work/session-fold-$direction.json" \
+    --projection rows --root "$work/session-order-root" --format json)
+  fold_materialized=$("$binary" observe \
+    --definition "$work/session-fold-$direction-materialized.json" --projection rows \
+    --root "$work/session-order-root" --format json)
+  printf '%s\n' "$fold_stream" "$fold_materialized" | jq -se --arg direction "$direction" '
+    .[0].corpus.digest == .[1].corpus.digest and .[0].data.rows == .[1].data.rows and
+    ([.[0].data.rows[].session_id] ==
+      (if $direction == "asc" then ["alpha", "zeta"] else ["zeta", "alpha"] end))' >/dev/null
+done
+
+mkdir -p "$work/late-identity-root"
+cp "$rollout" "$work/late-identity-root/a.jsonl"
+{
+  printf '%s\n' '{"type":"turn_context","timestamp":"2026-07-26T09:59:59Z","payload":{"cwd":"/repo"}}'
+  cat "$rollout"
+} >"$work/late-identity-root/b.jsonl"
+jq '.relations[0].fields += ["model"]' "$lineage_definition" >"$work/late-materialized.json"
+late_stream=$("$binary" observe --definition "$lineage_definition" --projection rows \
+  --root "$work/late-identity-root" --format json)
+late_materialized=$("$binary" observe --definition "$work/late-materialized.json" \
+  --projection rows --root "$work/late-identity-root" --format json)
+"$binary" explain --definition "$work/late-materialized.json" --projection rows --format json |
+  jq -e '.strategy.kind == "materialized-graph"' >/dev/null
+printf '%s\n' "$late_stream" "$late_materialized" | jq -se '
+  .[0].data.rows == .[1].data.rows and
+  ([.[0].data.rows[].session_id] == ["fixture-session", null])' >/dev/null

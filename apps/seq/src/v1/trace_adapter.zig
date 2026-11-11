@@ -79,15 +79,8 @@ pub fn discoverSessionIdentity(
     const prefix = readDiscoveryPrefixAlloc(allocator, input.reader(), options) catch |err|
         return input.sourceError(err);
     defer allocator.free(prefix);
-    var reader = std.Io.Reader.fixed(prefix);
-    var summary = try trace_core.parseSessionSummaryTraceReader(
-        io,
-        allocator,
-        path,
-        &reader,
-        stat.mtime.nanoseconds,
-        .{ .ongoing_threshold_secs = options.ongoing_threshold_secs, .as_of_ns = options.as_of_ns },
-    );
+    const mtime = stat.mtime.nanoseconds;
+    var summary = try parseDiscoveryLine(io, allocator, path, prefix, mtime, options);
     defer summary.deinit(allocator);
     var identity: SessionIdentity = .{
         .session_id = null,
@@ -841,6 +834,26 @@ fn requiresSummaryPreselection(selection: SessionSelection) bool {
         selection.filter_time;
 }
 
+fn parseDiscoveryLine(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    path: []const u8,
+    prefix: []const u8,
+    source_mtime_ns: i128,
+    options: Options,
+) !trace_core.CanonicalSessionTrace {
+    const line_end = if (std.mem.indexOfScalar(u8, prefix, '\n')) |index| index + 1 else prefix.len;
+    var reader = std.Io.Reader.fixed(prefix[0..line_end]);
+    return trace_core.parseSessionSummaryTraceReader(
+        io,
+        allocator,
+        path,
+        &reader,
+        source_mtime_ns,
+        .{ .ongoing_threshold_secs = options.ongoing_threshold_secs, .as_of_ns = options.as_of_ns },
+    );
+}
+
 fn preselectSession(
     io: std.Io,
     allocator: std.mem.Allocator,
@@ -853,15 +866,7 @@ fn preselectSession(
     if (!requiresSummaryPreselection(selection)) {
         return .{};
     }
-    var reader = std.Io.Reader.fixed(prefix);
-    var summary = try trace_core.parseSessionSummaryTraceReader(
-        io,
-        allocator,
-        path,
-        &reader,
-        source_mtime_ns,
-        .{ .ongoing_threshold_secs = options.ongoing_threshold_secs, .as_of_ns = options.as_of_ns },
-    );
+    var summary = try parseDiscoveryLine(io, allocator, path, prefix, source_mtime_ns, options);
     defer summary.deinit(allocator);
     if (selection.session_id) |wanted| {
         if (!exactSessionPasses(summary.session.session_id, wanted)) {

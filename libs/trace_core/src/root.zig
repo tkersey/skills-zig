@@ -887,7 +887,9 @@ pub fn parseSessionTraceReaderWithVisitorMetrics(
             },
         } orelse continue;
         try rejectUnsupportedSource(root);
-        if (source_is_pi == null) source_is_pi = isPiSessionHeader(root);
+        if (source_is_pi == null) {
+            source_is_pi = primaryLine(record.number) and isPiSessionHeader(root);
+        }
         const parsed_record = ParsedRecord.init(root, record.number, line);
         if (source_is_pi.?) {
             try pi_parser.apply(parsed_record);
@@ -2140,7 +2142,9 @@ pub fn parseSessionSummaryTraceReaderWithVisitorMetrics(
             },
         } orelse continue;
         try rejectUnsupportedSource(root);
-        if (source_is_pi == null) source_is_pi = isPiSessionHeader(root);
+        if (source_is_pi == null) {
+            source_is_pi = primaryLine(record.number) and isPiSessionHeader(root);
+        }
         const parsed_record = ParsedRecord.init(root, record.number, line);
         if (source_is_pi.?) {
             try pi_parser.apply(parsed_record);
@@ -2493,7 +2497,6 @@ pub fn cutBoundContextAlloc(
 ) !CutBoundContext {
     var context = CutBoundContext{};
     errdefer context.deinit(allocator);
-    var saw_primary_meta = false;
     for (trace.occurrences.items) |occurrence| {
         if (occurrence.line_number > last_fixed_line) break;
         const payload_json = occurrence.payload_json orelse continue;
@@ -2512,8 +2515,7 @@ pub fn cutBoundContextAlloc(
             else => continue,
         };
         if (std.mem.eql(u8, occurrence.entry_type, "session_meta")) {
-            if (saw_primary_meta) continue;
-            saw_primary_meta = true;
+            if (!primaryLine(occurrence.line_number)) continue;
             try applyCutSessionContext(allocator, &context, payload);
         } else if (std.mem.eql(u8, occurrence.entry_type, "turn_context")) {
             try applyCutTurnContext(allocator, &context, payload);
@@ -2809,8 +2811,11 @@ fn applySessionMeta(
     }
 }
 
+fn primaryLine(line_number: usize) bool {
+    return line_number == 1;
+}
+
 const PrimaryMetadata = struct {
-    seen: bool = false,
     inherited_session_id: ?[]u8 = null,
 
     fn deinit(self: *PrimaryMetadata, allocator: std.mem.Allocator) void {
@@ -2835,15 +2840,22 @@ fn applyPrimarySessionMeta(
     state: *PrimaryMetadata,
     record: ParsedRecord,
 ) !void {
-    if (!state.seen) {
+    if (primaryLine(record.line_number)) {
         try applySessionMeta(allocator, &trace.session, meta);
         state.inherited_session_id = try dupOpt(allocator, trace.session.forked_from_session_id);
         try appendMetadataWorkerEdge(allocator, trace, meta);
-        state.seen = true;
         return;
     }
     const later_id = stringField(meta, "id") orelse return;
-    const primary_id = trace.session.session_id orelse return;
+    const primary_id = trace.session.session_id orelse {
+        const warning = try allocator.print(
+            "{s}:{d}: session_meta {s} after the first line establishes no session identity",
+            .{ trace.session.path, record.line_number, later_id },
+        );
+        errdefer allocator.free(warning);
+        try trace.warnings.append(allocator, warning);
+        return;
+    };
     if (state.inherited_session_id) |expected| {
         const within_prefix = trace.session.subagent_history_start_ordinal == null or
             record.isInherited(trace.session);
@@ -4419,27 +4431,11 @@ const WorkerGraphParser = struct {
         const kind = stringField(payload, "type") orelse "";
         const event = std.mem.eql(u8, record.root_type orelse "", "event_msg");
         if (event and std.mem.eql(u8, kind, "collab_agent_spawn_end")) {
-            if (try workerRecordUnlocated(allocator, trace, record)) return;
-            return appendSpawnGraphEdge(
-                allocator,
-                trace,
-                payload,
-                record.timestamp,
-                turn_index,
-                null,
-            );
+            return appendSpawnGraphEdge(allocator, trace, payload, record, turn_index, null);
         }
         if (event and std.mem.eql(u8, kind, "sub_agent_activity")) {
             if (std.mem.eql(u8, stringField(payload, "kind") orelse "", "started")) {
-                if (try workerRecordUnlocated(allocator, trace, record)) return;
-                try appendSpawnGraphEdge(
-                    allocator,
-                    trace,
-                    payload,
-                    record.timestamp,
-                    turn_index,
-                    null,
-                );
+                try appendSpawnGraphEdge(allocator, trace, payload, record, turn_index, null);
             }
             return;
         }
@@ -4454,7 +4450,6 @@ const WorkerGraphParser = struct {
         if (declaration and kindFromName(name) == .spawn_agent and
             !self.pending.contains(call_id))
         {
-            if (try workerRecordUnlocated(allocator, trace, record)) return;
             const key = try allocator.dupe(u8, call_id);
             errdefer allocator.free(key);
             try self.pending.put(allocator, key, turn_index);
@@ -4462,16 +4457,8 @@ const WorkerGraphParser = struct {
         if (result) if (payload.get("output")) |output| {
             const pending = self.pending.fetchRemove(call_id) orelse return;
             defer allocator.free(pending.key);
-            if (try workerRecordUnlocated(allocator, trace, record)) return;
             if (boolField(payload, "success") == false) return;
-            try applyOutput(
-                allocator,
-                trace,
-                output,
-                call_id,
-                record.timestamp,
-                pending.value,
-            );
+            try applyOutput(allocator, trace, output, call_id, record, pending.value);
         };
     }
 
@@ -4480,7 +4467,7 @@ const WorkerGraphParser = struct {
         trace: *CanonicalSessionTrace,
         output: std.json.Value,
         call_id: []const u8,
-        timestamp: ?[]const u8,
+        record: ParsedRecord,
         turn_index: ?usize,
     ) !void {
         if (output == .array) {
@@ -4494,14 +4481,14 @@ const WorkerGraphParser = struct {
                     trace,
                     stringField(block, "text") orelse continue,
                     call_id,
-                    timestamp,
+                    record,
                     turn_index,
                 );
             }
             return;
         }
         if (output != .string) return;
-        try applyOutputText(allocator, trace, output.string, call_id, timestamp, turn_index);
+        try applyOutputText(allocator, trace, output.string, call_id, record, turn_index);
     }
 
     fn applyOutputText(
@@ -4509,7 +4496,7 @@ const WorkerGraphParser = struct {
         trace: *CanonicalSessionTrace,
         output: []const u8,
         call_id: []const u8,
-        timestamp: ?[]const u8,
+        record: ParsedRecord,
         turn_index: ?usize,
     ) !void {
         var parsed = std.json.parseFromSlice(std.json.Value, allocator, output, .{}) catch |err| {
@@ -4521,7 +4508,7 @@ const WorkerGraphParser = struct {
         if (payload.contains("error") or boolField(payload, "success") == false) return;
         if (stringField(payload, "agent_id") == null and
             stringField(payload, "task_name") == null) return;
-        try appendSpawnGraphEdge(allocator, trace, payload, timestamp, turn_index, call_id);
+        try appendSpawnGraphEdge(allocator, trace, payload, record, turn_index, call_id);
     }
 };
 
@@ -4547,7 +4534,7 @@ fn appendSpawnGraphEdge(
     allocator: std.mem.Allocator,
     trace: *CanonicalSessionTrace,
     payload: std.json.ObjectMap,
-    timestamp: ?[]const u8,
+    record: ParsedRecord,
     turn_index: ?usize,
     call_id: ?[]const u8,
 ) !void {
@@ -4557,6 +4544,7 @@ fn appendSpawnGraphEdge(
     const agent_path = stringField(payload, "agent_path") orelse stringField(payload, "task_name");
     if (worker_id == null and agent_path == null) return;
     if (boolField(payload, "success") == false) return;
+    if (try workerRecordUnlocated(allocator, trace, record)) return;
     var edge = SessionGraphEdge{
         .parent_path = try allocator.dupe(u8, trace.session.path),
     };
@@ -4583,7 +4571,7 @@ fn appendSpawnGraphEdge(
     edge.model = try dupOpt(allocator, stringField(payload, "model"));
     const effort = stringField(payload, "reasoning_effort") orelse stringField(payload, "effort");
     edge.reasoning_effort = try dupOpt(allocator, effort);
-    edge.spawned_at = try dupOpt(allocator, timestamp);
+    edge.spawned_at = try dupOpt(allocator, record.timestamp);
     if (stringField(payload, "prompt")) |v| edge.prompt_preview = try previewAlloc(allocator, v);
     edge.worker_status = try dupOpt(allocator, stringField(payload, "status"));
     if (try retainWorkerEdge(allocator, trace, edge) and owned) {
@@ -6205,6 +6193,26 @@ fn workerGraphTestTraces(source: []const u8, spaced: bool) ![2]CanonicalSessionT
     return .{ full, summary };
 }
 
+test "unlocated forks warn only for spawns that establish a worker" {
+    const source =
+        \\{"type":"session_meta","payload":{"id":"child","forked_from_id":"history"}}
+        \\{"type":"response_item","payload":{"type":"function_call","name":"functions.spawn_agent","call_id":"declared","arguments":"{}"}}
+        \\{"type":"response_item","payload":{"type":"function_call","name":"functions.spawn_agent","call_id":"failed","arguments":"{}"}}
+        \\{"type":"response_item","payload":{"type":"function_call_output","call_id":"failed","output":"{\"error\":\"denied\"}"}}
+        \\{"type":"event_msg","payload":{"type":"collab_agent_spawn_end","call_id":"gone","new_thread_id":null,"status":"not_found"}}
+        \\
+    ;
+    for ([_]bool{ false, true }) |spaced| {
+        var traces = try workerGraphTestTraces(source, spaced);
+        defer for (&traces) |*trace| trace.deinit(std.testing.allocator);
+        for (&traces) |*trace| {
+            try std.testing.expectEqual(@as(usize, 0), trace.graph_edges.items.len);
+            try std.testing.expectEqual(@as(usize, 0), trace.warnings.items.len);
+            try std.testing.expectEqual(@as(i64, 0), trace.session.spawned_worker_count);
+        }
+    }
+}
+
 test "fork worker attribution requires a history boundary even with record ordinals" {
     const allocator = std.testing.allocator;
     for ([_]bool{ false, true }) |with_ordinals| {
@@ -6340,6 +6348,36 @@ test "summary retains later noncompact metadata without timestamps" {
                 1,
                 "conflicting later session_meta unrelated",
             ));
+        }
+    }
+}
+
+test "session identity comes only from the first line" {
+    const late_meta =
+        \\{"type":"turn_context","payload":{"cwd":"/repo"}}
+        \\{"type":"session_meta","payload":{"id":"late","forked_from_id":"parent"}}
+    ;
+    const late_pi = "\n{\"type\":\"session\",\"version\":3,\"id\":\"late-pi\"}\n";
+    for ([_]bool{ false, true }) |spaced| {
+        var traces = try workerGraphTestTraces(late_meta, spaced);
+        defer for (&traces) |*trace| trace.deinit(std.testing.allocator);
+        for (&traces) |*trace| {
+            try std.testing.expect(trace.session.session_id == null);
+            try std.testing.expect(trace.session.parent_session_id == null);
+            try std.testing.expect(trace.session.forked_from_session_id == null);
+            try std.testing.expectEqual(@as(usize, 1), trace.warnings.items.len);
+            try std.testing.expect(std.mem.containsAtLeast(
+                u8,
+                trace.warnings.items[0],
+                1,
+                "session_meta late after the first line establishes no session identity",
+            ));
+        }
+        var pi_traces = try workerGraphTestTraces(late_pi, spaced);
+        defer for (&pi_traces) |*trace| trace.deinit(std.testing.allocator);
+        for (&pi_traces) |*trace| {
+            try std.testing.expect(trace.session.source_format != .pi_session_jsonl);
+            try std.testing.expect(trace.session.session_id == null);
         }
     }
 }
