@@ -83,10 +83,11 @@ files. Definition-owned exclusions remain declared parameters and are bound by
 
 `context.as_of_ms` is the single observation instant used by every trace parser
 to assess freshness. `ongoing_threshold_secs` records the policy, and
-`source_metadata_digest` binds the ordered paths and exact nanosecond mtimes of
-the trace sessions whose state the observation evaluated: every admitted session
-and, for streaming lineage, every discovered session that passes `--repo`, because
-its session relation includes them. Files skipped by selection cannot affect the
+`source_metadata_digest` binds, once per session and in source-path order, the path
+and exact nanosecond mtime of each trace session whose state the observation
+evaluated: every admitted session with the mtime it was parsed at and, for
+streaming lineage, every other discovered session that passes `--repo` with the
+mtime it was discovered at, because its session relation includes them. Files skipped by selection cannot affect the
 result and are not bound. Keep this context alongside corpus
 identity: identical session content can have different current liveness. The
 metadata digest distinguishes those inputs; it does not store a replayable
@@ -122,8 +123,8 @@ corpus with compressed files is parsed sequentially, and each file may read the
 decoded budget that is neither admitted nor reserved by a later file. Growth
 beyond the spare fails with `ObservationInputByteBoundExceeded`; a failed read
 never yields a partial success. Each discovery read (a session identity or
-selection prefix) must find the first line, newline included, within 256 MiB of
-decoded bytes per file, the parser's line limit. Discovery has no separate fixed
+selection prefix) reads a file's first line under the parser's line limit: at most
+256 MiB of decoded bytes per file, not counting its newline. Discovery has no separate fixed
 total: it is bounded by that per-file limit and the native
 candidate limit of 1,000,000 session files. `stats.files_opened` counts source
 file opens, including discovery reopens; `discovery_files_opened` and

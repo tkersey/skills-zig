@@ -1672,7 +1672,7 @@ fn createStreamingParseTasks(
         if (seq.opencode_adapter.recognizes(path)) {
             return error.GraphObservationOpenCodeUnsupported;
         }
-        const compressed = std.mem.endsWith(u8, path, ".jsonl.zst");
+        const compressed = seq.trace_adapter.SessionInput.isCompressed(path);
         if (!compressed) try reserveInputBytes(
             &reserved_bytes,
             item.identity.file_size,
@@ -1768,11 +1768,14 @@ const StreamingGraphState = struct {
     session_seed: ?*seq.relation_graph.ScanInput = null,
     usage_column: ?usize = null,
     corpus_entries: std.ArrayList(CorpusEntry) = .empty,
+    discovered: []const DiscoveredSession = &.{},
+    paths: []const []const u8 = &.{},
 
     const CorpusEntry = struct {
         path_index: usize,
         path: []const u8,
         digest: [71]u8,
+        source_mtime_ns: i128,
     };
 
     fn deinit(self: *StreamingGraphState) void {
@@ -1788,12 +1791,36 @@ const StreamingGraphState = struct {
         self.metrics.opened = discovered.items.len;
         self.metrics.discovery_opened = discovered.items.len;
         try recordDiscoveryBytes(&self.metrics, discovered.identity_bytes);
-        for (discovered.items) |item| {
+        self.discovered = discovered.items;
+        self.paths = paths;
+    }
+
+    fn bindSourceMetadata(self: *StreamingGraphState) void {
+        var admitted: usize = 0;
+        for (self.discovered) |item| {
             if (!item.identity.repo_matches) continue;
-            self.metrics.source_metadata.add(
-                paths[item.path_index],
-                item.identity.source_mtime_ns,
-            );
+            while (admitted < self.corpus_entries.items.len and
+                self.corpus_entries.items[admitted].path_index < item.path_index)
+            {
+                const entry = self.corpus_entries.items[admitted];
+                self.metrics.source_metadata.add(entry.path, entry.source_mtime_ns);
+                admitted += 1;
+            }
+            const parsed = admitted < self.corpus_entries.items.len and
+                self.corpus_entries.items[admitted].path_index == item.path_index;
+            if (parsed) {
+                const entry = self.corpus_entries.items[admitted];
+                self.metrics.source_metadata.add(entry.path, entry.source_mtime_ns);
+                admitted += 1;
+            } else {
+                self.metrics.source_metadata.add(
+                    self.paths[item.path_index],
+                    item.identity.source_mtime_ns,
+                );
+            }
+        }
+        for (self.corpus_entries.items[admitted..]) |entry| {
+            self.metrics.source_metadata.add(entry.path, entry.source_mtime_ns);
         }
     }
 
@@ -1819,7 +1846,7 @@ const StreamingGraphState = struct {
             });
         };
         try self.metrics.admitAdapter(seq.trace_adapter.adapterId(&parsed.trace));
-        try admitTraceSession(&self.metrics, parsed);
+        try countTraceSession(&self.metrics, parsed);
         if (self.usage_column) |column| {
             const seed = self.session_seed orelse return error.ObservationPhysicalParseMissing;
             const row = task.session_seed_row orelse return error.ObservationPhysicalParseMissing;
@@ -1834,6 +1861,7 @@ const StreamingGraphState = struct {
             .path_index = task.path_index,
             .path = task.path,
             .digest = parsed.corpus_digest,
+            .source_mtime_ns = parsed.source_mtime_ns,
         });
         try self.appendPartition(parsed, task, reducer);
     }
@@ -1881,6 +1909,7 @@ const StreamingGraphState = struct {
         const graph = self.graph;
         std.mem.sort(CorpusEntry, self.corpus_entries.items, {}, corpusEntryLessThan);
         for (self.corpus_entries.items) |entry| self.digest_set.add(entry.path, &entry.digest);
+        self.bindSourceMetadata();
         const owned = try reducer.finish();
         var scans = [_]seq.relation_graph.ScanInput{
             session_seed.*,
@@ -2552,6 +2581,14 @@ fn admitTraceSession(
     metrics: *PhysicalMetrics,
     parsed: *const seq.trace_adapter.ParsedTrace,
 ) !void {
+    try countTraceSession(metrics, parsed);
+    metrics.source_metadata.add(parsed.trace.session.path, parsed.source_mtime_ns);
+}
+
+fn countTraceSession(
+    metrics: *PhysicalMetrics,
+    parsed: *const seq.trace_adapter.ParsedTrace,
+) !void {
     metrics.warnings = std.math.add(
         usize,
         metrics.warnings,
@@ -2559,7 +2596,6 @@ fn admitTraceSession(
     ) catch return error.ObservationMetricOverflow;
     metrics.files += 1;
     metrics.sessions += 1;
-    metrics.source_metadata.add(parsed.trace.session.path, parsed.source_mtime_ns);
 }
 
 fn feedTraceRows(

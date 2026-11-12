@@ -1,7 +1,7 @@
 const std = @import("std");
 const definition_core = @import("definition_core");
 const trace_core = @import("trace_core");
-const SessionInput = trace_core.SessionInput;
+pub const SessionInput = trace_core.SessionInput;
 const definition = @import("definition.zig");
 const execution = @import("execution.zig");
 const physical = @import("physical.zig");
@@ -416,7 +416,7 @@ test "identity discovery obeys its per-file prefix limit" {
     try std.testing.expectEqualStrings("discovery", identity.session_id.?);
 }
 
-test "identity discovery admits a header that fits although the read passes the limit" {
+test "identity discovery admits a first line within the parser's line limit" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const header = "{\"type\":\"session_meta\",\"payload\":{\"id\":\"fits\"}}\n";
@@ -430,7 +430,7 @@ test "identity discovery admits a header that fits although the read passes the 
         tmp.dir,
         std.testing.allocator,
         "session.jsonl",
-        .{ .discovery_prefix_limit = header.len },
+        .{ .discovery_prefix_limit = header.len - 1 },
         null,
     );
     defer identity.deinit(std.testing.allocator);
@@ -442,10 +442,41 @@ test "identity discovery admits a header that fits although the read passes the 
             tmp.dir,
             std.testing.allocator,
             "session.jsonl",
-            .{ .discovery_prefix_limit = header.len - 1 },
+            .{ .discovery_prefix_limit = header.len - 2 },
             null,
         ),
     );
+}
+
+test "a discovery read admits exactly the first lines the parser's line limit admits" {
+    const allocator = std.testing.allocator;
+    var prng = std.Random.DefaultPrng.init(0x5eed_11e5);
+    const random = prng.random();
+    var source: std.ArrayList(u8) = .empty;
+    defer source.deinit(allocator);
+    for (0..256) |_| {
+        source.clearRetainingCapacity();
+        const limit = 1 + random.uintLessThan(usize, 96);
+        const length = (limit + random.uintLessThan(usize, 5)) -| 2;
+        try source.appendNTimes(allocator, 'x', length);
+        const terminated = random.boolean();
+        if (terminated) try source.append(allocator, '\n');
+        if (terminated and random.boolean()) try source.appendSlice(allocator, "{}\n");
+        var reader = std.Io.Reader.fixed(source.items);
+        const result = readDiscoveryPrefixAlloc(
+            allocator,
+            &reader,
+            .{ .discovery_prefix_limit = limit },
+        );
+        if (length > limit) {
+            try std.testing.expectError(error.ObservationDiscoveryByteBoundExceeded, result);
+            continue;
+        }
+        const prefix = try result;
+        defer allocator.free(prefix);
+        try std.testing.expect(std.mem.startsWith(u8, prefix, source.items[0..length]));
+        try std.testing.expectEqualSlices(u8, source.items, prefix);
+    }
 }
 
 fn writeRepoSession(dir: std.Io.Dir, name: []const u8, cwd: []const u8) !void {
@@ -651,23 +682,11 @@ fn readDiscoveryPrefixAlloc(
     source: *std.Io.Reader,
     options: Options,
 ) ![]u8 {
-    var prefix: std.ArrayList(u8) = .empty;
-    errdefer prefix.deinit(allocator);
-    var chunk: [16 * 1024]u8 = undefined;
-    while (true) { // tiger: event-loop -- bounded by newline, EOF, or the per-file prefix limit.
-        const read = try source.readSliceShort(&chunk);
-        if (read == 0) break;
-        const newline = std.mem.indexOfScalar(u8, chunk[0..read], '\n');
-        const line_bytes = prefix.items.len + if (newline) |index| index + 1 else read;
-        if (line_bytes > options.discovery_prefix_limit or
-            (newline == null and line_bytes == options.discovery_prefix_limit))
-        {
-            return error.ObservationDiscoveryByteBoundExceeded;
-        }
-        try prefix.appendSlice(allocator, chunk[0..read]);
-        if (newline != null) break;
-    }
-    return prefix.toOwnedSlice(allocator);
+    const limit = options.discovery_prefix_limit;
+    return trace_core.readFirstLinePrefixAlloc(allocator, source, limit) catch |err| switch (err) {
+        error.LineTooLong => error.ObservationDiscoveryByteBoundExceeded,
+        else => err,
+    };
 }
 
 fn openTraceFile(io: std.Io, dir: std.Io.Dir, path: []const u8) !std.Io.File {

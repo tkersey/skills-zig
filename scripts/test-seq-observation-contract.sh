@@ -1047,3 +1047,64 @@ for id in root-spawn nested-event root-context; do
     (if $id == "root-context" then $full.model == "gpt-root" and $full.cwd == "/repo"
      else $full.spawned_worker_count == 1 end)' >/dev/null
 done
+
+depth_root="$work/stage-depth"
+mkdir -p "$depth_root"
+jq -c 'if .type == "session_meta" then .payload.id = "p0" else . end' "$rollout" \
+  >"$depth_root/a.jsonl"
+jq -c 'if .type == "session_meta" then .payload.id = "c0" | .payload.forked_from_id = "p0"
+  else . end' "$rollout" >"$depth_root/b.jsonl"
+for shape in executor seed; do
+  jq --arg shape "$shape" '
+    def keep(src; dst): {op: "filter", input: src, "as": dst,
+      where: [{field: "session_id", op: "ne", value: "none"}]};
+    def key: [{left: "session_id", right: "session_id"}];
+    def id: [{source: 0, field: "session_id", name: "session_id", type: "string",
+      nullable: false}];
+    .bounds.max_graph_depth = 5 | .relations = [.relations[0]] |
+    .pipeline = [{op: "scan", relation: "sessions", "as": "s"},
+        keep("s"; "f1"), keep("f1"; "f2"), keep("f2"; "z")] +
+      (if $shape == "executor"
+       then [keep("z"; "c"), keep("c"; "b"), keep("b"; "x"), keep("z"; "g")]
+       else [keep("z"; "b"), keep("b"; "c"), keep("c"; "g"), keep("z"; "x")] end) +
+      [{op: "join", inputs: ["x", "x", "g"], "as": "j", fields: id,
+        on: {kind: "anti", keys: key, lineage: {left: "session_id",
+          right: "session_id", node: "session_id", parent: "parent_session_id"}}},
+       keep("z"; "g2"),
+       {op: "join", inputs: ["g2", "j"], "as": "p", fields: id,
+        on: {kind: "semi", keys: key}}] |
+    .projections = {rows: {relation: "p", schema: "example/stage-depth/v1",
+      fields: ["session_id"], renderers: ["json"]}}' "$lineage_definition" \
+    >"$work/depth-$shape.json"
+  jq '.relations[0].fields += ["model"]' "$work/depth-$shape.json" \
+    >"$work/depth-$shape-materialized.json"
+  "$binary" explain --definition "$work/depth-$shape.json" --projection rows \
+    --format json | jq -e '.strategy.kind == "partition-lineage-stream"' >/dev/null
+  depth_stream=$("$binary" observe --definition "$work/depth-$shape.json" \
+    --projection rows --root "$depth_root" --format json)
+  depth_materialized=$("$binary" observe \
+    --definition "$work/depth-$shape-materialized.json" --projection rows \
+    --root "$depth_root" --format json)
+  printf '%s\n' "$depth_stream" "$depth_materialized" | jq -se '
+    .[0].data.rows == .[1].data.rows and (.[0].data.rows | length) == 2' >/dev/null
+done
+
+digest_root="$work/digest-order"
+mkdir -p "$digest_root"
+jq -c 'if .type == "session_meta" then .payload.id = "C" | .payload.forked_from_id = "P"
+  else . end' "$rollout" >"$digest_root/a.jsonl"
+jq -c 'if .type == "session_meta" then .payload.id = "P" else . end' "$rollout" \
+  >"$digest_root/b.jsonl"
+jq '.pipeline = [.pipeline[0], {op: "filter", input: "session_rows", "as": "graph_rows",
+      where: [{field: "session_id", op: "exact", value: "P"}]}] + .pipeline[1:] |
+  (.pipeline[] | select(.op == "join") | .inputs[2]) = "graph_rows"' \
+  "$lineage_definition" >"$work/digest-filtered.json"
+"$binary" explain --definition "$work/digest-filtered.json" --projection rows \
+  --format json | jq -e '.strategy.kind == "partition-lineage-stream"' >/dev/null
+digest_plain=$("$binary" observe --definition "$lineage_definition" --projection rows \
+  --root "$digest_root" --format json)
+digest_filtered=$("$binary" observe --definition "$work/digest-filtered.json" \
+  --projection rows --root "$digest_root" --format json)
+printf '%s\n' "$digest_plain" "$digest_filtered" | jq -se '
+  .[0].corpus.digest == .[1].corpus.digest and
+  .[0].context.source_metadata_digest == .[1].context.source_metadata_digest' >/dev/null

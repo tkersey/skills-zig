@@ -104,18 +104,8 @@ pub fn streamingLineagePlan(
 ) !?StreamingLineagePlan {
     const projection_index = findProjection(definition_plan, projection_name) orelse
         return error.UnknownObservationProjection;
-    const reachable = try allocator.alloc(bool, native_plan.stages.len);
+    const reachable = try reachableStages(allocator, definition_plan, native_plan, projection_name);
     defer allocator.free(reachable);
-    @memset(reachable, false);
-    try markReachable(
-        allocator,
-        definition_plan,
-        native_plan,
-        native_plan.projections[projection_index].stage_index,
-        reachable,
-        &.{},
-        0,
-    );
     try requireValidJoins(allocator, definition_plan, native_plan, reachable);
     for (native_plan.stages, 0..) |stage, stage_index| {
         if (!reachable[stage_index] or stage.operation != .generic) continue;
@@ -364,7 +354,7 @@ fn streamingSeedScan(
         graph_stage,
         graph_reachable,
         &.{},
-        0,
+        null,
     );
     var seeded_scan: ?u16 = null;
     for (native_plan.stages, graph_reachable, 0..) |stage, reached, index| {
@@ -388,7 +378,7 @@ fn streamingSeedScan(
         projection_stage,
         reachable,
         &boundary,
-        0,
+        null,
     );
     for (native_plan.stages, reachable, 0..) |stage, reached, index| {
         if (reached and stage.operation == .scan and index != seed) return null;
@@ -402,20 +392,8 @@ pub fn projectionMayTruncate(
     native_plan: *const plan.Plan,
     projection_name: []const u8,
 ) !bool {
-    const projection_index = findProjection(definition_plan, projection_name) orelse
-        return error.UnknownObservationProjection;
-    const reachable = try allocator.alloc(bool, native_plan.stages.len);
+    const reachable = try reachableStages(allocator, definition_plan, native_plan, projection_name);
     defer allocator.free(reachable);
-    @memset(reachable, false);
-    try markReachable(
-        allocator,
-        definition_plan,
-        native_plan,
-        native_plan.projections[projection_index].stage_index,
-        reachable,
-        &.{},
-        0,
-    );
     for (native_plan.stages, reachable) |stage, reached| {
         if (!reached) continue;
         switch (stage.operation) {
@@ -747,7 +725,7 @@ fn reachableStages(
         native_plan.projections[projection_index].stage_index,
         reachable,
         &.{},
-        0,
+        definition_plan.bounds.max_graph_depth,
     );
     return reachable;
 }
@@ -782,7 +760,7 @@ const GraphExecution = struct {
         const reachable = try allocator.alloc(bool, count);
         errdefer allocator.free(reachable);
         @memset(reachable, false);
-        try markReachable(allocator, definition_plan, native_plan, target, reachable, scans, 0);
+        try markReachable(allocator, definition_plan, native_plan, target, reachable, scans, null);
         const tables = try allocator.alloc(?Table, count);
         errdefer allocator.free(tables);
         @memset(tables, null);
@@ -1017,11 +995,10 @@ fn markReachable(
     stage_index: u16,
     reachable: []bool,
     scans: []ScanInput,
-    depth: usize,
+    depth_limit: ?usize,
 ) !void {
-    const max_depth = definition_plan.bounds.max_graph_depth;
-    if (depth > max_depth) return error.ObservationGraphDepthExceeded;
-    const frames = try allocator.alloc(StageFrame, max_depth - depth + 1);
+    const frame_count = if (depth_limit) |limit| limit + 1 else native_plan.stages.len + 1;
+    const frames = try allocator.alloc(StageFrame, frame_count);
     defer allocator.free(frames);
     frames[0] = .{ .stage_index = stage_index };
     var count: usize = 1;
@@ -4395,7 +4372,7 @@ test "partition ranks order sessions exactly as the fold sort orders their rows"
     try std.testing.expectEqualSlices(usize, &.{ 2, 3, 0, 4, 1 }, ascending);
 }
 
-test "stage traversal checks depth before memoization and respects scan boundaries" {
+test "only a bounded stage walk applies the depth law, before memoization and at scan boundaries" {
     var definition_plan = graph_test_definition;
     definition_plan.bounds.max_graph_depth = 1;
     var reachable = [_]bool{ true, false, false };
@@ -4406,7 +4383,7 @@ test "stage traversal checks depth before memoization and respects scan boundari
         2,
         &reachable,
         &.{},
-        0,
+        definition_plan.bounds.max_graph_depth,
     ));
     @memset(&reachable, false);
     definition_plan.bounds.max_graph_depth = 2;
@@ -4417,7 +4394,7 @@ test "stage traversal checks depth before memoization and respects scan boundari
         2,
         &reachable,
         &.{},
-        0,
+        definition_plan.bounds.max_graph_depth,
     );
     try std.testing.expectEqualSlices(bool, &.{ true, true, true }, &reachable);
     @memset(&reachable, false);
@@ -4432,7 +4409,18 @@ test "stage traversal checks depth before memoization and respects scan boundari
         2,
         &reachable,
         &scans,
-        0,
+        definition_plan.bounds.max_graph_depth,
     );
     try std.testing.expectEqualSlices(bool, &.{ false, true, true }, &reachable);
+    @memset(&reachable, false);
+    try markReachable(
+        std.testing.allocator,
+        &definition_plan,
+        &graph_test_native,
+        2,
+        &reachable,
+        &.{},
+        null,
+    );
+    try std.testing.expectEqualSlices(bool, &.{ true, true, true }, &reachable);
 }

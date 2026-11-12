@@ -842,6 +842,37 @@ fn appendMalformedWarning(
     try trace.warnings.append(allocator, warning);
 }
 
+pub fn readFirstLinePrefixAlloc(
+    allocator: std.mem.Allocator,
+    reader: *std.Io.Reader,
+    max_line_bytes: usize,
+) ![]u8 {
+    var consumed: std.ArrayList(u8) = .empty;
+    errdefer consumed.deinit(allocator);
+    var collector = ConsumedBytes{ .allocator = allocator, .bytes = &consumed };
+    var lines = try jsonl_stream.Stream.init(allocator, reader, .{
+        .max_line_bytes = max_line_bytes,
+        .chunk_observer = collector.observer(),
+    });
+    defer lines.deinit();
+    _ = try lines.next();
+    return consumed.toOwnedSlice(allocator);
+}
+
+const ConsumedBytes = struct {
+    allocator: std.mem.Allocator,
+    bytes: *std.ArrayList(u8),
+
+    fn observer(self: *ConsumedBytes) jsonl_stream.ChunkObserver {
+        return .{ .context = self, .observeFn = observe };
+    }
+
+    fn observe(context: *anyopaque, bytes: []const u8) anyerror!void {
+        const self: *ConsumedBytes = @ptrCast(@alignCast(context));
+        try self.bytes.appendSlice(self.allocator, bytes);
+    }
+};
+
 pub fn parseSessionTraceReaderWithVisitorMetrics(
     io: std.Io,
     allocator: std.mem.Allocator,
