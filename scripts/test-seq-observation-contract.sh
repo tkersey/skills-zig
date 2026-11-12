@@ -1017,3 +1017,33 @@ for first in child parent; do
       >/dev/null
   done
 done
+
+parity_root="$work/parser-parity"
+mkdir -p "$parity_root"
+parity_meta='{"timestamp":"2026-07-26T10:00:00Z","type":"session_meta","payload":{"id":"#"}}'
+parity_session() {
+  { printf '%s\n' "${parity_meta/\#/$1}"; cat; } >"$parity_root/$1.jsonl"
+}
+parity_session root-spawn <<'LINES'
+{"type":"function_call","name":"spawn_agent","call_id":"c1","arguments":"{}"}
+{"type":"function_call_output","call_id":"c1","output":"{\"agent_id\":\"w1\"}"}
+LINES
+parity_session nested-event <<'LINES'
+{"type":"event_msg","payload":{"meta":{"type":"response_item"},"type":"sub_agent_activity","event_id":"e1","agent_thread_id":"w2","agent_path":"/root/w2","kind":"started"}}
+LINES
+parity_session root-context <<'LINES'
+{"timestamp":"2026-07-26T10:00:01Z","type":"turn_context","model":"gpt-root","cwd":"/repo"}
+LINES
+summary_rows=$("$binary" sessions --root "$parity_root" --format json)
+for id in root-spawn nested-event root-context; do
+  full_session=$("$binary" session-detail --path "$parity_root/$id.jsonl" --format json)
+  printf '%s\n' "$summary_rows" "$full_session" | jq -se --arg id "$id" '
+    ([.[0] | .. | objects | select(.session_id? == $id and has("spawned_worker_count"))]
+      | first) as $summary |
+    .[1].session as $full |
+    $summary != null and
+    ($summary | {spawned_worker_count, model, cwd}) ==
+      ($full | {spawned_worker_count, model, cwd}) and
+    (if $id == "root-context" then $full.model == "gpt-root" and $full.cwd == "/repo"
+     else $full.spawned_worker_count == 1 end)' >/dev/null
+done

@@ -291,6 +291,11 @@ On a declared fork, records that establish a worker without a usable replay boun
 record ordinal remain unattributed and emit a warning; declarations and failed spawns
 establish no worker and emit none. Primary metadata control
 links remain available independently of those creation records.
+Native `sessions` rows and linear definitions parse with the same rules as graph
+strategies for session identity, lineage, model, service tier, working directory,
+worker links, and token-usage observation counts, so those fields agree across
+strategies. Their fast path skips a line only when its root and payload types
+show that none of those fields depends on it.
 
 Strict native row commands stage their bounded output before writing it.
 Parser warnings remain failures, with source path, count, and a representative

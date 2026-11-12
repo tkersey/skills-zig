@@ -865,10 +865,38 @@ pub fn parseSessionTraceReaderWithVisitorMetrics(
     };
     defer parser.seen_messages.deinit();
     defer parser.tool_lookup.deinit(allocator);
-    defer parser.metadata.deinit(allocator);
-    defer parser.workers.deinit(allocator);
     var pi_parser = PiParser.init(allocator, &trace, options, false);
     defer pi_parser.deinit();
+    const source_is_pi = try parseSessionLines(
+        allocator,
+        &trace,
+        reader,
+        context,
+        visit,
+        metrics,
+        &parser,
+        &pi_parser,
+    );
+    if (source_is_pi) {
+        try pi_parser.finish(io, source_mtime_ns);
+    } else {
+        try finalizeTrace(io, allocator, &trace, source_mtime_ns, options);
+    }
+    return trace;
+}
+
+fn parseSessionLines(
+    allocator: std.mem.Allocator,
+    trace: *CanonicalSessionTrace,
+    reader: *std.Io.Reader,
+    context: anytype,
+    comptime visit: anytype,
+    metrics: *StreamMetrics,
+    parser: anytype,
+    pi_parser: *PiParser,
+) !bool {
+    var facts: SessionFacts = .{};
+    defer facts.deinit(allocator);
     var source_is_pi: ?bool = null;
     var scratch = ParseScratch.init(allocator);
     defer scratch.deinit();
@@ -879,10 +907,15 @@ pub fn parseSessionTraceReaderWithVisitorMetrics(
         try visit(context, record.bytes, record.number);
         const line = std.mem.trim(u8, record.bytes, " \t\r\n");
         if (line.len == 0) continue;
+        if (source_is_pi != null and !source_is_pi.? and
+            try parser.skipsLine(scratch.arena.allocator(), line, &facts.workers))
+        {
+            continue;
+        }
         const root = scratch.parse(line) catch |err| switch (err) {
             error.OutOfMemory => return err,
             else => {
-                try appendMalformedWarning(allocator, &trace, record.number);
+                try appendMalformedWarning(allocator, trace, record.number);
                 continue;
             },
         } orelse continue;
@@ -893,17 +926,58 @@ pub fn parseSessionTraceReaderWithVisitorMetrics(
         const parsed_record = ParsedRecord.init(root, record.number, line);
         if (source_is_pi.?) {
             try pi_parser.apply(parsed_record);
-        } else {
-            try parser.apply(parsed_record);
+            continue;
         }
-    }
-    if (source_is_pi orelse false) {
-        try pi_parser.finish(io, source_mtime_ns);
-    } else {
-        try finalizeTrace(io, allocator, &trace, source_mtime_ns, options);
+        try parser.apply(parsed_record);
+        try facts.apply(allocator, trace, parsed_record, parser.turnIndex());
     }
     metrics.* = .{ .bytes_read = lines.bytes_read, .lines_seen = lines.line_number };
-    return trace;
+    return source_is_pi orelse false;
+}
+
+const SessionFacts = struct {
+    metadata: PrimaryMetadata = .{},
+    workers: WorkerGraphParser = .{},
+
+    fn deinit(self: *SessionFacts, allocator: std.mem.Allocator) void {
+        self.metadata.deinit(allocator);
+        self.workers.deinit(allocator);
+    }
+
+    fn apply(
+        self: *SessionFacts,
+        allocator: std.mem.Allocator,
+        trace: *CanonicalSessionTrace,
+        record: ParsedRecord,
+        turn_index: ?usize,
+    ) !void {
+        if (record.isState()) return;
+        if (sessionMetaObject(record)) |meta| {
+            try applyPrimarySessionMeta(allocator, trace, meta, &self.metadata, record);
+        }
+        if (turnContextObject(record)) |ctx| {
+            try applySessionContextFields(allocator, &trace.session, ctx);
+        }
+        try self.workers.apply(allocator, trace, record, turn_index);
+    }
+};
+
+fn sessionMetaObject(record: ParsedRecord) ?std.json.ObjectMap {
+    if (record.root_type) |entry_type| {
+        return if (std.mem.eql(u8, entry_type, "session_meta")) record.payload else null;
+    }
+    if (record.payload) |payload| {
+        const is_meta = std.mem.eql(u8, stringField(payload, "type") orelse "", "session_meta");
+        return if (is_meta) payload else null;
+    }
+    const legacy_meta = record.root.get("id") != null and record.root.get("timestamp") != null;
+    return if (legacy_meta) record.root else null;
+}
+
+fn turnContextObject(record: ParsedRecord) ?std.json.ObjectMap {
+    const entry_type = record.root_type orelse return null;
+    if (!std.mem.eql(u8, entry_type, "turn_context")) return null;
+    return record.payload orelse record.root;
 }
 
 fn isPiSessionHeader(root: std.json.ObjectMap) bool {
@@ -1651,10 +1725,21 @@ const TraceParser = struct {
     current_turn_index: ?usize = null,
     synthetic_turns: i64 = 0,
     saw_task_started: bool = false,
-    metadata: PrimaryMetadata = .{},
-    workers: WorkerGraphParser = .{},
     seen_messages: MessageDigestMap,
     tool_lookup: ToolLookup,
+
+    fn turnIndex(self: *const TraceParser) ?usize {
+        return self.current_turn_index;
+    }
+
+    fn skipsLine(
+        _: *TraceParser,
+        _: std.mem.Allocator,
+        _: []const u8,
+        _: *const WorkerGraphParser,
+    ) !bool {
+        return false;
+    }
 
     fn ensure(self: *TraceParser, record: ParsedRecord, turn_id: ?[]const u8) !usize {
         return ensureTurn(
@@ -1697,30 +1782,10 @@ const TraceParser = struct {
         try applySessionTimestamp(self.allocator, &self.trace.session, record.timestamp);
         if (record.root_type) |entry_type| {
             try self.applyTyped(record, entry_type, occurrence_index);
-        } else if (record.payload) |payload| {
-            if (std.mem.eql(u8, stringField(payload, "type") orelse "", "session_meta")) {
-                try self.applyMeta(payload, record);
-            }
-        } else {
+        } else if (record.payload == null) {
             try self.applyLegacy(record);
             self.assignOccurrence(occurrence_index);
         }
-        try self.workers.apply(
-            self.allocator,
-            self.trace,
-            record,
-            self.current_turn_index,
-        );
-    }
-
-    fn applyMeta(self: *TraceParser, meta: std.json.ObjectMap, record: ParsedRecord) !void {
-        try applyPrimarySessionMeta(
-            self.allocator,
-            self.trace,
-            meta,
-            &self.metadata,
-            record,
-        );
     }
 
     fn applyTyped(
@@ -1732,15 +1797,11 @@ const TraceParser = struct {
         const Kind = enum { session_meta, turn_context, compacted, event_msg, response_item };
         const kind = std.meta.stringToEnum(Kind, entry_type) orelse return;
         switch (kind) {
-            .session_meta => {
-                if (record.payload) |payload| try self.applyMeta(payload, record);
-                return;
-            },
+            .session_meta => return,
             .turn_context => {
                 const idx = try self.ensure(record, null);
                 const turn = &self.trace.turns.items[idx];
                 try applyTurnContext(self.allocator, turn, record.payload orelse record.root);
-                try applySessionContextFromTurn(self.allocator, &self.trace.session, turn.*);
             },
             .compacted => {
                 const idx = try self.ensure(record, null);
@@ -1898,9 +1959,8 @@ const TraceParser = struct {
 
     fn applyLegacy(self: *TraceParser, record: ParsedRecord) !void {
         const root = record.root;
-        if (root.get("id") != null and root.get("timestamp") != null) {
-            try self.applyMeta(root, record);
-        } else if (root.get("role") != null and root.get("content") != null) {
+        if (root.get("id") != null and root.get("timestamp") != null) return;
+        if (root.get("role") != null and root.get("content") != null) {
             try self.applyLegacyMessage(record);
         } else if (root.get("call_id") != null and
             root.get("arguments") != null and root.get("name") != null)
@@ -2114,99 +2174,69 @@ pub fn parseSessionSummaryTraceReaderWithVisitorMetrics(
     defer parser.deinit();
     var pi_parser = PiParser.init(allocator, &trace, options, true);
     defer pi_parser.deinit();
-    var source_is_pi: ?bool = null;
-    var scratch = ParseScratch.init(allocator);
-    defer scratch.deinit();
-    var lines = try jsonl_stream.Stream.init(allocator, reader, .{});
-    defer lines.deinit();
-    while (try lines.next()) |record| {
-        defer scratch.reset();
-        try visit(context, record.bytes, record.number);
-        const line = std.mem.trim(u8, record.bytes, " \t\r\n");
-        if (line.len == 0) continue;
-        if (source_is_pi != null and !source_is_pi.?) {
-            if (fastTimestampSlice(line)) |timestamp| {
-                try applySessionTimestamp(allocator, &trace.session, timestamp);
-            }
-            if (!sessionSummaryLineCouldMatter(line, parser.workers.pending.count() > 0) and
-                std.mem.indexOf(u8, line, "\"sessionId\"") == null)
-            {
-                continue;
-            }
-        }
-        const root = scratch.parse(line) catch |err| switch (err) {
-            error.OutOfMemory => return err,
-            else => {
-                try appendMalformedWarning(allocator, &trace, record.number);
-                continue;
-            },
-        } orelse continue;
-        try rejectUnsupportedSource(root);
-        if (source_is_pi == null) {
-            source_is_pi = primaryLine(record.number) and isPiSessionHeader(root);
-        }
-        const parsed_record = ParsedRecord.init(root, record.number, line);
-        if (source_is_pi.?) {
-            try pi_parser.apply(parsed_record);
-        } else {
-            try parser.apply(parsed_record);
-        }
-    }
-    if (source_is_pi orelse false) {
+    const source_is_pi = try parseSessionLines(
+        allocator,
+        &trace,
+        reader,
+        context,
+        visit,
+        metrics,
+        &parser,
+        &pi_parser,
+    );
+    if (source_is_pi) {
         try pi_parser.finish(io, source_mtime_ns);
     } else {
         try parser.finish(io, source_mtime_ns, options);
     }
-    metrics.* = .{ .bytes_read = lines.bytes_read, .lines_seen = lines.line_number };
     return trace;
 }
+
+const SummaryEvent = enum {
+    task_started,
+    task_complete,
+    turn_aborted,
+    @"error",
+    token_count,
+    thread_settings_applied,
+    thread_name_updated,
+};
 
 const SummaryParser = struct {
     allocator: std.mem.Allocator,
     trace: *CanonicalSessionTrace,
     seen_turn_ids: std.StringHashMap(void),
     last_turn_open: bool = false,
-    metadata: PrimaryMetadata = .{},
-    workers: WorkerGraphParser = .{},
 
     fn deinit(self: *SummaryParser) void {
         var it = self.seen_turn_ids.keyIterator();
         while (it.next()) |key| self.allocator.free(key.*);
         self.seen_turn_ids.deinit();
-        self.metadata.deinit(self.allocator);
-        self.workers.deinit(self.allocator);
     }
 
-    fn applyMeta(self: *SummaryParser, meta: std.json.ObjectMap, record: ParsedRecord) !void {
-        try applyPrimarySessionMeta(
-            self.allocator,
-            self.trace,
-            meta,
-            &self.metadata,
-            record,
-        );
+    fn turnIndex(_: *const SummaryParser) ?usize {
+        return null;
+    }
+
+    fn skipsLine(
+        self: *SummaryParser,
+        scratch: std.mem.Allocator,
+        line: []const u8,
+        workers: *const WorkerGraphParser,
+    ) !bool {
+        if (fastTimestampSlice(line)) |timestamp| {
+            try applySessionTimestamp(self.allocator, &self.trace.session, timestamp);
+        }
+        return !try summaryLineMatters(scratch, line, workers.pending.count() > 0);
     }
 
     fn apply(self: *SummaryParser, record: ParsedRecord) !void {
         if (record.isState()) return;
         try applySessionTimestamp(self.allocator, &self.trace.session, record.timestamp);
-        if (record.root_type) |entry_type| {
-            const payload = record.payload orelse return;
-            if (std.mem.eql(u8, entry_type, "session_meta")) {
-                try self.applyMeta(payload, record);
-            } else if (std.mem.eql(u8, entry_type, "turn_context")) {
-                try applySessionContextFields(self.allocator, &self.trace.session, payload);
-            } else if (std.mem.eql(u8, entry_type, "event_msg")) {
-                try self.applyEvent(payload, record.timestamp);
-            }
-        } else if (record.payload) |payload| {
-            if (std.mem.eql(u8, stringField(payload, "type") orelse "", "session_meta")) {
-                try self.applyMeta(payload, record);
-            }
-        } else if (record.root.get("id") != null and record.root.get("timestamp") != null) {
-            try self.applyMeta(record.root, record);
-        }
-        try self.workers.apply(self.allocator, self.trace, record, null);
+        const entry_type = record.root_type orelse return;
+        if (!std.mem.eql(u8, entry_type, "event_msg")) return;
+        const payload = record.payload orelse return;
+        try self.applyEvent(payload, record.timestamp);
     }
 
     fn applyEvent(
@@ -2215,16 +2245,7 @@ const SummaryParser = struct {
         _: ?[]const u8,
     ) !void {
         const event_type = stringField(payload, "type") orelse "";
-        const Kind = enum {
-            task_started,
-            task_complete,
-            turn_aborted,
-            @"error",
-            token_count,
-            thread_settings_applied,
-            thread_name_updated,
-        };
-        const kind = std.meta.stringToEnum(Kind, event_type) orelse return;
+        const kind = std.meta.stringToEnum(SummaryEvent, event_type) orelse return;
         const session = &self.trace.session;
         switch (kind) {
             .task_started, .@"error" => {
@@ -2573,25 +2594,110 @@ fn oneOfString(value: []const u8, allowed: []const []const u8) bool {
     return false;
 }
 
-fn sessionSummaryLineCouldMatter(line: []const u8, pending_spawns: bool) bool {
-    const prefix = line[0..@min(line.len, 96)];
-    if (std.mem.indexOf(u8, prefix, "\"type\":\"response_item\"") != null) {
-        return pending_spawns or std.mem.containsAtLeast(u8, line, 1, "spawn_agent");
+const LinePayload = struct {
+    object: bool = false,
+    kind: ?[]const u8 = null,
+    name: ?[]const u8 = null,
+    complete: bool = false,
+};
+
+fn summaryLineMatters(
+    allocator: std.mem.Allocator,
+    line: []const u8,
+    pending_spawns: bool,
+) !bool {
+    var scanner = std.json.Scanner.initCompleteInput(allocator, line);
+    defer scanner.deinit();
+    return scanSummaryLine(&scanner, allocator, pending_spawns) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return true,
+    };
+}
+
+fn scanSummaryLine(
+    scanner: *std.json.Scanner,
+    allocator: std.mem.Allocator,
+    pending_spawns: bool,
+) !bool {
+    if (try scanner.next() != .object_begin) return true;
+    var root_type: ?[]const u8 = null;
+    var payload: ?LinePayload = null;
+    while (try nextObjectKey(scanner, allocator)) |key| {
+        if (std.mem.eql(u8, key, "type")) {
+            root_type = try nextStringValue(scanner, allocator) orelse return true;
+        } else if (std.mem.eql(u8, key, "payload")) {
+            payload = try scanLinePayload(scanner, allocator, root_type, pending_spawns);
+        } else {
+            try scanner.skipValue();
+        }
+        if (summaryLineDecision(root_type, payload, pending_spawns)) |matters| return matters;
     }
-    if (std.mem.indexOf(u8, prefix, "\"type\":\"session_meta\"") != null) return true;
-    if (std.mem.indexOf(u8, prefix, "\"type\":\"turn_context\"") != null) return true;
-    if (std.mem.indexOf(u8, prefix, "\"type\":\"event_msg\"") != null) {
-        return std.mem.containsAtLeast(u8, line, 1, "task_started") or
-            std.mem.containsAtLeast(u8, line, 1, "task_complete") or
-            std.mem.containsAtLeast(u8, line, 1, "turn_aborted") or
-            std.mem.containsAtLeast(u8, line, 1, "token_count") or
-            std.mem.containsAtLeast(u8, line, 1, "thread_name_updated") or
-            std.mem.containsAtLeast(u8, line, 1, "thread_settings_applied") or
-            std.mem.containsAtLeast(u8, line, 1, "collab_agent_spawn_end") or
-            std.mem.containsAtLeast(u8, line, 1, "sub_agent_activity") or
-            std.mem.containsAtLeast(u8, line, 1, "\"error\"");
+    const absent = LinePayload{ .complete = true };
+    return summaryLineDecision(root_type, payload orelse absent, pending_spawns) orelse true;
+}
+
+fn scanLinePayload(
+    scanner: *std.json.Scanner,
+    allocator: std.mem.Allocator,
+    root_type: ?[]const u8,
+    pending_spawns: bool,
+) !LinePayload {
+    if (try scanner.peekNextTokenType() != .object_begin) {
+        try scanner.skipValue();
+        return .{ .complete = true };
     }
-    return true;
+    _ = try scanner.next();
+    var payload = LinePayload{ .object = true };
+    while (try nextObjectKey(scanner, allocator)) |key| {
+        if (std.mem.eql(u8, key, "type")) {
+            payload.kind = try nextStringValue(scanner, allocator) orelse "";
+        } else if (std.mem.eql(u8, key, "name")) {
+            payload.name = try nextStringValue(scanner, allocator) orelse "";
+        } else {
+            try scanner.skipValue();
+        }
+        if (summaryLineDecision(root_type, payload, pending_spawns) != null) return payload;
+    }
+    payload.complete = true;
+    return payload;
+}
+
+fn summaryLineDecision(root_type: ?[]const u8, line_payload: ?LinePayload, pending: bool) ?bool {
+    const entry_type = root_type orelse return null;
+    const response = std.mem.eql(u8, entry_type, "response_item");
+    if (!response and !std.mem.eql(u8, entry_type, "event_msg")) return true;
+    if (response and pending) return true;
+    const payload = line_payload orelse return null;
+    if (!payload.object) return false;
+    const kind = payload.kind orelse return if (payload.complete) false else null;
+    if (!response) {
+        return std.meta.stringToEnum(SummaryEvent, kind) != null or
+            std.meta.stringToEnum(WorkerEvent, kind) != null;
+    }
+    if (!oneOfString(kind, &spawn_declaration_kinds)) return false;
+    const name = payload.name orelse return if (payload.complete) false else null;
+    return kindFromName(name) == .spawn_agent;
+}
+
+fn nextObjectKey(scanner: *std.json.Scanner, allocator: std.mem.Allocator) !?[]const u8 {
+    return switch (try scanner.nextAlloc(allocator, .alloc_if_needed)) {
+        .string => |key| key,
+        .allocated_string => |key| key,
+        .object_end => null,
+        else => error.UnexpectedToken,
+    };
+}
+
+fn nextStringValue(scanner: *std.json.Scanner, allocator: std.mem.Allocator) !?[]const u8 {
+    if (try scanner.peekNextTokenType() != .string) {
+        try scanner.skipValue();
+        return null;
+    }
+    return switch (try scanner.nextAlloc(allocator, .alloc_if_needed)) {
+        .string => |value| value,
+        .allocated_string => |value| value,
+        else => error.UnexpectedToken,
+    };
 }
 
 fn fastTimestampSlice(line: []const u8) ?[]const u8 {
@@ -2889,15 +2995,6 @@ fn applyTurnContext(
     if (stringField(ctx, "reasoning_effort") orelse stringField(ctx, "effort")) |v| {
         try replaceOpt(allocator, &turn.reasoning_effort, v);
     }
-}
-
-fn applySessionContextFromTurn(
-    allocator: std.mem.Allocator,
-    session: *SessionRecord,
-    turn: TurnRecord,
-) !void {
-    if (session.model == null) if (turn.model) |v| try replaceOpt(allocator, &session.model, v);
-    if (session.cwd == null) if (turn.cwd) |v| try replaceOpt(allocator, &session.cwd, v);
 }
 
 fn startTurn(
@@ -4410,6 +4507,10 @@ fn parseExecArgsIntoRecord(
     if (stringField(obj, "cwd")) |v| try replaceOpt(allocator, &record.cwd, v);
 }
 
+const WorkerEvent = enum { collab_agent_spawn_end, sub_agent_activity };
+
+const spawn_declaration_kinds = [_][]const u8{ "function_call", "custom_tool_call" };
+
 const WorkerGraphParser = struct {
     pending: std.StringHashMapUnmanaged(?usize) = .empty,
 
@@ -4429,19 +4530,14 @@ const WorkerGraphParser = struct {
         if (record.isInherited(trace.session)) return;
         const payload = record.payload orelse record.root;
         const kind = stringField(payload, "type") orelse "";
-        const event = std.mem.eql(u8, record.root_type orelse "", "event_msg");
-        if (event and std.mem.eql(u8, kind, "collab_agent_spawn_end")) {
+        if (std.mem.eql(u8, record.root_type orelse "", "event_msg")) {
+            const event = std.meta.stringToEnum(WorkerEvent, kind) orelse return;
+            const started = std.mem.eql(u8, stringField(payload, "kind") orelse "", "started");
+            if (event == .sub_agent_activity and !started) return;
             return appendSpawnGraphEdge(allocator, trace, payload, record, turn_index, null);
         }
-        if (event and std.mem.eql(u8, kind, "sub_agent_activity")) {
-            if (std.mem.eql(u8, stringField(payload, "kind") orelse "", "started")) {
-                try appendSpawnGraphEdge(allocator, trace, payload, record, turn_index, null);
-            }
-            return;
-        }
-        if (event) return;
         const legacy = record.root_type == null and record.payload == null;
-        const declaration = oneOfString(kind, &.{ "function_call", "custom_tool_call" }) or
+        const declaration = oneOfString(kind, &spawn_declaration_kinds) or
             legacy and (payload.contains("arguments") or payload.contains("input"));
         const result = oneOfString(kind, &.{ "function_call_output", "custom_tool_call_output" }) or
             legacy and payload.contains("output");
@@ -6194,6 +6290,167 @@ fn workerGraphTestTraces(source: []const u8, spaced: bool) ![2]CanonicalSessionT
         .{},
     );
     return .{ full, summary };
+}
+
+const parity_first_lines = [_][]const u8{
+    \\{"timestamp":"2026-07-26T10:00:00Z","type":"session_meta","payload":{"id":"s#","cwd":"/repo"}}
+    ,
+    \\{"timestamp":"2026-07-26T10:00:00Z","type":"session_meta","payload":{"id":"s#","forked_from_id":"p#","subagent_history_start_ordinal":2}}
+    ,
+    \\{"type":"session_meta","payload":{"id":"s#","source":{"subagent":{"thread_spawn":{"parent_thread_id":"c#"}}}}}
+    ,
+    \\{"payload":{"type":"session_meta","id":"s#"}}
+    ,
+    \\{"id":"s#","timestamp":"2026-07-26T10:00:00Z"}
+    ,
+    \\{"timestamp":"2026-07-26T10:00:00Z","type":"turn_context","payload":{"model":"first"}}
+    ,
+    "",
+};
+
+const parity_lines = [_][]const u8{
+    \\{"timestamp":"2026-07-26T10:00:01Z","type":"turn_context","payload":{"model":"m#","cwd":"/r#"}}
+    ,
+    \\{"timestamp":"2026-07-26T10:00:01Z","type":"turn_context","model":"m#","cwd":"/r#"}
+    ,
+    \\{"type":"event_msg","payload":{"type":"thread_settings_applied","thread_settings":{"model":"t#","service_tier":"tier#"}}}
+    ,
+    \\{"type":"event_msg","payload":{"type":"thread_name_updated","thread_name":"name#"}}
+    ,
+    \\{"type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"total_tokens":#}}}}
+    ,
+    \\{"type":"event_msg","payload":{"type":"token_count","last_token_usage":{"total_tokens":#}}}
+    ,
+    \\{"type":"event_msg","payload":{"type":"task_started","turn_id":"turn#"}}
+    ,
+    \\{"type":"event_msg","payload":{"type":"task_complete","turn_id":"turn#"}}
+    ,
+    \\{"type":"event_msg","payload":{"type":"collab_agent_spawn_end","call_id":"c#","new_thread_id":"w#"}}
+    ,
+    \\{"ordinal":#,"type":"event_msg","payload":{"type":"sub_agent_activity","event_id":"e#","agent_thread_id":"w#","agent_path":"/root/w#","kind":"started"}}
+    ,
+    \\{"type":"event_msg","payload":{"meta":{"type":"response_item"},"type":"sub_agent_activity","event_id":"e#","agent_thread_id":"w#","kind":"started"}}
+    ,
+    \\{"payload":{"type":"collab_agent_spawn_end","call_id":"c#","new_thread_id":"w#"},"type":"event_msg"}
+    ,
+    \\{"type":"event_msg","payload":{"type":"sub\u005fagent_activity","event_id":"e#","agent_thread_id":"w#","kind":"started"}}
+    ,
+    \\{"type":"event_msg","payload":{"type":"thread\u005fsettings_applied","thread_settings":{"model":"x#"}}}
+    ,
+    \\{"timestamp":"2026-07-26T10:00:02Z","type":"response_item","payload":{"type":"function_call","name":"spawn_agent","call_id":"c#","arguments":"{}"}}
+    ,
+    \\{"type":"response_item","payload":{"type":"function_call_output","call_id":"c#","output":"{\"agent_id\":\"w#\"}"}}
+    ,
+    \\{"type":"response_item","payload":{"type":"function_call_output","call_id":"c#","output":"{\"task_name\":\"/root/w#\"}"}}
+    ,
+    \\{"type":"response_item","payload":{"type":"function_call","arguments":"{}","call_id":"c#","name":"collaboration.spawn_agent"}}
+    ,
+    \\{"type":"function_call","name":"spawn_agent","call_id":"c#","arguments":"{}"}
+    ,
+    \\{"type":"function_call_output","call_id":"c#","output":"{\"agent_id\":\"w#\"}"}
+    ,
+    \\{"type":"response_item","payload":{"type":"custom_tool_call","name":"spawn_agent","call_id":"c#","input":"{}"}}
+    ,
+    \\{"type":"response_item","payload":{"type":"custom_tool_call_output","call_id":"c#","output":"{\"agent_id\":\"w#\"}"}}
+    ,
+    \\{"call_id":"c#","name":"spawn_agent","arguments":"{}"}
+    ,
+    \\{"call_id":"c#","output":"{\"agent_id\":\"w#\"}"}
+    ,
+    \\{"type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"token_count #"}]}}
+    ,
+    \\{"type":"event_msg","payload":{"type":"agent_message","message":"sub_agent_activity spawn_agent #"}}
+    ,
+    \\{"record_type":"state","timestamp":"2026-07-26T10:00:0#Z"}
+    ,
+    \\{"type":"session_meta","payload":{"id":"s#"}}
+    ,
+    \\{"type":"event_msg","payload":{"type":"token_count"
+    ,
+    \\[#]
+    ,
+    "",
+};
+
+fn appendParityLine(
+    allocator: std.mem.Allocator,
+    out: *std.ArrayList(u8),
+    template: []const u8,
+    random: std.Random,
+) !void {
+    const digit: u8 = '0' + random.uintLessThan(u8, 3);
+    const spaced = random.uintLessThan(u8, 4) == 0;
+    for (template, 0..) |byte, index| {
+        const separator = byte == '"' and index + 1 < template.len and template[index + 1] == ':';
+        if (byte == '#') {
+            try out.append(allocator, digit);
+        } else if (spaced and separator) {
+            try out.appendSlice(allocator, "\" ");
+        } else {
+            try out.append(allocator, byte);
+        }
+    }
+    try out.append(allocator, '\n');
+}
+
+fn expectSameSessionFacts(full: SessionRecord, summary: SessionRecord) !void {
+    const fields = .{
+        "session_id",                     "cwd",                           "git_branch",
+        "git_commit_hash",                "git_repository_url",            "originator",
+        "cli_version",                    "model",                         "model_provider",
+        "thread_name",                    "is_external_worker",            "is_inline_worker",
+        "spawned_worker_count",           "root_session_id",               "parent_session_id",
+        "parent_relation",                "control_parent_session_id",     "forked_from_session_id",
+        "subagent_history_start_ordinal", "token_usage_observation_count", "lineage_conflict",
+        "service_tier",                   "source_format",
+    };
+    inline for (fields) |name| {
+        std.testing.expectEqualDeep(@field(full, name), @field(summary, name)) catch |err| {
+            std.debug.print("session field {s} differs\n", .{name});
+            return err;
+        };
+    }
+}
+
+fn expectParsersAgree(bytes: []const u8) !void {
+    const allocator = std.testing.allocator;
+    var reader = std.Io.Reader.fixed(bytes);
+    const io = std.testing.io;
+    const summary_result =
+        parseSessionSummaryTraceReader(io, allocator, "p.jsonl", &reader, 0, .{});
+    var full = parseSessionTraceBytes(io, allocator, "p.jsonl", bytes, 0, .{}) catch |err| {
+        if (summary_result) |value| {
+            var summary = value;
+            summary.deinit(allocator);
+            return error.TestUnexpectedResult;
+        } else |summary_err| return std.testing.expectEqual(err, summary_err);
+    };
+    defer full.deinit(allocator);
+    var summary = try summary_result;
+    defer summary.deinit(allocator);
+    try expectSameSessionFacts(full.session, summary.session);
+    try std.testing.expectEqualDeep(full.graph_edges.items, summary.graph_edges.items);
+}
+
+test "summary and full parses agree on every shared session fact" {
+    const allocator = std.testing.allocator;
+    var prng = std.Random.DefaultPrng.init(0x5eed_9a7e);
+    const random = prng.random();
+    var bytes: std.ArrayList(u8) = .empty;
+    defer bytes.deinit(allocator);
+    for (0..512) |_| {
+        bytes.clearRetainingCapacity();
+        const first = parity_first_lines[random.uintLessThan(usize, parity_first_lines.len)];
+        try appendParityLine(allocator, &bytes, first, random);
+        for (0..random.uintLessThan(usize, 16)) |_| {
+            const line = parity_lines[random.uintLessThan(usize, parity_lines.len)];
+            try appendParityLine(allocator, &bytes, line, random);
+        }
+        expectParsersAgree(bytes.items) catch |err| {
+            std.debug.print("parity counterexample:\n{s}\n", .{bytes.items});
+            return err;
+        };
+    }
 }
 
 test "unlocated forks warn only for spawns that establish a worker" {
