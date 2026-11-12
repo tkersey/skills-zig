@@ -182,6 +182,11 @@ A lineage definition streams (`partition-lineage-stream`) only when all of these
 - its projection reads no other scan, and the sessions scan declares only fields
   discovery seeds (identity, lineage, path, and token count fields).
 
+An expression reads or copies a field only through a `field` reference, as both
+expression evaluators resolve it; a string that names a field is a literal. The token
+count is the sessions scan's field, not a column that a derive defines under the same
+name.
+
 Streaming reduces each session after every session its rows can inherit from: its
 ancestors in the lineage join's checked graph input, and the session that its topmost
 ancestor there names as parent, which a filter on the graph input may leave out. It

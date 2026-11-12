@@ -1108,3 +1108,54 @@ digest_filtered=$("$binary" observe --definition "$work/digest-filtered.json" \
 printf '%s\n' "$digest_plain" "$digest_filtered" | jq -se '
   .[0].corpus.digest == .[1].corpus.digest and
   .[0].context.source_metadata_digest == .[1].context.source_metadata_digest' >/dev/null
+
+expression_home="$work/expression-home"
+mkdir -p "$expression_home/sessions"
+cp "$rollout" "$expression_home/sessions/one.jsonl"
+graph_derive() {
+  jq --argjson stages "$2" '.requires.operators += ["derive"] |
+    .selectors = ["path", "root", "session-id"] |
+    .pipeline = [.pipeline[0]] + $stages + .pipeline[1:] |
+    (.pipeline[] | select(.op == "join") | .inputs[2]) = "graph_rows"' \
+    "$lineage_definition" | jq "$3" >"$work/$1.json"
+}
+token_tag='{op: "derive", input: "session_rows", "as": "graph_rows", fields: [{name: "tag",
+  type: $type, nullable: true, expr: $expr}]}'
+graph_derive token-literal "$(jq -n --arg type string \
+  --argjson expr '"token_usage_observation_count"' "[$token_tag]")" \
+  '.relations[0].fields += ["token_usage_observation_count"]'
+graph_derive token-read "$(jq -n --arg type integer \
+  --argjson expr '{"field":"token_usage_observation_count"}' "[$token_tag]")" \
+  '.relations[0].fields += ["token_usage_observation_count"]'
+graph_derive token-defined '[{"op":"derive","input":"session_rows","as":"defined_rows",
+    "fields":[{"name":"token_usage_observation_count","type":"integer","nullable":false,
+      "expr":0}]},
+  {"op":"filter","input":"defined_rows","as":"graph_rows",
+    "where":[{"field":"token_usage_observation_count","op":"eq","value":0}]}]' .
+jq '.requires.operators += ["derive"] | .selectors = ["path", "root", "session-id"] |
+  .pipeline = .pipeline[0:3] + [{op: "derive", input: "assistant_rows", "as": "copied_rows",
+    preserve_input: false,
+    fields: [{name: "session_id", type: "string", nullable: false,
+        expr: {field: "session_id", note: "copy"}},
+      {name: "role", type: "string", nullable: true, expr: {field: "role"}},
+      {name: "source_event_id", type: "string", nullable: false,
+        expr: {field: "source_event_id"}}]}] + .pipeline[3:] |
+  (.pipeline[] | select(.op == "join") | .inputs) =
+    ["copied_rows", "copied_rows", "session_rows"]' \
+  "$lineage_definition" >"$work/copy-extra-key.json"
+for streaming in token-literal token-defined copy-extra-key; do
+  "$binary" explain --definition "$work/$streaming.json" --projection rows --format json |
+    jq -e '.strategy.kind == "partition-lineage-stream"' >/dev/null
+  CODEX_HOME="$expression_home" "$binary" observe --definition "$work/$streaming.json" \
+    --projection rows --session-id fixture-session --format json |
+    jq -e '.corpus.files == 1 and (.data.rows | length) == 1' >/dev/null
+done
+"$binary" explain --definition "$work/token-read.json" --projection rows --format json |
+  jq -e '.strategy.kind == "materialized-graph"' >/dev/null
+if token_read=$(CODEX_HOME="$expression_home" "$binary" observe \
+  --definition "$work/token-read.json" --projection rows --session-id fixture-session \
+  --format json); then
+  echo "a graph-input derive that reads the parsed token count streamed" >&2
+  exit 1
+fi
+jq -e '.code == "ObservationStreamingLineageShapeUnsupported"' <<<"$token_read" >/dev/null

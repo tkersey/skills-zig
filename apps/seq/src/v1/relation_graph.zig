@@ -195,70 +195,77 @@ fn requireBinding(
     if (bindings.find(name) == null) return error.MissingObservationParameter;
 }
 
+const parsed_session_field = "token_usage_observation_count";
+
 fn carriesSessionColumns(
     allocator: std.mem.Allocator,
     native_plan: *const plan.Plan,
     graph_stage: u16,
 ) !bool {
+    var reads_parsed_field = false;
     var current = graph_stage;
     for (0..native_plan.stages.len) |_| {
         const stage = native_plan.stages[current];
-        if (readsParsedSessionColumn(native_plan, stage)) return false;
+        const input = switch (stage.operation) {
+            .scan => return !reads_parsed_field,
+            else => switch (stage.source orelse return false) {
+                .stage => |index| index,
+                .external => return false,
+            },
+        };
         switch (stage.operation) {
-            .scan => return true,
-            .filter, .project, .alias, .sort => {},
+            .scan, .project, .alias, .sort => {},
+            .filter => |filter| for (filter.predicates) |predicate| {
+                const name = native_plan.stages[input].schema.columns[predicate.field_index].name;
+                if (std.mem.eql(u8, name, parsed_session_field)) reads_parsed_field = true;
+            },
             .generic => |generic| {
                 if (generic.operator != .derive) return false;
-                if (!try derivePreservesSessionColumns(allocator, generic.canonical_config)) {
-                    return false;
+                switch (try deriveSessionUse(allocator, generic.canonical_config)) {
+                    .replaces_session_columns => return false,
+                    .defines_parsed_field => reads_parsed_field = false,
+                    .reads_parsed_field => reads_parsed_field = true,
+                    .preserves_session_columns => {},
                 }
             },
             .limit, .top_k, .distinct, .aggregate => return false,
         }
-        current = switch (stage.source orelse return false) {
-            .stage => |index| index,
-            .external => return false,
-        };
+        current = input;
     }
     return false;
 }
 
-fn readsParsedSessionColumn(native_plan: *const plan.Plan, stage: plan.Stage) bool {
-    const name = "token_usage_observation_count";
-    const input = switch (stage.source orelse return false) {
-        .stage => |index| native_plan.stages[index],
-        .external => return false,
-    };
-    const column = input.schema.find(name) orelse return false;
-    return switch (stage.operation) {
-        .filter => |filter| for (filter.predicates) |predicate| {
-            if (predicate.field_index == column) break true;
-        } else false,
-        .generic => |generic| std.mem.indexOf(
-            u8,
-            generic.canonical_config,
-            "\"" ++ name ++ "\"",
-        ) != null,
-        else => false,
-    };
-}
+const DeriveSessionUse = enum {
+    replaces_session_columns,
+    defines_parsed_field,
+    reads_parsed_field,
+    preserves_session_columns,
+};
 
-fn derivePreservesSessionColumns(allocator: std.mem.Allocator, config: []const u8) !bool {
+fn deriveSessionUse(allocator: std.mem.Allocator, config: []const u8) !DeriveSessionUse {
     var parsed = try parseConfig(allocator, config);
     defer parsed.deinit();
     const root = try definition_core.json.object(parsed.value);
     if (root.get("preserve_input")) |raw| {
-        if (!try definition_core.json.boolean(raw)) return false;
+        if (!try definition_core.json.boolean(raw)) return .replaces_session_columns;
     }
     const fields = try definition_core.json.array(try definition_core.json.field(root, "fields"));
+    var defines = false;
+    var reads = false;
     for (fields.items) |item| {
         const field = try definition_core.json.object(item);
         const name = try definition_core.json.requiredString(field, "name");
         if (std.mem.eql(u8, name, "session_id") or std.mem.eql(u8, name, "parent_session_id")) {
-            return false;
+            return .replaces_session_columns;
+        }
+        defines = defines or std.mem.eql(u8, name, parsed_session_field);
+        const expression = field.get("expr") orelse continue;
+        if (try expressions.referencesField(allocator, expression, parsed_session_field)) {
+            reads = true;
         }
     }
-    return true;
+    if (defines) return .defines_parsed_field;
+    return if (reads) .reads_parsed_field else .preserves_session_columns;
 }
 
 fn seedsSessionFields(field_indices: []const u16) bool {
@@ -506,7 +513,9 @@ fn copiesSessionFields(outputs: std.json.Array) !bool {
         const field = try definition_core.json.object(item);
         const name = try definition_core.json.requiredString(field, "name");
         if (!std.mem.eql(u8, name, "session_id")) continue;
-        if (!copiesSessionExpression(try definition_core.json.field(field, "expr"))) return false;
+        const expression = try definition_core.json.field(field, "expr");
+        const copied = expressions.fieldReference(expression) orelse return false;
+        if (!std.mem.eql(u8, copied, "session_id")) return false;
     }
     return true;
 }
@@ -599,16 +608,6 @@ const PartitionContext = struct {
         return if (session) |text| .{ .string = text } else .null;
     }
 };
-
-fn copiesSessionExpression(raw: std.json.Value) bool {
-    const expr = switch (raw) {
-        .object => |object| object,
-        else => return false,
-    };
-    if (expr.count() != 1) return false;
-    const copied = expr.get("field") orelse return false;
-    return copied == .string and std.mem.eql(u8, copied.string, "session_id");
-}
 
 fn joinsSessionLocally(
     allocator: std.mem.Allocator,
@@ -4423,4 +4422,112 @@ test "only a bounded stage walk applies the depth law, before memoization and at
         null,
     );
     try std.testing.expectEqualSlices(bool, &.{ true, true, true }, &reachable);
+}
+
+const lineage_expression_template =
+    \\{"schema":"seq-observation-definition/v1","id":"test/lineage-expressions",
+    \\ "requires":{"abi":"seq-observation-abi/v1","operators":["derive","filter","join","scan"]},
+    \\ "parameters":{},"selectors":[],"inputs":[],
+    \\ "relations":[{"name":"sessions","fields":["session_id","parent_session_id"@TOKEN@]},
+    \\   {"name":"messages","fields":["session_id","source_event_id","role"]}],
+    \\ "pipeline":[{"op":"scan","relation":"sessions","as":"session_rows"},
+    \\   {"op":"scan","relation":"messages","as":"message_rows"},@STAGES@
+    \\   {"op":"join","inputs":["@LOCAL@","@LOCAL@","@GRAPH@"],"as":"owned_rows",
+    \\    "on":{"kind":"anti","keys":[{"left":"source_event_id","right":"source_event_id"}],
+    \\      "lineage":{"left":"session_id","right":"session_id","node":"session_id",
+    \\        "parent":"parent_session_id"}},
+    \\    "fields":[{"source":0,"field":"session_id","name":"session_id","type":"string",
+    \\      "nullable":false},{"source":0,"field":"source_event_id","name":"source_event_id",
+    \\      "type":"string","nullable":false}]}],
+    \\ "projections":{"rows":{"relation":"owned_rows","schema":"test/lineage-expressions/v1",
+    \\   "fields":["session_id","source_event_id"],"renderers":["json"]}},
+    \\ "bounds":{"max_rows":100,"max_output_bytes":4096,"max_fold_states":4,
+    \\   "max_input_bytes":1048576,"max_graph_depth":8,"max_graph_nodes":100,
+    \\   "max_diagnostics":8}}
+;
+
+const lineage_graph_derive =
+    \\{"op":"derive","input":"session_rows","as":"graph_rows","fields":[
+    \\  {"name":"tag","type":"string","nullable":true,"expr":@EXPR@}]},
+;
+
+const LineageExpressionCase = struct {
+    token: []const u8 = ",\"token_usage_observation_count\"",
+    stages: []const u8 = lineage_graph_derive,
+    expr: []const u8 = "",
+    local: []const u8 = "message_rows",
+    graph: []const u8 = "graph_rows",
+    streams: bool,
+};
+
+fn testLineageExpressionStreams(case: LineageExpressionCase) !bool {
+    const allocator = std.testing.allocator;
+    var source: []u8 = try allocator.dupe(u8, lineage_expression_template);
+    defer allocator.free(source);
+    const markers = [_][2][]const u8{
+        .{ "@TOKEN@", case.token },
+        .{ "@STAGES@", case.stages },
+        .{ "@LOCAL@", case.local },
+        .{ "@GRAPH@", case.graph },
+        .{ "@EXPR@", case.expr },
+    };
+    for (markers) |marker| {
+        const replaced = try std.mem.replaceOwned(u8, allocator, source, marker[0], marker[1]);
+        allocator.free(source);
+        source = replaced;
+    }
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "definition.json", .data = source });
+    var closure = try definition_core.closure.loadFromDir(
+        std.testing.io,
+        allocator,
+        &tmp.dir,
+        "definition.json",
+        .{},
+    );
+    defer closure.deinit(allocator);
+    var definition_plan = try definition.compile(allocator, &closure, "definition.json");
+    defer definition_plan.deinit(allocator);
+    var native_plan = try plan.compile(allocator, &definition_plan);
+    defer native_plan.deinit(allocator);
+    return try streamingLineagePlan(allocator, &definition_plan, &native_plan, "rows") != null;
+}
+
+test "streaming eligibility reads expressions through the evaluators' grammar" {
+    const cases = [_]LineageExpressionCase{
+        .{ .expr = "\"token_usage_observation_count\"", .streams = true },
+        .{ .expr = "{\"field\":\"token_usage_observation_count\"}", .streams = false },
+        .{
+            .expr = "{\"op\":\"concat\",\"args\":[{\"field\":\"token_usage_observation_count\"}]}",
+            .streams = false,
+        },
+        .{ .token = "", .streams = true, .stages =
+        \\{"op":"derive","input":"session_rows","as":"defined_rows","fields":[
+        \\  {"name":"token_usage_observation_count","type":"integer","nullable":false,
+        \\   "expr":0}]},
+        \\{"op":"filter","input":"defined_rows","as":"graph_rows","where":[
+        \\  {"field":"token_usage_observation_count","op":"eq","value":0}]},
+        },
+        .{ .streams = false, .stages =
+        \\{"op":"filter","input":"session_rows","as":"graph_rows","where":[
+        \\  {"field":"token_usage_observation_count","op":"eq","value":0}]},
+        },
+        .{ .token = "", .local = "local_rows", .graph = "session_rows", .streams = true, .stages =
+        \\{"op":"derive","input":"message_rows","as":"local_rows","preserve_input":false,
+        \\ "fields":[{"name":"session_id","type":"string","nullable":false,
+        \\   "expr":{"field":"session_id","note":"x"}},
+        \\  {"name":"source_event_id","type":"string","nullable":false,
+        \\   "expr":{"field":"source_event_id"}}]},
+        },
+        .{ .token = "", .local = "local_rows", .graph = "session_rows", .streams = false, .stages =
+        \\{"op":"derive","input":"message_rows","as":"local_rows","preserve_input":false,
+        \\ "fields":[{"name":"session_id","type":"string","nullable":false,"expr":"fixed"},
+        \\  {"name":"source_event_id","type":"string","nullable":false,
+        \\   "expr":{"field":"source_event_id"}}]},
+        },
+    };
+    for (cases) |case| {
+        try std.testing.expectEqual(case.streams, try testLineageExpressionStreams(case));
+    }
 }

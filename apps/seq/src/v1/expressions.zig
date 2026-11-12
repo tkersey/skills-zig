@@ -180,22 +180,19 @@ const ExpressionCompiler = struct {
         source: std.json.Value,
         object: std.json.ObjectMap,
     ) !CompiledExpr {
-        if (object.get("field")) |raw| return self.compileField(raw);
-        if (object.get("state") != null or object.get("param") != null or
-            object.get("selector") != null)
-        {
-            return .{ .dynamic = source };
-        }
-        const op = try definition_core.json.requiredString(object, "op");
-        const args = try definition_core.json.array(
-            try definition_core.json.field(object, "args"),
-        );
+        const operation = switch (try expressionForm(object)) {
+            .field => |raw| return self.compileField(raw),
+            .state, .param, .selector => return .{ .dynamic = source },
+            .operation => |operation| operation,
+        };
+        const op = operation.op;
+        const args = operation.args;
         if (std.mem.eql(u8, op, "coalesce")) {
-            return .{ .coalesce = try self.children(args.items) };
+            return .{ .coalesce = try self.children(args) };
         }
         if (std.mem.eql(u8, op, "if")) {
-            if (args.items.len != 3) return error.InvalidObservationExpressionArity;
-            const nodes = try self.children(args.items);
+            if (args.len != 3) return error.InvalidObservationExpressionArity;
+            const nodes = try self.children(args);
             return .{ .if_else = .{
                 .condition = nodes[0],
                 .then_value = nodes[1],
@@ -203,16 +200,16 @@ const ExpressionCompiler = struct {
             } };
         }
         if (std.mem.eql(u8, op, "is-null") or std.mem.eql(u8, op, "not")) {
-            if (args.items.len != 1) return error.InvalidObservationExpressionArity;
-            const nodes = try self.children(args.items);
+            if (args.len != 1) return error.InvalidObservationExpressionArity;
+            const nodes = try self.children(args);
             return if (std.mem.eql(u8, op, "is-null"))
                 .{ .is_null = nodes[0] }
             else
                 .{ .not = nodes[0] };
         }
         const compiled_op = parseCompiledOp(op) orelse return .{ .dynamic = source };
-        if (args.items.len != 2) return error.InvalidObservationExpressionArity;
-        const nodes = try self.children(args.items);
+        if (args.len != 2) return error.InvalidObservationExpressionArity;
+        const nodes = try self.children(args);
         return .{ .binary = .{ .op = compiled_op, .left = nodes[0], .right = nodes[1] } };
     }
 
@@ -428,32 +425,86 @@ fn inspectDynamicObject(
     object: std.json.ObjectMap,
     context: ExpressionContext,
 ) !ExpressionInspection {
-    if (object.get("field")) |raw| {
-        const name = try definition_core.json.string(raw);
-        const index = context.schema.find(name) orelse
-            return error.UnknownObservationExpressionField;
-        return .{ .value = context.row[index] };
-    }
-    if (object.get("state")) |raw| {
-        const name = try definition_core.json.string(raw);
-        const index = findName(context.state_names, name) orelse
-            return error.UnknownObservationFoldState;
-        return .{ .value = context.state[index] };
-    }
-    if (object.get("param")) |raw| {
-        const name = try definition_core.json.string(raw);
-        const binding = context.bindings.find(name) orelse return error.UnknownParameter;
-        return .{ .value = scalarValue(binding.value) };
-    }
-    if (object.get("selector")) |raw| {
-        return .{ .value = try selectorValue(
+    switch (try expressionForm(object)) {
+        .field => |raw| {
+            const name = try definition_core.json.string(raw);
+            const index = context.schema.find(name) orelse
+                return error.UnknownObservationExpressionField;
+            return .{ .value = context.row[index] };
+        },
+        .state => |raw| {
+            const name = try definition_core.json.string(raw);
+            const index = findName(context.state_names, name) orelse
+                return error.UnknownObservationFoldState;
+            return .{ .value = context.state[index] };
+        },
+        .param => |raw| {
+            const name = try definition_core.json.string(raw);
+            const binding = context.bindings.find(name) orelse return error.UnknownParameter;
+            return .{ .value = scalarValue(binding.value) };
+        },
+        .selector => |raw| return .{ .value = try selectorValue(
             context.selectors,
             try definition_core.json.string(raw),
-        ) };
+        ) },
+        .operation => |operation| return expressionBranch(operation.op, operation.args.len),
     }
+}
+
+const ExpressionForm = union(enum) {
+    field: std.json.Value,
+    state: std.json.Value,
+    param: std.json.Value,
+    selector: std.json.Value,
+    operation: struct { op: []const u8, args: []const std.json.Value },
+};
+
+fn expressionForm(object: std.json.ObjectMap) !ExpressionForm {
+    if (object.get("field")) |raw| return .{ .field = raw };
+    if (object.get("state")) |raw| return .{ .state = raw };
+    if (object.get("param")) |raw| return .{ .param = raw };
+    if (object.get("selector")) |raw| return .{ .selector = raw };
     const op = try definition_core.json.requiredString(object, "op");
     const args = try definition_core.json.array(try definition_core.json.field(object, "args"));
-    return expressionBranch(op, args.items.len);
+    return .{ .operation = .{ .op = op, .args = args.items } };
+}
+
+pub fn fieldReference(expression: std.json.Value) ?[]const u8 {
+    const object = switch (expression) {
+        .object => |object| object,
+        else => return null,
+    };
+    const form = expressionForm(object) catch return null;
+    return switch (form) {
+        .field => |raw| definition_core.json.string(raw) catch null,
+        .state, .param, .selector, .operation => null,
+    };
+}
+
+pub fn referencesField(
+    allocator: std.mem.Allocator,
+    expression: std.json.Value,
+    name: []const u8,
+) !bool {
+    var pending: std.ArrayList(std.json.Value) = .empty;
+    defer pending.deinit(allocator);
+    try pending.append(allocator, expression);
+    while (pending.pop()) |node| {
+        const object = switch (node) {
+            .object => |object| object,
+            else => continue,
+        };
+        const form = expressionForm(object) catch continue;
+        switch (form) {
+            .field => |raw| {
+                const referenced = definition_core.json.string(raw) catch continue;
+                if (std.mem.eql(u8, referenced, name)) return true;
+            },
+            .state, .param, .selector => {},
+            .operation => |operation| try pending.appendSlice(allocator, operation.args),
+        }
+    }
+    return false;
 }
 
 const ExpressionFrame = struct {
@@ -835,4 +886,159 @@ test "native expression text budget bounds live concat frames before allocation"
     defer lazy_parsed.deinit();
     const result = try workspace.evaluate(.{ .dynamic = lazy_parsed.value }, context);
     try std.testing.expectEqualStrings("ok", result.string);
+}
+
+const query_compiled_ops = [_][]const u8{ "coalesce", "if", "is-null", "not", "eq", "add" };
+const query_compiled_leaves = [_][]const u8{
+    "\"token\"",
+    "\"a\"",
+    "7",
+    "null",
+    "true",
+    "{\"field\":\"a\"}",
+    "{\"field\":\"token\"}",
+    "{\"field\":\"a\",\"note\":\"token\"}",
+    "{\"field\":\"token\",\"note\":\"a\"}",
+    "{\"field\":\"b\",\"op\":\"eq\",\"args\":[{\"field\":\"token\"},1]}",
+    "{\"param\":\"token\"}",
+    "{\"selector\":\"root\"}",
+    "{\"state\":\"token\"}",
+    "[{\"field\":\"token\"}]",
+};
+const query_dynamic_leaves = [_][]const u8{
+    "\"token\"",
+    "\"a\"",
+    "{\"field\":\"a\"}",
+    "{\"field\":\"b\"}",
+    "{\"field\":\"token\"}",
+    "{\"field\":\"a\",\"note\":\"token\"}",
+    "{\"field\":\"token\",\"note\":\"x\"}",
+    "{\"field\":\"b\",\"op\":\"concat\",\"args\":[{\"field\":\"token\"}]}",
+    "{\"param\":\"token\"}",
+    "{\"selector\":\"root\"}",
+};
+
+fn queryTestSource(arena: std.mem.Allocator, random: std.Random, compiled: bool) ![]const u8 {
+    const leaves: []const []const u8 = if (compiled)
+        &query_compiled_leaves
+    else
+        &query_dynamic_leaves;
+    var fragments: std.ArrayList([]const u8) = .empty;
+    for (0..1 + random.uintLessThan(usize, 3)) |_| {
+        try fragments.append(arena, leaves[random.uintLessThan(usize, leaves.len)]);
+    }
+    for (0..random.uintLessThan(usize, 6)) |_| {
+        const items = fragments.items;
+        const x = items[random.uintLessThan(usize, items.len)];
+        const y = items[random.uintLessThan(usize, items.len)];
+        const z = items[random.uintLessThan(usize, items.len)];
+        const op = if (compiled)
+            query_compiled_ops[random.uintLessThan(usize, query_compiled_ops.len)]
+        else
+            "concat";
+        const args = if (std.mem.eql(u8, op, "if"))
+            try std.fmt.allocPrint(arena, "{s},{s},{s}", .{ x, y, z })
+        else if (std.mem.eql(u8, op, "is-null") or std.mem.eql(u8, op, "not"))
+            x
+        else
+            try std.fmt.allocPrint(arena, "{s},{s}", .{ x, y });
+        try fragments.append(arena, try std.fmt.allocPrint(
+            arena,
+            "{{\"op\":\"{s}\",\"args\":[{s}]}}",
+            .{ op, args },
+        ));
+    }
+    return fragments.items[fragments.items.len - 1];
+}
+
+fn queryTestEvaluate(
+    arena: std.mem.Allocator,
+    node: ExpressionNode,
+    schema: *const plan.Schema,
+    row: []const Value,
+    bindings: *const definition_core.parameters.Bindings,
+    config_bytes: usize,
+) !Value {
+    var workspace: ExpressionWorkspace = .{
+        .allocator = std.testing.allocator,
+        .config_bytes = config_bytes,
+    };
+    defer workspace.deinit();
+    return workspace.evaluate(node, .{
+        .allocator = arena,
+        .row = row,
+        .schema = schema,
+        .bindings = bindings,
+        .selectors = .{ .root = "vr" },
+    });
+}
+
+test "planner field queries agree with the compiler and the dynamic evaluator" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var full_columns = [_]plan.Column{
+        .{ .name = @constCast("a"), .kind = .string, .nullable = false },
+        .{ .name = @constCast("token"), .kind = .string, .nullable = false },
+        .{ .name = @constCast("b"), .kind = .string, .nullable = false },
+    };
+    var renamed_columns = full_columns;
+    renamed_columns[1].name = @constCast("renamed");
+    const full: plan.Schema = .{ .columns = &full_columns };
+    const renamed: plan.Schema = .{ .columns = &renamed_columns };
+    const row = [_]Value{ .{ .string = "va" }, .{ .string = "vt" }, .{ .string = "vb" } };
+    var binding_items = [_]definition_core.parameters.Binding{
+        .{ .name = @constCast("token"), .value = .{ .string = @constCast("vp") } },
+    };
+    const bindings: definition_core.parameters.Bindings = .{
+        .items = &binding_items,
+        .values_digest = @splat(0),
+    };
+    var prng = std.Random.DefaultPrng.init(0x14_1414);
+    for (0..512) |_| for ([_]bool{ true, false }) |compiled_grammar| {
+        const source = try queryTestSource(arena, prng.random(), compiled_grammar);
+        const expression = (try parseConfig(arena, source)).value;
+        const references = try referencesField(std.testing.allocator, expression, "token");
+        const compiled = try compileExpr(arena, expression, &full, null, 0);
+        if (compiled_grammar) {
+            const unresolved = if (compileExpr(arena, expression, &renamed, null, 0)) |_|
+                false
+            else |err| switch (err) {
+                error.UnknownObservationExpressionField => true,
+                else => return err,
+            };
+            try std.testing.expectEqual(unresolved, references);
+        } else {
+            const dynamic: ExpressionNode = .{ .dynamic = expression };
+            const present =
+                try queryTestEvaluate(arena, dynamic, &full, &row, &bindings, source.len);
+            const through_compiled = try queryTestEvaluate(
+                arena,
+                .{ .compiled = compiled },
+                &full,
+                &row,
+                &bindings,
+                source.len,
+            );
+            try std.testing.expectEqualStrings(present.string, through_compiled.string);
+            const absent = queryTestEvaluate(arena, dynamic, &renamed, &row, &bindings, source.len);
+            if (references) {
+                try std.testing.expectError(error.UnknownObservationExpressionField, absent);
+            } else {
+                try std.testing.expectEqualStrings(present.string, (try absent).string);
+            }
+        }
+        const copied: ?[]const u8 = switch (compiled.*) {
+            .field => |index| full.columns[index].name,
+            else => null,
+        };
+        const reference = fieldReference(expression);
+        try std.testing.expectEqual(copied == null, reference == null);
+        if (reference) |name| {
+            try std.testing.expectEqualStrings(copied.?, name);
+            const dynamic: ExpressionNode = .{ .dynamic = expression };
+            const value = try queryTestEvaluate(arena, dynamic, &full, &row, &bindings, source.len);
+            try std.testing.expectEqualStrings(row[full.find(name).?].string, value.string);
+        }
+    };
 }
