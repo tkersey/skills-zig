@@ -5,14 +5,9 @@ const definition = @import("definition.zig");
 const plan = @import("plan.zig");
 const physical = @import("physical.zig");
 
-pub const Value = union(enum) {
-    string: []const u8,
-    integer: i64,
-    float: f64,
-    boolean: bool,
-    json: []const u8,
-    null,
-};
+const value_module = @import("value.zig");
+pub const Value = value_module.Value;
+const expressions = @import("expressions.zig");
 
 pub const Rows = struct {
     values: []const Value,
@@ -87,6 +82,7 @@ pub const RuntimeTopK = struct {
 pub const RuntimeOperation = union(enum) {
     filter_all: PredicateRange,
     filter_any: PredicateRange,
+    derive: u16,
     limit: struct {
         count: usize,
         state_index: u16,
@@ -95,6 +91,17 @@ pub const RuntimeOperation = union(enum) {
     top_k: RuntimeTopK,
     distinct: FieldRange,
     aggregate: FieldRange,
+};
+
+const RuntimeDerivation = struct {
+    compiled: expressions.Derivation,
+    input_fields: []u16,
+
+    fn deinit(self: *RuntimeDerivation, allocator: std.mem.Allocator) void {
+        self.compiled.deinit();
+        allocator.free(self.input_fields);
+        self.* = undefined;
+    }
 };
 
 pub const Program = struct {
@@ -112,8 +119,15 @@ pub const Program = struct {
     limit_state_count: u16,
     first_blocking_operation: ?u16,
     max_rows: usize,
+    derivations: []RuntimeDerivation = &.{},
+    streaming_row_width: u16 = 0,
+    expression_byte_bound: usize = 0,
+    bindings: ?definition_core.parameters.Bindings = null,
+    selectors: expressions.RuntimeSelectors = .{},
 
     pub fn deinit(self: *Program, allocator: std.mem.Allocator) void {
+        for (self.derivations) |*derivation| derivation.deinit(allocator);
+        allocator.free(self.derivations);
         allocator.free(self.source_field_indices);
         allocator.free(self.materialized_field_indices);
         allocator.free(self.operations);
@@ -215,6 +229,43 @@ pub fn compile(
         projection_name,
     ) orelse return error.UnknownObservationProjection;
     const projection = native_plan.projections[projection_index];
+    return compileProjection(allocator, definition_plan, native_plan, bindings, &projection);
+}
+
+pub fn compileTarget(
+    allocator: std.mem.Allocator,
+    definition_plan: *const definition.Plan,
+    native_plan: *const plan.Plan,
+    bindings: *const definition_core.parameters.Bindings,
+    stage_index: u16,
+    selectors: expressions.RuntimeSelectors,
+) !Program {
+    const fields = try allocator.alloc(u16, native_plan.stages[stage_index].schema.columns.len);
+    defer allocator.free(fields);
+    for (fields, 0..) |*field, index| field.* = @intCast(index);
+    const projection: plan.Projection = .{
+        .definition_index = 0,
+        .stage_index = stage_index,
+        .field_indices = fields,
+    };
+    var program = try compileProjection(
+        allocator,
+        definition_plan,
+        native_plan,
+        bindings,
+        &projection,
+    );
+    program.selectors = selectors;
+    return program;
+}
+
+fn compileProjection(
+    allocator: std.mem.Allocator,
+    definition_plan: *const definition.Plan,
+    native_plan: *const plan.Plan,
+    bindings: *const definition_core.parameters.Bindings,
+    projection: *const plan.Projection,
+) !Program {
     const resolved = try resolveSource(
         definition_plan,
         native_plan,
@@ -236,7 +287,7 @@ pub fn compile(
         ];
         try builder.applyStage(stage);
     }
-    return builder.finish(&resolved, &projection);
+    return builder.finish(&resolved, projection);
 }
 
 const ResolvedSource = struct {
@@ -303,6 +354,8 @@ const ProgramBuilder = struct {
     distinct_fields: std.ArrayList(u16) = .empty,
     aggregate_metrics: std.ArrayList(RuntimeAggregateMetric) = .empty,
     materialized_field_indices: std.ArrayList(u16) = .empty,
+    derivations: std.ArrayList(RuntimeDerivation) = .empty,
+    streaming_row_width: usize,
     limit_state_count: u16 = 0,
     first_blocking_operation: ?u16 = null,
     aggregate_seen: bool = false,
@@ -324,6 +377,7 @@ const ProgramBuilder = struct {
             .bindings = bindings,
             .field_map = undefined,
             .field_count = source_width,
+            .streaming_row_width = source_width,
         };
         for (builder.field_map[0..source_width], 0..) |*field, index| {
             field.* = @intCast(index);
@@ -332,6 +386,8 @@ const ProgramBuilder = struct {
     }
 
     fn deinit(self: *ProgramBuilder) void {
+        for (self.derivations.items) |*derivation| derivation.deinit(self.allocator);
+        self.derivations.deinit(self.allocator);
         self.predicates.deinit(self.allocator);
         self.operations.deinit(self.allocator);
         self.sort_keys.deinit(self.allocator);
@@ -353,8 +409,47 @@ const ProgramBuilder = struct {
             .aggregate => |aggregate| {
                 try self.applyAggregate(aggregate, stage);
             },
-            .generic => return error.ObservationGraphOperatorRequiresGraphExecutor,
+            .generic => |generic| {
+                if (generic.operator != .derive) {
+                    return error.ObservationGraphOperatorRequiresGraphExecutor;
+                }
+                try self.applyDerive(stage);
+            },
         }
+    }
+
+    fn applyDerive(self: *ProgramBuilder, stage: *const plan.Stage) !void {
+        try self.requireStreaming();
+        if (self.first_blocking_operation != null) {
+            return error.ObservationGraphOperatorRequiresGraphExecutor;
+        }
+        const input = switch (stage.source orelse
+            return error.ObservationPipelineSourceMissing) {
+            .stage => |index| &self.native_plan.stages[index].schema,
+            .external => return error.ObservationGraphOperatorRequiresGraphExecutor,
+        };
+        var compiled = try expressions.Derivation.init(
+            self.allocator,
+            input,
+            &stage.schema,
+            stage.operation.generic.canonical_config,
+        );
+        errdefer compiled.deinit();
+        if (compiled.output_width > self.field_map.len) {
+            return error.InvalidObservationSourceWidth;
+        }
+        const fields = try self.allocator.dupe(u16, self.field_map[0..self.field_count]);
+        errdefer self.allocator.free(fields);
+        try self.operations.append(self.allocator, .{
+            .derive = @intCast(self.derivations.items.len),
+        });
+        try self.derivations.append(self.allocator, .{
+            .compiled = compiled,
+            .input_fields = fields,
+        });
+        self.field_count = compiled.output_width;
+        for (self.field_map[0..self.field_count], 0..) |*field, index| field.* = @intCast(index);
+        self.streaming_row_width = @max(self.streaming_row_width, self.field_count);
     }
 
     fn requireStreaming(self: ProgramBuilder) !void {
@@ -599,6 +694,7 @@ const ProgramBuilder = struct {
         const aggregate_metric_slice =
             try self.aggregate_metrics.toOwnedSlice(self.allocator);
         errdefer self.allocator.free(aggregate_metric_slice);
+        const derivations = try self.derivations.toOwnedSlice(self.allocator);
         return .{
             .source = resolved.source,
             .source_width = @intCast(resolved.source_width),
@@ -614,6 +710,10 @@ const ProgramBuilder = struct {
             .limit_state_count = self.limit_state_count,
             .first_blocking_operation = self.first_blocking_operation,
             .max_rows = self.native_plan.max_rows,
+            .derivations = derivations,
+            .streaming_row_width = @intCast(self.streaming_row_width),
+            .expression_byte_bound = self.definition_plan.bounds.max_output_bytes,
+            .bindings = self.bindings.*,
         };
     }
 
@@ -692,6 +792,8 @@ pub const Runner = struct {
     output_row_count: usize = 0,
     stopped: bool = false,
     finalized: bool = false,
+    expression_workspace: ?expressions.ExpressionWorkspace = null,
+    expression_buffer: []u8 = &.{},
 
     pub fn init(program: *const Program, output: []Value) !Runner {
         try validateRunnerInputs(program);
@@ -787,6 +889,20 @@ pub const Runner = struct {
         errdefer runner.deinit();
         runner.value_allocator = allocator;
         runner.owned_value_bytes_max = owned_value_bytes_max;
+        if (program.derivations.len != 0) {
+            const bound = @min(owned_value_bytes_max, program.expression_byte_bound);
+            if (bound == 0) return error.ObservationRetainedValueByteBoundInvalid;
+            runner.expression_buffer = try allocator.alloc(u8, bound);
+            var config_bytes: usize = 0;
+            for (program.derivations) |derivation| {
+                config_bytes = @max(config_bytes, derivation.compiled.config_bytes);
+            }
+            runner.expression_workspace = .{
+                .allocator = allocator,
+                .config_bytes = config_bytes,
+                .text_budget = .{ .max_bytes = bound },
+            };
+        }
         if (streamingTopK(program) != null) {
             runner.top_k_owned_values = try allocator.alloc(
                 std.ArrayList([]u8),
@@ -798,6 +914,7 @@ pub const Runner = struct {
     }
 
     pub fn deinit(self: *Runner) void {
+        if (self.expression_workspace) |*workspace| workspace.deinit();
         if (self.allocator) |allocator| {
             allocator.free(self.materialized);
             allocator.free(self.row_refs);
@@ -805,6 +922,7 @@ pub const Runner = struct {
             allocator.free(self.duplicate_marks);
         }
         if (self.value_allocator) |allocator| {
+            allocator.free(self.expression_buffer);
             for (self.top_k_owned_values) |*values| {
                 for (values.items) |value| allocator.free(value);
                 values.deinit(allocator);
@@ -830,24 +948,36 @@ pub const Runner = struct {
             }
         }
         self.source_row_count += 1;
-
+        var scratch: [256]Value = undefined;
+        var expression_buffer: ExpressionBuffer = .{ .fixed = .init(self.expression_buffer) };
+        const working = if (self.program.derivations.len == 0) @constCast(row) else derived: {
+            if (self.expression_workspace == null) {
+                return error.ObservationDerivationWorkspaceRequired;
+            }
+            @memcpy(scratch[0..row.len], row);
+            break :derived scratch[0..self.program.streaming_row_width];
+        };
         const operation_end = self.program.first_blocking_operation orelse
             self.program.operations.len;
-        const disposition = try self.applyStreaming(
-            row,
+        const disposition = self.applyStreaming(
+            working,
             self.program.operations[0..operation_end],
-        );
+            expression_buffer.allocator(),
+        ) catch |err| return if (err == error.OutOfMemory and expression_buffer.exhausted)
+            error.ObservationExpressionByteBoundExceeded
+        else
+            err;
         if (disposition.accepted) {
             if (streamingTopK(self.program)) |top_k| {
                 try self.materializeTopK(
-                    row,
+                    working,
                     top_k,
                     self.source_row_count - 1,
                 );
             } else if (self.program.first_blocking_operation != null) {
-                try self.materialize(row);
+                try self.materialize(working);
             } else {
-                try self.append(row);
+                try self.append(working);
             }
         }
         if (disposition.stop_after_row) {
@@ -890,6 +1020,7 @@ pub const Runner = struct {
                         range,
                     ),
                     .aggregate => return error.ObservationAggregateAfterBlocking,
+                    .derive => return error.ObservationDerivationAfterBlocking,
                 };
                 resetOrdinals(self.row_refs[0..active_count]);
             }
@@ -923,13 +1054,15 @@ pub const Runner = struct {
 
     fn applyStreaming(
         self: *Runner,
-        row: []const Value,
+        row: []Value,
         operations: []const RuntimeOperation,
+        expression_allocator: std.mem.Allocator,
     ) !StreamingDisposition {
         var accepted = true;
         var stop_after_row = false;
         for (operations) |operation| {
             switch (operation) {
+                .derive => |index| try self.applyDerivation(row, index, expression_allocator),
                 .filter_all => |range| {
                     if (!self.rowMatches(row, range, .all)) {
                         accepted = false;
@@ -968,6 +1101,28 @@ pub const Runner = struct {
             .accepted = accepted,
             .stop_after_row = stop_after_row,
         };
+    }
+
+    fn applyDerivation(
+        self: *Runner,
+        row: []Value,
+        index: u16,
+        allocator: std.mem.Allocator,
+    ) !void {
+        const derivation = &self.program.derivations[index];
+        var input: [256]Value = undefined;
+        var output: [256]Value = undefined;
+        for (derivation.input_fields, 0..) |field, column| input[column] = row[field];
+        try derivation.compiled.apply(
+            &self.expression_workspace.?,
+            allocator,
+            &self.program.bindings.?,
+            self.program.selectors,
+            input[0..derivation.input_fields.len],
+            output[0..derivation.compiled.output_width],
+        );
+        const width = derivation.compiled.output_width;
+        @memcpy(row[0..width], output[0..width]);
     }
 
     fn rowMatches(
@@ -1025,8 +1180,11 @@ pub const Runner = struct {
             return;
         }
         const worst_index = self.auxiliary_refs[0].row_index;
+        var projected: [256]Value = undefined;
+        const fields = self.program.materialized_field_indices;
+        for (fields, 0..) |field, index| projected[index] = row[field];
         if (!rowSortsBefore(
-            row,
+            projected[0..fields.len],
             ordinal,
             self.materializedRow(worst_index),
             self.row_refs[worst_index].ordinal,
@@ -1520,6 +1678,54 @@ fn sortKeySlice(
     return program.sort_keys[range.start..end];
 }
 
+const ExpressionBuffer = struct {
+    fixed: std.heap.FixedBufferAllocator,
+    exhausted: bool = false,
+
+    fn allocator(self: *ExpressionBuffer) std.mem.Allocator {
+        return .{ .ptr = self, .vtable = &.{
+            .alloc = alloc,
+            .resize = resize,
+            .remap = remap,
+            .free = free,
+        } };
+    }
+
+    fn alloc(context: *anyopaque, len: usize, alignment: std.mem.Alignment, ret: usize) ?[*]u8 {
+        const self: *ExpressionBuffer = @ptrCast(@alignCast(context));
+        const memory = self.fixed.allocator().rawAlloc(len, alignment, ret);
+        if (memory == null) self.exhausted = true;
+        return memory;
+    }
+
+    fn resize(
+        context: *anyopaque,
+        memory: []u8,
+        alignment: std.mem.Alignment,
+        new_len: usize,
+        ret: usize,
+    ) bool {
+        const self: *ExpressionBuffer = @ptrCast(@alignCast(context));
+        return self.fixed.allocator().rawResize(memory, alignment, new_len, ret);
+    }
+
+    fn remap(
+        context: *anyopaque,
+        memory: []u8,
+        alignment: std.mem.Alignment,
+        new_len: usize,
+        ret: usize,
+    ) ?[*]u8 {
+        const self: *ExpressionBuffer = @ptrCast(@alignCast(context));
+        return self.fixed.allocator().rawRemap(memory, alignment, new_len, ret);
+    }
+
+    fn free(context: *anyopaque, memory: []u8, alignment: std.mem.Alignment, ret: usize) void {
+        const self: *ExpressionBuffer = @ptrCast(@alignCast(context));
+        self.fixed.allocator().rawFree(memory, alignment, ret);
+    }
+};
+
 fn rowSortsBefore(
     left_row: []const Value,
     left_ordinal: usize,
@@ -1528,21 +1734,13 @@ fn rowSortsBefore(
     keys: []const RuntimeSortKey,
 ) bool {
     for (keys) |key| {
-        const left_value = left_row[key.field_index];
-        const right_value = right_row[key.field_index];
-        const order = compareForSort(
-            left_value,
-            right_value,
-            key.nulls,
+        const order = value_module.sortOrder(
+            left_row[key.field_index],
+            right_row[key.field_index],
+            key.direction == .descending,
+            key.nulls == .first,
         );
-        if (order == .eq) continue;
-        if (left_value == .null or right_value == .null) {
-            return order == .lt;
-        }
-        return if (key.direction == .ascending)
-            order == .lt
-        else
-            order == .gt;
+        if (order != .eq) return order == .lt;
     }
     return left_ordinal < right_ordinal;
 }
@@ -1570,7 +1768,7 @@ const DistinctContext = struct {
         const left_row = context.runner.materializedRow(left.row_index);
         const right_row = context.runner.materializedRow(right.row_index);
         for (context.fields) |field_index| {
-            const order = compareValues(
+            const order = value_module.order(
                 left_row[field_index],
                 right_row[field_index],
             );
@@ -1589,112 +1787,13 @@ fn distinctKeysEqual(
     const left_row = runner.materializedRow(left.row_index);
     const right_row = runner.materializedRow(right.row_index);
     for (fields) |field_index| {
-        if (!valuesEqual(
+        if (!value_module.equal(
             left_row[field_index],
             right_row[field_index],
             false,
         )) return false;
     }
     return true;
-}
-
-fn compareForSort(
-    left: Value,
-    right: Value,
-    nulls: plan.NullOrder,
-) std.math.Order {
-    if (left == .null or right == .null) {
-        if (left == .null and right == .null) return .eq;
-        const left_first = nulls == .first;
-        return if (left == .null)
-            if (left_first) .lt else .gt
-        else if (left_first)
-            .gt
-        else
-            .lt;
-    }
-    return compareValues(left, right);
-}
-
-fn compareValues(left: Value, right: Value) std.math.Order {
-    return switch (left) {
-        .string => |left_text| switch (right) {
-            .string => |right_text| std.mem.order(
-                u8,
-                left_text,
-                right_text,
-            ),
-            else => compareValueTags(left, right),
-        },
-        .integer => |left_number| switch (right) {
-            .integer => |right_number| std.math.order(
-                left_number,
-                right_number,
-            ),
-            .float => |right_number| compareIntegerFloat(
-                left_number,
-                right_number,
-            ),
-            else => compareValueTags(left, right),
-        },
-        .float => |left_number| switch (right) {
-            .integer => |right_number| switch (compareIntegerFloat(
-                right_number,
-                left_number,
-            )) {
-                .lt => .gt,
-                .eq => .eq,
-                .gt => .lt,
-            },
-            .float => |right_number| compareFloat(
-                left_number,
-                right_number,
-            ),
-            else => compareValueTags(left, right),
-        },
-        .boolean => |left_flag| switch (right) {
-            .boolean => |right_flag| std.math.order(
-                @intFromBool(left_flag),
-                @intFromBool(right_flag),
-            ),
-            else => compareValueTags(left, right),
-        },
-        .json => |left_json| switch (right) {
-            .json => |right_json| std.mem.order(
-                u8,
-                left_json,
-                right_json,
-            ),
-            else => compareValueTags(left, right),
-        },
-        .null => if (right == .null) .eq else .lt,
-    };
-}
-
-fn compareFloat(left: f64, right: f64) std.math.Order {
-    if (left < right) return .lt;
-    if (left > right) return .gt;
-    return .eq;
-}
-
-fn compareIntegerFloat(left: i64, right: f64) std.math.Order {
-    const integer_min: f64 = -9_223_372_036_854_775_808.0;
-    const integer_limit: f64 = 9_223_372_036_854_775_808.0;
-    if (right < integer_min) return .gt;
-    if (right >= integer_limit) return .lt;
-    const truncated: i64 = @intFromFloat(right);
-    const integer_order = std.math.order(left, truncated);
-    if (integer_order != .eq) return integer_order;
-    if (right > 0 and right != @trunc(right)) return .lt;
-    if (right < 0 and right != @trunc(right)) return .gt;
-    return .eq;
-}
-
-fn compareValueTags(left: Value, right: Value) std.math.Order {
-    return std.math.order(
-        @backingInt(std.meta.activeTag(left)),
-        @backingInt(std.meta.activeTag(right)),
-    );
 }
 
 pub fn execute(
@@ -1739,14 +1838,10 @@ fn executeRunner(
 }
 
 fn matches(value: Value, predicate: RuntimePredicate) bool {
-    const equal = valuesEqual(
-        value,
-        predicate.operand,
-        predicate.case_insensitive,
-    );
+    const operand = predicate.operand;
     return switch (predicate.operator) {
-        .exact => equal,
-        .not_equal => !equal,
+        .exact => value_module.equal(value, operand, predicate.case_insensitive),
+        .not_equal => !value_module.equal(value, operand, predicate.case_insensitive),
         .contains => stringOperation(
             value,
             predicate.operand,
@@ -1765,36 +1860,11 @@ fn matches(value: Value, predicate: RuntimePredicate) bool {
             predicate.case_insensitive,
             .suffix,
         ),
-        .less_than => if (numericOrder(value, predicate.operand)) |order|
-            order == .lt
-        else
-            false,
-        .less_or_equal => if (numericOrder(
-            value,
-            predicate.operand,
-        )) |order|
-            order == .lt or order == .eq
-        else
-            false,
-        .greater_than => if (numericOrder(value, predicate.operand)) |order|
-            order == .gt
-        else
-            false,
-        .greater_or_equal => if (numericOrder(
-            value,
-            predicate.operand,
-        )) |order|
-            order == .gt or order == .eq
-        else
-            false,
+        .less_than => value_module.holds(value, operand, .lt),
+        .less_or_equal => value_module.holds(value, operand, .le),
+        .greater_than => value_module.holds(value, operand, .gt),
+        .greater_or_equal => value_module.holds(value, operand, .ge),
     };
-}
-
-fn numericOrder(left: Value, right: Value) ?std.math.Order {
-    const left_numeric = left == .integer or left == .float;
-    const right_numeric = right == .integer or right == .float;
-    if (!left_numeric or !right_numeric) return null;
-    return compareValues(left, right);
 }
 
 const StringOperation = enum { contains, prefix, suffix };
@@ -1840,43 +1910,6 @@ fn containsIgnoreCase(haystack: []const u8, needle: []const u8) bool {
         )) return true;
     }
     return false;
-}
-
-fn valuesEqual(left: Value, right: Value, case_insensitive: bool) bool {
-    return switch (left) {
-        .string => |left_text| switch (right) {
-            .string => |right_text| if (case_insensitive)
-                std.ascii.eqlIgnoreCase(left_text, right_text)
-            else
-                std.mem.eql(u8, left_text, right_text),
-            else => false,
-        },
-        .integer => |left_number| switch (right) {
-            .integer => |right_number| left_number == right_number,
-            .float => |right_number| compareIntegerFloat(
-                left_number,
-                right_number,
-            ) == .eq,
-            else => false,
-        },
-        .float => |left_number| switch (right) {
-            .integer => |right_number| compareIntegerFloat(
-                right_number,
-                left_number,
-            ) == .eq,
-            .float => |right_number| left_number == right_number,
-            else => false,
-        },
-        .boolean => |left_flag| switch (right) {
-            .boolean => |right_flag| left_flag == right_flag,
-            else => false,
-        },
-        .json => |left_json| switch (right) {
-            .json => |right_json| std.mem.eql(u8, left_json, right_json),
-            else => false,
-        },
-        .null => right == .null,
-    };
 }
 
 fn findProjection(
@@ -2642,30 +2675,51 @@ test "compiled aggregate streams bounded numeric summaries in one pass" {
     );
 }
 
+test "native predicates and ordering stay defined for NaN against integers" {
+    const nan: Value = .{ .float = std.math.nan(f64) };
+    for ([_]plan.PredicateOperator{
+        .less_than, .less_or_equal, .greater_than, .greater_or_equal, .exact,
+    }) |operator| {
+        try std.testing.expect(!matches(nan, .{
+            .field_index = 0,
+            .operator = operator,
+            .operand = .{ .integer = 1 },
+            .case_insensitive = false,
+        }));
+    }
+    const keys = [_]RuntimeSortKey{
+        .{ .field_index = 0, .direction = .descending, .nulls = .last },
+    };
+    const integer_row = [_]Value{.{ .integer = 1 }};
+    const nan_row = [_]Value{nan};
+    try std.testing.expect(rowSortsBefore(&nan_row, 1, &integer_row, 0, &keys));
+    try std.testing.expect(!rowSortsBefore(&integer_row, 0, &nan_row, 1, &keys));
+}
+
 test "integer and float comparison preserves large integer identity" {
     const exact: i64 = 9_007_199_254_740_992;
     const adjacent: i64 = 9_007_199_254_740_993;
     const exact_float: f64 = 9_007_199_254_740_992.0;
-    try std.testing.expect(valuesEqual(
+    try std.testing.expect(value_module.equal(
         .{ .integer = exact },
         .{ .float = exact_float },
         false,
     ));
-    try std.testing.expect(!valuesEqual(
+    try std.testing.expect(!value_module.equal(
         .{ .integer = adjacent },
         .{ .float = exact_float },
         false,
     ));
     try std.testing.expectEqual(
         std.math.Order.gt,
-        compareValues(
+        value_module.order(
             .{ .integer = adjacent },
             .{ .float = exact_float },
         ),
     );
     try std.testing.expectEqual(
         std.math.Order.lt,
-        compareValues(
+        value_module.order(
             .{ .float = exact_float },
             .{ .integer = adjacent },
         ),
@@ -2703,4 +2757,103 @@ test "owned runners bound retained value bytes" {
         error.ObservationRetainedValueByteBoundExceeded,
         runner.feed(&.{.{ .string = "four" }}),
     );
+}
+
+const derive_top_k_test_definition =
+    \\{"schema":"seq-observation-definition/v1","id":"example/derived-search",
+    \\ "requires":{"abi":"seq-observation-abi/v1",
+    \\ "operators":["derive","filter","project","scan","top-k"]},
+    \\ "parameters":{"role":{"type":"string","required":true}},
+    \\ "selectors":[],"inputs":[],
+    \\ "relations":[{"name":"messages","fields":["role","text"]}],
+    \\ "pipeline":[
+    \\ {"op":"scan","relation":"messages","as":"source"},
+    \\ {"op":"project","input":"source","as":"reordered","fields":["text","role"]},
+    \\ {"op":"derive","input":"reordered","as":"derived","fields":[
+    \\ {"name":"selected","type":"boolean","nullable":false,
+    \\ "expr":{"op":"or","args":[{"op":"eq","args":[{"param":"role"},""]},
+    \\ {"op":"eq","args":[{"field":"role"},{"param":"role"}]}]}},
+    \\ {"name":"label","type":"string","nullable":false,
+    \\ "expr":{"op":"concat","args":[{"field":"role"},":",{"field":"text"}]}}]},
+    \\ {"op":"filter","input":"derived","as":"matched","where":[
+    \\ {"field":"selected","op":"exact","value":true},
+    \\ {"field":"text","op":"contains","value":"marker"}]},
+    \\ {"op":"project","input":"matched","as":"ranked","fields":["label","text"]},
+    \\ {"op":"top-k","input":"ranked","as":"bounded",
+    \\ "by":[{"field":"text","direction":"desc"}],"limit":2}],
+    \\ "projections":{"rows":{"relation":"bounded","schema":"example-search/v1",
+    \\ "fields":["text","label"],"renderers":["json"]}},
+    \\ "bounds":{"max_rows":8,"max_output_bytes":4096,"max_fold_states":1}}
+;
+
+fn derivedRunnerProbe(allocator: std.mem.Allocator, program: *const Program) !void {
+    var output: [4]Value = undefined;
+    var runner = try Runner.initOwnedAllocBounded(allocator, program, &output, 4096);
+    defer runner.deinit();
+    for ([_][]const u8{ "marker-a", "marker-c", "marker-b" }) |text| {
+        _ = try runner.feed(&.{ .{ .string = "user" }, .{ .string = text } });
+    }
+    const result = try runner.finish();
+    try std.testing.expectEqual(@as(usize, 2), result.row_count);
+    try std.testing.expectEqualStrings("user:marker-c", result.rows().row(0)[1].string);
+    try std.testing.expectEqualStrings("user:marker-b", result.rows().row(1)[1].string);
+}
+
+test "derived native prefix keeps exact optional roles and a bounded retained working set" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    for ([_][]const u8{ "user", "", "u" }) |role| {
+        var fixture = try compileTestProgram(
+            &tmp.dir,
+            derive_top_k_test_definition,
+            &.{.{ .name = "role", .raw_value = role }},
+            "rows",
+        );
+        defer fixture.deinit();
+        var output: [4]Value = undefined;
+        var runner = try Runner.initOwnedAllocBounded(
+            std.testing.allocator,
+            &fixture.program,
+            &output,
+            4096,
+        );
+        defer runner.deinit();
+        for (0..100_001) |_| {
+            _ = try runner.feed(&.{ .{ .string = "user" }, .{ .string = "no match" } });
+        }
+        var buffer: [32]u8 = undefined;
+        for ([_]usize{ 2, 1, 0 }) |index| {
+            const text = try std.fmt.bufPrint(&buffer, "marker-{d}", .{index});
+            _ = try runner.feed(&.{
+                .{ .string = if (index == 1) "assistant" else "user" },
+                .{ .string = text },
+            });
+        }
+        @memset(&buffer, 'x');
+        const result = try runner.finish();
+        try std.testing.expectEqual(@as(usize, 100_004), result.source_row_count);
+        try std.testing.expectEqual(@as(usize, 2), runner.row_refs.len);
+        try std.testing.expect(runner.owned_value_bytes <= 4096);
+        if (std.mem.eql(u8, role, "u")) {
+            try std.testing.expectEqual(@as(usize, 0), result.row_count);
+            continue;
+        }
+        try std.testing.expectEqual(@as(usize, 2), result.row_count);
+        try std.testing.expectEqualStrings("user:marker-2", result.rows().row(0)[1].string);
+        try std.testing.expectEqualStrings(
+            if (role.len == 0) "assistant:marker-1" else "user:marker-0",
+            result.rows().row(1)[1].string,
+        );
+        if (role.len == 0) continue;
+        try @import("test_support").checkAllAllocationFailures(
+            std.testing.allocator,
+            compileForAllocationFailure,
+            .{ &fixture.definition_plan, &fixture.native_plan, &fixture.bindings },
+        );
+        try @import("test_support").checkAllAllocationFailures(
+            std.testing.allocator,
+            derivedRunnerProbe,
+            .{&fixture.program},
+        );
+    }
 }

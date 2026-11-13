@@ -324,6 +324,11 @@ write_seq_smoke() {
   printf '#!/usr/bin/env bash\n' >scripts/test-seq-cli.sh
 }
 
+write_seq_observation_contract() {
+  mkdir -p scripts
+  printf '#!/usr/bin/env bash\n' >scripts/test-seq-observation-contract.sh
+}
+
 write_ledger_smoke() {
   mkdir -p scripts
   printf '#!/usr/bin/env bash\n' >scripts/test-ledger-cli.sh
@@ -390,6 +395,7 @@ assert_affected seq write_durable_store_perf
 assert_ci_affected seq,ledger write_definition_guard
 assert_ci_affected "$all_apps" write_cas_runtime
 assert_ci_affected seq write_seq_smoke
+assert_ci_affected seq write_seq_observation_contract
 assert_ci_affected ledger write_ledger_smoke
 assert_affected "" write_ci_helper
 assert_ci_affected seq,lift,ledger,memory-note,siwc write_ci_helper

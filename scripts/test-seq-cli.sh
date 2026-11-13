@@ -2,6 +2,7 @@
 set -euo pipefail
 
 binary=$1
+bash scripts/test-seq-observation-contract.sh "$binary"
 message_definition=apps/seq/src/v1/fixtures/message-observation.json
 external_definition=apps/seq/src/v1/fixtures/external-observation.json
 external_facts=apps/seq/src/v1/fixtures/external-facts.json
@@ -49,7 +50,7 @@ observation_output=$("$binary" observe \
   --path "$rollout" \
   --param needle=failure \
   --format json)
-grep -Fq '"schema":"seq-observation-result/v1"' <<<"$observation_output"
+grep -Fq '"schema":"seq-observation-result/v2"' <<<"$observation_output"
 grep -Fq '"schema":"example-message-rows/v1"' <<<"$observation_output"
 grep -Fq '"text":"Observed FAILURE evidence"' <<<"$observation_output"
 grep -Fq '"source_event_id":"sha256:' <<<"$observation_output"
@@ -363,13 +364,14 @@ grep -Fq '"observation_abis":["seq-observation-abi/v1"]' <<<"$capabilities"
 grep -Fq '"id":"scan","version":2' <<<"$capabilities"
 grep -Fq '"id":"filter","version":3' <<<"$capabilities"
 grep -Fq '"id":"project","version":1' <<<"$capabilities"
-grep -Fq '"id":"derive","version":2' <<<"$capabilities"
+grep -Fq '"id":"derive","version":3' <<<"$capabilities"
 grep -Fq '"id":"join","version":1' <<<"$capabilities"
 grep -Fq '"id":"aggregate","version":2' <<<"$capabilities"
 grep -Fq '"id":"sort","version":1' <<<"$capabilities"
 grep -Fq '"id":"top-k","version":1' <<<"$capabilities"
 grep -Fq '"id":"distinct","version":1' <<<"$capabilities"
-grep -Fq '"id":"ordered-fold","version":1' <<<"$capabilities"
+grep -Fq '"id":"ordered-fold","version":2' <<<"$capabilities"
+grep -Fq '"source_encodings":["jsonl","jsonl.zst"]' <<<"$capabilities"
 grep -Fq '"id":"reachability","version":1' <<<"$capabilities"
 grep -Fq '"opencode-prompt-history-jsonl/v1"' <<<"$capabilities"
 grep -Fq '"pi-session-jsonl/v1"' <<<"$capabilities"
@@ -378,7 +380,7 @@ grep -Fq '"seq-definition-check-result/v1"' <<<"$capabilities"
 grep -Fq '"seq-definition-description/v1"' <<<"$capabilities"
 grep -Fq '"seq-index-result/v1"' <<<"$capabilities"
 grep -Fq '"seq-observation-plan/v1"' <<<"$capabilities"
-grep -Fq '"seq-observation-result/v1"' <<<"$capabilities"
+grep -Fq '"seq-observation-result/v2"' <<<"$capabilities"
 if grep -Eq \
   'actuat|universal|learnings|negative-ledger|synesthesia|SKDC|SDR|EPG' \
   <<<"$capabilities"

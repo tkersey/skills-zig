@@ -4232,9 +4232,14 @@ fn normalizeSemanticEntry(key: []const u8, value: *std.json.Value) !bool {
     if (std.mem.eql(u8, key, "definition")) try normalizeDefinitionDigest(value);
     if (std.mem.eql(u8, key, "compile_ns") or
         std.mem.eql(u8, key, "execution_ns") or
-        std.mem.eql(u8, key, "output_bytes"))
+        std.mem.eql(u8, key, "output_bytes") or
+        std.mem.eql(u8, key, "as_of_ms"))
     {
         value.* = .{ .integer = 0 };
+        return false;
+    }
+    if (std.mem.eql(u8, key, "seq_version")) {
+        value.* = .{ .string = "normalized" };
         return false;
     }
     if (std.mem.eql(u8, key, "source_event_id")) {
@@ -7713,6 +7718,29 @@ test "semantic output normalization preserves data and removes locality" {
             "/tmp/a",
         ),
     );
+}
+
+test "semantic output normalization ignores the observation instant and binary version" {
+    const first = try semanticOutputDigest(
+        std.testing.allocator,
+        "{\"seq_version\":\"1.4.0\",\"context\":{\"as_of_ms\":1000," ++
+            "\"ongoing_threshold_secs\":60},\"data\":{\"rows\":[{\"value\":1}]}}",
+        "/tmp/a",
+    );
+    const second = try semanticOutputDigest(
+        std.testing.allocator,
+        "{\"seq_version\":\"1.4.1\",\"context\":{\"as_of_ms\":2000," ++
+            "\"ongoing_threshold_secs\":60},\"data\":{\"rows\":[{\"value\":1}]}}",
+        "/tmp/b",
+    );
+    const changed = try semanticOutputDigest(
+        std.testing.allocator,
+        "{\"seq_version\":\"1.4.0\",\"context\":{\"as_of_ms\":1000," ++
+            "\"ongoing_threshold_secs\":30},\"data\":{\"rows\":[{\"value\":1}]}}",
+        "/tmp/a",
+    );
+    try std.testing.expectEqualSlices(u8, &first, &second);
+    try std.testing.expect(!std.mem.eql(u8, &first, &changed));
 }
 
 test "sealed evidence rejects content substitution" {

@@ -145,6 +145,28 @@ pub const Options = struct {
     limit: usize = native_output_rows_max,
     format: Format = .json,
     environment: ?*const std.process.Environ.Map = null,
+    diagnostic: ?*SourceDiagnostic = null,
+};
+
+pub const SourceDiagnostic = struct {
+    allocator: std.mem.Allocator,
+    path: ?[]u8 = null,
+    message: ?[]u8 = null,
+    warning_count: usize = 0,
+
+    pub fn deinit(self: *SourceDiagnostic) void {
+        if (self.path) |path| self.allocator.free(path);
+        if (self.message) |message| self.allocator.free(message);
+    }
+
+    fn record(self: *SourceDiagnostic, path: []const u8, message: []const u8, count: usize) !void {
+        if (self.path != null) return;
+        const owned_path = try self.allocator.dupe(u8, path);
+        errdefer self.allocator.free(owned_path);
+        self.message = try self.allocator.dupe(u8, message);
+        self.path = owned_path;
+        self.warning_count = count;
+    }
 };
 
 pub fn run(
@@ -155,18 +177,22 @@ pub fn run(
     writer: *std.Io.Writer,
     io: std.Io,
     dir: std.Io.Dir,
+    diagnostic: ?*SourceDiagnostic,
 ) !u8 {
     var options = try parseOptions(command, argv, io);
     options.environment = environment;
+    options.diagnostic = diagnostic;
     const normalized_repo = if (options.repo) |repo|
         try absolutePathAlloc(allocator, options.environment, repo, io, dir)
     else
         null;
     defer if (normalized_repo) |repo| allocator.free(repo);
     if (normalized_repo) |repo| options.repo = repo;
+    var output: std.Io.Writer.Allocating = .init(allocator);
+    defer output.deinit();
     var output_buffer: [8 * 1024]u8 = undefined;
     var bounded = BoundedWriter.init(
-        writer,
+        &output.writer,
         native_output_bytes_max,
         &output_buffer,
     );
@@ -189,6 +215,7 @@ pub fn run(
         }
         return err;
     };
+    try writer.writeAll(output.written());
     return 0;
 }
 
@@ -622,12 +649,13 @@ fn runRelation(
             );
             continue;
         }
-        var trace = if (relation == .sessions)
-            try trace_core.parseSessionSummaryTrace(io, dir, allocator, path, trace_options)
+        var trace = (if (relation == .sessions)
+            trace_core.parseSessionSummaryTrace(io, dir, allocator, path, trace_options)
         else
-            try trace_core.parseSessionTrace(io, dir, allocator, path, trace_options);
+            trace_core.parseSessionTrace(io, dir, allocator, path, trace_options)) catch |err|
+            return sourceFailure(options, path, err);
         defer trace.deinit(allocator);
-        try rejectTraceWarnings(&trace);
+        try rejectTraceWarnings(&trace, options);
         if (relation == .sessions and
             !sessionPasses(trace.session, options))
         {
@@ -674,13 +702,13 @@ fn runSessionDetail(
     if (opencode_adapter.recognizes(paths.items[0])) {
         return error.OpenCodeSessionDetailUnavailable;
     }
-    var trace = try trace_core.parseSessionTrace(
+    var trace = trace_core.parseSessionTrace(
         io,
         dir,
         allocator,
         paths.items[0],
         .{},
-    );
+    ) catch |err| return sourceFailure(options, paths.items[0], err);
     defer trace.deinit(allocator);
     try trace_adapter.writeTraceDetailJson(writer, &trace);
     try writer.writeByte('\n');
@@ -711,18 +739,19 @@ fn runSessionGraph(
     var remaining = options.limit;
     for (paths.items) |path| {
         if (remaining == 0) break;
-        var trace = try trace_core.parseSessionTrace(
+        var trace = trace_core.parseSessionTrace(
             io,
             dir,
             allocator,
             path,
             traceOptions(.session_edges),
-        );
+        ) catch |err| return sourceFailure(options, path, err);
         defer trace.deinit(allocator);
+        try rejectTraceWarnings(&trace, options);
         for (trace.graph_edges.items) |edge| {
             if (remaining == 0) break;
             const parent = edge.parent_session_id orelse continue;
-            const worker = edge.worker_session_id orelse continue;
+            const worker = edge.worker_session_id orelse edge.agent_path orelse continue;
             try writer.writeAll("  ");
             try definition_core.canonical_json.writeCanonicalString(writer, parent);
             try writer.writeAll(" -> ");
@@ -764,13 +793,7 @@ fn runFindSession(
         return error.MissingFindSessionSelector;
     }
     if (options.format != .json) return error.UnsupportedNativeFormat;
-    var paths = try resolveTargetPaths(
-        allocator,
-        io,
-        dir,
-        options,
-        false,
-    );
+    var paths = try resolveTargetPaths(allocator, io, dir, options, false);
     defer freePaths(allocator, &paths);
 
     try writer.writeByte('[');
@@ -797,22 +820,16 @@ fn runFindSession(
             );
             continue;
         }
-        var trace = try trace_core.parseSessionTrace(
+        var trace = trace_core.parseSessionTrace(
             io,
             dir,
             allocator,
             path,
             traceOptions(.messages),
-        );
+        ) catch |err| return sourceFailure(options, path, err);
         defer trace.deinit(allocator);
-        if (options.session_id) |wanted| {
-            const actual = trace.session.session_id orelse continue;
-            if (!std.mem.eql(u8, actual, wanted)) continue;
-        }
-        if (options.prompt) |needle| {
-            if (!traceContainsPrompt(&trace, needle)) continue;
-        }
-        if (!sessionPasses(trace.session, options)) continue;
+        try rejectTraceWarnings(&trace, options);
+        if (!findSessionMatches(&trace, options)) continue;
         _ = try trace_adapter.writeRelationRowsJsonSelected(
             writer,
             &trace,
@@ -822,6 +839,17 @@ fn runFindSession(
         );
     }
     try writer.writeAll("]\n");
+}
+
+fn findSessionMatches(trace: *const trace_core.CanonicalSessionTrace, options: Options) bool {
+    if (options.session_id) |wanted| {
+        const actual = trace.session.session_id orelse return false;
+        if (!std.mem.eql(u8, actual, wanted)) return false;
+    }
+    if (options.prompt) |needle| {
+        if (!traceContainsPrompt(trace, needle)) return false;
+    }
+    return sessionPasses(trace.session, options);
 }
 
 fn runDatasets(writer: *std.Io.Writer, options: Options) !void {
@@ -1033,12 +1061,13 @@ fn feedQueryPath(
         compilation.program.source_field_indices,
         .{},
     );
-    var trace = if (compilation.relation == .sessions)
-        try trace_core.parseSessionSummaryTrace(io, dir, allocator, path, trace_options)
+    var trace = (if (compilation.relation == .sessions)
+        trace_core.parseSessionSummaryTrace(io, dir, allocator, path, trace_options)
     else
-        try trace_core.parseSessionTrace(io, dir, allocator, path, trace_options);
+        trace_core.parseSessionTrace(io, dir, allocator, path, trace_options)) catch |err|
+        return sourceFailure(options, path, err);
     defer trace.deinit(allocator);
-    try rejectTraceWarnings(&trace);
+    try rejectTraceWarnings(&trace, options);
     if (compilation.relation == .sessions) {
         if (!sessionPasses(trace.session, options)) {
             return .continue_scanning;
@@ -1110,14 +1139,43 @@ fn feedOpenCodeQueryPath(
         path,
         256 * 1024 * 1024,
     );
-    if (metrics.warnings != 0) return error.PhysicalSourceWarningsPresent;
+    try rejectSourceWarnings(
+        options,
+        path,
+        metrics.warnings,
+        "Malformed OpenCode prompt-history records",
+    );
     return if (runner.stopped) .stop else .continue_scanning;
 }
 
-fn rejectTraceWarnings(trace: *const trace_core.CanonicalSessionTrace) !void {
+fn rejectTraceWarnings(trace: *const trace_core.CanonicalSessionTrace, options: Options) !void {
     if (trace.warnings.items.len != 0) {
+        try rejectSourceWarnings(
+            options,
+            trace.session.path,
+            trace.warnings.items.len,
+            trace.warnings.items[0],
+        );
+    }
+}
+
+fn rejectSourceWarnings(
+    options: Options,
+    path: []const u8,
+    count: usize,
+    message: []const u8,
+) !void {
+    if (count != 0) {
+        if (options.diagnostic) |diagnostic| try diagnostic.record(path, message, count);
         return error.PhysicalSourceWarningsPresent;
     }
+}
+
+fn sourceFailure(options: Options, path: []const u8, err: anyerror) anyerror {
+    if (options.diagnostic) |diagnostic| {
+        diagnostic.record(path, @errorName(err), 0) catch |failure| return failure;
+    }
+    return err;
 }
 
 fn loadQuerySpecAlloc(
@@ -1594,7 +1652,12 @@ fn writeOpenCodeRelationRows(
                 null,
         },
     );
-    if (metrics.warnings != 0) return error.PhysicalSourceWarningsPresent;
+    try rejectSourceWarnings(
+        options,
+        path,
+        metrics.warnings,
+        "Malformed OpenCode prompt-history records",
+    );
     const result = try runner.finish();
     const rows = result.rows();
     const count = try writeOpenCodeQueryRows(
@@ -1736,13 +1799,7 @@ fn runIndex(
     {
         return error.UnknownIndexAction;
     }
-    var paths = try collectJsonlPaths(
-        allocator,
-        io,
-        dir,
-        root,
-        options.root != null,
-    );
+    var paths = try resolveTargetPaths(allocator, io, dir, options, false);
     defer freePaths(allocator, &paths);
     var total_bytes: u64 = 0;
     var newest_mtime_ns: i128 = 0;
@@ -1764,6 +1821,12 @@ fn runIndex(
     }
     try writer.writeAll("{\"schema\":\"seq-index-result/v1\",\"root\":");
     try definition_core.canonical_json.writeCanonicalString(writer, root);
+    try writer.writeAll(",\"archive_root\":");
+    if (options.root == null) {
+        const archive = try archiveRootAlloc(allocator, root);
+        defer allocator.free(archive);
+        try definition_core.canonical_json.writeCanonicalString(writer, archive);
+    } else try writer.writeAll("null");
     try writer.writeAll(",\"action\":");
     try definition_core.canonical_json.writeCanonicalString(writer, action);
     try writer.print(
@@ -1823,13 +1886,8 @@ pub fn resolveTargetPaths(
     }
     const root = try current.rootAlloc(allocator, options, io, dir);
     defer allocator.free(root);
-    const live_native_root = !current.pi and try isLiveNativeSessionRoot(
-        allocator,
-        options,
-        root,
-        io,
-        dir,
-    );
+    const live_native_root = !current.pi and
+        try isLiveNativeSessionRoot(allocator, options, root, io, dir);
     var paths = try collectTargetJsonlPaths(
         allocator,
         io,
@@ -1838,6 +1896,12 @@ pub fn resolveTargetPaths(
         options,
     );
     errdefer freePaths(allocator, &paths);
+    const archive = if (options.root == null and !current.pi)
+        try archiveRootAlloc(allocator, root)
+    else
+        null;
+    defer if (archive) |archive_root| allocator.free(archive_root);
+    if (archive != null) try appendArchivedPaths(allocator, io, dir, archive.?, &paths);
     const exact_session_id = options.session_id orelse current.id;
     if (exact_session_id == null) {
         retainCanonicalRolloutWindow(
@@ -1847,16 +1911,18 @@ pub fn resolveTargetPaths(
             &paths,
             options,
             live_native_root,
+            archive,
         );
     }
     if (exact_session_id) |wanted| {
-        retainSessionId(
+        try retainSessionId(
             io,
             dir,
             allocator,
             &paths,
             wanted,
             live_native_root,
+            options,
         );
     }
     if (require_single or exact_session_id != null) {
@@ -1866,6 +1932,23 @@ pub fn resolveTargetPaths(
     return paths;
 }
 
+fn appendArchivedPaths(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    dir: std.Io.Dir,
+    archive: []const u8,
+    paths: *std.ArrayList([]u8),
+) !void {
+    var archived = try collectJsonlPaths(allocator, io, dir, archive, false);
+    defer freePaths(allocator, &archived);
+    if (archived.items.len > session_candidate_max -| paths.items.len) {
+        return error.SessionCandidateBoundExceeded;
+    }
+    try paths.appendSlice(allocator, archived.items);
+    archived.items.len = 0;
+    std.mem.sort([]u8, paths.items, {}, lessThanPath);
+}
+
 fn retainCanonicalRolloutWindow(
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -1873,6 +1956,7 @@ fn retainCanonicalRolloutWindow(
     paths: *std.ArrayList([]u8),
     options: Options,
     live_native_root: bool,
+    archive: ?[]const u8,
 ) void {
     if (options.since_ms == null and options.until_ms == null) return;
     var write_index: usize = 0;
@@ -1882,10 +1966,13 @@ fn retainCanonicalRolloutWindow(
             modifiedMillis(io, dir, path)
         else
             null;
+        const archived = archive != null and
+            std.mem.eql(u8, std.fs.path.dirname(path) orelse "", archive.?);
         if (canonicalRolloutPathPassesWindow(
             path,
             options,
             modified_ms,
+            archived,
         )) {
             paths.items[write_index] = path;
             write_index += 1;
@@ -1913,6 +2000,7 @@ fn canonicalRolloutPathPassesWindow(
     path: []const u8,
     options: Options,
     modified_ms: ?i64,
+    archived: bool,
 ) bool {
     const basename = std.fs.path.basename(path);
     const prefix = "rollout-";
@@ -1925,27 +2013,10 @@ fn canonicalRolloutPathPassesWindow(
     const filename_date = seq_time.parseDayLiteral(
         basename[prefix.len .. prefix.len + 10],
     ) orelse return true;
-    const parent = std.fs.path.basename(
-        std.fs.path.dirname(path) orelse return true,
-    );
-    const month_parent = std.fs.path.basename(
-        std.fs.path.dirname(
-            std.fs.path.dirname(path) orelse return true,
-        ) orelse return true,
-    );
-    const year_parent = std.fs.path.basename(
-        std.fs.path.dirname(
-            std.fs.path.dirname(
-                std.fs.path.dirname(path) orelse return true,
-            ) orelse return true,
-        ) orelse return true,
-    );
-    const canonical_parent_date = parsePartitionDate(
-        year_parent,
-        month_parent,
-        parent,
-    ) orelse return true;
-    if (compareDates(filename_date, canonical_parent_date) != .eq) return true;
+    if (!archived) {
+        const canonical_parent_date = canonicalPartitionDate(path) orelse return true;
+        if (compareDates(filename_date, canonical_parent_date) != .eq) return true;
+    }
 
     // A canonical partition is a session-start index. On the live native
     // source, filesystem modification time is the append frontier: a resumed
@@ -1969,6 +2040,17 @@ fn canonicalRolloutPathPassesWindow(
         if (compareDates(filename_date, upper) == .gt) return false;
     }
     return true;
+}
+
+fn canonicalPartitionDate(path: []const u8) ?seq_time.Date {
+    const day_dir = std.fs.path.dirname(path) orelse return null;
+    const month_dir = std.fs.path.dirname(day_dir) orelse return null;
+    const year_dir = std.fs.path.dirname(month_dir) orelse return null;
+    return parsePartitionDate(
+        std.fs.path.basename(year_dir),
+        std.fs.path.basename(month_dir),
+        std.fs.path.basename(day_dir),
+    );
 }
 
 fn parsePartitionDate(
@@ -2001,15 +2083,18 @@ fn retainSessionId(
     paths: *std.ArrayList([]u8),
     wanted: []const u8,
     live_native_root: bool,
-) void {
+    options: Options,
+) !void {
     var write_index: usize = 0;
+    var failure: ?anyerror = null;
     for (paths.items) |path| {
         if (opencode_adapter.recognizes(path)) {
             var session_id_buffer: [64]u8 = undefined;
             const session_id = opencode_adapter.sessionId(
                 &session_id_buffer,
                 path,
-            ) catch {
+            ) catch |err| {
+                if (failure == null) failure = sourceFailure(options, path, err);
                 allocator.free(path);
                 continue;
             };
@@ -2034,7 +2119,8 @@ fn retainSessionId(
             allocator,
             path,
             traceOptions(.sessions),
-        ) catch {
+        ) catch |err| {
+            if (failure == null) failure = sourceFailure(options, path, err);
             allocator.free(path);
             continue;
         };
@@ -2049,11 +2135,17 @@ fn retainSessionId(
         }
     }
     paths.items.len = write_index;
+    if (failure) |err| return err;
 }
 
 fn isCanonicalRolloutBasename(basename: []const u8) bool {
     return std.mem.startsWith(u8, basename, "rollout-") and
-        std.mem.endsWith(u8, basename, ".jsonl");
+        isSessionSourcePath(basename);
+}
+
+fn isSessionSourcePath(path: []const u8) bool {
+    return std.mem.endsWith(u8, path, ".jsonl") or
+        std.mem.endsWith(u8, path, ".jsonl.zst");
 }
 
 fn rolloutBasenameMatchesSessionId(
@@ -2061,7 +2153,7 @@ fn rolloutBasenameMatchesSessionId(
     wanted: []const u8,
 ) bool {
     const basename = std.fs.path.basename(path);
-    const extension = ".jsonl";
+    const extension = if (std.mem.endsWith(u8, basename, ".zst")) ".jsonl.zst" else ".jsonl";
     if (!isCanonicalRolloutBasename(basename) or
         basename.len < wanted.len + extension.len + 1)
     {
@@ -2106,7 +2198,7 @@ fn collectJsonlPaths(
             return error.SessionTraversalBoundExceeded;
         }
         if (entry.kind != .file) continue;
-        if (!std.mem.endsWith(u8, entry.path, ".jsonl")) continue;
+        if (!isSessionSourcePath(entry.path)) continue;
         if (std.mem.eql(u8, std.fs.path.basename(entry.path), ".seq-index.jsonl")) {
             continue;
         }
@@ -2144,7 +2236,7 @@ pub fn freePaths(
     paths.deinit(allocator);
 }
 
-fn resolveRootAlloc(
+pub fn resolveRootAlloc(
     allocator: std.mem.Allocator,
     environment: ?*const std.process.Environ.Map,
     root: ?[]const u8,
@@ -2155,11 +2247,22 @@ fn resolveRootAlloc(
         return absolutePathAlloc(allocator, environment, explicit, io, dir);
     }
     if (environmentValue(environment, "CODEX_HOME")) |codex_home| {
-        return std.fs.path.join(allocator, &.{ codex_home, "sessions" });
+        const base = try absolutePathAlloc(allocator, environment, codex_home, io, dir);
+        defer allocator.free(base);
+        return std.fs.path.join(allocator, &.{ base, "sessions" });
     }
     const home = environmentValue(environment, "HOME") orelse
         return error.EnvironmentVariableNotFound;
-    return std.fs.path.join(allocator, &.{ home, ".codex", "sessions" });
+    const base = try absolutePathAlloc(allocator, environment, home, io, dir);
+    defer allocator.free(base);
+    return std.fs.path.join(allocator, &.{ base, ".codex", "sessions" });
+}
+
+pub fn archiveRootAlloc(allocator: std.mem.Allocator, session_root: []const u8) ![]u8 {
+    return std.fs.path.join(allocator, &.{
+        std.fs.path.dirname(session_root) orelse return error.InvalidSessionRoot,
+        "archived_sessions",
+    });
 }
 
 fn resolvePiRootAlloc(
@@ -2621,21 +2724,25 @@ test "canonical rollout partitions preserve resumed sessions" {
         "/sessions/2026/06/01/rollout-2026-06-01T10-00-00-old.jsonl",
         options,
         null,
+        false,
     ));
     try std.testing.expect(canonicalRolloutPathPassesWindow(
         "/sessions/2026/07/25/rollout-2026-07-25T23-59-59-margin.jsonl",
         options,
         null,
+        false,
     ));
     try std.testing.expect(canonicalRolloutPathPassesWindow(
         "/sessions/2026/06/01/renamed.jsonl",
         options,
         null,
+        false,
     ));
     try std.testing.expect(canonicalRolloutPathPassesWindow(
         "/sessions/2026/06/02/rollout-2026-06-01T10-00-00-mismatch.jsonl",
         options,
         null,
+        false,
     ));
     try std.testing.expect(!canonicalRolloutPathPassesWindow(
         "/sessions/2026/06/01/rollout-2026-06-01T10-00-00-old.jsonl",
@@ -2643,6 +2750,7 @@ test "canonical rollout partitions preserve resumed sessions" {
         seq_time.parseIsoTimestampMillis(
             "2026-06-02T00:00:00Z",
         ),
+        false,
     ));
     try std.testing.expect(canonicalRolloutPathPassesWindow(
         "/sessions/2026/06/01/rollout-2026-06-01T10-00-00-resumed.jsonl",
@@ -2650,6 +2758,48 @@ test "canonical rollout partitions preserve resumed sessions" {
         seq_time.parseIsoTimestampMillis(
             "2026-07-27T12:00:00Z",
         ),
+        false,
+    ));
+}
+
+test "archived rollouts window by start date and modification time" {
+    const options: Options = .{
+        .since_ms = seq_time.parseIsoTimestampMillis(
+            "2026-07-27T00:00:00Z",
+        ),
+        .until_ms = seq_time.parseIsoTimestampMillis(
+            "2026-07-27T23:59:59Z",
+        ),
+    };
+    try std.testing.expect(!canonicalRolloutPathPassesWindow(
+        "/archived_sessions/rollout-2026-06-01T10-00-00-old.jsonl.zst",
+        options,
+        seq_time.parseIsoTimestampMillis("2026-06-02T00:00:00Z"),
+        true,
+    ));
+    try std.testing.expect(canonicalRolloutPathPassesWindow(
+        "/archived_sessions/rollout-2026-06-01T10-00-00-resumed.jsonl.zst",
+        options,
+        seq_time.parseIsoTimestampMillis("2026-07-27T12:00:00Z"),
+        true,
+    ));
+    try std.testing.expect(canonicalRolloutPathPassesWindow(
+        "/archived_sessions/rollout-2026-06-01T10-00-00-imported.jsonl.zst",
+        options,
+        null,
+        true,
+    ));
+    try std.testing.expect(!canonicalRolloutPathPassesWindow(
+        "/archived_sessions/rollout-2026-08-01T10-00-00-later.jsonl.zst",
+        options,
+        null,
+        true,
+    ));
+    try std.testing.expect(canonicalRolloutPathPassesWindow(
+        "/archived_sessions/rollout-2026-08-01T10-00-00-later.jsonl.zst",
+        options,
+        null,
+        false,
     ));
 }
 
@@ -3155,4 +3305,117 @@ test "native output writer fails closed at the aggregate byte bound" {
     );
     try std.testing.expect(bounded.exceeded);
     try std.testing.expectEqualStrings("", output.written());
+}
+
+test "native failure discards every staged row and identifies the damaged source" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const large_name = @as([12_000]u8, @splat('x'));
+    const source = try std.fmt.allocPrint(
+        allocator,
+        "{{\"type\":\"session_meta\",\"payload\":{{\"id\":\"good\",\"thread_name\":\"{s}\"}}}}\n",
+        .{&large_name},
+    );
+    defer allocator.free(source);
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "a-good.jsonl", .data = source });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "b-bad.jsonl", .data = "{bad-json\n" });
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", allocator);
+    defer allocator.free(root);
+    var environment = std.process.Environ.Map.init(allocator);
+    defer environment.deinit();
+    var output: std.Io.Writer.Allocating = .init(allocator);
+    defer output.deinit();
+    var diagnostic: SourceDiagnostic = .{ .allocator = allocator };
+    defer diagnostic.deinit();
+    try std.testing.expectError(error.PhysicalSourceWarningsPresent, run(
+        allocator,
+        &environment,
+        .sessions,
+        &.{ "--root", root },
+        &output.writer,
+        std.testing.io,
+        std.Io.Dir.cwd(),
+        &diagnostic,
+    ));
+    try std.testing.expectEqual(@as(usize, 0), output.written().len);
+    try std.testing.expect(std.mem.endsWith(u8, diagnostic.path.?, "b-bad.jsonl"));
+    try std.testing.expectEqual(@as(usize, 1), diagnostic.warning_count);
+    try std.testing.expect(diagnostic.message.?.len != 0);
+}
+
+test "default discovery windows archived rollouts by their start date" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "sessions");
+    try tmp.dir.createDirPath(std.testing.io, "archived_sessions");
+    for ([_][]const u8{
+        "archived_sessions/rollout-2026-06-01T10-00-00-earlier.jsonl.zst",
+        "archived_sessions/rollout-2026-08-01T10-00-00-later.jsonl.zst",
+        "archived_sessions/renamed.jsonl.zst",
+    }) |sub_path| {
+        try tmp.dir.writeFile(std.testing.io, .{ .sub_path = sub_path, .data = "" });
+    }
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", allocator);
+    defer allocator.free(root);
+    var environment = std.process.Environ.Map.init(allocator);
+    defer environment.deinit();
+    try environment.put("CODEX_HOME", root);
+    var paths = try resolveTargetPaths(
+        allocator,
+        std.testing.io,
+        std.Io.Dir.cwd(),
+        .{
+            .environment = &environment,
+            .until_ms = seq_time.parseIsoTimestampMillis("2026-07-27T23:59:59Z"),
+        },
+        false,
+    );
+    defer freePaths(allocator, &paths);
+    try std.testing.expectEqual(@as(usize, 2), paths.items.len);
+    for (paths.items) |path| {
+        try std.testing.expect(std.mem.indexOf(u8, path, "later") == null);
+    }
+}
+
+test "default Codex discovery includes archives while explicit roots retain their scope" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "sessions");
+    try tmp.dir.createDirPath(std.testing.io, "archived_sessions");
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "sessions/live.jsonl", .data = "" });
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "archived_sessions/old.jsonl.zst",
+        .data = "",
+    });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "unrelated.jsonl", .data = "" });
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", allocator);
+    defer allocator.free(root);
+    const sessions = try std.fs.path.join(allocator, &.{ root, "sessions" });
+    defer allocator.free(sessions);
+    var environment = std.process.Environ.Map.init(allocator);
+    defer environment.deinit();
+    try environment.put("CODEX_HOME", root);
+    var all = try resolveTargetPaths(
+        allocator,
+        std.testing.io,
+        std.Io.Dir.cwd(),
+        .{ .environment = &environment },
+        false,
+    );
+    defer freePaths(allocator, &all);
+    try std.testing.expectEqual(@as(usize, 2), all.items.len);
+    try std.testing.expect(std.mem.endsWith(u8, all.items[0], "archived_sessions/old.jsonl.zst"));
+    var selected = try resolveTargetPaths(
+        allocator,
+        std.testing.io,
+        std.Io.Dir.cwd(),
+        .{ .environment = &environment, .root = sessions },
+        false,
+    );
+    defer freePaths(allocator, &selected);
+    try std.testing.expectEqual(@as(usize, 1), selected.items.len);
+    try std.testing.expect(std.mem.endsWith(u8, selected.items[0], "sessions/live.jsonl"));
 }

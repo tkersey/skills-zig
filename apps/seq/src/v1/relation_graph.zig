@@ -4,16 +4,20 @@ const definition_core = @import("definition_core");
 const definition = @import("definition.zig");
 const execution = @import("execution.zig");
 const plan = @import("plan.zig");
-const seq_time = @import("seq_time");
-
-pub const RuntimeSelectors = struct {
-    path: ?[]const u8 = null,
-    root: ?[]const u8 = null,
-    session_id: ?[]const u8 = null,
-    repo: ?[]const u8 = null,
-    since_ms: ?i64 = null,
-    until_ms: ?i64 = null,
-};
+const expressions = @import("expressions.zig");
+pub const RuntimeSelectors = expressions.RuntimeSelectors;
+const ExpressionWorkspace = expressions.ExpressionWorkspace;
+const ExpressionNode = expressions.ExpressionNode;
+const compileExpr = expressions.compileExpr;
+const evalExpr = expressions.evalExpr;
+const parseConfig = expressions.parseConfig;
+const scalarValue = expressions.scalarValue;
+const findName = expressions.findName;
+const truthy = expressions.truthy;
+const value_module = @import("value.zig");
+const valuesEqual = value_module.equal;
+const valueFloat = expressions.valueFloat;
+const valueText = expressions.valueText;
 
 pub const Table = struct {
     values: []execution.Value,
@@ -50,12 +54,47 @@ pub const TargetResult = struct {
     materialized_rows: usize,
 };
 
+pub const PartitionOrder = union(enum) {
+    path,
+    session: plan.SortKey,
+};
+
 pub const StreamingLineagePlan = struct {
     scan_stage: u16,
     local_stage: u16,
     lineage_stage: u16,
     graph_stage: u16,
+    seed_stage: u16,
+    partition_order: PartitionOrder,
 };
+
+pub fn boundedNativePrefix(
+    definition_plan: *const definition.Plan,
+    native_plan: *const plan.Plan,
+    projection_name: []const u8,
+) !?u16 {
+    const projection = findProjection(definition_plan, projection_name) orelse
+        return error.UnknownObservationProjection;
+    var current = native_plan.projections[projection].stage_index;
+    var target: ?u16 = null;
+    var depth: usize = 0;
+    while (depth < 256 and depth <= definition_plan.bounds.max_graph_depth) : (depth += 1) {
+        const stage = &native_plan.stages[current];
+        switch (stage.operation) {
+            .scan => |scan| return if (scan.relation == .sessions) null else target,
+            .filter, .project, .alias, .limit => {},
+            .top_k => target = current,
+            .generic => |generic| if (generic.operator != .derive) return null,
+            else => return null,
+        }
+        if (definition_plan.steps[current].input_names.len != 1) return null;
+        current = switch (stage.source orelse return null) {
+            .stage => |index| index,
+            .external => return null,
+        };
+    }
+    return error.ObservationPipelineTooDeep;
+}
 
 pub fn streamingLineagePlan(
     allocator: std.mem.Allocator,
@@ -65,55 +104,318 @@ pub fn streamingLineagePlan(
 ) !?StreamingLineagePlan {
     const projection_index = findProjection(definition_plan, projection_name) orelse
         return error.UnknownObservationProjection;
-    const reachable = try allocator.alloc(bool, native_plan.stages.len);
+    const reachable = try reachableStages(allocator, definition_plan, native_plan, projection_name);
+    defer allocator.free(reachable);
+    var lineage_join = try soleLineageJoin(
+        allocator,
+        definition_plan,
+        native_plan,
+        reachable,
+    ) orelse return null;
+    defer lineage_join.spec.deinit(allocator);
+    const spec = &lineage_join.spec;
+    const lineage = spec.lineage.?;
+    if (!streamableLineageJoin(native_plan, spec)) return null;
+    if (!try carriesSessionColumns(allocator, native_plan, lineage.graph_stage)) return null;
+    const scan_stage = try streamablePartitionRoot(
+        allocator,
+        definition_plan,
+        native_plan,
+        spec.left_stage,
+    ) orelse return null;
+    const seed_stage = try streamingSeedScan(
+        allocator,
+        definition_plan,
+        native_plan,
+        native_plan.projections[projection_index].stage_index,
+        lineage_join.stage,
+        lineage.graph_stage,
+    ) orelse return null;
+    return .{
+        .scan_stage = scan_stage,
+        .local_stage = spec.left_stage,
+        .lineage_stage = lineage_join.stage,
+        .graph_stage = lineage.graph_stage,
+        .seed_stage = seed_stage,
+        .partition_order = try localPartitionOrder(
+            allocator,
+            definition_plan,
+            native_plan,
+            spec.left_stage,
+        ),
+    };
+}
+
+pub fn requireBoundParameters(
+    allocator: std.mem.Allocator,
+    definition_plan: *const definition.Plan,
+    native_plan: *const plan.Plan,
+    bindings: *const definition_core.parameters.Bindings,
+    projection_name: []const u8,
+) !void {
+    const reachable = try reachableStages(allocator, definition_plan, native_plan, projection_name);
+    defer allocator.free(reachable);
+    for (native_plan.stages, reachable) |stage, is_reachable| {
+        if (!is_reachable) continue;
+        switch (stage.operation) {
+            .filter => |filter| for (filter.predicates) |predicate| switch (predicate.operand) {
+                .parameter => |index| try requireBinding(definition_plan, bindings, index),
+                .constant => {},
+            },
+            .limit => |limit| try requireLimitBinding(definition_plan, bindings, limit),
+            .top_k => |top_k| try requireLimitBinding(definition_plan, bindings, top_k.limit),
+            else => {},
+        }
+    }
+}
+
+fn requireLimitBinding(
+    definition_plan: *const definition.Plan,
+    bindings: *const definition_core.parameters.Bindings,
+    limit: plan.Limit,
+) !void {
+    switch (limit) {
+        .parameter => |index| try requireBinding(definition_plan, bindings, index),
+        .fixed => {},
+    }
+}
+
+fn requireBinding(
+    definition_plan: *const definition.Plan,
+    bindings: *const definition_core.parameters.Bindings,
+    index: u16,
+) !void {
+    const name = definition_plan.parameter_declarations.items[index].name;
+    if (bindings.find(name) == null) return error.MissingObservationParameter;
+}
+
+const parsed_session_field = "token_usage_observation_count";
+
+fn carriesSessionColumns(
+    allocator: std.mem.Allocator,
+    native_plan: *const plan.Plan,
+    graph_stage: u16,
+) !bool {
+    var reads_parsed_field = false;
+    var current = graph_stage;
+    for (0..native_plan.stages.len) |_| {
+        const stage = native_plan.stages[current];
+        const input = switch (stage.operation) {
+            .scan => return !reads_parsed_field,
+            else => switch (stage.source orelse return false) {
+                .stage => |index| index,
+                .external => return false,
+            },
+        };
+        switch (stage.operation) {
+            .scan, .project, .alias, .sort => {},
+            .filter => |filter| for (filter.predicates) |predicate| {
+                const name = native_plan.stages[input].schema.columns[predicate.field_index].name;
+                if (std.mem.eql(u8, name, parsed_session_field)) reads_parsed_field = true;
+            },
+            .generic => |generic| {
+                if (generic.operator != .derive) return false;
+                switch (try deriveSessionUse(allocator, generic.canonical_config)) {
+                    .replaces_session_columns => return false,
+                    .defines_parsed_field => reads_parsed_field = false,
+                    .reads_parsed_field => reads_parsed_field = true,
+                    .preserves_session_columns => {},
+                }
+            },
+            .limit, .top_k, .distinct, .aggregate => return false,
+        }
+        current = input;
+    }
+    return false;
+}
+
+const DeriveSessionUse = enum {
+    replaces_session_columns,
+    defines_parsed_field,
+    reads_parsed_field,
+    preserves_session_columns,
+};
+
+fn deriveSessionUse(allocator: std.mem.Allocator, config: []const u8) !DeriveSessionUse {
+    var parsed = try parseConfig(allocator, config);
+    defer parsed.deinit();
+    const root = try definition_core.json.object(parsed.value);
+    if (root.get("preserve_input")) |raw| {
+        if (!try definition_core.json.boolean(raw)) return .replaces_session_columns;
+    }
+    const fields = try definition_core.json.array(try definition_core.json.field(root, "fields"));
+    var defines = false;
+    var reads = false;
+    for (fields.items) |item| {
+        const field = try definition_core.json.object(item);
+        const name = try definition_core.json.requiredString(field, "name");
+        if (std.mem.eql(u8, name, "session_id") or std.mem.eql(u8, name, "parent_session_id")) {
+            return .replaces_session_columns;
+        }
+        defines = defines or std.mem.eql(u8, name, parsed_session_field);
+        const expression = field.get("expr") orelse continue;
+        if (try expressions.referencesField(allocator, expression, parsed_session_field)) {
+            reads = true;
+        }
+    }
+    if (defines) return .defines_parsed_field;
+    return if (reads) .reads_parsed_field else .preserves_session_columns;
+}
+
+fn seedsSessionFields(field_indices: []const u16) bool {
+    const seeded = [_][]const u8{
+        "session_id",
+        "path",
+        "parent_session_id",
+        "control_parent_session_id",
+        "forked_from_session_id",
+        "parent_relation",
+        "lineage_conflict",
+        "subagent_history_start_ordinal",
+        "token_usage_observation_count",
+    };
+    for (field_indices) |field_index| {
+        const name = @import("physical.zig").Relation.sessions.fields()[field_index].name;
+        for (seeded) |candidate| {
+            if (std.mem.eql(u8, name, candidate)) break;
+        } else return false;
+    }
+    return true;
+}
+
+const LineageJoin = struct { stage: u16, spec: JoinSpec };
+
+fn soleLineageJoin(
+    allocator: std.mem.Allocator,
+    definition_plan: *const definition.Plan,
+    native_plan: *const plan.Plan,
+    reachable: []const bool,
+) !?LineageJoin {
+    var sole: ?LineageJoin = null;
+    errdefer if (sole) |*found| found.spec.deinit(allocator);
+    var lineage_joins: usize = 0;
+    for (native_plan.stages, reachable, 0..) |stage, reached, stage_index| {
+        if (!reached or stage.operation != .generic) continue;
+        if (stage.operation.generic.operator != .join) continue;
+        var spec = try compileJoin(
+            allocator,
+            native_plan,
+            definition_plan.steps[stage_index],
+            stage.operation.generic.canonical_config,
+        );
+        if (spec.lineage != null) lineage_joins += 1;
+        if (spec.lineage == null or sole != null) {
+            spec.deinit(allocator);
+            continue;
+        }
+        sole = .{ .stage = @intCast(stage_index), .spec = spec };
+    }
+    if (lineage_joins == 1) return sole;
+    if (sole) |*found| found.spec.deinit(allocator);
+    return null;
+}
+
+fn streamableLineageJoin(native_plan: *const plan.Plan, spec: *const JoinSpec) bool {
+    const lineage = spec.lineage orelse return false;
+    if (spec.kind != .anti or spec.left_stage != spec.right_stage) return false;
+    for (spec.keys) |key| {
+        if (key.comparison != .eq or key.left != key.right) return false;
+    }
+    const local = native_plan.stages[spec.left_stage].schema;
+    const graph = native_plan.stages[lineage.graph_stage].schema;
+    return columnNamed(local, lineage.left, "session_id") and
+        columnNamed(local, lineage.right, "session_id") and
+        columnNamed(graph, lineage.node, "session_id") and
+        columnNamed(graph, lineage.parent, "parent_session_id");
+}
+
+fn columnNamed(schema: plan.Schema, column: u16, name: []const u8) bool {
+    return std.mem.eql(u8, schema.columns[column].name, name);
+}
+
+fn streamablePartitionRoot(
+    allocator: std.mem.Allocator,
+    definition_plan: *const definition.Plan,
+    native_plan: *const plan.Plan,
+    local_stage: u16,
+) !?u16 {
+    const root = partitionScanRoot(allocator, definition_plan, native_plan, local_stage);
+    return root catch |err| switch (err) {
+        error.ObservationPartitionOperatorUnsupported,
+        error.ObservationPartitionLayoutMissing,
+        error.ObservationPartitionPrefixHasMultipleScans,
+        => return null,
+        else => return err,
+    };
+}
+
+fn streamingSeedScan(
+    allocator: std.mem.Allocator,
+    definition_plan: *const definition.Plan,
+    native_plan: *const plan.Plan,
+    projection_stage: u16,
+    lineage_stage: u16,
+    graph_stage: u16,
+) !?u16 {
+    const count = native_plan.stages.len;
+    const graph_reachable = try allocator.alloc(bool, count);
+    defer allocator.free(graph_reachable);
+    @memset(graph_reachable, false);
+    try markReachable(
+        allocator,
+        definition_plan,
+        native_plan,
+        graph_stage,
+        graph_reachable,
+        &.{},
+        null,
+    );
+    var seeded_scan: ?u16 = null;
+    for (native_plan.stages, graph_reachable, 0..) |stage, reached, index| {
+        if (!reached or stage.operation != .scan) continue;
+        if (seeded_scan != null or stage.operation.scan.relation != .sessions) return null;
+        if (!seedsSessionFields(stage.operation.scan.field_indices)) return null;
+        seeded_scan = @intCast(index);
+    }
+    const seed = seeded_scan orelse return null;
+    var boundary = [_]ScanInput{.{
+        .stage_index = lineage_stage,
+        .table = .{ .values = &.{}, .width = 0 },
+    }};
+    const reachable = try allocator.alloc(bool, count);
     defer allocator.free(reachable);
     @memset(reachable, false);
     try markReachable(
         allocator,
         definition_plan,
         native_plan,
-        native_plan.projections[projection_index].stage_index,
+        projection_stage,
         reachable,
-        &.{},
-        0,
+        &boundary,
+        null,
     );
-    for (native_plan.stages, 0..) |stage, stage_index| {
-        if (!reachable[stage_index] or stage.operation != .generic) continue;
-        const generic = stage.operation.generic;
-        if (generic.operator != .join) continue;
-        var parsed = try parseConfig(allocator, generic.canonical_config);
-        defer parsed.deinit();
-        const root = try definition_core.json.object(parsed.value);
-        const on = try definition_core.json.object(
-            try definition_core.json.field(root, "on"),
-        );
-        if (on.get("lineage") == null) continue;
-        const step = definition_plan.steps[stage_index];
-        if (step.input_names.len != 3 or
-            !std.mem.eql(u8, step.input_names[0], step.input_names[1]))
-        {
-            return error.ObservationStreamingLineageShapeUnsupported;
-        }
-        const local_stage = native_plan.findStage(step.input_names[0]) orelse
-            return error.ObservationExternalGraphInputUnsupported;
-        const graph_stage = native_plan.findStage(step.input_names[2]) orelse
-            return error.ObservationExternalGraphInputUnsupported;
-        const scan_stage = try partitionScanRoot(
-            allocator,
-            definition_plan,
-            native_plan,
-            local_stage,
-            null,
-            0,
-        );
-        return .{
-            .scan_stage = scan_stage,
-            .local_stage = local_stage,
-            .lineage_stage = @intCast(stage_index),
-            .graph_stage = graph_stage,
-        };
+    for (native_plan.stages, reachable, 0..) |stage, reached, index| {
+        if (reached and stage.operation == .scan and index != seed) return null;
     }
-    return null;
+    return seed;
+}
+
+pub fn projectionMayTruncate(
+    allocator: std.mem.Allocator,
+    definition_plan: *const definition.Plan,
+    native_plan: *const plan.Plan,
+    projection_name: []const u8,
+) !bool {
+    const reachable = try reachableStages(allocator, definition_plan, native_plan, projection_name);
+    defer allocator.free(reachable);
+    for (native_plan.stages, reachable) |stage, reached| {
+        if (!reached) continue;
+        switch (stage.operation) {
+            .limit, .top_k => return true,
+            else => {},
+        }
+    }
+    return false;
 }
 
 const StageFrame = struct {
@@ -127,42 +429,33 @@ fn partitionScanRoot(
     definition_plan: *const definition.Plan,
     native_plan: *const plan.Plan,
     stage_index: u16,
-    expected: ?u16,
-    depth: usize,
 ) !u16 {
-    const max_depth = definition_plan.bounds.max_graph_depth;
-    if (depth > max_depth) return error.ObservationGraphDepthExceeded;
-    const frames = try allocator.alloc(StageFrame, max_depth - depth + 1);
-    defer allocator.free(frames);
-    frames[0] = .{ .stage_index = stage_index };
-    var count: usize = 1;
-    var root = expected;
-    while (count > 0) {
-        const frame = &frames[count - 1];
-        const stage = native_plan.stages[frame.stage_index];
-        if (!frame.entered) {
-            frame.entered = true;
-            if (stage.operation == .scan) {
-                try validatePartitionScan(stage, frame.stage_index, root);
-                root = frame.stage_index;
-                count -= 1;
-                continue;
-            }
-            try validatePartitionOperator(stage);
-        }
-        const step = definition_plan.steps[frame.stage_index];
-        if (step.input_names.len == 0) return error.ObservationPartitionLayoutMissing;
-        if (frame.next_input == step.input_names.len) {
-            count -= 1;
+    const visited = try allocator.alloc(bool, native_plan.stages.len);
+    defer allocator.free(visited);
+    @memset(visited, false);
+    var pending: std.ArrayList(u16) = .empty;
+    defer pending.deinit(allocator);
+    try pending.append(allocator, stage_index);
+    var root: ?u16 = null;
+    while (pending.pop()) |current| {
+        if (visited[current]) continue;
+        visited[current] = true;
+        const stage = native_plan.stages[current];
+        if (stage.operation == .scan) {
+            try validatePartitionScan(stage, current, root);
+            root = current;
             continue;
         }
-        const name = step.input_names[frame.next_input];
-        frame.next_input += 1;
-        const input = native_plan.findStage(name) orelse
-            return error.ObservationExternalGraphInputUnsupported;
-        if (count == frames.len) return error.ObservationGraphDepthExceeded;
-        frames[count] = .{ .stage_index = input };
-        count += 1;
+        try validatePartitionOperator(allocator, definition_plan, native_plan, current);
+        const inputs = definition_plan.steps[current].input_names;
+        if (inputs.len == 0) return error.ObservationPartitionLayoutMissing;
+        var index = inputs.len;
+        while (index > 0) {
+            index -= 1;
+            const input = native_plan.findStage(inputs[index]) orelse
+                return error.ObservationExternalGraphInputUnsupported;
+            if (!visited[input]) try pending.append(allocator, input);
+        }
     }
     return root.?;
 }
@@ -176,15 +469,181 @@ fn validatePartitionScan(stage: plan.Stage, stage_index: u16, expected: ?u16) !v
     };
 }
 
-fn validatePartitionOperator(stage: plan.Stage) !void {
-    switch (stage.operation) {
-        .filter, .project, .alias, .distinct => {},
+fn validatePartitionOperator(
+    allocator: std.mem.Allocator,
+    definition_plan: *const definition.Plan,
+    native_plan: *const plan.Plan,
+    stage_index: u16,
+) !void {
+    const stage = native_plan.stages[stage_index];
+    const local = switch (stage.operation) {
+        .filter, .project, .alias => true,
+        .distinct => |distinct| keysSession(native_plan, stage, distinct.field_indices),
         .generic => |generic| switch (generic.operator) {
-            .derive, .ordered_fold, .join => {},
-            else => return error.ObservationPartitionOperatorUnsupported,
+            .derive => try copiesSessionOutputs(allocator, generic.canonical_config, "fields"),
+            .join => try joinsSessionLocally(allocator, definition_plan, native_plan, stage_index),
+            .ordered_fold => try sessionFoldOrder(
+                allocator,
+                definition_plan,
+                native_plan,
+                stage_index,
+            ) != null,
+            else => false,
         },
-        else => return error.ObservationPartitionOperatorUnsupported,
+        else => false,
+    };
+    if (!local) return error.ObservationPartitionOperatorUnsupported;
+}
+
+fn keysSession(native_plan: *const plan.Plan, stage: plan.Stage, field_indices: []const u16) bool {
+    const input = switch (stage.source orelse return false) {
+        .stage => |index| native_plan.stages[index],
+        .external => return false,
+    };
+    const column = input.schema.find("session_id") orelse return false;
+    return std.mem.indexOfScalar(u16, field_indices, column) != null;
+}
+
+fn copiesSessionOutputs(
+    allocator: std.mem.Allocator,
+    config: []const u8,
+    outputs: []const u8,
+) !bool {
+    var parsed = try parseConfig(allocator, config);
+    defer parsed.deinit();
+    const root = try definition_core.json.object(parsed.value);
+    return copiesSessionFields(try configArray(root, outputs));
+}
+
+fn copiesSessionFields(outputs: std.json.Array) !bool {
+    for (outputs.items) |item| {
+        const field = try definition_core.json.object(item);
+        const name = try definition_core.json.requiredString(field, "name");
+        if (!std.mem.eql(u8, name, "session_id")) continue;
+        const expression = try definition_core.json.field(field, "expr");
+        const copied = expressions.fieldReference(expression) orelse return false;
+        if (!std.mem.eql(u8, copied, "session_id")) return false;
     }
+    return true;
+}
+
+fn sessionFoldOrder(
+    allocator: std.mem.Allocator,
+    definition_plan: *const definition.Plan,
+    native_plan: *const plan.Plan,
+    stage_index: u16,
+) !?plan.SortKey {
+    const inputs = definition_plan.steps[stage_index].input_names;
+    if (inputs.len != 1) return null;
+    const input = native_plan.findStage(inputs[0]) orelse return null;
+    const schema = &native_plan.stages[input].schema;
+    const config = native_plan.stages[stage_index].operation.generic.canonical_config;
+    var parsed = try parseConfig(allocator, config);
+    defer parsed.deinit();
+    const root = try definition_core.json.object(parsed.value);
+    if (!try copiesSessionFields(try configArray(root, "emit"))) return null;
+    const session = schema.find("session_id") orelse return null;
+    const keys = try stringFieldIndices(allocator, schema, try configArray(root, "keys"));
+    defer allocator.free(keys);
+    if (std.mem.indexOfScalar(u16, keys, session) == null) return null;
+    const order = try compileDynamicSort(allocator, schema, try configArray(root, "order_by"));
+    defer allocator.free(order);
+    if (order.len == 0 or order[0].field_index != session) return null;
+    return order[0];
+}
+
+fn localPartitionOrder(
+    allocator: std.mem.Allocator,
+    definition_plan: *const definition.Plan,
+    native_plan: *const plan.Plan,
+    local_stage: u16,
+) !PartitionOrder {
+    var current = local_stage;
+    for (0..native_plan.stages.len) |_| {
+        const stage = native_plan.stages[current];
+        switch (stage.operation) {
+            .scan => return .path,
+            .generic => |generic| if (generic.operator == .ordered_fold) {
+                const key = try sessionFoldOrder(allocator, definition_plan, native_plan, current);
+                return .{ .session = key.? };
+            },
+            else => {},
+        }
+        const inputs = definition_plan.steps[current].input_names;
+        current = native_plan.findStage(inputs[0]) orelse
+            return error.ObservationExternalGraphInputUnsupported;
+    }
+    unreachable;
+}
+
+pub fn rankPartitions(
+    allocator: std.mem.Allocator,
+    order: PartitionOrder,
+    sessions: []const ?[]const u8,
+) ![]usize {
+    const ranks = try allocator.alloc(usize, sessions.len);
+    errdefer allocator.free(ranks);
+    for (ranks, 0..) |*rank, index| rank.* = index;
+    const key = switch (order) {
+        .path => return ranks,
+        .session => |value| value,
+    };
+    const partitions = try allocator.alloc(usize, sessions.len);
+    defer allocator.free(partitions);
+    for (partitions, 0..) |*partition, index| partition.* = index;
+    const context: PartitionContext = .{ .key = key, .sessions = sessions };
+    std.mem.sort(usize, partitions, context, PartitionContext.lessThan);
+    for (partitions, 0..) |partition, rank| ranks[partition] = rank;
+    return ranks;
+}
+
+const PartitionContext = struct {
+    key: plan.SortKey,
+    sessions: []const ?[]const u8,
+
+    fn lessThan(context: PartitionContext, left: usize, right: usize) bool {
+        const compared = sortKeyOrder(
+            context.key,
+            sessionValue(context.sessions[left]),
+            sessionValue(context.sessions[right]),
+        );
+        if (compared != .eq) return compared == .lt;
+        return left < right;
+    }
+
+    fn sessionValue(session: ?[]const u8) execution.Value {
+        return if (session) |text| .{ .string = text } else .null;
+    }
+};
+
+fn joinsSessionLocally(
+    allocator: std.mem.Allocator,
+    definition_plan: *const definition.Plan,
+    native_plan: *const plan.Plan,
+    stage_index: u16,
+) !bool {
+    const stage = native_plan.stages[stage_index];
+    var spec = try compileJoin(
+        allocator,
+        native_plan,
+        definition_plan.steps[stage_index],
+        stage.operation.generic.canonical_config,
+    );
+    defer spec.deinit(allocator);
+    const left_session = native_plan.stages[spec.left_stage].schema.find("session_id") orelse
+        return false;
+    const right_session = native_plan.stages[spec.right_stage].schema.find("session_id") orelse
+        return false;
+    const paired = for (spec.keys) |key| {
+        const session_pair = key.left == left_session and key.right == right_session;
+        if (key.comparison == .eq and session_pair) break true;
+    } else false;
+    if (!paired) return false;
+    for (spec.outputs, stage.schema.columns) |output, column| {
+        if (!std.mem.eql(u8, column.name, "session_id")) continue;
+        if (output.side != .left or output.column != left_session) return false;
+    }
+    return true;
 }
 
 pub fn requiredScanStages(
@@ -193,20 +652,8 @@ pub fn requiredScanStages(
     native_plan: *const plan.Plan,
     projection_name: []const u8,
 ) ![]u16 {
-    const projection_index = findProjection(definition_plan, projection_name) orelse
-        return error.UnknownObservationProjection;
-    const reachable = try allocator.alloc(bool, native_plan.stages.len);
+    const reachable = try reachableStages(allocator, definition_plan, native_plan, projection_name);
     defer allocator.free(reachable);
-    @memset(reachable, false);
-    try markReachable(
-        allocator,
-        definition_plan,
-        native_plan,
-        native_plan.projections[projection_index].stage_index,
-        reachable,
-        &.{},
-        0,
-    );
     var scans: std.ArrayList(u16) = .empty;
     errdefer scans.deinit(allocator);
     for (native_plan.stages, 0..) |stage, index| {
@@ -215,6 +662,78 @@ pub fn requiredScanStages(
         }
     }
     return scans.toOwnedSlice(allocator);
+}
+
+pub fn selectsPhysically(
+    allocator: std.mem.Allocator,
+    definition_plan: *const definition.Plan,
+    native_plan: *const plan.Plan,
+    projection_name: []const u8,
+) !bool {
+    const reachable = try reachableStages(allocator, definition_plan, native_plan, projection_name);
+    defer allocator.free(reachable);
+    var scans: usize = 0;
+    for (native_plan.stages, reachable) |stage, is_reachable| {
+        if (!is_reachable) continue;
+        switch (stage.operation) {
+            .scan => scans += 1,
+            .generic => |generic| switch (generic.operator) {
+                .reachability => return false,
+                .join => if (try joinsLineage(allocator, generic.canonical_config)) return false,
+                else => {},
+            },
+            else => {},
+        }
+    }
+    return scans == 1;
+}
+
+pub fn reachesLineageJoin(
+    allocator: std.mem.Allocator,
+    definition_plan: *const definition.Plan,
+    native_plan: *const plan.Plan,
+    projection_name: []const u8,
+) !bool {
+    const reachable = try reachableStages(allocator, definition_plan, native_plan, projection_name);
+    defer allocator.free(reachable);
+    for (native_plan.stages, reachable) |stage, is_reachable| {
+        if (!is_reachable or stage.operation != .generic) continue;
+        const generic = stage.operation.generic;
+        if (generic.operator != .join) continue;
+        if (try joinsLineage(allocator, generic.canonical_config)) return true;
+    }
+    return false;
+}
+
+fn joinsLineage(allocator: std.mem.Allocator, config: []const u8) !bool {
+    var parsed = try parseConfig(allocator, config);
+    defer parsed.deinit();
+    const root = try definition_core.json.object(parsed.value);
+    const on = try definition_core.json.object(try definition_core.json.field(root, "on"));
+    return on.get("lineage") != null;
+}
+
+fn reachableStages(
+    allocator: std.mem.Allocator,
+    definition_plan: *const definition.Plan,
+    native_plan: *const plan.Plan,
+    projection_name: []const u8,
+) ![]bool {
+    const projection_index = findProjection(definition_plan, projection_name) orelse
+        return error.UnknownObservationProjection;
+    const reachable = try allocator.alloc(bool, native_plan.stages.len);
+    errdefer allocator.free(reachable);
+    @memset(reachable, false);
+    try markReachable(
+        allocator,
+        definition_plan,
+        native_plan,
+        native_plan.projections[projection_index].stage_index,
+        reachable,
+        &.{},
+        definition_plan.bounds.max_graph_depth,
+    );
+    return reachable;
 }
 
 const GraphExecution = struct {
@@ -247,7 +766,7 @@ const GraphExecution = struct {
         const reachable = try allocator.alloc(bool, count);
         errdefer allocator.free(reachable);
         @memset(reachable, false);
-        try markReachable(allocator, definition_plan, native_plan, target, reachable, scans, 0);
+        try markReachable(allocator, definition_plan, native_plan, target, reachable, scans, null);
         const tables = try allocator.alloc(?Table, count);
         errdefer allocator.free(tables);
         @memset(tables, null);
@@ -331,6 +850,20 @@ const GraphExecution = struct {
             self.allocations[index] = found.allocation orelse found.table.values;
             break :blk found.table;
         } else blk: {
+            const stage = self.native_plan.stages[index];
+            if (stage.operation == .scan) return error.ObservationInputNotExecuted;
+            const first_index = self.native_plan.findStage(step.input_names[0]) orelse
+                return error.ObservationExternalGraphInputUnsupported;
+            const input = self.tables[first_index] orelse return error.ObservationInputNotExecuted;
+            const exclusive = self.owned[first_index] and self.consumers[first_index] == 1;
+            const copy_input = !exclusive and switch (stage.operation) {
+                .filter => true,
+                .generic => |generic| generic.operator == .ordered_fold,
+                else => false,
+            };
+            const working = if (copy_input) try copyTable(self.allocator, input) else input;
+            var copy_adopted = false;
+            defer if (copy_input and !copy_adopted) self.allocator.free(working.values);
             const value = try executeStage(
                 self.allocator,
                 self.retained_allocator,
@@ -338,11 +871,17 @@ const GraphExecution = struct {
                 self.native_plan,
                 self.bindings,
                 self.selectors,
-                self.native_plan.stages[index],
+                stage,
                 step,
                 self.tables,
+                working,
+                exclusive,
             );
-            self.adoptTable(index, step, value);
+            if (copy_input and value.values.ptr == working.values.ptr) {
+                self.owned[index] = true;
+                self.allocations[index] = working.values;
+                copy_adopted = true;
+            } else self.adoptTable(index, step, value);
             break :blk value;
         };
         // Record the owner before any subsequent fallible validation.
@@ -360,6 +899,9 @@ const GraphExecution = struct {
             const input = self.native_plan.findStage(name) orelse continue;
             const prior = self.tables[input] orelse continue;
             if (table.values.ptr != prior.values.ptr) continue;
+            const allocation = self.allocations[input] orelse continue;
+            if (allocation.len == 0) continue;
+            std.debug.assert(self.owned[input] and self.consumers[input] == 1);
             self.owned[index] = self.owned[input];
             self.owned[input] = false;
             self.allocations[index] = self.allocations[input];
@@ -459,11 +1001,10 @@ fn markReachable(
     stage_index: u16,
     reachable: []bool,
     scans: []ScanInput,
-    depth: usize,
+    depth_limit: ?usize,
 ) !void {
-    const max_depth = definition_plan.bounds.max_graph_depth;
-    if (depth > max_depth) return error.ObservationGraphDepthExceeded;
-    const frames = try allocator.alloc(StageFrame, max_depth - depth + 1);
+    const frame_count = if (depth_limit) |limit| limit + 1 else native_plan.stages.len + 1;
+    const frames = try allocator.alloc(StageFrame, frame_count);
     defer allocator.free(frames);
     frames[0] = .{ .stage_index = stage_index };
     var count: usize = 1;
@@ -539,10 +1080,11 @@ fn executeStage(
     stage: plan.Stage,
     step: definition.Step,
     tables: []const ?Table,
+    input: Table,
+    input_is_exclusive: bool,
 ) !Table {
     const first_index = native_plan.findStage(step.input_names[0]) orelse
         return error.ObservationExternalGraphInputUnsupported;
-    const input = tables[first_index] orelse return error.ObservationInputNotExecuted;
     return switch (stage.operation) {
         .filter => |filter| try filterTable(
             allocator,
@@ -579,6 +1121,7 @@ fn executeStage(
             tables,
             input,
             first_index,
+            input_is_exclusive,
         ),
         .aggregate => |aggregate| try aggregateTable(
             allocator,
@@ -650,6 +1193,7 @@ fn executeGenericStage(
     tables: []const ?Table,
     input: Table,
     first_index: u16,
+    input_is_exclusive: bool,
 ) !Table {
     const generic = stage.operation.generic;
     return switch (generic.operator) {
@@ -671,6 +1215,7 @@ fn executeGenericStage(
             stage.schema,
             generic.canonical_config,
             definition_plan.bounds,
+            input_is_exclusive,
         ),
         .ordered_fold => try orderedFoldTable(
             allocator,
@@ -875,18 +1420,9 @@ fn resolveOperand(
             .null => .null,
         },
         .parameter => |index| scalarValue(
-            bindings.find(definition_plan.parameter_declarations.items[index].name).?.value,
+            (bindings.find(definition_plan.parameter_declarations.items[index].name) orelse
+                return error.MissingObservationParameter).value,
         ),
-    };
-}
-
-fn scalarValue(value: definition_core.scalar.Value) execution.Value {
-    return switch (value) {
-        .string, .digest, .timestamp, .safe_identifier, .relative_path => |text| .{
-            .string = text,
-        },
-        .integer => |number| .{ .integer = number },
-        .boolean => |flag| .{ .boolean = flag },
     };
 }
 
@@ -905,10 +1441,10 @@ fn valueMatches(
             operator,
             case_insensitive,
         ),
-        .less_than => compareValues(left, right) == .lt,
-        .less_or_equal => compareValues(left, right) != .gt,
-        .greater_than => compareValues(left, right) == .gt,
-        .greater_or_equal => compareValues(left, right) != .lt,
+        .less_than => value_module.holds(left, right, .lt),
+        .less_or_equal => value_module.holds(left, right, .le),
+        .greater_than => value_module.holds(left, right, .gt),
+        .greater_or_equal => value_module.holds(left, right, .ge),
     };
 }
 
@@ -959,11 +1495,17 @@ fn limitCount(
 ) !usize {
     return switch (limit) {
         .fixed => |value| value,
-        .parameter => |index| switch (bindings.find(
+        .parameter => |index| switch ((bindings.find(
             definition_plan.parameter_declarations.items[index].name,
-        ).?.value) {
-            .integer => |value| std.math.cast(usize, value) orelse
-                return error.InvalidObservationLimit,
+        ) orelse return error.MissingObservationParameter).value) {
+            .integer => |value| bound: {
+                const count = std.math.cast(usize, value) orelse
+                    return error.InvalidObservationLimit;
+                if (count == 0 or count > definition_plan.bounds.max_rows) {
+                    return error.InvalidObservationLimit;
+                }
+                break :bound count;
+            },
             else => return error.ObservationLimitParameterMustBeInteger,
         },
     };
@@ -977,20 +1519,20 @@ const SortContext = struct {
         const left = context.table.row(a);
         const right = context.table.row(b);
         for (context.keys) |key| {
-            const order = compareNullable(
-                left[key.field_index],
-                right[key.field_index],
-                key.nulls,
-            );
-            if (order == .eq) continue;
-            return if (key.direction == .ascending)
-                order == .lt
-            else
-                order == .gt;
+            const order = sortKeyOrder(key, left[key.field_index], right[key.field_index]);
+            if (order != .eq) return order == .lt;
         }
         return a < b;
     }
 };
+
+fn sortKeyOrder(
+    key: plan.SortKey,
+    left: execution.Value,
+    right: execution.Value,
+) std.math.Order {
+    return value_module.sortOrder(left, right, key.direction == .descending, key.nulls == .first);
+}
 
 fn sortTable(
     allocator: std.mem.Allocator,
@@ -1050,26 +1592,37 @@ fn sortTableInPlace(
         SortContext{ .table = input, .keys = sort.keys },
         SortContext.lessThan,
     );
-    const temporary = try allocator.alloc(execution.Value, input.width);
+    try permuteRowsInPlace(allocator, input, indices);
+    return input;
+}
+
+fn permuteRowsInPlace(allocator: std.mem.Allocator, table: Table, order: []usize) !void {
+    const count = order.len;
+    std.debug.assert(count == try table.rowCount());
+    const temporary = try allocator.alloc(execution.Value, table.width);
     defer allocator.free(temporary);
     for (0..count) |start| {
-        if (indices[start] == start) continue;
-        @memcpy(temporary, input.row(start));
+        if (order[start] == start) continue;
+        @memcpy(temporary, table.row(start));
         var current = start;
         var moved: usize = 0;
         while (moved < count) : (moved += 1) {
-            const next = indices[current];
-            indices[current] = current;
-            const target = input.values[current * input.width ..][0..input.width];
+            const next = order[current];
+            order[current] = current;
+            const target = table.values[current * table.width ..][0..table.width];
             if (next == start) {
                 @memcpy(target, temporary);
                 break;
             }
-            @memcpy(target, input.row(next));
+            @memcpy(target, table.row(next));
             current = next;
         }
     }
-    return input;
+}
+
+fn keyThenIndexLessThan(keys: []const usize, left: usize, right: usize) bool {
+    if (keys[left] != keys[right]) return keys[left] < keys[right];
+    return left < right;
 }
 
 fn distinctTable(
@@ -1132,33 +1685,13 @@ fn deriveTable(
 ) !Table {
     var workspace: ExpressionWorkspace = .{ .allocator = allocator, .config_bytes = config.len };
     defer workspace.deinit();
-    var parsed = try parseConfig(allocator, config);
-    defer parsed.deinit();
-    const root = try definition_core.json.object(parsed.value);
-    const fields = try definition_core.json.array(
-        try definition_core.json.field(root, "fields"),
+    var derivation = try expressions.Derivation.init(
+        allocator,
+        input_schema,
+        &output_schema,
+        config,
     );
-    const preserve_input = if (root.get("preserve_input")) |raw|
-        try definition_core.json.boolean(raw)
-    else
-        true;
-    const sequential = if (root.get("sequential")) |raw|
-        try definition_core.json.boolean(raw)
-    else
-        false;
-    var expression_arena = std.heap.ArenaAllocator.init(allocator);
-    defer expression_arena.deinit();
-    const expressions = try expression_arena.allocator().alloc(*CompiledExpr, fields.items.len);
-    for (fields.items, 0..) |field, index| {
-        const object = try definition_core.json.object(field);
-        expressions[index] = try compileExpr(
-            expression_arena.allocator(),
-            try definition_core.json.field(object, "expr"),
-            input_schema,
-            if (sequential) &output_schema else null,
-            index,
-        );
-    }
+    defer derivation.deinit();
     const values = try allocator.alloc(
         execution.Value,
         (try input.rowCount()) * output_schema.columns.len,
@@ -1167,237 +1700,24 @@ fn deriveTable(
     for (0..try input.rowCount()) |row_index| {
         const row = input.row(row_index);
         const out = values[row_index * output_schema.columns.len ..][0..output_schema.columns.len];
-        if (preserve_input) @memcpy(out[0..input.width], row);
-        for (expressions, 0..) |expression, index| {
-            out[(if (preserve_input) input.width else 0) + index] = try evalCompiledExpr(
-                &workspace,
-                retained_allocator,
-                expression,
-                row,
-                out,
-                input_schema,
-                bindings,
-                selectors,
-            );
-        }
+        try derivation.apply(&workspace, retained_allocator, bindings, selectors, row, out);
     }
     return .{ .values = values, .width = output_schema.columns.len };
-}
-
-const CompiledOp = enum {
-    eq,
-    ne,
-    lt,
-    le,
-    gt,
-    ge,
-    and_op,
-    or_op,
-    add,
-    subtract,
-    multiply,
-    divide,
-};
-
-const CompiledExpr = union(enum) {
-    null_value,
-    boolean: bool,
-    integer: i64,
-    float: f64,
-    text: []const u8,
-    field: u16,
-    output_field: u16,
-    dynamic: std.json.Value,
-    is_null: *CompiledExpr,
-    not: *CompiledExpr,
-    if_else: struct {
-        condition: *CompiledExpr,
-        then_value: *CompiledExpr,
-        else_value: *CompiledExpr,
-    },
-    coalesce: []*CompiledExpr,
-    binary: struct {
-        op: CompiledOp,
-        left: *CompiledExpr,
-        right: *CompiledExpr,
-    },
-};
-
-const ExpressionCompiler = struct {
-    allocator: std.mem.Allocator,
-    schema: *const plan.Schema,
-    output_schema: ?*const plan.Schema,
-    output_limit: usize,
-    tasks: std.ArrayList(Task) = .empty,
-
-    const Task = struct { source: std.json.Value, output: *CompiledExpr };
-
-    fn compile(self: *ExpressionCompiler, expression: std.json.Value) !*CompiledExpr {
-        const root = try self.allocator.create(CompiledExpr);
-        try self.tasks.append(self.allocator, .{ .source = expression, .output = root });
-        defer self.tasks.deinit(self.allocator);
-        // Each task belongs to one node of the already bounded, parsed config.
-        while (self.tasks.pop()) |task| {
-            task.output.* = try self.compileNode(task.source);
-        }
-        return root;
-    }
-
-    fn compileNode(self: *ExpressionCompiler, source: std.json.Value) !CompiledExpr {
-        return switch (source) {
-            .null => .null_value,
-            .bool => |value| .{ .boolean = value },
-            .integer => |value| .{ .integer = value },
-            .float => |value| .{ .float = value },
-            .number_string => |value| if (std.fmt.parseInt(i64, value, 10)) |integer|
-                .{ .integer = integer }
-            else |_|
-                .{ .float = try std.fmt.parseFloat(f64, value) },
-            .string => |value| .{ .text = value },
-            .array => .{ .dynamic = source },
-            .object => |object| try self.compileObject(source, object),
-        };
-    }
-
-    fn compileObject(
-        self: *ExpressionCompiler,
-        source: std.json.Value,
-        object: std.json.ObjectMap,
-    ) !CompiledExpr {
-        if (object.get("field")) |raw| return self.compileField(raw);
-        if (object.get("state") != null or object.get("param") != null or
-            object.get("selector") != null)
-        {
-            return .{ .dynamic = source };
-        }
-        const op = try definition_core.json.requiredString(object, "op");
-        const args = try definition_core.json.array(
-            try definition_core.json.field(object, "args"),
-        );
-        if (std.mem.eql(u8, op, "coalesce")) {
-            return .{ .coalesce = try self.children(args.items) };
-        }
-        if (std.mem.eql(u8, op, "if")) {
-            if (args.items.len != 3) return error.InvalidObservationExpressionArity;
-            const nodes = try self.children(args.items);
-            return .{ .if_else = .{
-                .condition = nodes[0],
-                .then_value = nodes[1],
-                .else_value = nodes[2],
-            } };
-        }
-        if (std.mem.eql(u8, op, "is-null") or std.mem.eql(u8, op, "not")) {
-            if (args.items.len != 1) return error.InvalidObservationExpressionArity;
-            const nodes = try self.children(args.items);
-            return if (std.mem.eql(u8, op, "is-null"))
-                .{ .is_null = nodes[0] }
-            else
-                .{ .not = nodes[0] };
-        }
-        const compiled_op = parseCompiledOp(op) orelse return .{ .dynamic = source };
-        if (args.items.len != 2) return error.InvalidObservationExpressionArity;
-        const nodes = try self.children(args.items);
-        return .{ .binary = .{ .op = compiled_op, .left = nodes[0], .right = nodes[1] } };
-    }
-
-    fn compileField(self: *const ExpressionCompiler, raw: std.json.Value) !CompiledExpr {
-        const name = try definition_core.json.string(raw);
-        if (self.schema.find(name)) |index| return .{ .field = index };
-        if (self.output_schema) |output| {
-            for (output.columns[0..self.output_limit], 0..) |column, index| {
-                if (std.mem.eql(u8, column.name, name)) {
-                    return .{ .output_field = @intCast(index) };
-                }
-            }
-        }
-        return error.UnknownObservationExpressionField;
-    }
-
-    fn children(self: *ExpressionCompiler, args: []const std.json.Value) ![]*CompiledExpr {
-        const nodes = try self.allocator.alloc(*CompiledExpr, args.len);
-        for (nodes) |*node| node.* = try self.allocator.create(CompiledExpr);
-        var remaining = args.len;
-        while (remaining > 0) {
-            remaining -= 1;
-            try self.tasks.append(self.allocator, .{
-                .source = args[remaining],
-                .output = nodes[remaining],
-            });
-        }
-        return nodes;
-    }
-};
-
-fn compileExpr(
-    allocator: std.mem.Allocator,
-    expression: std.json.Value,
-    schema: *const plan.Schema,
-    output_schema: ?*const plan.Schema,
-    output_limit: usize,
-) !*CompiledExpr {
-    var compiler: ExpressionCompiler = .{
-        .allocator = allocator,
-        .schema = schema,
-        .output_schema = output_schema,
-        .output_limit = output_limit,
-    };
-    return compiler.compile(expression);
-}
-
-fn parseCompiledOp(op: []const u8) ?CompiledOp {
-    if (std.mem.eql(u8, op, "eq")) return .eq;
-    if (std.mem.eql(u8, op, "ne")) return .ne;
-    if (std.mem.eql(u8, op, "lt")) return .lt;
-    if (std.mem.eql(u8, op, "le")) return .le;
-    if (std.mem.eql(u8, op, "gt")) return .gt;
-    if (std.mem.eql(u8, op, "ge")) return .ge;
-    if (std.mem.eql(u8, op, "and")) return .and_op;
-    if (std.mem.eql(u8, op, "or")) return .or_op;
-    if (std.mem.eql(u8, op, "add")) return .add;
-    if (std.mem.eql(u8, op, "subtract")) return .subtract;
-    if (std.mem.eql(u8, op, "multiply")) return .multiply;
-    if (std.mem.eql(u8, op, "divide")) return .divide;
-    return null;
-}
-
-fn evalCompiledExpr(
-    workspace: *ExpressionWorkspace,
-    allocator: std.mem.Allocator,
-    expression: *const CompiledExpr,
-    row: []const execution.Value,
-    output: []const execution.Value,
-    schema: *const plan.Schema,
-    bindings: *const definition_core.parameters.Bindings,
-    selectors: RuntimeSelectors,
-) !execution.Value {
-    return workspace.evaluate(.{ .compiled = expression }, .{
-        .allocator = allocator,
-        .row = row,
-        .output = output,
-        .schema = schema,
-        .bindings = bindings,
-        .selectors = selectors,
-    });
 }
 
 const JoinContext = struct {
     allocator: std.mem.Allocator,
     left: Table,
     right: Table,
-    left_schema: plan.Schema,
-    right_schema: plan.Schema,
+    spec: *const JoinSpec,
     output_width: usize,
-    on: std.json.ObjectMap,
-    keys: std.json.Array,
-    fields: std.json.Array,
-    kind: []const u8,
     lineage: ?*LineageIndex,
     index: *const JoinIndex,
     max_rows: usize,
 
     fn first(self: *const JoinContext, row: []const execution.Value) ?usize {
-        if (!joinRequiredTrue(self.left_schema, row, self.on, "left_true")) return null;
-        const hash = joinEqualityHash(self.left_schema, row, self.keys, true) orelse return null;
+        if (!joinFlagEnabled(self.spec.left_true, row)) return null;
+        const hash = joinEqualityHash(self.spec.keys, row, .left) orelse return null;
         return self.index.first(hash);
     }
 
@@ -1405,15 +1725,13 @@ const JoinContext = struct {
         self: *const JoinContext,
         left: []const execution.Value,
         right: []const execution.Value,
-    ) !bool {
-        if (!joinKeysMatch(self.left_schema, left, self.right_schema, right, self.keys)) {
-            return false;
-        }
+    ) bool {
+        if (!joinKeysMatch(self.spec.keys, left, right)) return false;
         if (self.lineage) |lineage| return lineage.matches(left, right);
         return true;
     }
 
-    fn membership(self: *const JoinContext) !Table {
+    fn membership(self: *const JoinContext, input_is_exclusive: bool) !Table {
         const keep = try self.allocator.alloc(bool, try self.left.rowCount());
         defer self.allocator.free(keep);
         for (0..keep.len) |left_index| {
@@ -1421,25 +1739,25 @@ const JoinContext = struct {
             var matched = false;
             var candidate = self.first(row);
             while (candidate) |right_index| : (candidate = self.index.after(right_index)) {
-                if (!try self.matches(row, self.right.row(right_index))) continue;
+                if (!self.matches(row, self.right.row(right_index))) continue;
                 matched = true;
                 break;
             }
-            keep[left_index] = if (std.mem.eql(u8, self.kind, "anti")) !matched else matched;
+            keep[left_index] = if (self.spec.kind == .anti) !matched else matched;
         }
-        const aliases_right = self.left.values.ptr == self.right.values.ptr;
+        const copy_output = !input_is_exclusive or self.left.values.ptr == self.right.values.ptr;
         var retained: usize = 0;
         for (keep) |retain| if (retain) {
             retained += 1;
         };
-        const output = if (aliases_right)
+        const output = if (copy_output)
             try self.allocator.alloc(execution.Value, retained * self.left.width)
         else
             self.left.values;
         var kept: usize = 0;
         for (keep, 0..) |retain, source_index| {
             if (!retain) continue;
-            if (aliases_right or kept != source_index) {
+            if (copy_output or kept != source_index) {
                 @memcpy(
                     output[kept * self.left.width ..][0..self.left.width],
                     self.left.row(source_index),
@@ -1450,10 +1768,8 @@ const JoinContext = struct {
         return .{ .values = output[0 .. kept * self.left.width], .width = self.left.width };
     }
 
-    fn materialize(self: *const JoinContext, membership_join: bool) !Table {
-        if (membership_join and !joinProjectsOnlyLeft(self.fields)) {
-            return error.ObservationMembershipJoinProjectsRight;
-        }
+    fn materialize(self: *const JoinContext) !Table {
+        const membership_join = self.spec.membership();
         var values: std.ArrayList(execution.Value) = .empty;
         errdefer values.deinit(self.allocator);
         for (0..try self.left.rowCount()) |left_index| {
@@ -1462,39 +1778,25 @@ const JoinContext = struct {
             var candidate = self.first(row);
             while (candidate) |right_index| : (candidate = self.index.after(right_index)) {
                 const right = self.right.row(right_index);
-                if (!try self.matches(row, right)) continue;
+                if (!self.matches(row, right)) continue;
                 matched = true;
                 if (membership_join) break;
-                try self.append(&values, row, right);
+                try appendJoinOutputs(self.allocator, &values, self.spec.outputs, row, right);
                 if (values.items.len / self.output_width > self.max_rows) {
                     return error.ObservationRowBoundExceeded;
                 }
             }
-            if (membership_join) {
-                const retain = if (std.mem.eql(u8, self.kind, "anti")) !matched else matched;
-                if (retain) try self.append(&values, row, null);
-            } else if (!matched and std.mem.eql(u8, self.kind, "left")) {
-                try self.append(&values, row, null);
+            const keeps_left_row = switch (self.spec.kind) {
+                .anti => !matched,
+                .semi => matched,
+                .left => !matched,
+                .inner => false,
+            };
+            if (keeps_left_row) {
+                try appendJoinOutputs(self.allocator, &values, self.spec.outputs, row, null);
             }
         }
         return .{ .values = try values.toOwnedSlice(self.allocator), .width = self.output_width };
-    }
-
-    fn append(
-        self: *const JoinContext,
-        values: *std.ArrayList(execution.Value),
-        left: []const execution.Value,
-        right: ?[]const execution.Value,
-    ) !void {
-        try appendJoinRow(
-            self.allocator,
-            values,
-            self.fields,
-            self.left_schema,
-            left,
-            self.right_schema,
-            right,
-        );
     }
 };
 
@@ -1506,198 +1808,364 @@ fn joinTable(
     output_schema: plan.Schema,
     config: []const u8,
     bounds: definition.Bounds,
+    input_is_exclusive: bool,
 ) !Table {
-    if (step.input_names.len < 2 or step.input_names.len > 3) {
-        return error.InvalidPipelineInputCount;
-    }
-    const left_index = native_plan.findStage(step.input_names[0]) orelse
-        return error.ObservationExternalGraphInputUnsupported;
-    const right_index = native_plan.findStage(step.input_names[1]) orelse
-        return error.ObservationExternalGraphInputUnsupported;
-    const left = tables[left_index] orelse return error.ObservationInputNotExecuted;
-    const right = tables[right_index] orelse return error.ObservationInputNotExecuted;
-    var parsed = try parseConfig(allocator, config);
-    defer parsed.deinit();
-    const root = try definition_core.json.object(parsed.value);
-    const on = try definition_core.json.object(try definition_core.json.field(root, "on"));
-    const keys = try definition_core.json.array(try definition_core.json.field(on, "keys"));
-    const kind = if (on.get("kind")) |raw| try definition_core.json.string(raw) else "inner";
-    const fields = try definition_core.json.array(try definition_core.json.field(root, "fields"));
-    var lineage = try initJoinLineage(
+    var spec = try compileJoin(allocator, native_plan, step, config);
+    defer spec.deinit(allocator);
+    const left = tables[spec.left_stage] orelse return error.ObservationInputNotExecuted;
+    const right = tables[spec.right_stage] orelse return error.ObservationInputNotExecuted;
+    var lineage = if (spec.lineage) |columns| try LineageIndex.init(
         allocator,
-        native_plan,
-        step,
-        tables,
-        on,
-        left_index,
-        right_index,
+        tables[columns.graph_stage] orelse return error.ObservationInputNotExecuted,
+        columns,
         bounds.max_graph_depth,
-    );
+    ) else null;
     defer if (lineage) |*index| index.deinit(allocator);
     var index = try JoinIndex.init(allocator, try right.rowCount());
     defer index.deinit(allocator);
-    try populateJoinIndex(
-        allocator,
-        &index,
-        right,
-        native_plan.stages[right_index].schema,
-        on,
-        keys,
-    );
+    try populateJoinIndex(allocator, &index, right, &spec);
     const context: JoinContext = .{
         .allocator = allocator,
         .left = left,
         .right = right,
-        .left_schema = native_plan.stages[left_index].schema,
-        .right_schema = native_plan.stages[right_index].schema,
+        .spec = &spec,
         .output_width = output_schema.columns.len,
-        .on = on,
-        .keys = keys,
-        .fields = fields,
-        .kind = kind,
         .lineage = if (lineage) |*value| value else null,
         .index = &index,
         .max_rows = bounds.max_rows,
     };
-    const membership_join = std.mem.eql(u8, kind, "semi") or std.mem.eql(u8, kind, "anti");
-    if (membership_join and joinProjectsLeft(fields, context.left_schema)) {
-        return context.membership();
+    if (spec.membership() and spec.projectsLeftColumns(left.width)) {
+        return context.membership(input_is_exclusive);
     }
-    return context.materialize(membership_join);
+    return context.materialize();
 }
 
-fn initJoinLineage(
+const JoinKind = enum { inner, left, semi, anti };
+
+const JoinOperator = enum { eq, lt, le, gt, ge };
+
+const JoinSide = enum { left, right };
+
+const JoinComparison = union(JoinOperator) {
+    eq: bool,
+    lt: void,
+    le: void,
+    gt: void,
+    ge: void,
+};
+
+const JoinKey = struct {
+    left: u16,
+    right: u16,
+    comparison: JoinComparison,
+};
+
+const JoinOutput = struct {
+    side: JoinSide,
+    column: u16,
+};
+
+const JoinLineage = struct {
+    graph_stage: u16,
+    node: u16,
+    parent: u16,
+    left: u16,
+    right: u16,
+};
+
+const JoinSpec = struct {
+    kind: JoinKind,
+    left_stage: u16,
+    right_stage: u16,
+    keys: []JoinKey,
+    left_true: ?u16,
+    right_true: ?u16,
+    lineage: ?JoinLineage,
+    outputs: []JoinOutput,
+
+    fn deinit(self: *JoinSpec, allocator: std.mem.Allocator) void {
+        allocator.free(self.keys);
+        allocator.free(self.outputs);
+        self.* = undefined;
+    }
+
+    fn membership(self: *const JoinSpec) bool {
+        return self.kind == .semi or self.kind == .anti;
+    }
+
+    fn projectsLeftColumns(self: *const JoinSpec, width: usize) bool {
+        if (self.outputs.len != width) return false;
+        for (self.outputs, 0..) |output, column| {
+            if (output.side != .left or output.column != column) return false;
+        }
+        return true;
+    }
+};
+
+fn compileJoin(
     allocator: std.mem.Allocator,
     native_plan: *const plan.Plan,
     step: definition.Step,
-    tables: []const ?Table,
-    on: std.json.ObjectMap,
-    left_index: u16,
-    right_index: u16,
-    max_depth: usize,
-) !?LineageIndex {
-    const raw = on.get("lineage") orelse return null;
-    if (step.input_names.len != 3) return error.ObservationLineageInputMissing;
-    const graph_index = native_plan.findStage(step.input_names[2]) orelse
-        return error.ObservationExternalGraphInputUnsupported;
-    const graph = tables[graph_index] orelse return error.ObservationInputNotExecuted;
-    return try LineageIndex.init(
+    config: []const u8,
+) !JoinSpec {
+    var parsed = try parseConfig(allocator, config);
+    defer parsed.deinit();
+    const root = try definition_core.json.object(parsed.value);
+    const on = try definition_core.json.object(try definition_core.json.field(root, "on"));
+    try requireJoinOptions(on, &.{ "kind", "keys", "left_true", "right_true", "lineage" });
+    const lineage = on.get("lineage");
+    if (lineage != null and step.input_names.len != 3) {
+        return error.ObservationLineageInputMissing;
+    }
+    if (step.input_names.len < 2 or step.input_names.len > 3) {
+        return error.InvalidPipelineInputCount;
+    }
+    const left_stage = try joinInputStage(native_plan, step, 0);
+    const right_stage = try joinInputStage(native_plan, step, 1);
+    const left = native_plan.stages[left_stage].schema;
+    const right = native_plan.stages[right_stage].schema;
+    const kind = if (on.get("kind")) |raw|
+        std.meta.stringToEnum(JoinKind, try definition_core.json.string(raw)) orelse
+            return error.ObservationJoinKindUnsupported
+    else
+        JoinKind.inner;
+    const left_true = try compileJoinFlag(on, "left_true", left);
+    const right_true = try compileJoinFlag(on, "right_true", right);
+    const keys = try compileJoinKeys(allocator, try configArray(on, "keys"), left, right);
+    errdefer allocator.free(keys);
+    const outputs = try compileJoinOutputs(
         allocator,
-        graph,
-        native_plan.stages[graph_index].schema,
-        try definition_core.json.object(raw),
-        native_plan.stages[left_index].schema,
-        native_plan.stages[right_index].schema,
-        max_depth,
+        try configArray(root, "fields"),
+        left,
+        right,
+        kind,
     );
+    errdefer allocator.free(outputs);
+    return .{
+        .kind = kind,
+        .left_stage = left_stage,
+        .right_stage = right_stage,
+        .keys = keys,
+        .left_true = left_true,
+        .right_true = right_true,
+        .lineage = if (lineage) |raw|
+            try compileJoinLineage(native_plan, step, try definition_core.json.object(raw))
+        else
+            null,
+        .outputs = outputs,
+    };
+}
+
+fn joinInputStage(native_plan: *const plan.Plan, step: definition.Step, input: usize) !u16 {
+    return native_plan.findStage(step.input_names[input]) orelse
+        error.ObservationExternalGraphInputUnsupported;
+}
+
+fn compileJoinFlag(on: std.json.ObjectMap, name: []const u8, schema: plan.Schema) !?u16 {
+    const raw = on.get(name) orelse return null;
+    const column = schema.find(try definition_core.json.string(raw)) orelse
+        return error.UnknownObservationJoinField;
+    if (schema.columns[column].kind != .boolean) return error.ObservationJoinFlagRequiresBoolean;
+    return column;
+}
+
+fn compileJoinKeys(
+    allocator: std.mem.Allocator,
+    keys: std.json.Array,
+    left: plan.Schema,
+    right: plan.Schema,
+) ![]JoinKey {
+    const compiled = try allocator.alloc(JoinKey, keys.items.len);
+    errdefer allocator.free(compiled);
+    var equality_keys: usize = 0;
+    for (keys.items, compiled) |item, *key| {
+        const object = try definition_core.json.object(item);
+        try requireJoinOptions(object, &.{ "left", "right", "op", "nulls_equal" });
+        const op = if (object.get("op")) |raw|
+            std.meta.stringToEnum(JoinOperator, try definition_core.json.string(raw)) orelse
+                return error.ObservationJoinOperatorUnsupported
+        else
+            JoinOperator.eq;
+        const nulls_equal = if (object.get("nulls_equal")) |raw|
+            try definition_core.json.boolean(raw)
+        else
+            false;
+        if (nulls_equal and op != .eq) return error.ObservationJoinNullsEqualRequiresEquality;
+        key.* = .{
+            .left = left.find(try definition_core.json.requiredString(object, "left")) orelse
+                return error.UnknownObservationJoinField,
+            .right = right.find(try definition_core.json.requiredString(object, "right")) orelse
+                return error.UnknownObservationJoinField,
+            .comparison = switch (op) {
+                .eq => .{ .eq = nulls_equal },
+                .lt => .lt,
+                .le => .le,
+                .gt => .gt,
+                .ge => .ge,
+            },
+        };
+        if (op == .eq) equality_keys += 1;
+    }
+    if (equality_keys == 0) return error.ObservationJoinRequiresEqualityKey;
+    return compiled;
+}
+
+fn compileJoinOutputs(
+    allocator: std.mem.Allocator,
+    fields: std.json.Array,
+    left: plan.Schema,
+    right: plan.Schema,
+    kind: JoinKind,
+) ![]JoinOutput {
+    const outputs = try allocator.alloc(JoinOutput, fields.items.len);
+    errdefer allocator.free(outputs);
+    for (fields.items, outputs) |item, *output| {
+        const field = try definition_core.json.object(item);
+        try requireJoinOptions(field, &.{ "source", "field", "name", "type", "nullable" });
+        const source = try definition_core.json.unsigned(
+            try definition_core.json.field(field, "source"),
+        );
+        const side: JoinSide = switch (source) {
+            0 => .left,
+            1 => .right,
+            else => return error.ObservationJoinSourceUnsupported,
+        };
+        if (side == .right and (kind == .semi or kind == .anti)) {
+            return error.ObservationMembershipJoinProjectsRight;
+        }
+        const schema = if (side == .left) left else right;
+        output.* = .{
+            .side = side,
+            .column = schema.find(try definition_core.json.requiredString(field, "field")) orelse
+                return error.UnknownObservationJoinField,
+        };
+    }
+    return outputs;
+}
+
+fn compileJoinLineage(
+    native_plan: *const plan.Plan,
+    step: definition.Step,
+    config: std.json.ObjectMap,
+) !JoinLineage {
+    try requireJoinOptions(config, &.{ "node", "parent", "left", "right" });
+    const graph_stage = try joinInputStage(native_plan, step, 2);
+    const graph = native_plan.stages[graph_stage].schema;
+    const left = native_plan.stages[try joinInputStage(native_plan, step, 0)].schema;
+    const right = native_plan.stages[try joinInputStage(native_plan, step, 1)].schema;
+    return .{
+        .graph_stage = graph_stage,
+        .node = try lineageColumn(graph, config, "node"),
+        .parent = try lineageColumn(graph, config, "parent"),
+        .left = try lineageColumn(left, config, "left"),
+        .right = try lineageColumn(right, config, "right"),
+    };
+}
+
+fn lineageColumn(schema: plan.Schema, config: std.json.ObjectMap, name: []const u8) !u16 {
+    return schema.find(try definition_core.json.requiredString(config, name)) orelse
+        error.UnknownObservationLineageField;
+}
+
+fn requireJoinOptions(object: std.json.ObjectMap, allowed: []const []const u8) !void {
+    for (object.keys()) |key| {
+        if (!namesOneOf(allowed, key)) return error.UnknownObservationJoinOption;
+    }
+}
+
+fn namesOneOf(names: []const []const u8, wanted: []const u8) bool {
+    for (names) |name| if (std.mem.eql(u8, name, wanted)) return true;
+    return false;
 }
 
 fn populateJoinIndex(
     allocator: std.mem.Allocator,
     index: *JoinIndex,
     right: Table,
-    schema: plan.Schema,
-    on: std.json.ObjectMap,
-    keys: std.json.Array,
+    spec: *const JoinSpec,
 ) !void {
-    var equality_keys: usize = 0;
-    for (keys.items) |item| {
-        const key = try definition_core.json.object(item);
-        const op = if (key.get("op")) |raw| try definition_core.json.string(raw) else "eq";
-        if (std.mem.eql(u8, op, "eq")) equality_keys += 1;
-    }
-    if (equality_keys == 0) return error.ObservationJoinRequiresEqualityKey;
     for (0..try right.rowCount()) |row_index| {
         const row = right.row(row_index);
-        if (!joinRequiredTrue(schema, row, on, "right_true")) continue;
-        const hash = joinEqualityHash(schema, row, keys, false) orelse continue;
+        if (!joinFlagEnabled(spec.right_true, row)) continue;
+        const hash = joinEqualityHash(spec.keys, row, .right) orelse continue;
         try index.add(allocator, hash, row_index);
     }
 }
 
-fn joinProjectsOnlyLeft(fields: std.json.Array) bool {
-    for (fields.items) |item| {
-        const field = definition_core.json.object(item) catch return false;
-        const source = definition_core.json.unsigned(
-            definition_core.json.field(field, "source") catch return false,
-        ) catch return false;
-        if (source != 0) return false;
-    }
-    return true;
+fn joinFlagEnabled(column: ?u16, row: []const execution.Value) bool {
+    const index = column orelse return true;
+    return switch (row[index]) {
+        .boolean => |flag| flag,
+        else => false,
+    };
 }
 
-fn joinProjectsLeft(fields: std.json.Array, schema: plan.Schema) bool {
-    if (fields.items.len != schema.columns.len) return false;
-    for (fields.items, 0..) |item, index| {
-        const field = definition_core.json.object(item) catch return false;
-        const source = definition_core.json.unsigned(
-            definition_core.json.field(field, "source") catch return false,
-        ) catch return false;
-        if (source != 0) return false;
-        const name = definition_core.json.requiredString(field, "field") catch return false;
-        if (!std.mem.eql(u8, name, schema.columns[index].name)) return false;
-    }
-    return true;
-}
-
-const CompiledJoinKey = struct {
-    left: u16,
-    right: u16,
-    nulls_equal: bool,
-};
-
-fn joinTrueFieldIndex(on: std.json.ObjectMap, schema: plan.Schema, key: []const u8) !?u16 {
-    const raw = on.get(key) orelse return null;
-    return schema.find(try definition_core.json.string(raw)) orelse
-        error.UnknownObservationJoinField;
-}
-
-fn compileStreamingJoinKeys(
-    allocator: std.mem.Allocator,
-    on: std.json.ObjectMap,
-    left_schema: plan.Schema,
-) ![]CompiledJoinKey {
-    const raw_keys = try definition_core.json.array(try definition_core.json.field(on, "keys"));
-    const keys = try allocator.alloc(CompiledJoinKey, raw_keys.items.len);
-    errdefer allocator.free(keys);
-    for (raw_keys.items, 0..) |item, index| {
-        const key = try definition_core.json.object(item);
-        const op = if (key.get("op")) |raw|
-            try definition_core.json.string(raw)
-        else
-            "eq";
-        if (!std.mem.eql(u8, op, "eq")) {
-            return error.ObservationStreamingLineageKeyUnsupported;
-        }
-        keys[index] = .{
-            .left = left_schema.find(
-                try definition_core.json.requiredString(key, "left"),
-            ) orelse return error.UnknownObservationJoinField,
-            .right = left_schema.find(
-                try definition_core.json.requiredString(key, "right"),
-            ) orelse return error.UnknownObservationJoinField,
-            .nulls_equal = if (key.get("nulls_equal")) |raw|
-                try definition_core.json.boolean(raw)
-            else
-                false,
+fn joinEqualityHash(keys: []const JoinKey, row: []const execution.Value, side: JoinSide) ?u64 {
+    var hash = std.hash.Wyhash.init(0);
+    for (keys) |key| {
+        const nulls_equal = switch (key.comparison) {
+            .eq => |value| value,
+            else => continue,
         };
+        const value = row[if (side == .left) key.left else key.right];
+        if (value == .null and !nulls_equal) return null;
+        hashValue(&hash, value);
     }
-    return keys;
+    return hash.final();
+}
+
+fn joinKeysMatch(
+    keys: []const JoinKey,
+    left: []const execution.Value,
+    right: []const execution.Value,
+) bool {
+    for (keys) |key| {
+        const left_value = left[key.left];
+        const right_value = right[key.right];
+        const matched = switch (key.comparison) {
+            .eq => |nulls_equal| if (left_value == .null or right_value == .null)
+                nulls_equal and left_value == .null and right_value == .null
+            else
+                valuesEqual(left_value, right_value, false),
+            .lt => value_module.holds(left_value, right_value, .lt),
+            .le => value_module.holds(left_value, right_value, .le),
+            .gt => value_module.holds(left_value, right_value, .gt),
+            .ge => value_module.holds(left_value, right_value, .ge),
+        };
+        if (!matched) return false;
+    }
+    return true;
+}
+
+fn appendJoinOutputs(
+    allocator: std.mem.Allocator,
+    output: *std.ArrayList(execution.Value),
+    outputs: []const JoinOutput,
+    left: []const execution.Value,
+    right: ?[]const execution.Value,
+) !void {
+    for (outputs) |field| {
+        try output.append(allocator, switch (field.side) {
+            .left => left[field.column],
+            .right => if (right) |row| row[field.column] else .null,
+        });
+    }
 }
 
 pub const StreamingLineageReducer = struct {
     allocator: std.mem.Allocator,
-    left_schema: plan.Schema,
-    output_width: usize,
-    keys: []CompiledJoinKey,
+    spec: JoinSpec,
+    width: usize,
     lineage: LineageIndex,
     heads: std.AutoHashMapUnmanaged(u64, usize) = .{},
     next: std.ArrayList(usize) = .empty,
     output: std.ArrayList(execution.Value) = .empty,
-    left_true_index: ?u16,
-    right_true_index: ?u16,
+    ranks: std.ArrayList(usize) = .empty,
+    partitions: std.StringHashMapUnmanaged(bool) = .{},
     max_rows: usize,
     max_retained_bytes: usize,
+
+    const no_owner = std.math.maxInt(usize);
 
     pub fn init(
         allocator: std.mem.Allocator,
@@ -1713,48 +2181,29 @@ pub const StreamingLineageReducer = struct {
             else => return error.ObservationStreamingLineageShapeUnsupported,
         };
         if (generic.operator != .join) return error.ObservationStreamingLineageShapeUnsupported;
-        var parsed = try parseConfig(allocator, generic.canonical_config);
-        defer parsed.deinit();
-        const root = try definition_core.json.object(parsed.value);
-        const on = try definition_core.json.object(
-            try definition_core.json.field(root, "on"),
+        var spec = try compileJoin(
+            allocator,
+            native_plan,
+            definition_plan.steps[schedule.lineage_stage],
+            generic.canonical_config,
         );
-        const kind = try definition_core.json.requiredString(on, "kind");
-        if (!std.mem.eql(u8, kind, "anti")) {
+        errdefer spec.deinit(allocator);
+        if (!streamableLineageJoin(native_plan, &spec)) {
             return error.ObservationStreamingLineageShapeUnsupported;
         }
-        const fields = try definition_core.json.array(
-            try definition_core.json.field(root, "fields"),
-        );
-        const left_schema = native_plan.stages[schedule.local_stage].schema;
-        if (!joinProjectsLeft(fields, left_schema)) {
-            return error.ObservationStreamingLineageProjectionUnsupported;
-        }
-        const keys = try compileStreamingJoinKeys(allocator, on, left_schema);
-        errdefer allocator.free(keys);
-        const lineage_config = try definition_core.json.object(
-            on.get("lineage") orelse return error.ObservationLineageInputMissing,
-        );
         var lineage = try LineageIndex.init(
             allocator,
             graph,
-            native_plan.stages[schedule.graph_stage].schema,
-            lineage_config,
-            left_schema,
-            left_schema,
+            spec.lineage.?,
             definition_plan.bounds.max_graph_depth,
         );
         errdefer lineage.deinit(allocator);
-        const left_true = try joinTrueFieldIndex(on, left_schema, "left_true");
-        const right_true = try joinTrueFieldIndex(on, left_schema, "right_true");
+        std.debug.assert(stage.schema.columns.len == spec.outputs.len);
         return .{
             .allocator = allocator,
-            .left_schema = left_schema,
-            .output_width = stage.schema.columns.len,
-            .keys = keys,
+            .spec = spec,
+            .width = native_plan.stages[spec.left_stage].schema.columns.len,
             .lineage = lineage,
-            .left_true_index = left_true,
-            .right_true_index = right_true,
             .max_rows = definition_plan.bounds.max_rows,
             .max_retained_bytes = max_retained_bytes,
         };
@@ -1762,124 +2211,145 @@ pub const StreamingLineageReducer = struct {
 
     pub fn deinit(self: *StreamingLineageReducer) void {
         self.lineage.deinit(self.allocator);
-        self.allocator.free(self.keys);
+        self.spec.deinit(self.allocator);
         self.heads.deinit(self.allocator);
         self.next.deinit(self.allocator);
         self.output.deinit(self.allocator);
+        self.ranks.deinit(self.allocator);
+        self.partitions.deinit(self.allocator);
         self.* = undefined;
     }
 
-    pub fn appendPartition(self: *StreamingLineageReducer, rows: Table) !void {
-        if (rows.width != self.left_schema.columns.len) {
-            return error.InvalidObservationRows;
+    pub fn scheduleSessions(
+        self: *StreamingLineageReducer,
+        allocator: std.mem.Allocator,
+        sessions: []const ?[]const u8,
+    ) ![]usize {
+        for (sessions) |session| {
+            if (session) |id| try self.partitions.put(self.allocator, id, false);
+        }
+        return self.lineage.scheduleSessions(allocator, sessions);
+    }
+
+    pub fn appendPartition(
+        self: *StreamingLineageReducer,
+        session: ?[]const u8,
+        rank: usize,
+        rows: Table,
+    ) !void {
+        if (rows.width != self.width) return error.InvalidObservationRows;
+        if (self.lineage.sessionNode(session)) |node| {
+            var walk = self.lineage.ancestorWalk(node);
+            while (walk.next()) |ancestor| {
+                const consumed = self.partitions.get(ancestor) orelse continue;
+                if (!consumed) return error.ObservationStreamingPartitionOutOfOrder;
+            }
         }
         for (0..try rows.rowCount()) |row_index| {
             const row = rows.row(row_index);
-            const left_enabled = if (self.left_true_index) |index|
-                switch (row[index]) {
-                    .boolean => |flag| flag,
-                    else => false,
-                }
-            else
-                true;
-            if (!left_enabled) {
-                try self.output.appendSlice(self.allocator, row);
-                try self.next.append(self.allocator, std.math.maxInt(usize));
-                try self.checkBounds();
-                continue;
-            }
-            const key_hash = self.keyHash(row) orelse {
-                try self.output.appendSlice(self.allocator, row);
-                try self.next.append(self.allocator, std.math.maxInt(usize));
-                try self.checkBounds();
+            const key_hash = joinEqualityHash(self.spec.keys, row, .left) orelse {
+                try self.retain(row, null, rank);
                 continue;
             };
-            var matched_ancestor = false;
-            var candidate = self.heads.get(key_hash);
-            while (candidate) |owner_index| {
-                const owner = self.ownerRow(owner_index);
-                if (self.keysMatch(row, owner) and
-                    try self.lineage.matches(row, owner))
-                {
-                    matched_ancestor = true;
-                    break;
-                }
-                const following = self.next.items[owner_index];
-                candidate = if (following == std.math.maxInt(usize)) null else following;
-            }
-            if (matched_ancestor) continue;
-            const right_enabled = if (self.right_true_index) |index|
-                switch (row[index]) {
-                    .boolean => |flag| flag,
-                    else => false,
-                }
-            else
-                true;
-            const output_index = self.output.items.len / self.output_width;
-            try self.output.appendSlice(self.allocator, row);
-            if (right_enabled) {
-                const entry = try self.heads.getOrPut(self.allocator, key_hash);
-                try self.next.append(
-                    self.allocator,
-                    if (entry.found_existing) entry.value_ptr.* else std.math.maxInt(usize),
-                );
-                entry.value_ptr.* = output_index;
-            } else try self.next.append(self.allocator, std.math.maxInt(usize));
-            try self.checkBounds();
+            if (joinFlagEnabled(self.spec.left_true, row) and
+                self.ancestorMatches(row, key_hash)) continue;
+            const owner = joinFlagEnabled(self.spec.right_true, row);
+            try self.retain(row, if (owner) key_hash else null, rank);
+        }
+        if (session) |id| {
+            if (self.partitions.getPtr(id)) |consumed| consumed.* = true;
         }
     }
 
-    fn checkBounds(self: *const StreamingLineageReducer) !void {
-        if (self.output.items.len / self.output_width > self.max_rows) {
-            return error.ObservationRowBoundExceeded;
+    fn ancestorMatches(
+        self: *const StreamingLineageReducer,
+        row: []const execution.Value,
+        key_hash: u64,
+    ) bool {
+        var candidate = self.heads.get(key_hash);
+        while (candidate) |owner_index| {
+            const owner = self.ownerRow(owner_index);
+            if (joinKeysMatch(self.spec.keys, row, owner) and
+                self.lineage.matches(row, owner)) return true;
+            const following = self.next.items[owner_index];
+            candidate = if (following == no_owner) null else following;
         }
+        return false;
+    }
+
+    fn retain(
+        self: *StreamingLineageReducer,
+        row: []const execution.Value,
+        owner_hash: ?u64,
+        rank: usize,
+    ) !void {
+        const output_index = self.rowCount();
+        try self.ranks.append(self.allocator, rank);
+        try self.output.appendSlice(self.allocator, row);
+        if (owner_hash) |hash| {
+            const entry = try self.heads.getOrPut(self.allocator, hash);
+            try self.next.append(
+                self.allocator,
+                if (entry.found_existing) entry.value_ptr.* else no_owner,
+            );
+            entry.value_ptr.* = output_index;
+        } else try self.next.append(self.allocator, no_owner);
+        try self.checkBounds();
+    }
+
+    fn checkBounds(self: *const StreamingLineageReducer) !void {
+        if (self.rowCount() > self.max_rows) return error.ObservationRowBoundExceeded;
         const value_bytes = try std.math.mul(
             usize,
             self.output.items.len,
             @sizeOf(execution.Value),
         );
-        const next_bytes = try std.math.mul(usize, self.next.items.len, @sizeOf(usize));
-        if (try std.math.add(usize, value_bytes, next_bytes) > self.max_retained_bytes) {
+        const index_bytes = try std.math.mul(
+            usize,
+            try std.math.add(usize, self.next.items.len, self.ranks.items.len),
+            @sizeOf(usize),
+        );
+        if (try std.math.add(usize, value_bytes, index_bytes) > self.max_retained_bytes) {
             return error.ObservationRetainedByteBoundExceeded;
         }
     }
 
     pub fn finish(self: *StreamingLineageReducer) !Table {
-        const values = try self.output.toOwnedSlice(self.allocator);
-        self.output = .empty;
-        return .{ .values = values, .width = self.output_width };
+        const order = try self.allocator.alloc(usize, self.ranks.items.len);
+        defer self.allocator.free(order);
+        for (order, 0..) |*slot, index| slot.* = index;
+        std.mem.sort(usize, order, self.ranks.items, keyThenIndexLessThan);
+        try permuteRowsInPlace(
+            self.allocator,
+            .{ .values = self.output.items, .width = self.width },
+            order,
+        );
+        if (self.spec.projectsLeftColumns(self.width)) {
+            const values = try self.output.toOwnedSlice(self.allocator);
+            self.output = .empty;
+            return .{ .values = values, .width = self.width };
+        }
+        const rows = self.rowCount();
+        const width = self.spec.outputs.len;
+        const values = try self.allocator.alloc(
+            execution.Value,
+            try std.math.mul(usize, rows, width),
+        );
+        for (0..rows) |row_index| {
+            const row = self.ownerRow(row_index);
+            const target = values[row_index * width ..][0..width];
+            for (self.spec.outputs, target) |output, *value| value.* = row[output.column];
+        }
+        self.output.clearAndFree(self.allocator);
+        return .{ .values = values, .width = width };
+    }
+
+    pub fn rowCount(self: *const StreamingLineageReducer) usize {
+        return self.output.items.len / self.width;
     }
 
     fn ownerRow(self: *const StreamingLineageReducer, index: usize) []const execution.Value {
-        const width = self.left_schema.columns.len;
-        return self.output.items[index * width ..][0..width];
-    }
-
-    fn keyHash(self: *const StreamingLineageReducer, row: []const execution.Value) ?u64 {
-        var hasher = std.hash.Wyhash.init(0);
-        for (self.keys) |key| {
-            const value = row[key.left];
-            if (value == .null and !key.nulls_equal) return null;
-            hashValue(&hasher, value);
-        }
-        return hasher.final();
-    }
-
-    fn keysMatch(
-        self: *const StreamingLineageReducer,
-        left: []const execution.Value,
-        right: []const execution.Value,
-    ) bool {
-        for (self.keys) |key| {
-            if (left[key.left] == .null or right[key.right] == .null) {
-                if (key.nulls_equal and left[key.left] == .null and right[key.right] == .null) {
-                    continue;
-                }
-                return false;
-            }
-            if (!valuesEqual(left[key.left], right[key.right], false)) return false;
-        }
-        return true;
+        return self.output.items[index * self.width ..][0..self.width];
     }
 };
 
@@ -1921,56 +2391,9 @@ const JoinIndex = struct {
     }
 };
 
-fn joinRequiredTrue(
-    schema: plan.Schema,
-    row: []const execution.Value,
-    on: std.json.ObjectMap,
-    name: []const u8,
-) bool {
-    const raw = on.get(name) orelse return true;
-    const field = definition_core.json.string(raw) catch return false;
-    return switch (row[schema.find(field) orelse return false]) {
-        .boolean => |flag| flag,
-        else => false,
-    };
-}
-
-fn joinEqualityHash(
-    schema: plan.Schema,
-    row: []const execution.Value,
-    keys: std.json.Array,
-    left: bool,
-) ?u64 {
-    var hash = std.hash.Wyhash.init(0);
-    var count: usize = 0;
-    for (keys.items) |item| {
-        const key = definition_core.json.object(item) catch return null;
-        const op = if (key.get("op")) |raw|
-            definition_core.json.string(raw) catch return null
-        else
-            "eq";
-        if (!std.mem.eql(u8, op, "eq")) continue;
-        const name = definition_core.json.requiredString(
-            key,
-            if (left) "left" else "right",
-        ) catch return null;
-        const value = row[schema.find(name) orelse return null];
-        if (value == .null) {
-            const nulls_equal = if (key.get("nulls_equal")) |raw|
-                definition_core.json.boolean(raw) catch return null
-            else
-                false;
-            if (!nulls_equal) return null;
-        }
-        hashValue(&hash, value);
-        count += 1;
-    }
-    return if (count == 0) null else hash.final();
-}
-
 fn hashValue(hash: *std.hash.Wyhash, value: execution.Value) void {
     if (valueFloat(value)) |number| {
-        const bits: u64 = @bitCast(number);
+        const bits: u64 = @bitCast(if (number == 0) @as(f64, 0) else number);
         hash.update(std.mem.asBytes(&bits));
         return;
     }
@@ -1991,144 +2414,110 @@ fn hashValue(hash: *std.hash.Wyhash, value: execution.Value) void {
 
 const LineageIndex = struct {
     rows: Table,
-    node_index: u16,
     parent_index: u16,
     left_index: u16,
     right_index: u16,
-    max_depth: usize,
     nodes: std.StringHashMapUnmanaged(usize) = .{},
+    parents: []?usize = &.{},
 
     fn init(
         allocator: std.mem.Allocator,
         rows: Table,
-        graph_schema: plan.Schema,
-        config: std.json.ObjectMap,
-        left_schema: plan.Schema,
-        right_schema: plan.Schema,
+        columns: JoinLineage,
         max_depth: usize,
     ) !LineageIndex {
         var result = LineageIndex{
             .rows = rows,
-            .node_index = graph_schema.find(
-                try definition_core.json.requiredString(config, "node"),
-            ) orelse return error.UnknownObservationLineageField,
-            .parent_index = graph_schema.find(
-                try definition_core.json.requiredString(config, "parent"),
-            ) orelse return error.UnknownObservationLineageField,
-            .left_index = left_schema.find(
-                try definition_core.json.requiredString(config, "left"),
-            ) orelse return error.UnknownObservationLineageField,
-            .right_index = right_schema.find(
-                try definition_core.json.requiredString(config, "right"),
-            ) orelse return error.UnknownObservationLineageField,
-            .max_depth = max_depth,
+            .parent_index = columns.parent,
+            .left_index = columns.left,
+            .right_index = columns.right,
         };
         errdefer result.deinit(allocator);
         for (0..try rows.rowCount()) |row_index| {
-            const node = valueText(rows.row(row_index)[result.node_index]) orelse
-                return error.InvalidObservationLineageNode;
+            const value = rows.row(row_index)[columns.node];
+            if (value == .null) continue;
+            const node = valueText(value) orelse return error.InvalidObservationLineageNode;
             const entry = try result.nodes.getOrPut(allocator, node);
             if (entry.found_existing) return error.DuplicateObservationLineageNode;
             entry.value_ptr.* = row_index;
         }
+        result.parents = try parentLinks(
+            allocator,
+            rows,
+            columns.node,
+            columns.parent,
+            &result.nodes,
+            false,
+        );
+        try requireBoundedAncestry(allocator, result.parents, max_depth);
         return result;
     }
 
     fn deinit(self: *LineageIndex, allocator: std.mem.Allocator) void {
         self.nodes.deinit(allocator);
+        allocator.free(self.parents);
         self.* = undefined;
+    }
+
+    const AncestorWalk = struct {
+        index: *const LineageIndex,
+        current: ?usize,
+        remaining: usize,
+
+        fn next(self: *AncestorWalk) ?[]const u8 {
+            const node = self.current orelse return null;
+            if (self.remaining == 0) return null;
+            self.remaining -= 1;
+            const row = self.index.rows.row(node);
+            const parent = valueText(row[self.index.parent_index]) orelse {
+                self.current = null;
+                return null;
+            };
+            self.current = self.index.parents[node];
+            return parent;
+        }
+    };
+
+    fn ancestorWalk(self: *const LineageIndex, node: usize) AncestorWalk {
+        return .{ .index = self, .current = node, .remaining = self.parents.len };
+    }
+
+    fn sessionNode(self: *const LineageIndex, session: ?[]const u8) ?usize {
+        return self.nodes.get(session orelse return null);
+    }
+
+    fn scheduleSessions(
+        self: *const LineageIndex,
+        allocator: std.mem.Allocator,
+        sessions: []const ?[]const u8,
+    ) ![]usize {
+        const levels = try allocator.alloc(usize, sessions.len);
+        defer allocator.free(levels);
+        for (levels, sessions) |*level, session| {
+            level.* = 0;
+            var walk = self.ancestorWalk(self.sessionNode(session) orelse continue);
+            while (walk.next()) |_| level.* += 1;
+        }
+        const order = try allocator.alloc(usize, sessions.len);
+        for (order, 0..) |*slot, index| slot.* = index;
+        std.mem.sort(usize, order, levels, keyThenIndexLessThan);
+        return order;
     }
 
     fn matches(
         self: *const LineageIndex,
         left: []const execution.Value,
         right: []const execution.Value,
-    ) !bool {
+    ) bool {
         const descendant = valueText(left[self.left_index]) orelse return false;
         const ancestor = valueText(right[self.right_index]) orelse return false;
-        var current = descendant;
-        var depth: usize = 0;
-        while (self.nodes.get(current)) |row_index| {
-            if (depth >= self.max_depth) return error.ObservationGraphDepthExceeded;
-            const parent = valueText(self.rows.row(row_index)[self.parent_index]) orelse
-                return false;
-            depth += 1;
+        var walk = self.ancestorWalk(self.nodes.get(descendant) orelse return false);
+        while (walk.next()) |parent| {
             if (std.mem.eql(u8, parent, ancestor)) return true;
-            if (std.mem.eql(u8, parent, current)) return error.ObservationGraphCycle;
-            current = parent;
         }
         return false;
     }
 };
-
-fn joinKeysMatch(
-    left_schema: plan.Schema,
-    left: []const execution.Value,
-    right_schema: plan.Schema,
-    right: []const execution.Value,
-    keys: std.json.Array,
-) bool {
-    for (keys.items) |item| {
-        const key = definition_core.json.object(item) catch return false;
-        const left_name = definition_core.json.requiredString(key, "left") catch return false;
-        const right_name = definition_core.json.requiredString(key, "right") catch return false;
-        const left_index = left_schema.find(left_name) orelse return false;
-        const right_index = right_schema.find(right_name) orelse return false;
-        const nulls_equal = if (key.get("nulls_equal")) |raw|
-            definition_core.json.boolean(raw) catch return false
-        else
-            false;
-        if (left[left_index] == .null or right[right_index] == .null) {
-            if (nulls_equal and left[left_index] == .null and right[right_index] == .null) {
-                continue;
-            }
-            return false;
-        }
-        const op = if (key.get("op")) |raw|
-            definition_core.json.string(raw) catch return false
-        else
-            "eq";
-        const matched = if (std.mem.eql(u8, op, "eq"))
-            valuesEqual(left[left_index], right[right_index], false)
-        else if (std.mem.eql(u8, op, "lt"))
-            compareValues(left[left_index], right[right_index]) == .lt
-        else if (std.mem.eql(u8, op, "le"))
-            compareValues(left[left_index], right[right_index]) != .gt
-        else if (std.mem.eql(u8, op, "gt"))
-            compareValues(left[left_index], right[right_index]) == .gt
-        else if (std.mem.eql(u8, op, "ge"))
-            compareValues(left[left_index], right[right_index]) != .lt
-        else
-            false;
-        if (!matched) return false;
-    }
-    return true;
-}
-
-fn appendJoinRow(
-    allocator: std.mem.Allocator,
-    output: *std.ArrayList(execution.Value),
-    fields: std.json.Array,
-    left_schema: plan.Schema,
-    left: []const execution.Value,
-    right_schema: plan.Schema,
-    right: ?[]const execution.Value,
-) !void {
-    for (fields.items) |item| {
-        const field = try definition_core.json.object(item);
-        const source = try definition_core.json.unsigned(
-            try definition_core.json.field(field, "source"),
-        );
-        const name = try definition_core.json.requiredString(field, "field");
-        const value: execution.Value = if (source == 0)
-            left[left_schema.find(name) orelse return error.UnknownObservationJoinField]
-        else if (source == 1 and right != null)
-            right.?[right_schema.find(name) orelse return error.UnknownObservationJoinField]
-        else
-            .null;
-        try output.append(allocator, value);
-    }
-}
 
 fn configArray(object: std.json.ObjectMap, name: []const u8) !std.json.Array {
     return definition_core.json.array(try definition_core.json.field(object, name));
@@ -2359,12 +2748,16 @@ fn reachabilityTable(
     var nodes: std.StringHashMapUnmanaged(usize) = .{};
     defer nodes.deinit(allocator);
     for (0..count) |index| {
-        const node = valueText(input.row(index)[node_index]) orelse
-            return error.InvalidObservationReachabilityNode;
+        const value = input.row(index)[node_index];
+        if (value == .null) continue;
+        const node = valueText(value) orelse return error.InvalidObservationReachabilityNode;
         const entry = try nodes.getOrPut(allocator, node);
         if (entry.found_existing) return error.DuplicateObservationReachabilityNode;
         entry.value_ptr.* = index;
     }
+    const parents = try parentLinks(allocator, input, node_index, parent_index, &nodes, true);
+    defer allocator.free(parents);
+    try requireBoundedAncestry(allocator, parents, bounds.max_graph_depth);
     if (keys.get("mode")) |raw_mode| {
         const mode = try definition_core.json.string(raw_mode);
         if (std.mem.eql(u8, mode, "closure")) {
@@ -2375,9 +2768,8 @@ fn reachabilityTable(
                 output_schema,
                 fields,
                 node_index,
-                parent_index,
+                parents,
                 bounds,
-                &nodes,
             );
         }
         return error.UnknownObservationReachabilityMode;
@@ -2389,10 +2781,68 @@ fn reachabilityTable(
         output_schema,
         fields,
         keys,
-        parent_index,
+        parents,
         bounds,
-        &nodes,
     );
+}
+
+fn parentLinks(
+    allocator: std.mem.Allocator,
+    rows: Table,
+    node_index: u16,
+    parent_index: u16,
+    nodes: *const std.StringHashMapUnmanaged(usize),
+    comptime text_parents: bool,
+) ![]?usize {
+    const parents = try allocator.alloc(?usize, try rows.rowCount());
+    errdefer allocator.free(parents);
+    for (parents, 0..) |*parent, index| {
+        const row = rows.row(index);
+        parent.* = null;
+        if (row[node_index] == .null or row[parent_index] == .null) continue;
+        const text = valueText(row[parent_index]) orelse {
+            if (text_parents) return error.InvalidObservationReachabilityNode;
+            continue;
+        };
+        parent.* = nodes.get(text);
+    }
+    return parents;
+}
+
+fn requireBoundedAncestry(
+    allocator: std.mem.Allocator,
+    parents: []const ?usize,
+    max_depth: usize,
+) !void {
+    const depths = try allocator.alloc(usize, parents.len);
+    defer allocator.free(depths);
+    const settled = try allocator.alloc(bool, parents.len);
+    defer allocator.free(settled);
+    const visiting = try allocator.alloc(bool, parents.len);
+    defer allocator.free(visiting);
+    @memset(settled, false);
+    @memset(visiting, false);
+    var path: std.ArrayList(usize) = .empty;
+    defer path.deinit(allocator);
+    for (0..parents.len) |start| {
+        path.clearRetainingCapacity();
+        var current: ?usize = start;
+        while (current) |node| {
+            if (settled[node]) break;
+            if (visiting[node]) return error.ObservationGraphCycle;
+            visiting[node] = true;
+            try path.append(allocator, node);
+            current = parents[node];
+        }
+        var remaining = path.items.len;
+        while (remaining > 0) {
+            remaining -= 1;
+            const node = path.items[remaining];
+            depths[node] = if (parents[node]) |parent| depths[parent] + 1 else 0;
+            if (depths[node] > max_depth) return error.ObservationGraphDepthExceeded;
+            settled[node] = true;
+        }
+    }
 }
 
 fn reachabilitySeeded(
@@ -2402,9 +2852,8 @@ fn reachabilitySeeded(
     output_schema: plan.Schema,
     fields: std.json.Array,
     keys: std.json.ObjectMap,
-    parent_index: u16,
+    parents: []const ?usize,
     bounds: definition.Bounds,
-    nodes: *const std.StringHashMapUnmanaged(usize),
 ) !Table {
     const count = try input.rowCount();
     const seed_index = input_schema.find(
@@ -2434,11 +2883,9 @@ fn reachabilitySeeded(
         },
         else => {},
     };
-    try expandReachability(
-        input,
-        parent_index,
+    expandReachability(
+        parents,
         bounds.max_graph_depth,
-        nodes,
         walk_ancestors,
         walk_descendants,
         reachable,
@@ -2456,39 +2903,27 @@ fn reachabilitySeeded(
 }
 
 fn expandReachability(
-    input: Table,
-    parent_index: u16,
+    parents: []const ?usize,
     max_depth: usize,
-    nodes: *const std.StringHashMapUnmanaged(usize),
     walk_ancestors: bool,
     walk_descendants: bool,
     reachable: []bool,
     depths: []i64,
-) !void {
-    const count = try input.rowCount();
+) void {
     var depth: usize = 0;
     while (depth < max_depth) : (depth += 1) {
         var changed = false;
-        for (0..count) |child_index| {
-            const parent = input.row(child_index)[parent_index];
-            if (parent == .null) continue;
-            const parent_text = valueText(parent) orelse
-                return error.InvalidObservationReachabilityNode;
-            if (nodes.get(parent_text)) |candidate_index| {
-                if (walk_ancestors and reachable[child_index] and
-                    !reachable[candidate_index])
-                {
-                    reachable[candidate_index] = true;
-                    depths[candidate_index] = depths[child_index] + 1;
-                    changed = true;
-                }
-                if (walk_descendants and reachable[candidate_index] and
-                    !reachable[child_index])
-                {
-                    reachable[child_index] = true;
-                    depths[child_index] = depths[candidate_index] + 1;
-                    changed = true;
-                }
+        for (parents, 0..) |parent, child_index| {
+            const candidate_index = parent orelse continue;
+            if (walk_ancestors and reachable[child_index] and !reachable[candidate_index]) {
+                reachable[candidate_index] = true;
+                depths[candidate_index] = depths[child_index] + 1;
+                changed = true;
+            }
+            if (walk_descendants and reachable[candidate_index] and !reachable[child_index]) {
+                reachable[child_index] = true;
+                depths[child_index] = depths[candidate_index] + 1;
+                changed = true;
             }
         }
         if (!changed) break;
@@ -2544,30 +2979,19 @@ fn reachabilityClosure(
     output_schema: plan.Schema,
     fields: std.json.Array,
     node_index: u16,
-    parent_index: u16,
+    parents: []const ?usize,
     bounds: definition.Bounds,
-    nodes: *const std.StringHashMapUnmanaged(usize),
 ) !Table {
     const count = try input.rowCount();
     var output: std.ArrayList(execution.Value) = .empty;
     errdefer output.deinit(allocator);
     for (0..count) |descendant_index| {
         const descendant = input.row(descendant_index);
-        var parent = descendant[parent_index];
+        var current = parents[descendant_index];
         var depth: usize = 1;
-        while (parent != .null) : (depth += 1) {
-            if (depth > bounds.max_graph_depth) {
-                return error.ObservationGraphDepthExceeded;
-            }
-            const parent_text = valueText(parent) orelse
-                return error.InvalidObservationReachabilityNode;
-            const found = nodes.get(parent_text) orelse break;
+        while (current) |found| : (depth += 1) {
+            std.debug.assert(depth <= bounds.max_graph_depth and found != descendant_index);
             const ancestor = input.row(found);
-            if (valuesEqual(
-                descendant[node_index],
-                ancestor[node_index],
-                false,
-            )) return error.ObservationGraphCycle;
             for (fields.items) |item| {
                 const field = try definition_core.json.object(item);
                 if (field.get("meta")) |raw| {
@@ -2599,407 +3023,13 @@ fn reachabilityClosure(
             {
                 return error.ObservationGraphNodeBoundExceeded;
             }
-            parent = ancestor[parent_index];
+            current = parents[found];
         }
     }
     return .{
         .values = try output.toOwnedSlice(allocator),
         .width = output_schema.columns.len,
     };
-}
-
-fn parseConfig(
-    allocator: std.mem.Allocator,
-    config: []const u8,
-) !std.json.Parsed(std.json.Value) {
-    return std.json.parseFromSlice(std.json.Value, allocator, config, .{
-        .allocate = .alloc_always,
-        .duplicate_field_behavior = .@"error",
-        .parse_numbers = false,
-    });
-}
-
-const ExpressionContext = struct {
-    allocator: std.mem.Allocator,
-    row: []const execution.Value,
-    output: []const execution.Value = &.{},
-    schema: *const plan.Schema,
-    state: []const execution.Value = &.{},
-    state_names: []const []const u8 = &.{},
-    bindings: *const definition_core.parameters.Bindings,
-    selectors: RuntimeSelectors,
-};
-
-const ExpressionBranch = struct {
-    kind: enum { coalesce, if_else, unary, binary, concat },
-    op: []const u8,
-    count: usize,
-    compiled_op: ?CompiledOp = null,
-};
-
-const ExpressionInspection = union(enum) {
-    value: execution.Value,
-    branch: ExpressionBranch,
-};
-
-const ExpressionNode = union(enum) {
-    compiled: *const CompiledExpr,
-    dynamic: std.json.Value,
-
-    fn inspect(self: ExpressionNode, context: ExpressionContext) !ExpressionInspection {
-        return switch (self) {
-            .dynamic => |value| inspectDynamicExpression(value, context),
-            .compiled => |expression| switch (expression.*) {
-                .null_value => .{ .value = .null },
-                .boolean => |value| .{ .value = .{ .boolean = value } },
-                .integer => |value| .{ .value = .{ .integer = value } },
-                .float => |value| .{ .value = .{ .float = value } },
-                .text => |value| .{ .value = .{
-                    .string = try context.allocator.dupe(u8, value),
-                } },
-                .field => |index| .{ .value = context.row[index] },
-                .output_field => |index| .{ .value = context.output[index] },
-                .dynamic => |value| inspectDynamicExpression(value, context),
-                .is_null => expressionBranch("is-null", 1),
-                .not => expressionBranch("not", 1),
-                .if_else => expressionBranch("if", 3),
-                .coalesce => |children| expressionBranch("coalesce", children.len),
-                .binary => |binary| .{ .branch = .{
-                    .kind = .binary,
-                    .op = compiledOpName(binary.op),
-                    .count = 2,
-                    .compiled_op = binary.op,
-                } },
-            },
-        };
-    }
-
-    fn child(self: ExpressionNode, index: usize) ExpressionNode {
-        return switch (self) {
-            .dynamic => |value| .{ .dynamic = value.object.get("args").?.array.items[index] },
-            .compiled => |expression| switch (expression.*) {
-                .dynamic => |value| .{
-                    .dynamic = value.object.get("args").?.array.items[index],
-                },
-                .is_null, .not => |value| .{ .compiled = value },
-                .if_else => |value| .{ .compiled = switch (index) {
-                    0 => value.condition,
-                    1 => value.then_value,
-                    2 => value.else_value,
-                    else => unreachable,
-                } },
-                .coalesce => |children| .{ .compiled = children[index] },
-                .binary => |value| .{ .compiled = if (index == 0) value.left else value.right },
-                else => unreachable,
-            },
-        };
-    }
-};
-
-fn compiledOpName(op: CompiledOp) []const u8 {
-    return switch (op) {
-        .and_op => "and",
-        .or_op => "or",
-        else => @tagName(op),
-    };
-}
-
-fn expressionBranch(op: []const u8, count: usize) !ExpressionInspection {
-    const kind: @FieldType(ExpressionBranch, "kind") = if (std.mem.eql(u8, op, "coalesce"))
-        .coalesce
-    else if (std.mem.eql(u8, op, "if"))
-        .if_else
-    else if (std.mem.eql(u8, op, "concat"))
-        .concat
-    else if (std.mem.eql(u8, op, "is-null") or std.mem.eql(u8, op, "not") or
-        std.mem.eql(u8, op, "parse-time"))
-        .unary
-    else
-        .binary;
-    const required: ?usize = switch (kind) {
-        .if_else => 3,
-        .unary => 1,
-        .binary => 2,
-        .coalesce, .concat => null,
-    };
-    if (required) |arity| if (count != arity) return error.InvalidObservationExpressionArity;
-    return .{ .branch = .{ .kind = kind, .op = op, .count = count } };
-}
-
-fn inspectDynamicExpression(
-    expression: std.json.Value,
-    context: ExpressionContext,
-) !ExpressionInspection {
-    return switch (expression) {
-        .null => .{ .value = .null },
-        .bool => |value| .{ .value = .{ .boolean = value } },
-        .integer => |value| .{ .value = .{ .integer = value } },
-        .float => |value| .{ .value = .{ .float = value } },
-        .number_string => |value| .{ .value = if (std.fmt.parseInt(i64, value, 10)) |integer|
-            .{ .integer = integer }
-        else |_|
-            .{ .float = try std.fmt.parseFloat(f64, value) } },
-        .string => |value| .{ .value = .{ .string = try context.allocator.dupe(u8, value) } },
-        .array => error.InvalidObservationExpression,
-        .object => |object| inspectDynamicObject(object, context),
-    };
-}
-
-fn inspectDynamicObject(
-    object: std.json.ObjectMap,
-    context: ExpressionContext,
-) !ExpressionInspection {
-    if (object.get("field")) |raw| {
-        const name = try definition_core.json.string(raw);
-        const index = context.schema.find(name) orelse
-            return error.UnknownObservationExpressionField;
-        return .{ .value = context.row[index] };
-    }
-    if (object.get("state")) |raw| {
-        const name = try definition_core.json.string(raw);
-        const index = findName(context.state_names, name) orelse
-            return error.UnknownObservationFoldState;
-        return .{ .value = context.state[index] };
-    }
-    if (object.get("param")) |raw| {
-        const name = try definition_core.json.string(raw);
-        const binding = context.bindings.find(name) orelse return error.UnknownParameter;
-        return .{ .value = scalarValue(binding.value) };
-    }
-    if (object.get("selector")) |raw| {
-        return .{ .value = try selectorValue(
-            context.selectors,
-            try definition_core.json.string(raw),
-        ) };
-    }
-    const op = try definition_core.json.requiredString(object, "op");
-    const args = try definition_core.json.array(try definition_core.json.field(object, "args"));
-    return expressionBranch(op, args.items.len);
-}
-
-const ExpressionFrame = struct {
-    node: ExpressionNode,
-    branch: ExpressionBranch,
-    next: usize = 0,
-    left: execution.Value = .null,
-    text: std.ArrayList(u8) = .empty,
-
-    fn accept(
-        self: *ExpressionFrame,
-        value: *execution.Value,
-        scratch_allocator: std.mem.Allocator,
-        retained_allocator: std.mem.Allocator,
-    ) !bool {
-        switch (self.branch.kind) {
-            .coalesce => {
-                if (value.* != .null or self.next + 1 == self.branch.count) return true;
-                self.next += 1;
-                return false;
-            },
-            .if_else => {
-                if (self.next != 0) return true;
-                self.next = if (truthy(value.*)) 1 else 2;
-                return false;
-            },
-            .unary => value.* = unaryExpression(self.branch.op, value.*),
-            .binary => {
-                if (self.next == 0) {
-                    self.left = value.*;
-                    self.next = 1;
-                    return false;
-                }
-                value.* = if (self.branch.compiled_op) |op|
-                    try compiledBinaryExpression(op, self.left, value.*)
-                else
-                    try binaryExpression(self.branch.op, self.left, value.*);
-            },
-            .concat => {
-                try self.text.appendSlice(scratch_allocator, valueText(value.*) orelse "");
-                self.next += 1;
-                if (self.next < self.branch.count) return false;
-                value.* = .{ .string = try retained_allocator.dupe(u8, self.text.items) };
-            },
-        }
-        return true;
-    }
-};
-
-const ExpressionWorkspace = struct {
-    allocator: std.mem.Allocator,
-    // Every pending expression consumes at least one byte in this bounded config.
-    config_bytes: usize,
-    frames: std.ArrayList(ExpressionFrame) = .empty,
-
-    fn deinit(self: *ExpressionWorkspace) void {
-        std.debug.assert(self.frames.items.len == 0);
-        self.frames.deinit(self.allocator);
-    }
-
-    fn evaluate(
-        self: *ExpressionWorkspace,
-        root: ExpressionNode,
-        context: ExpressionContext,
-    ) !execution.Value {
-        std.debug.assert(self.frames.items.len == 0);
-        defer {
-            for (self.frames.items) |*frame| frame.text.deinit(self.allocator);
-            self.frames.clearRetainingCapacity();
-        }
-        var pending: ?ExpressionNode = root;
-        var value: execution.Value = .null;
-        while (pending != null or self.frames.items.len > 0) {
-            if (pending) |node| {
-                pending = null;
-                switch (try node.inspect(context)) {
-                    .value => |result| value = result,
-                    .branch => |branch| {
-                        if (branch.count == 0) {
-                            value = if (branch.kind == .concat)
-                                .{ .string = try context.allocator.alloc(u8, 0) }
-                            else
-                                .null;
-                        } else {
-                            if (self.frames.items.len >= self.config_bytes) {
-                                return error.InvalidObservationExpression;
-                            }
-                            try self.frames.append(self.allocator, .{
-                                .node = node,
-                                .branch = branch,
-                            });
-                            pending = node.child(0);
-                            continue;
-                        }
-                    },
-                }
-            }
-            if (self.frames.items.len == 0) return value;
-            const frame = &self.frames.items[self.frames.items.len - 1];
-            if (try frame.accept(&value, self.allocator, context.allocator)) {
-                frame.text.deinit(self.allocator);
-                _ = self.frames.pop();
-            } else {
-                std.debug.assert(frame.next < frame.branch.count);
-                pending = frame.node.child(frame.next);
-            }
-        }
-        return value;
-    }
-};
-
-fn unaryExpression(op: []const u8, value: execution.Value) execution.Value {
-    if (std.mem.eql(u8, op, "parse-time")) {
-        const text = valueText(value) orelse return .null;
-        return if (seq_time.parseIsoTimestampMillis(text)) |millis|
-            .{ .integer = millis }
-        else
-            .null;
-    }
-    return .{ .boolean = if (std.mem.eql(u8, op, "is-null")) value == .null else !truthy(value) };
-}
-
-fn binaryExpression(
-    op: []const u8,
-    left: execution.Value,
-    right: execution.Value,
-) !execution.Value {
-    if (parseCompiledOp(op)) |compiled| return compiledBinaryExpression(compiled, left, right);
-    return numericOperator(op, left, right);
-}
-
-fn compiledBinaryExpression(
-    op: CompiledOp,
-    left: execution.Value,
-    right: execution.Value,
-) !execution.Value {
-    return switch (op) {
-        .eq => .{ .boolean = valuesEqual(left, right, false) },
-        .ne => .{ .boolean = !valuesEqual(left, right, false) },
-        .lt => .{ .boolean = compareValues(left, right) == .lt },
-        .le => .{ .boolean = compareValues(left, right) != .gt },
-        .gt => .{ .boolean = compareValues(left, right) == .gt },
-        .ge => .{ .boolean = compareValues(left, right) != .lt },
-        .and_op => .{ .boolean = truthy(left) and truthy(right) },
-        .or_op => .{ .boolean = truthy(left) or truthy(right) },
-        .add, .subtract, .multiply, .divide => numericOperator(@tagName(op), left, right),
-    };
-}
-
-fn evalExpr(
-    workspace: *ExpressionWorkspace,
-    allocator: std.mem.Allocator,
-    expression: std.json.Value,
-    row: []const execution.Value,
-    schema: *const plan.Schema,
-    state: []const execution.Value,
-    state_names: []const []const u8,
-    bindings: *const definition_core.parameters.Bindings,
-    selectors: RuntimeSelectors,
-) !execution.Value {
-    return workspace.evaluate(.{ .dynamic = expression }, .{
-        .allocator = allocator,
-        .row = row,
-        .schema = schema,
-        .state = state,
-        .state_names = state_names,
-        .bindings = bindings,
-        .selectors = selectors,
-    });
-}
-
-fn selectorValue(
-    selectors: RuntimeSelectors,
-    name: []const u8,
-) !execution.Value {
-    if (std.mem.eql(u8, name, "since")) {
-        return if (selectors.since_ms) |value| .{ .integer = value } else .null;
-    }
-    if (std.mem.eql(u8, name, "until")) {
-        return if (selectors.until_ms) |value| .{ .integer = value } else .null;
-    }
-    const value = if (std.mem.eql(u8, name, "path"))
-        selectors.path
-    else if (std.mem.eql(u8, name, "root"))
-        selectors.root
-    else if (std.mem.eql(u8, name, "session-id"))
-        selectors.session_id
-    else if (std.mem.eql(u8, name, "repo"))
-        selectors.repo
-    else
-        return error.UnknownObservationSelector;
-    return if (value) |text| .{ .string = text } else .null;
-}
-
-fn numericOperator(
-    op: []const u8,
-    left: execution.Value,
-    right: execution.Value,
-) !execution.Value {
-    if (left == .null or right == .null) return .null;
-    if (left == .integer and right == .integer and !std.mem.eql(u8, op, "divide")) {
-        const a = left.integer;
-        const b = right.integer;
-        return .{ .integer = if (std.mem.eql(u8, op, "add"))
-            try std.math.add(i64, a, b)
-        else if (std.mem.eql(u8, op, "subtract"))
-            try std.math.sub(i64, a, b)
-        else if (std.mem.eql(u8, op, "multiply"))
-            try std.math.mul(i64, a, b)
-        else
-            return error.UnsupportedObservationExpression };
-    }
-    const a = valueFloat(left) orelse return error.ObservationExpressionTypeMismatch;
-    const b = valueFloat(right) orelse return error.ObservationExpressionTypeMismatch;
-    if (std.mem.eql(u8, op, "divide") and b == 0) return .null;
-    return .{ .float = if (std.mem.eql(u8, op, "add"))
-        a + b
-    else if (std.mem.eql(u8, op, "subtract"))
-        a - b
-    else if (std.mem.eql(u8, op, "multiply"))
-        a * b
-    else if (std.mem.eql(u8, op, "divide"))
-        a / b
-    else
-        return error.UnsupportedObservationExpression };
 }
 
 fn stringFieldIndices(
@@ -3046,82 +3076,6 @@ fn compileDynamicSort(
         };
     }
     return keys;
-}
-
-fn findName(names: []const []const u8, wanted: []const u8) ?usize {
-    for (names, 0..) |name, index| if (std.mem.eql(u8, name, wanted)) return index;
-    return null;
-}
-
-fn truthy(value: execution.Value) bool {
-    return switch (value) {
-        .boolean => |flag| flag,
-        .integer => |number| number != 0,
-        .float => |number| number != 0,
-        .string => |text| text.len != 0,
-        .json => |text| text.len != 0,
-        .null => false,
-    };
-}
-
-fn valuesEqual(a: execution.Value, b: execution.Value, ignore_case: bool) bool {
-    if (a == .null or b == .null) return a == .null and b == .null;
-    if (valueFloat(a)) |left| if (valueFloat(b)) |right| return left == right;
-    if (valueText(a)) |left| if (valueText(b)) |right| {
-        return if (ignore_case)
-            std.ascii.eqlIgnoreCase(left, right)
-        else
-            std.mem.eql(u8, left, right);
-    };
-    return switch (a) {
-        .boolean => |left| switch (b) {
-            .boolean => |right| left == right,
-            else => false,
-        },
-        else => false,
-    };
-}
-
-fn compareNullable(
-    a: execution.Value,
-    b: execution.Value,
-    nulls: plan.NullOrder,
-) std.math.Order {
-    if (a == .null and b == .null) return .eq;
-    if (a == .null) return if (nulls == .first) .lt else .gt;
-    if (b == .null) return if (nulls == .first) .gt else .lt;
-    return compareValues(a, b);
-}
-
-fn compareValues(a: execution.Value, b: execution.Value) std.math.Order {
-    if (valueFloat(a)) |left| if (valueFloat(b)) |right| {
-        return std.math.order(left, right);
-    };
-    if (valueText(a)) |left| if (valueText(b)) |right| {
-        return std.mem.order(u8, left, right);
-    };
-    return switch (a) {
-        .boolean => |left| switch (b) {
-            .boolean => |right| std.math.order(@intFromBool(left), @intFromBool(right)),
-            else => .eq,
-        },
-        else => .eq,
-    };
-}
-
-fn valueFloat(value: execution.Value) ?f64 {
-    return switch (value) {
-        .integer => |number| @floatFromInt(number),
-        .float => |number| number,
-        else => null,
-    };
-}
-
-fn valueText(value: execution.Value) ?[]const u8 {
-    return switch (value) {
-        .string, .json => |text| text,
-        else => null,
-    };
 }
 
 fn expectGraphTopK(input: Table, keys: []plan.SortKey, limit: usize) !void {
@@ -3241,33 +3195,16 @@ test "graph top-k releases its bounded index and output at every allocation fail
 }
 
 test "lineage ownership is strict and does not cross siblings" {
-    var graph_columns = [_]plan.Column{
-        .{ .name = @constCast("session_id"), .kind = .string, .nullable = false },
-        .{ .name = @constCast("parent_session_id"), .kind = .string, .nullable = true },
-    };
-    var event_columns = [_]plan.Column{
-        .{ .name = @constCast("session_id"), .kind = .string, .nullable = false },
-    };
     var graph_values = [_]execution.Value{
         .{ .string = "root" },       .null,
         .{ .string = "child-a" },    .{ .string = "root" },
         .{ .string = "child-b" },    .{ .string = "root" },
         .{ .string = "grandchild" }, .{ .string = "child-a" },
     };
-    var parsed = try parseConfig(
-        std.testing.allocator,
-        "{\"left\":\"session_id\",\"right\":\"session_id\"," ++
-            "\"node\":\"session_id\",\"parent\":\"parent_sessi" ++
-            "on_id\"}",
-    );
-    defer parsed.deinit();
     var index = try LineageIndex.init(
         std.testing.allocator,
         .{ .values = &graph_values, .width = 2 },
-        .{ .columns = &graph_columns },
-        try definition_core.json.object(parsed.value),
-        .{ .columns = &event_columns },
-        .{ .columns = &event_columns },
+        .{ .graph_stage = 0, .node = 0, .parent = 1, .left = 0, .right = 0 },
         8,
     );
     defer index.deinit(std.testing.allocator);
@@ -3275,30 +3212,361 @@ test "lineage ownership is strict and does not cross siblings" {
     const sibling = [_]execution.Value{.{ .string = "child-b" }};
     const root = [_]execution.Value{.{ .string = "root" }};
     const grandchild = [_]execution.Value{.{ .string = "grandchild" }};
-    try std.testing.expect(try index.matches(&child, &root));
-    try std.testing.expect(try index.matches(&grandchild, &root));
-    try std.testing.expect(!try index.matches(&child, &sibling));
-    try std.testing.expect(!try index.matches(&child, &child));
+    try std.testing.expect(index.matches(&child, &root));
+    try std.testing.expect(index.matches(&grandchild, &root));
+    try std.testing.expect(!index.matches(&child, &sibling));
+    try std.testing.expect(!index.matches(&child, &child));
+}
+
+test "streaming schedule orders each session after its ancestors in the checked graph" {
+    var graph_values = [_]execution.Value{
+        .{ .string = "child" },  .{ .string = "parent" },
+        .{ .string = "parent" }, .{ .string = "outside" },
+        .{ .string = "root" },   .null,
+    };
+    var index = try LineageIndex.init(
+        std.testing.allocator,
+        .{ .values = &graph_values, .width = 2 },
+        .{ .graph_stage = 0, .node = 0, .parent = 1, .left = 0, .right = 0 },
+        8,
+    );
+    defer index.deinit(std.testing.allocator);
+    const sessions = [_]?[]const u8{ "child", "parent", "root", null, "unknown", "outside" };
+    const order = try index.scheduleSessions(std.testing.allocator, &sessions);
+    defer std.testing.allocator.free(order);
+    try std.testing.expectEqualSlices(usize, &.{ 2, 3, 4, 5, 1, 0 }, order);
+}
+
+test "streaming partitions fail closed until every session they inherit from is consumed" {
+    var graph_values = [_]execution.Value{
+        .{ .string = "child" },  .{ .string = "parent" },
+        .{ .string = "parent" }, .{ .string = "outside" },
+    };
+    const lineage: JoinLineage = .{
+        .graph_stage = 0,
+        .node = 0,
+        .parent = 1,
+        .left = 0,
+        .right = 0,
+    };
+    var reducer: StreamingLineageReducer = .{
+        .allocator = std.testing.allocator,
+        .spec = .{
+            .kind = .anti,
+            .left_stage = 1,
+            .right_stage = 1,
+            .keys = try std.testing.allocator.alloc(JoinKey, 0),
+            .left_true = null,
+            .right_true = null,
+            .lineage = lineage,
+            .outputs = try std.testing.allocator.alloc(JoinOutput, 0),
+        },
+        .width = 1,
+        .lineage = try LineageIndex.init(
+            std.testing.allocator,
+            .{ .values = &graph_values, .width = 2 },
+            lineage,
+            8,
+        ),
+        .max_rows = 10,
+        .max_retained_bytes = 4096,
+    };
+    defer reducer.deinit();
+    const sessions = [_]?[]const u8{ "child", "parent", "outside" };
+    const order = try reducer.scheduleSessions(std.testing.allocator, &sessions);
+    defer std.testing.allocator.free(order);
+    try std.testing.expectEqualSlices(usize, &.{ 2, 1, 0 }, order);
+    var none: [0]execution.Value = .{};
+    const empty: Table = .{ .values = &none, .width = 1 };
+    try std.testing.expectError(
+        error.ObservationStreamingPartitionOutOfOrder,
+        reducer.appendPartition("parent", 0, empty),
+    );
+    try reducer.appendPartition("outside", 0, empty);
+    try std.testing.expectError(
+        error.ObservationStreamingPartitionOutOfOrder,
+        reducer.appendPartition("child", 1, empty),
+    );
+    try reducer.appendPartition("parent", 1, empty);
+    try reducer.appendPartition("child", 2, empty);
+    try reducer.appendPartition(null, 3, empty);
+    try reducer.appendPartition("unknown", 4, empty);
+}
+
+const property_names = [_][]const u8{ "s0", "s1", "s2", "s3", "s4", "s5" };
+const property_width = 4;
+const property_lineage: JoinLineage = .{
+    .graph_stage = 0,
+    .node = 0,
+    .parent = 1,
+    .left = 0,
+    .right = 0,
+};
+
+const PropertyCase = struct {
+    graph: [property_names.len * 2]execution.Value = undefined,
+    graph_len: usize = 0,
+    rows: [property_names.len * 3 * property_width]execution.Value = undefined,
+    rows_len: usize = 0,
+    starts: [property_names.len + 1]usize = undefined,
+    sessions: [property_names.len]?[]const u8 = undefined,
+    partitions: usize = 0,
+
+    fn init(random: std.Random) PropertyCase {
+        var case: PropertyCase = .{};
+        var ranked: [property_names.len]usize = undefined;
+        for (&ranked, 0..) |*slot, index| slot.* = index;
+        random.shuffle(usize, &ranked);
+        var parents: [property_names.len]?usize = @splat(null);
+        for (ranked, 0..) |session, rank| {
+            if (rank == 0 or random.uintLessThan(u8, 10) >= 7) continue;
+            parents[session] = ranked[random.uintLessThan(usize, rank)];
+        }
+        for (property_names, parents) |name, parent| {
+            if (random.uintLessThan(u8, 10) < 7) {
+                case.graph[case.graph_len] = .{ .string = name };
+                case.graph[case.graph_len + 1] = if (parent) |found|
+                    .{ .string = property_names[found] }
+                else
+                    .null;
+                case.graph_len += 2;
+            }
+            if (random.uintLessThan(u8, 10) < 8) case.addPartition(random, name);
+        }
+        case.starts[case.partitions] = case.rows_len;
+        return case;
+    }
+
+    fn addPartition(case: *PropertyCase, random: std.Random, name: []const u8) void {
+        case.starts[case.partitions] = case.rows_len;
+        case.sessions[case.partitions] = name;
+        case.partitions += 1;
+        for (0..random.uintAtMost(usize, 3)) |_| {
+            const row = case.rows[case.rows_len..][0..property_width];
+            row.* = .{
+                .{ .string = name },
+                .{ .integer = random.intRangeAtMost(i64, 0, 1) },
+                .{ .boolean = random.boolean() },
+                .{ .boolean = random.boolean() },
+            };
+            case.rows_len += property_width;
+        }
+    }
+
+    fn graphTable(case: *PropertyCase) Table {
+        return .{ .values = case.graph[0..case.graph_len], .width = 2 };
+    }
+
+    fn partitionRows(case: *PropertyCase, partition: usize) Table {
+        const values = case.rows[case.starts[partition]..case.starts[partition + 1]];
+        return .{ .values = values, .width = property_width };
+    }
+};
+
+fn inheritsAnyOwner(
+    lineage: *const LineageIndex,
+    all: []const execution.Value,
+    left: []const execution.Value,
+) bool {
+    for (0..all.len / property_width) |right_index| {
+        const right = all[right_index * property_width ..][0..property_width];
+        if (!right[3].boolean or right[1].integer != left[1].integer) continue;
+        if (lineage.matches(left, right)) return true;
+    }
+    return false;
+}
+
+fn matcherAntiJoin(
+    allocator: std.mem.Allocator,
+    lineage: *const LineageIndex,
+    case: *const PropertyCase,
+) ![]execution.Value {
+    var kept: std.ArrayList(execution.Value) = .empty;
+    errdefer kept.deinit(allocator);
+    const all = case.rows[0..case.rows_len];
+    for (0..all.len / property_width) |left_index| {
+        const left = all[left_index * property_width ..][0..property_width];
+        if (left[2].boolean and inheritsAnyOwner(lineage, all, left)) continue;
+        try kept.appendSlice(allocator, left);
+    }
+    return kept.toOwnedSlice(allocator);
+}
+
+fn propertyReducer(allocator: std.mem.Allocator, case: *PropertyCase) !StreamingLineageReducer {
+    const keys = try allocator.alloc(JoinKey, 1);
+    errdefer allocator.free(keys);
+    keys[0] = .{ .left = 1, .right = 1, .comparison = .{ .eq = false } };
+    const outputs = try allocator.alloc(JoinOutput, property_width);
+    errdefer allocator.free(outputs);
+    for (outputs, 0..) |*output, index| output.* = .{ .side = .left, .column = @intCast(index) };
+    return .{
+        .allocator = allocator,
+        .spec = .{
+            .kind = .anti,
+            .left_stage = 1,
+            .right_stage = 1,
+            .keys = keys,
+            .left_true = 2,
+            .right_true = 3,
+            .lineage = property_lineage,
+            .outputs = outputs,
+        },
+        .width = property_width,
+        .lineage = try LineageIndex.init(allocator, case.graphTable(), property_lineage, 8),
+        .max_rows = 1000,
+        .max_retained_bytes = 1 << 20,
+    };
+}
+
+fn expectReducerMatchesAntiJoin(random: std.Random) !void {
+    const allocator = std.testing.allocator;
+    var case = PropertyCase.init(random);
+    var lineage = try LineageIndex.init(allocator, case.graphTable(), property_lineage, 8);
+    defer lineage.deinit(allocator);
+    const expected = try matcherAntiJoin(allocator, &lineage, &case);
+    defer allocator.free(expected);
+    var reducer = try propertyReducer(allocator, &case);
+    defer reducer.deinit();
+    const order = try reducer.scheduleSessions(allocator, case.sessions[0..case.partitions]);
+    defer allocator.free(order);
+    for (order) |partition| {
+        const rows = case.partitionRows(partition);
+        try reducer.appendPartition(case.sessions[partition], partition, rows);
+    }
+    const streamed = try reducer.finish();
+    defer allocator.free(streamed.values);
+    try std.testing.expectEqualDeep(expected, streamed.values);
+}
+
+test "streaming reducer equals the matcher anti join under its own schedule" {
+    var prng = std.Random.DefaultPrng.init(0x5eed_1ee7);
+    for (0..256) |_| try expectReducerMatchesAntiJoin(prng.random());
+}
+
+test "in-place row permutation follows every cycle" {
+    var values = [_]execution.Value{
+        .{ .integer = 10 }, .{ .integer = 11 }, .{ .integer = 12 },
+        .{ .integer = 13 }, .{ .integer = 14 }, .{ .integer = 15 },
+    };
+    var order = [_]usize{ 2, 0, 1, 4, 3, 5 };
+    try permuteRowsInPlace(std.testing.allocator, .{ .values = &values, .width = 1 }, &order);
+    try std.testing.expectEqualDeep(&[_]execution.Value{
+        .{ .integer = 12 }, .{ .integer = 10 }, .{ .integer = 11 },
+        .{ .integer = 14 }, .{ .integer = 13 }, .{ .integer = 15 },
+    }, &values);
+    var pairs = [_]execution.Value{
+        .{ .integer = 1 }, .{ .string = "a" },
+        .{ .integer = 2 }, .{ .string = "b" },
+    };
+    var swap = [_]usize{ 1, 0 };
+    try permuteRowsInPlace(std.testing.allocator, .{ .values = &pairs, .width = 2 }, &swap);
+    try std.testing.expectEqual(@as(i64, 2), pairs[0].integer);
+    try std.testing.expectEqualStrings("b", pairs[1].string);
+    try std.testing.expectEqual(@as(i64, 1), pairs[2].integer);
 }
 
 test "join equality hashes null-safe cumulative tuples consistently" {
-    var columns = [_]plan.Column{
-        .{ .name = @constCast("total"), .kind = .integer, .nullable = true },
-        .{ .name = @constCast("cached"), .kind = .integer, .nullable = true },
+    const keys = [_]JoinKey{
+        .{ .left = 0, .right = 0, .comparison = .{ .eq = false } },
+        .{ .left = 1, .right = 1, .comparison = .{ .eq = true } },
     };
-    var parsed = try parseConfig(
-        std.testing.allocator,
-        "[{\"left\":\"total\",\"right\":\"total\"},{\"left\":" ++
-            "\"cached\",\"right\":\"cached\",\"nulls_equal\":tr" ++
-            "ue}]",
-    );
-    defer parsed.deinit();
-    const keys = try definition_core.json.array(parsed.value);
     const row = [_]execution.Value{ .{ .integer = 42 }, .null };
+    try std.testing.expect(joinEqualityHash(&keys, &row, .left) != null);
     try std.testing.expectEqual(
-        joinEqualityHash(.{ .columns = &columns }, &row, keys, true),
-        joinEqualityHash(.{ .columns = &columns }, &row, keys, false),
+        joinEqualityHash(&keys, &row, .left),
+        joinEqualityHash(&keys, &row, .right),
     );
+    try std.testing.expect(joinKeysMatch(&keys, &row, &row));
+    const strict = [_]JoinKey{.{ .left = 1, .right = 1, .comparison = .{ .eq = false } }};
+    try std.testing.expect(joinEqualityHash(&strict, &row, .left) == null);
+    try std.testing.expect(!joinKeysMatch(&strict, &row, &row));
+}
+
+const lineage_eligibility_rows = [_]execution.Value{
+    .{ .string = "root" },
+    .{ .integer = 10 },
+    .{ .boolean = true },
+    .{ .boolean = true },
+    .{ .string = "child" },
+    .{ .integer = 20 },
+    .{ .boolean = false },
+    .{ .boolean = true },
+    .{ .string = "child" },
+    .{ .integer = 30 },
+    .{ .boolean = false },
+    .{ .boolean = false },
+    .{ .string = "grandchild" },
+    .{ .integer = 20 },
+    .{ .boolean = true },
+    .{ .boolean = true },
+    .{ .string = "grandchild" },
+    .{ .integer = 30 },
+    .{ .boolean = true },
+    .{ .boolean = true },
+};
+
+test "streaming lineage keeps right eligibility independent of left eligibility" {
+    const graph_columns = [_]plan.Column{
+        .{ .name = @constCast("node"), .kind = .string, .nullable = false },
+        .{ .name = @constCast("parent"), .kind = .string, .nullable = true },
+    };
+    const columns = [_]plan.Column{
+        .{ .name = @constCast("node"), .kind = .string, .nullable = false },
+        .{ .name = @constCast("key"), .kind = .integer, .nullable = false },
+        .{ .name = @constCast("left"), .kind = .boolean, .nullable = false },
+        .{ .name = @constCast("right"), .kind = .boolean, .nullable = false },
+    };
+    var graph_values = [_]execution.Value{
+        .{ .string = "root" },       .null,
+        .{ .string = "child" },      .{ .string = "root" },
+        .{ .string = "grandchild" }, .{ .string = "child" },
+    };
+    const keys = try std.testing.allocator.alloc(JoinKey, 1);
+    keys[0] = .{ .left = 1, .right = 1, .comparison = .{ .eq = false } };
+    const outputs = std.testing.allocator.alloc(JoinOutput, columns.len) catch |err| {
+        std.testing.allocator.free(keys);
+        return err;
+    };
+    for (outputs, 0..) |*output, index| output.* = .{ .side = .left, .column = @intCast(index) };
+    const lineage: JoinLineage = .{
+        .graph_stage = 0,
+        .node = 0,
+        .parent = 1,
+        .left = 0,
+        .right = 0,
+    };
+    var reducer: StreamingLineageReducer = .{
+        .allocator = std.testing.allocator,
+        .spec = .{
+            .kind = .anti,
+            .left_stage = 1,
+            .right_stage = 1,
+            .keys = keys,
+            .left_true = 2,
+            .right_true = 3,
+            .lineage = lineage,
+            .outputs = outputs,
+        },
+        .width = columns.len,
+        .lineage = try LineageIndex.init(
+            std.testing.allocator,
+            .{ .values = &graph_values, .width = graph_columns.len },
+            lineage,
+            8,
+        ),
+        .max_rows = 10,
+        .max_retained_bytes = 4096,
+    };
+    defer reducer.deinit();
+    try reducer.appendPartition(null, 0, .{
+        .values = @constCast(&lineage_eligibility_rows),
+        .width = columns.len,
+    });
+    const result = try reducer.finish();
+    defer std.testing.allocator.free(result.values);
+    try std.testing.expectEqual(@as(usize, 4), try result.rowCount());
+    try std.testing.expectEqualStrings("grandchild", result.row(3)[0].string);
+    try std.testing.expectEqual(@as(i64, 30), result.row(3)[1].integer);
 }
 
 test "streaming lineage lowering is selected from non-token topology" {
@@ -3323,11 +3591,11 @@ test "streaming lineage lowering is selected from non-token topology" {
         \\        "lineage":{"left":"session_id","right":"session_id","node":"session_id","parent":"parent_session_id"}},
         \\      "fields":[
         \\        {"source":0,"field":"session_id","name":"session_id","type":"string","nullable":false},
-        \\        {"source":0,"field":"source_event_id","name":"source_event_id","type":"string","nullable":false},
-        \\        {"source":0,"field":"role","name":"role","type":"string","nullable":true}
+        \\        {"source":0,"field":"role","name":"role","type":"string","nullable":true},
+        \\        {"source":0,"field":"source_event_id","name":"source_event_id","type":"string","nullable":false}
         \\      ]}
         \\  ],
-        \\  "projections":{"rows":{"relation":"owned_rows","schema":"test/message-lineage/v1","fields":["session_id","source_event_id","role"],"renderers":["json"]}},
+        \\  "projections":{"rows":{"relation":"owned_rows","schema":"test/message-lineage/v1","fields":["session_id","role","source_event_id"],"renderers":["json"]}},
         \\  "bounds":{"max_rows":100,"max_output_bytes":4096,"max_fold_states":4,"max_input_bytes":1048576,"max_graph_depth":8,"max_graph_nodes":100,"max_diagnostics":8}
         \\}
     ;
@@ -3430,6 +3698,54 @@ test "compiled field validation remains eager before row execution" {
     );
     const actual = try testExpressionValue(arena.allocator(), source, false);
     try std.testing.expectEqual(7, actual.integer);
+}
+
+test "text prefixes preserve UTF-8 and reject invalid bounds in both evaluators" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const cases = [_]struct { text: []const u8, bound: i64, expected: []const u8 }{
+        .{ .text = "plain", .bound = 0, .expected = "" },
+        .{ .text = "plain", .bound = 3, .expected = "pla" },
+        .{ .text = "plain", .bound = 100, .expected = "plain" },
+        .{ .text = "aé🌱z", .bound = 2, .expected = "a" },
+        .{ .text = "aé🌱z", .bound = 3, .expected = "aé" },
+        .{ .text = "aé🌱z", .bound = 6, .expected = "aé" },
+        .{ .text = "aé🌱z", .bound = 7, .expected = "aé🌱" },
+    };
+    for (cases) |case| {
+        const source = try std.fmt.allocPrint(
+            arena.allocator(),
+            "{{\"op\":\"text-prefix\",\"args\":[\"{s}\",{d}]}}",
+            .{ case.text, case.bound },
+        );
+        for ([_]bool{ false, true }) |compiled| {
+            const actual = try testExpressionValue(arena.allocator(), source, compiled);
+            try std.testing.expectEqualStrings(case.expected, actual.string);
+            try std.testing.expect(std.unicode.utf8ValidateSlice(actual.string));
+        }
+    }
+    for ([_]bool{ false, true }) |compiled| {
+        try std.testing.expectEqual(execution.Value.null, try testExpressionValue(
+            arena.allocator(),
+            "{\"op\":\"text-prefix\",\"args\":[null,8]}",
+            compiled,
+        ));
+        try std.testing.expectError(error.InvalidObservationTextBound, testExpressionValue(
+            arena.allocator(),
+            "{\"op\":\"text-prefix\",\"args\":[\"text\",-1]}",
+            compiled,
+        ));
+        for ([_][]const u8{
+            "{\"op\":\"text-prefix\",\"args\":[42,8]}",
+            "{\"op\":\"text-prefix\",\"args\":[\"text\",2.5]}",
+            "{\"op\":\"text-prefix\",\"args\":[\"text\",null]}",
+        }) |source| {
+            try std.testing.expectError(
+                error.ObservationExpressionTypeMismatch,
+                testExpressionValue(arena.allocator(), source, compiled),
+            );
+        }
+    }
 }
 
 test "deep expressions compile and evaluate with explicit frames" {
@@ -3662,7 +3978,407 @@ test "target graph output survives shared execution scratch teardown" {
     try std.testing.expectEqual(7, result.materialized_rows);
 }
 
-test "stage traversal checks depth before memoization and respects scan boundaries" {
+fn exerciseSharedGraph(
+    allocator: std.mem.Allocator,
+    definition_plan: *const definition.Plan,
+    native_plan: *const plan.Plan,
+    owned: bool,
+    count: usize,
+    folded: bool,
+) !void {
+    const expected = [_]execution.Value{
+        .{ .string = "assistant" }, .{ .string = "first" },
+        .{ .string = "user" },      .{ .string = "second" },
+    };
+    var borrowed = expected;
+    const values = if (owned)
+        try allocator.dupe(execution.Value, expected[0 .. count * 2])
+    else
+        borrowed[0 .. count * 2];
+    var scans = [_]ScanInput{
+        .{ .stage_index = 0, .table = .{ .values = values, .width = 2 }, .owned = owned },
+    };
+    defer if (scans[0].owned) allocator.free(values);
+    const result = try executeTarget(
+        allocator,
+        allocator,
+        definition_plan,
+        native_plan,
+        &expression_test_bindings,
+        .{},
+        native_plan.findStage("rows").?,
+        &scans,
+    );
+    defer allocator.free(result.table.values);
+    try std.testing.expectEqual(count, try result.table.rowCount());
+    for (0..count) |index| {
+        const row = result.table.row(index);
+        try std.testing.expectEqualDeep(expected[index * 2], row[0]);
+        try std.testing.expectEqualDeep(expected[index * 2 + 1], row[1]);
+        try std.testing.expectEqualDeep(
+            if (folded or index == 1) expected[index * 2] else execution.Value.null,
+            row[2],
+        );
+    }
+    if (!owned) try std.testing.expectEqualDeep(expected, borrowed);
+}
+
+test "streaming lineage falls back when the projection reads an unseeded scan" {
+    const Case = struct { source: []const u8, streams: bool };
+    const cases = [_]Case{
+        .{ .source = @embedFile("fixtures/lineage-observation.json"), .streams = true },
+        .{ .source = @embedFile("fixtures/lineage-control-parent.json"), .streams = false },
+        .{ .source = @embedFile("fixtures/lineage-extra-scan.json"), .streams = false },
+        .{ .source = @embedFile("fixtures/lineage-token-filter.json"), .streams = false },
+    };
+    for (cases) |case| {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        try tmp.dir.writeFile(std.testing.io, .{
+            .sub_path = "definition.json",
+            .data = case.source,
+        });
+        var closure = try definition_core.closure.loadFromDir(
+            std.testing.io,
+            std.testing.allocator,
+            &tmp.dir,
+            "definition.json",
+            .{},
+        );
+        defer closure.deinit(std.testing.allocator);
+        var definition_plan = try definition.compile(
+            std.testing.allocator,
+            &closure,
+            "definition.json",
+        );
+        defer definition_plan.deinit(std.testing.allocator);
+        var native_plan = try plan.compile(std.testing.allocator, &definition_plan);
+        defer native_plan.deinit(std.testing.allocator);
+        const schedule = try streamingLineagePlan(
+            std.testing.allocator,
+            &definition_plan,
+            &native_plan,
+            "rows",
+        );
+        try std.testing.expectEqual(case.streams, schedule != null);
+        if (case.streams or native_plan.findStage("joined_rows") == null) continue;
+        var scans = [_]ScanInput{
+            .{
+                .stage_index = native_plan.findStage("session_rows").?,
+                .table = .{ .values = &.{}, .width = 2 },
+            },
+            .{
+                .stage_index = native_plan.findStage("owned_rows").?,
+                .table = .{ .values = &.{}, .width = 3 },
+            },
+        };
+        try std.testing.expectError(error.ObservationInputNotExecuted, executeTarget(
+            std.testing.allocator,
+            std.testing.allocator,
+            &definition_plan,
+            &native_plan,
+            &expression_test_bindings,
+            .{},
+            native_plan.findStage("joined_rows").?,
+            &scans,
+        ));
+    }
+}
+
+test "branching filters membership joins and folds preserve shared inputs and ownership" {
+    const sources = [_][]const u8{
+        @embedFile("fixtures/shared-filter.json"),
+        @embedFile("fixtures/shared-membership.json"),
+        @embedFile("fixtures/shared-fold.json"),
+    };
+    for (sources, 0..) |source, index| {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "definition.json", .data = source });
+        var closure = try definition_core.closure.loadFromDir(
+            std.testing.io,
+            std.testing.allocator,
+            &tmp.dir,
+            "definition.json",
+            .{},
+        );
+        defer closure.deinit(std.testing.allocator);
+        var definition_plan = try definition.compile(
+            std.testing.allocator,
+            &closure,
+            "definition.json",
+        );
+        defer definition_plan.deinit(std.testing.allocator);
+        var native_plan = try plan.compile(std.testing.allocator, &definition_plan);
+        defer native_plan.deinit(std.testing.allocator);
+        for ([_]bool{ false, true }) |owned| {
+            for ([_]usize{ 0, 1, 2 }) |count| {
+                try exerciseSharedGraph(
+                    std.testing.allocator,
+                    &definition_plan,
+                    &native_plan,
+                    owned,
+                    count,
+                    index == 2,
+                );
+            }
+            try @import("test_support").checkAllAllocationFailures(
+                std.testing.allocator,
+                exerciseSharedGraph,
+                .{ &definition_plan, &native_plan, owned, @as(usize, 2), index == 2 },
+            );
+        }
+    }
+}
+
+test "integer comparison and distinct preserve adjacent values beyond float precision" {
+    const low: execution.Value = .{ .integer = 9_007_199_254_740_992 };
+    const high: execution.Value = .{ .integer = 9_007_199_254_740_993 };
+    try std.testing.expect(!valuesEqual(low, high, false));
+    try std.testing.expectEqual(std.math.Order.lt, value_module.order(low, high));
+    try std.testing.expectEqual(std.math.Order.gt, value_module.order(high, low));
+    try std.testing.expect(!valuesEqual(
+        .{ .integer = std.math.maxInt(i64) - 1 },
+        .{ .integer = std.math.maxInt(i64) },
+        false,
+    ));
+    var values = [_]execution.Value{ low, high, low };
+    var keys = [_]u16{0};
+    const distinct = try distinctTable(
+        std.testing.allocator,
+        .{ .values = &values, .width = 1 },
+        .{ .field_indices = &keys },
+    );
+    defer std.testing.allocator.free(distinct.values);
+    try std.testing.expectEqualDeep(&[_]execution.Value{ low, high }, distinct.values);
+}
+
+fn distinctCount(values: []execution.Value) !usize {
+    var keys = [_]u16{0};
+    const distinct = try distinctTable(
+        std.testing.allocator,
+        .{ .values = values, .width = 1 },
+        .{ .field_indices = &keys },
+    );
+    defer std.testing.allocator.free(distinct.values);
+    return distinct.values.len;
+}
+
+test "mixed integer and float comparisons stay exact and transitive beyond float precision" {
+    const boundary: i64 = 9_007_199_254_740_992;
+    const low: execution.Value = .{ .integer = boundary };
+    const float_low: execution.Value = .{ .float = @floatFromInt(boundary) };
+    const high: execution.Value = .{ .integer = boundary + 1 };
+    try std.testing.expect(valuesEqual(low, float_low, false));
+    try std.testing.expect(!valuesEqual(high, float_low, false));
+    try std.testing.expect(!valuesEqual(float_low, high, false));
+    try std.testing.expectEqual(std.math.Order.eq, value_module.order(low, float_low));
+    try std.testing.expectEqual(std.math.Order.lt, value_module.order(float_low, high));
+    try std.testing.expectEqual(std.math.Order.gt, value_module.order(high, float_low));
+    const orders = [_][3]execution.Value{
+        .{ low, float_low, high },
+        .{ float_low, low, high },
+        .{ high, float_low, low },
+        .{ high, low, float_low },
+        .{ low, high, float_low },
+        .{ float_low, high, low },
+    };
+    var sort_keys = [_]plan.SortKey{
+        .{ .field_index = 0, .direction = .ascending, .nulls = .last },
+    };
+    for (orders) |order| {
+        var values = order;
+        try std.testing.expectEqual(@as(usize, 2), try distinctCount(&values));
+        const input = Table{ .values = &values, .width = 1 };
+        try std.testing.expect(hasTotalSortOrder(input, &sort_keys));
+        for ([_]usize{ 0, 1, 2, 3 }) |limit| try expectGraphTopK(input, &sort_keys, limit);
+    }
+}
+
+test "numeric equality and hashing agree for signed zero" {
+    var values = [_]execution.Value{
+        .{ .float = -0.0 },
+        .{ .integer = 0 },
+        .{ .float = 0.0 },
+    };
+    try std.testing.expectEqual(@as(usize, 1), try distinctCount(&values));
+}
+
+test "graph comparisons stay defined for NaN" {
+    const nan: execution.Value = .{ .float = std.math.nan(f64) };
+    try std.testing.expect(!valuesEqual(nan, nan, false));
+    try std.testing.expect(!valuesEqual(nan, .{ .integer = 1 }, false));
+    try std.testing.expect(!valuesEqual(.{ .integer = 1 }, nan, false));
+    try std.testing.expect(!valueMatches(nan, .{ .integer = 1 }, .less_or_equal, false));
+    try std.testing.expect(!valueMatches(nan, .{ .integer = 1 }, .greater_or_equal, false));
+    var values = [_]execution.Value{ nan, .{ .integer = 3 }, nan };
+    try std.testing.expectEqual(@as(usize, 3), try distinctCount(&values));
+    var keys = [_]plan.SortKey{
+        .{ .field_index = 0, .direction = .ascending, .nulls = .last },
+    };
+    var mixed = [_]execution.Value{ nan, .{ .integer = 3 }, .null, .{ .float = 1.5 }, nan };
+    for ([_]plan.SortDirection{ .ascending, .descending }) |direction| {
+        keys[0].direction = direction;
+        const input = Table{ .values = &mixed, .width = 1 };
+        for (0..mixed.len + 1) |limit| try expectGraphTopK(input, &keys, limit);
+    }
+}
+
+test "reachability skips identity-less nodes" {
+    var node_name = "node".*;
+    var parent_name = "parent".*;
+    var seed_name = "seed".*;
+    var reachable_name = "reachable".*;
+    var input_columns = [_]plan.Column{
+        .{ .name = &node_name, .kind = .string, .nullable = true },
+        .{ .name = &parent_name, .kind = .string, .nullable = true },
+        .{ .name = &seed_name, .kind = .boolean, .nullable = false },
+    };
+    var output_columns = [_]plan.Column{
+        .{ .name = &node_name, .kind = .string, .nullable = true },
+        .{ .name = &reachable_name, .kind = .boolean, .nullable = false },
+    };
+    const input_schema = plan.Schema{ .columns = &input_columns };
+    var values = [_]execution.Value{
+        .{ .string = "root" },  .null,                 .{ .boolean = true },
+        .null,                  .{ .string = "root" }, .{ .boolean = false },
+        .{ .string = "child" }, .{ .string = "root" }, .{ .boolean = false },
+    };
+    const output = try reachabilityTable(
+        std.testing.allocator,
+        .{ .values = &values, .width = 3 },
+        &input_schema,
+        .{ .columns = &output_columns },
+        \\{"keys":{"node":"node","parent":"parent","seed":"seed","direction":"descendants"},
+        \\ "fields":[{"field":"node"},{"meta":"reachable"}]}
+    ,
+        graph_test_definition.bounds,
+    );
+    defer std.testing.allocator.free(output.values);
+    try std.testing.expectEqualDeep(&[_]execution.Value{
+        .{ .string = "root" },  .{ .boolean = true },
+        .null,                  .{ .boolean = false },
+        .{ .string = "child" }, .{ .boolean = true },
+    }, output.values);
+}
+
+test "reachability links no identity-less seed or descendant" {
+    var node_name = "node".*;
+    var parent_name = "parent".*;
+    var seed_name = "seed".*;
+    var reachable_name = "reachable".*;
+    var depth_name = "depth".*;
+    var input_columns = [_]plan.Column{
+        .{ .name = &node_name, .kind = .string, .nullable = true },
+        .{ .name = &parent_name, .kind = .string, .nullable = true },
+        .{ .name = &seed_name, .kind = .boolean, .nullable = false },
+    };
+    var seeded_columns = [_]plan.Column{
+        .{ .name = &node_name, .kind = .string, .nullable = true },
+        .{ .name = &reachable_name, .kind = .boolean, .nullable = false },
+    };
+    var closure_columns = [_]plan.Column{
+        .{ .name = &node_name, .kind = .string, .nullable = true },
+        .{ .name = &parent_name, .kind = .string, .nullable = true },
+        .{ .name = &depth_name, .kind = .integer, .nullable = false },
+    };
+    const input_schema = plan.Schema{ .columns = &input_columns };
+    var values = [_]execution.Value{
+        .{ .string = "root" },  .null,                  .{ .boolean = false },
+        .{ .string = "child" }, .{ .string = "root" },  .{ .boolean = false },
+        .null,                  .{ .string = "child" }, .{ .boolean = true },
+    };
+    const input: Table = .{ .values = &values, .width = 3 };
+    const seeded = try reachabilityTable(
+        std.testing.allocator,
+        input,
+        &input_schema,
+        .{ .columns = &seeded_columns },
+        \\{"keys":{"node":"node","parent":"parent","seed":"seed","direction":"ancestors"},
+        \\ "fields":[{"field":"node"},{"meta":"reachable"}]}
+    ,
+        graph_test_definition.bounds,
+    );
+    defer std.testing.allocator.free(seeded.values);
+    try std.testing.expectEqualDeep(&[_]execution.Value{
+        .{ .string = "root" },  .{ .boolean = false },
+        .{ .string = "child" }, .{ .boolean = false },
+        .null,                  .{ .boolean = true },
+    }, seeded.values);
+    const closure = try reachabilityTable(
+        std.testing.allocator,
+        input,
+        &input_schema,
+        .{ .columns = &closure_columns },
+        \\{"keys":{"node":"node","parent":"parent","mode":"closure"},
+        \\ "fields":[{"meta":"descendant"},{"meta":"ancestor"},{"meta":"depth"}]}
+    ,
+        graph_test_definition.bounds,
+    );
+    defer std.testing.allocator.free(closure.values);
+    try std.testing.expectEqualDeep(&[_]execution.Value{
+        .{ .string = "child" }, .{ .string = "root" }, .{ .integer = 1 },
+    }, closure.values);
+}
+
+test "graph sorting places nulls by position in both directions" {
+    var values = [_]execution.Value{ .null, .{ .integer = 1 }, .null, .{ .integer = 2 } };
+    var keys = [_]plan.SortKey{
+        .{ .field_index = 0, .direction = .descending, .nulls = .last },
+    };
+    const input = Table{ .values = &values, .width = 1 };
+    const sorted = try sortTable(std.testing.allocator, input, .{ .keys = &keys });
+    defer std.testing.allocator.free(sorted.values);
+    try std.testing.expectEqualDeep(
+        &[_]execution.Value{ .{ .integer = 2 }, .{ .integer = 1 }, .null, .null },
+        sorted.values,
+    );
+    keys[0].nulls = .first;
+    const nulls_first = try sortTable(std.testing.allocator, input, .{ .keys = &keys });
+    defer std.testing.allocator.free(nulls_first.values);
+    try std.testing.expectEqualDeep(
+        &[_]execution.Value{ .null, .null, .{ .integer = 2 }, .{ .integer = 1 } },
+        nulls_first.values,
+    );
+    try std.testing.expect(!valueMatches(.null, .{ .integer = 1 }, .less_or_equal, false));
+    try std.testing.expect(!valueMatches(.null, .{ .integer = 1 }, .greater_or_equal, false));
+}
+
+test "partition ranks order sessions exactly as the fold sort orders their rows" {
+    const allocator = std.testing.allocator;
+    const sessions = [_]?[]const u8{ "zeta", null, "alpha", null, "mid" };
+    const path_ranks = try rankPartitions(allocator, .path, &sessions);
+    defer allocator.free(path_ranks);
+    try std.testing.expectEqualSlices(usize, &.{ 0, 1, 2, 3, 4 }, path_ranks);
+    var values: [sessions.len]execution.Value = undefined;
+    for (&values, sessions) |*value, session| {
+        value.* = if (session) |text| .{ .string = text } else .null;
+    }
+    const input = Table{ .values = &values, .width = 1 };
+    for ([_]plan.SortDirection{ .ascending, .descending }) |direction| {
+        for ([_]plan.NullOrder{ .first, .last }) |nulls| {
+            var keys = [_]plan.SortKey{
+                .{ .field_index = 0, .direction = direction, .nulls = nulls },
+            };
+            const ranks = try rankPartitions(allocator, .{ .session = keys[0] }, &sessions);
+            defer allocator.free(ranks);
+            const sorted = try sortTable(allocator, input, .{ .keys = &keys });
+            defer allocator.free(sorted.values);
+            for (ranks, values) |rank, value| {
+                try std.testing.expectEqualDeep(value, sorted.values[rank]);
+            }
+        }
+    }
+    const ascending = try rankPartitions(
+        allocator,
+        .{ .session = .{ .field_index = 0, .direction = .ascending, .nulls = .last } },
+        &sessions,
+    );
+    defer allocator.free(ascending);
+    try std.testing.expectEqualSlices(usize, &.{ 2, 3, 0, 4, 1 }, ascending);
+}
+
+test "only a bounded stage walk applies the depth law, before memoization and at scan boundaries" {
     var definition_plan = graph_test_definition;
     definition_plan.bounds.max_graph_depth = 1;
     var reachable = [_]bool{ true, false, false };
@@ -3673,7 +4389,7 @@ test "stage traversal checks depth before memoization and respects scan boundari
         2,
         &reachable,
         &.{},
-        0,
+        definition_plan.bounds.max_graph_depth,
     ));
     @memset(&reachable, false);
     definition_plan.bounds.max_graph_depth = 2;
@@ -3684,7 +4400,7 @@ test "stage traversal checks depth before memoization and respects scan boundari
         2,
         &reachable,
         &.{},
-        0,
+        definition_plan.bounds.max_graph_depth,
     );
     try std.testing.expectEqualSlices(bool, &.{ true, true, true }, &reachable);
     @memset(&reachable, false);
@@ -3699,7 +4415,191 @@ test "stage traversal checks depth before memoization and respects scan boundari
         2,
         &reachable,
         &scans,
-        0,
+        definition_plan.bounds.max_graph_depth,
     );
     try std.testing.expectEqualSlices(bool, &.{ false, true, true }, &reachable);
+    @memset(&reachable, false);
+    try markReachable(
+        std.testing.allocator,
+        &definition_plan,
+        &graph_test_native,
+        2,
+        &reachable,
+        &.{},
+        null,
+    );
+    try std.testing.expectEqualSlices(bool, &.{ true, true, true }, &reachable);
+}
+
+const lineage_expression_template =
+    \\{"schema":"seq-observation-definition/v1","id":"test/lineage-expressions",
+    \\ "requires":{"abi":"seq-observation-abi/v1","operators":["derive","filter","join","scan"]},
+    \\ "parameters":{},"selectors":[],"inputs":[],
+    \\ "relations":[{"name":"sessions","fields":["session_id","parent_session_id"@TOKEN@]},
+    \\   {"name":"messages","fields":["session_id","source_event_id","role"]}],
+    \\ "pipeline":[{"op":"scan","relation":"sessions","as":"session_rows"},
+    \\   {"op":"scan","relation":"messages","as":"message_rows"},@STAGES@
+    \\   {"op":"join","inputs":["@LOCAL@","@LOCAL@","@GRAPH@"],"as":"owned_rows",
+    \\    "on":{"kind":"anti","keys":[{"left":"source_event_id","right":"source_event_id"}],
+    \\      "lineage":{"left":"session_id","right":"session_id","node":"session_id",
+    \\        "parent":"parent_session_id"}},
+    \\    "fields":[{"source":0,"field":"session_id","name":"session_id","type":"string",
+    \\      "nullable":false},{"source":0,"field":"source_event_id","name":"source_event_id",
+    \\      "type":"string","nullable":false}]}],
+    \\ "projections":{"rows":{"relation":"owned_rows","schema":"test/lineage-expressions/v1",
+    \\   "fields":["session_id","source_event_id"],"renderers":["json"]}},
+    \\ "bounds":{"max_rows":100,"max_output_bytes":4096,"max_fold_states":4,
+    \\   "max_input_bytes":1048576,"max_graph_depth":8,"max_graph_nodes":100,
+    \\   "max_diagnostics":8}}
+;
+
+const lineage_graph_derive =
+    \\{"op":"derive","input":"session_rows","as":"graph_rows","fields":[
+    \\  {"name":"tag","type":"string","nullable":true,"expr":@EXPR@}]},
+;
+
+const LineageExpressionCase = struct {
+    token: []const u8 = ",\"token_usage_observation_count\"",
+    stages: []const u8 = lineage_graph_derive,
+    expr: []const u8 = "",
+    local: []const u8 = "message_rows",
+    graph: []const u8 = "graph_rows",
+    streams: bool,
+};
+
+fn testLineageExpressionStreams(case: LineageExpressionCase) !bool {
+    const allocator = std.testing.allocator;
+    var source: []u8 = try allocator.dupe(u8, lineage_expression_template);
+    defer allocator.free(source);
+    const markers = [_][2][]const u8{
+        .{ "@TOKEN@", case.token },
+        .{ "@STAGES@", case.stages },
+        .{ "@LOCAL@", case.local },
+        .{ "@GRAPH@", case.graph },
+        .{ "@EXPR@", case.expr },
+    };
+    for (markers) |marker| {
+        const replaced = try std.mem.replaceOwned(u8, allocator, source, marker[0], marker[1]);
+        allocator.free(source);
+        source = replaced;
+    }
+    return testDefinitionStreams(source);
+}
+
+fn testDefinitionStreams(source: []const u8) !bool {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "definition.json", .data = source });
+    var closure = try definition_core.closure.loadFromDir(
+        std.testing.io,
+        allocator,
+        &tmp.dir,
+        "definition.json",
+        .{},
+    );
+    defer closure.deinit(allocator);
+    var definition_plan = try definition.compile(allocator, &closure, "definition.json");
+    defer definition_plan.deinit(allocator);
+    var native_plan = try plan.compile(allocator, &definition_plan);
+    defer native_plan.deinit(allocator);
+    return try streamingLineagePlan(allocator, &definition_plan, &native_plan, "rows") != null;
+}
+
+test "streaming eligibility reads expressions through the evaluators' grammar" {
+    const cases = [_]LineageExpressionCase{
+        .{ .expr = "\"token_usage_observation_count\"", .streams = true },
+        .{ .expr = "{\"field\":\"token_usage_observation_count\"}", .streams = false },
+        .{
+            .expr = "{\"op\":\"concat\",\"args\":[{\"field\":\"token_usage_observation_count\"}]}",
+            .streams = false,
+        },
+        .{ .token = "", .streams = true, .stages =
+        \\{"op":"derive","input":"session_rows","as":"defined_rows","fields":[
+        \\  {"name":"token_usage_observation_count","type":"integer","nullable":false,
+        \\   "expr":0}]},
+        \\{"op":"filter","input":"defined_rows","as":"graph_rows","where":[
+        \\  {"field":"token_usage_observation_count","op":"eq","value":0}]},
+        },
+        .{ .streams = false, .stages =
+        \\{"op":"filter","input":"session_rows","as":"graph_rows","where":[
+        \\  {"field":"token_usage_observation_count","op":"eq","value":0}]},
+        },
+        .{ .token = "", .local = "local_rows", .graph = "session_rows", .streams = true, .stages =
+        \\{"op":"derive","input":"message_rows","as":"local_rows","preserve_input":false,
+        \\ "fields":[{"name":"session_id","type":"string","nullable":false,
+        \\   "expr":{"field":"session_id","note":"x"}},
+        \\  {"name":"source_event_id","type":"string","nullable":false,
+        \\   "expr":{"field":"source_event_id"}}]},
+        },
+        .{ .token = "", .local = "local_rows", .graph = "session_rows", .streams = false, .stages =
+        \\{"op":"derive","input":"message_rows","as":"local_rows","preserve_input":false,
+        \\ "fields":[{"name":"session_id","type":"string","nullable":false,"expr":"fixed"},
+        \\  {"name":"source_event_id","type":"string","nullable":false,
+        \\   "expr":{"field":"source_event_id"}}]},
+        },
+    };
+    for (cases) |case| {
+        try std.testing.expectEqual(case.streams, try testLineageExpressionStreams(case));
+    }
+}
+
+const two_lineage_template =
+    \\{"schema":"seq-observation-definition/v1","id":"test/two-lineage",
+    \\ "requires":{"abi":"seq-observation-abi/v1","operators":["filter","join","scan"]},
+    \\ "parameters":{},"selectors":[],"inputs":[],
+    \\ "relations":[{"name":"sessions",
+    \\   "fields":["session_id","parent_session_id","control_parent_session_id"]},
+    \\   {"name":"messages","fields":["session_id","role","text"]}],
+    \\ "pipeline":[{"op":"scan","relation":"sessions","as":"s"},
+    \\   {"op":"scan","relation":"messages","as":"m"},
+    \\   {"op":"filter","input":"m","as":"a",
+    \\    "where":[{"field":"role","op":"exact","value":"assistant"}]},
+    \\   {"op":"join","inputs":["a","a","s"],"as":"h",
+    \\    "on":{"kind":"anti","keys":[{"left":"text","right":"text"}],
+    \\      "lineage":{"left":"session_id","right":"session_id","node":"session_id",
+    \\        "parent":"parent_session_id"}},
+    \\    "fields":[{"source":0,"field":"session_id","name":"session_id","type":"string",
+    \\      "nullable":false},{"source":0,"field":"text","name":"text","type":"string",
+    \\      "nullable":true}]},
+    \\   {"op":"join","inputs":["h","h","s"],"as":"c",
+    \\    "on":{"kind":"anti","keys":[{"left":"text","right":"text"}],
+    \\      "lineage":{"left":"session_id","right":"session_id","node":"session_id",
+    \\        "parent":"@PARENT@"}},
+    \\    "fields":[{"source":0,"field":"session_id","name":"session_id","type":"string",
+    \\      "nullable":false},{"source":0,"field":"text","name":"text","type":"string",
+    \\      "nullable":true}]}],
+    \\ "projections":{"rows":{"relation":"@PROJECTED@","schema":"test/two-lineage/v1",
+    \\   "fields":["session_id","text"],"renderers":["json"]}},
+    \\ "bounds":{"max_rows":100,"max_output_bytes":4096,"max_fold_states":4,
+    \\   "max_input_bytes":1048576,"max_graph_depth":8,"max_graph_nodes":100,
+    \\   "max_diagnostics":8}}
+;
+
+test "a plan that reaches more than one lineage join never streams" {
+    const cases = [_]struct { parent: []const u8, projected: []const u8, streams: bool }{
+        .{ .parent = "control_parent_session_id", .projected = "c", .streams = false },
+        .{ .parent = "parent_session_id", .projected = "c", .streams = false },
+        .{ .parent = "control_parent_session_id", .projected = "h", .streams = true },
+    };
+    const allocator = std.testing.allocator;
+    for (cases) |case| {
+        const parented = try std.mem.replaceOwned(
+            u8,
+            allocator,
+            two_lineage_template,
+            "@PARENT@",
+            case.parent,
+        );
+        defer allocator.free(parented);
+        const source = try std.mem.replaceOwned(
+            u8,
+            allocator,
+            parented,
+            "@PROJECTED@",
+            case.projected,
+        );
+        defer allocator.free(source);
+        try std.testing.expectEqual(case.streams, try testDefinitionStreams(source));
+    }
 }

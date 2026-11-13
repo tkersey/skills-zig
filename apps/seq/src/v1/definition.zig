@@ -63,8 +63,8 @@ pub const Operator = enum {
 
     pub fn version(self: Operator) u16 {
         return switch (self) {
-            .scan, .aggregate, .derive => 2,
-            .filter => 3,
+            .scan, .aggregate, .ordered_fold => 2,
+            .filter, .derive => 3,
             else => 1,
         };
     }
