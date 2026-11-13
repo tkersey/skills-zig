@@ -207,11 +207,14 @@ root; with `--path` or `--session-id` it fails with
 `ObservationStreamingLineageShapeUnsupported`, because only the streaming strategy
 reads the selection's lineage closure. That closure follows control and history
 parents through every discovered session and never fails on its own: cycles and
-depth fail only through the lineage graph check, as unscoped runs do. A streaming
-lineage `--session-id` that matches no discovered session passing `--repo` fails with
-`SessionNotFound`, as other strategies do. Streaming lineage indexes every discovered
-session, so a session id that appears twice under the root fails it with
-`DuplicateObservationLineageNode`.
+depth fail only through the lineage graph check, as unscoped runs do. A scoped
+streaming run computes the whole observation over that closure: stages after the
+lineage join see only the closure's rows, so a top-k, aggregate, or join that
+relates rows of different sessions answers for the closure, not for the whole root.
+A streaming lineage `--session-id` that matches no discovered session passing
+`--repo` fails with `SessionNotFound`, as other strategies do. Streaming lineage
+indexes every discovered session, so a session id that appears twice under the root
+fails it with `DuplicateObservationLineageNode`.
 A `limit` or `top-k` count
 bound from a parameter must lie between 1 and `bounds.max_rows`, as a literal count
 must; other values fail with `InvalidObservationLimit` on every strategy. Every
@@ -297,6 +300,11 @@ On a declared fork, records that establish a worker without a usable replay boun
 record ordinal remain unattributed and emit a warning; declarations and failed spawns
 establish no worker and emit none. Primary metadata control
 links remain available independently of those creation records.
+`session_edges` keeps one row per evidence source: a link recorded by both the
+parent's spawn evidence and the child's control metadata yields two rows, the
+parent's with `parent_path` and the child's with `worker_path`. A definition that
+needs one row per link, such as a reachability over `session_edges`, should first
+apply a `distinct` keyed by `parent_session_id` and `worker_session_id`.
 Native `sessions` rows and linear definitions parse with the same rules as graph
 strategies for session identity, lineage, model, service tier, working directory,
 worker links, and token-usage observation counts, so those fields agree across
