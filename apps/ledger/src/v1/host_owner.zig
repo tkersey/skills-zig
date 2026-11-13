@@ -279,14 +279,9 @@ fn runSelectedPlan(
             current,
             retired,
         );
-        discover_archives = coverage.discover_archives;
+        discover_archives = !coverage.target_present;
         if (coverage.covered) {
-            try registerContext(result, io, environment, options, current);
-            try result.put(
-                "source_coverage",
-                if (options.context.workspace != null) "checked" else "not_checked",
-            );
-            return;
+            return registerCoveredContext(result, io, environment, options, current);
         }
     }
     if (!options.ensure) return error.OwnerPreparationRequired;
@@ -298,6 +293,7 @@ fn runSelectedPlan(
         options,
         plan,
         bindings,
+        associations,
         selected,
         retired,
         discover_archives,
@@ -486,7 +482,7 @@ fn blockedReadiness(result: *Result, failure: []const u8) !OwnerReadiness {
 
 const Coverage = struct {
     covered: bool = false,
-    discover_archives: bool = true,
+    target_present: bool = false,
 };
 
 fn existingCoverage(
@@ -550,7 +546,7 @@ fn existingCoverage(
         );
     return .{
         .covered = covered and !health.preparation_pending,
-        .discover_archives = !present,
+        .target_present = present,
     };
 }
 
@@ -632,6 +628,20 @@ fn missingCovered(
         options.confirm_no_writers,
         false,
         true,
+    );
+}
+
+fn registerCoveredContext(
+    result: *Result,
+    io: std.Io,
+    environment: *const std.process.Environ.Map,
+    options: Options,
+    selected: host.ContextValue,
+) !void {
+    try registerContext(result, io, environment, options, selected);
+    try result.put(
+        "source_coverage",
+        if (options.context.workspace != null) "checked" else "not_checked",
     );
 }
 
@@ -1340,6 +1350,7 @@ fn prepare(
     options: Options,
     plan: *const compiled.PlanSet,
     bindings: *const parameters.Bindings,
+    associations: *const host.workspace.Associations,
     existing: ?host.ContextValue,
     retired: []const []const u8,
     discover_archives: bool,
@@ -1347,6 +1358,7 @@ fn prepare(
     const allocator = result.arena.allocator();
     var target: ?pending.Target = null;
     defer if (target) |*value| value.deinit();
+    var include_archives = discover_archives;
     const selected = existing orelse blk: {
         var sources = try discoverSources(
             result,
@@ -1362,7 +1374,23 @@ fn prepare(
         defer sources.deinit();
         try result.put("storage_mutated", @as(?bool, null));
         target = try pending.prepareTarget(allocator, io, environment, options.context, true);
-        break :blk target.?.context.value;
+        const current = target.?.context.value;
+        // Newly allocated custody uses the same coverage law as an existing empty owner.
+        const coverage = try existingCoverage(
+            result,
+            io,
+            environment,
+            options,
+            plan,
+            bindings,
+            associations,
+            current,
+            retired,
+        );
+        if (coverage.covered and !coverage.target_present)
+            return registerCoveredContext(result, io, environment, options, current);
+        include_archives = !coverage.target_present;
+        break :blk current;
     };
     try prepareSelected(
         result,
@@ -1372,8 +1400,8 @@ fn prepare(
         plan,
         bindings,
         selected,
-        if (discover_archives) retired else &.{},
-        discover_archives,
+        if (include_archives) retired else &.{},
+        include_archives,
     );
 }
 
@@ -1719,7 +1747,7 @@ fn testLateDiscoveryDiagnostic(reconcile: bool, segmented: bool) !void {
     var interleaving: LateDiscoveryInterleaving = .{
         .io = io,
         .directory = temporary.dir,
-        .trigger = if (reconcile) 2 else 3,
+        .trigger = if (reconcile) 2 else 5,
     };
     LateDiscoveryInterleaving.active = &interleaving;
     defer LateDiscoveryInterleaving.active = null;
@@ -1766,6 +1794,111 @@ fn expectLateDiscoveryDiagnostic(
         try std.testing.expect(result.value.object.get("preparation") != null);
         try std.testing.expect(result.value.object.get("storage_mutated").?.bool);
     }
+}
+
+test "empty owner families preserve discovery capacity without widening the import bound" {
+    try testEmptyOwnerFamily(true);
+    try testEmptyOwnerFamily(false);
+}
+
+fn testEmptyOwnerFamily(confirmed: bool) !void {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var temporary = try host.workspace.testPlainDirectory();
+    defer temporary.cleanup();
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const owned = arena.allocator();
+    const root = try temporary.dir.realPathFileAlloc(io, ".", owned);
+    try testOwnerInputs(temporary.dir);
+    var environment = std.process.Environ.Map.init(allocator);
+    defer environment.deinit();
+    var options = try testOwnerOptions(owned, root);
+    options.ensure = true;
+    options.confirm_no_writers = confirmed;
+    const roots = try testOwnerFamily(owned, &environment, options.context.workspace.?, root);
+    var initialized = try execute(allocator, io, &environment, options);
+    defer initialized.deinit();
+    if (initialized.exit_code != 0) std.debug.print(
+        "empty family confirmed={any}: {s}\n",
+        .{ confirmed, initialized.value.object.get("error_code").?.string },
+    );
+    try std.testing.expectEqual(@as(u8, 0), initialized.exit_code);
+    try std.testing.expect(initialized.value.object.get("cataloged").?.bool);
+    try std.testing.expectEqualStrings(
+        "checked",
+        initialized.value.object.get("source_coverage").?.string,
+    );
+    for (roots) |source| {
+        const payload = try std.fs.path.join(owned, &.{ source, ".ledger/example/events.jsonl" });
+        try std.testing.expect(!try host.catalog.exists(io, payload));
+    }
+    if (!confirmed)
+        try std.testing.expect(initialized.value.object.get("source_coordination_mutated").?.bool);
+    try testOwnerFamilyImportBound(&environment, options, &initialized, roots[1]);
+}
+
+fn testOwnerFamily(
+    allocator: std.mem.Allocator,
+    environment: *const std.process.Environ.Map,
+    workspace: []const u8,
+    root: []const u8,
+) ![]const []const u8 {
+    const io = std.testing.io;
+    _ = try host.workspace.git(allocator, io, environment, workspace, &.{ "init", "-q" });
+    _ = try host.workspace.git(allocator, io, environment, workspace, &.{
+        "-c",     "user.name=Fixture", "-c",  "user.email=fixture@example.invalid",
+        "commit", "--allow-empty",     "-qm", "fixture",
+    });
+    const roots = try allocator.alloc([]const u8, 33);
+    roots[0] = workspace;
+    for (roots[1..], 1..) |*path, index| {
+        path.* = try std.fmt.allocPrint(allocator, "{s}/linked-{d}", .{ root, index });
+        _ = try host.workspace.git(allocator, io, environment, workspace, &.{
+            "worktree", "add", "--detach", path.*,
+        });
+    }
+    return roots;
+}
+
+fn testOwnerFamilyImportBound(
+    environment: *const std.process.Environ.Map,
+    options: Options,
+    initialized: *const Result,
+    source: []const u8,
+) !void {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    try testAppendOwner(environment, options.definition, source);
+    const directory = try host.catalog.openDirectory(io, source, false);
+    defer directory.close(io);
+    const original = try host.catalog.readBytes(
+        allocator,
+        io,
+        directory,
+        ".ledger/example/events.jsonl",
+        4096,
+    );
+    defer allocator.free(original);
+    var reconcile = options;
+    reconcile.reconcile = true;
+    var rejected = try execute(allocator, io, environment, reconcile);
+    defer rejected.deinit();
+    try std.testing.expectEqual(@as(u8, 3), rejected.exit_code);
+    try std.testing.expectEqualStrings(
+        "PreparationSourceBoundExceeded",
+        rejected.value.object.get("error_code").?.string,
+    );
+    try std.testing.expectEqualStrings(
+        initialized.value.object.get("store_id").?.string,
+        rejected.value.object.get("store_id").?.string,
+    );
+    const payload = try std.fs.path.join(allocator, &.{
+        initialized.value.object.get("store_root").?.string, "example/events.jsonl",
+    });
+    defer allocator.free(payload);
+    try std.testing.expect(!try host.catalog.exists(io, payload));
+    try expectOwnerBytes(directory, original);
 }
 
 test "empty owner establishes native source custody and keeps canonical progress independent" {
