@@ -59,6 +59,10 @@ pub const Result = struct {
         try self.value.object.put(allocator, key, parsed.value);
     }
 
+    fn putDiscoveryFailure(self: *Result, diagnostic: discovery.Diagnostic) !void {
+        if (diagnostic.source_root != null) try self.put("source_failure", diagnostic);
+    }
+
     fn beginMutation(self: *Result) !void {
         const previous = self.value.object.get("storage_mutated");
         if (previous) |value| if (value == .bool and value.bool) return;
@@ -574,7 +578,7 @@ fn discoverSources(
         archives,
         &diagnostic,
     ) catch |err| {
-        if (diagnostic.source_root != null) try result.put("source_failure", diagnostic);
+        try result.putDiscoveryFailure(diagnostic);
         return err;
     };
 }
@@ -604,6 +608,7 @@ fn missingCovered(
     defer sources.deinit();
     if (plan.storage_plan.?.slots[0].layout == .segmented) {
         try requireSegmentedSourcesAbsent(
+            result,
             allocator,
             io,
             environment,
@@ -745,6 +750,7 @@ fn localCovered(
     defer sources.deinit();
     if (plan.storage_plan.?.slots[0].layout == .segmented) {
         try requireSegmentedSourcesAbsent(
+            result,
             allocator,
             io,
             environment,
@@ -801,6 +807,7 @@ fn coverSources(
     );
     defer coordination.deinit();
     return coverCoordinatedSources(
+        result,
         allocator,
         io,
         environment,
@@ -817,6 +824,7 @@ fn coverSources(
 }
 
 fn coverCoordinatedSources(
+    result: *Result,
     allocator: std.mem.Allocator,
     io: std.Io,
     environment: *const std.process.Environ.Map,
@@ -868,6 +876,7 @@ fn coverCoordinatedSources(
         covered = false;
     };
     try recheckCoverage(
+        result,
         allocator,
         io,
         environment,
@@ -1187,6 +1196,7 @@ fn openCoverageSource(
 }
 
 fn recheckCoverage(
+    result: *Result,
     allocator: std.mem.Allocator,
     io: std.Io,
     environment: *const std.process.Environ.Map,
@@ -1206,7 +1216,8 @@ fn recheckCoverage(
     if (!host.catalog.optionalEqual(associations.workspace_root, selected.workspace_root) or
         !host.catalog.optionalEqual(associations.git_common_dir, selected.git_common_dir))
         return error.WorkspaceCoverageChangedAfterPreparation;
-    var current = try discovery.discover(
+    var current = try discoverSources(
+        result,
         allocator,
         io,
         environment,
@@ -1254,6 +1265,7 @@ fn captureCoverageHistory(
 }
 
 fn requireSegmentedSourcesAbsent(
+    result: *Result,
     allocator: std.mem.Allocator,
     io: std.Io,
     environment: *const std.process.Environ.Map,
@@ -1309,6 +1321,7 @@ fn requireSegmentedSourcesAbsent(
             return error.PreparationRequiresQuiescence;
     }
     try recheckCoverage(
+        result,
         allocator,
         io,
         environment,
@@ -1418,7 +1431,7 @@ fn prepareSelected(
         options.repair_archive,
     );
     if (options.context.workspace) |workspace| {
-        try recheckPreparedTrees(allocator, io, environment, workspace, selected, sources.trees);
+        try recheckPreparedTrees(result, io, environment, workspace, selected, sources.trees);
     }
     try coordination.revalidate();
     try registerContext(result, io, environment, options, selected);
@@ -1485,14 +1498,27 @@ fn prepareNative(
 }
 
 fn recheckPreparedTrees(
-    allocator: std.mem.Allocator,
+    result: *Result,
     io: std.Io,
     environment: *const std.process.Environ.Map,
     workspace: []const u8,
     selected: host.ContextValue,
     expected: []const []const u8,
 ) !void {
-    var current = try discovery.treesForTarget(allocator, io, environment, workspace, selected);
+    const allocator = result.arena.allocator();
+    var diagnostic: discovery.Diagnostic = .{};
+    defer diagnostic.deinit(allocator);
+    var current = discovery.treesForTargetObserved(
+        allocator,
+        io,
+        environment,
+        workspace,
+        selected,
+        &diagnostic,
+    ) catch |err| {
+        try result.putDiscoveryFailure(diagnostic);
+        return err;
+    };
     defer current.deinit();
     if (current.roots.len != expected.len) return error.WorkspaceCoverageChangedAfterPreparation;
     for (current.roots, expected) |left, right| {
@@ -1610,6 +1636,137 @@ const OwnerAssociationInterleaving = struct {
         return self.io.vtable.dirStatFile(userdata, directory, path, options);
     }
 };
+
+const LateDiscoveryInterleaving = struct {
+    io: std.Io,
+    directory: std.Io.Dir,
+    trigger: usize,
+    discoveries: usize = 0,
+    moved: bool = false,
+
+    var active: ?*LateDiscoveryInterleaving = null;
+
+    fn spawn(
+        userdata: ?*anyopaque,
+        options: std.process.SpawnOptions,
+    ) std.process.SpawnError!std.process.Child {
+        const self = active.?;
+        if (options.argv.len >= 5 and std.mem.eql(u8, options.argv[0], "git") and
+            std.mem.eql(u8, options.argv[3], "worktree") and
+            std.mem.eql(u8, options.argv[4], "list"))
+        {
+            self.discoveries += 1;
+            if (self.discoveries == self.trigger) {
+                self.directory.rename("linked", self.directory, "moved", self.io) catch |err|
+                    @panic(@errorName(err));
+                self.moved = true;
+            }
+        }
+        return self.io.vtable.processSpawn(userdata, options);
+    }
+};
+
+test "owner coverage recheck retains a later unavailable worktree diagnostic" {
+    try testLateDiscoveryDiagnostic(true, false);
+}
+
+test "owner preparation recheck retains a later unavailable worktree diagnostic" {
+    try testLateDiscoveryDiagnostic(false, false);
+}
+
+test "segmented owner recheck retains a later unavailable worktree diagnostic" {
+    try testLateDiscoveryDiagnostic(true, true);
+}
+
+fn testLateDiscoveryDiagnostic(reconcile: bool, segmented: bool) !void {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var temporary = try host.workspace.testPlainDirectory();
+    defer temporary.cleanup();
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const owned = arena.allocator();
+    const root = try temporary.dir.realPathFileAlloc(io, ".", owned);
+    try testOwnerInputs(temporary.dir);
+    if (segmented) try testSegmentedDefinition(owned, temporary.dir);
+    var options = try testOwnerOptions(owned, root);
+    options.ensure = true;
+    options.reconcile = reconcile;
+    options.confirm_no_writers = segmented;
+    const workspace = options.context.workspace.?;
+    const linked = try std.fs.path.join(owned, &.{ root, "linked" });
+    var environment = std.process.Environ.Map.init(allocator);
+    defer environment.deinit();
+    _ = try host.workspace.git(owned, io, &environment, workspace, &.{ "init", "-q" });
+    _ = try host.workspace.git(owned, io, &environment, workspace, &.{
+        "-c",     "user.name=Fixture", "-c",  "user.email=fixture@example.invalid",
+        "commit", "--allow-empty",     "-qm", "fixture",
+    });
+    _ = try host.workspace.git(owned, io, &environment, workspace, &.{
+        "worktree", "add", "--detach", linked,
+    });
+    if (reconcile) {
+        var selected = try host.initialize(allocator, io, &environment, options.context);
+        defer selected.deinit();
+        if (!segmented) try testAppendOwner(
+            &environment,
+            options.definition,
+            selected.value.store_root,
+        );
+    } else {
+        try testAppendOwner(&environment, options.definition, linked);
+    }
+    var interleaving: LateDiscoveryInterleaving = .{
+        .io = io,
+        .directory = temporary.dir,
+        .trigger = if (reconcile) 2 else 3,
+    };
+    LateDiscoveryInterleaving.active = &interleaving;
+    defer LateDiscoveryInterleaving.active = null;
+    var vtable = io.vtable.*;
+    vtable.processSpawn = LateDiscoveryInterleaving.spawn;
+    var injected = io;
+    injected.vtable = &vtable;
+    var result = try execute(allocator, injected, &environment, options);
+    defer result.deinit();
+    try expectLateDiscoveryDiagnostic(&result, &interleaving, linked, !reconcile);
+}
+
+fn expectLateDiscoveryDiagnostic(
+    result: *const Result,
+    interleaving: *const LateDiscoveryInterleaving,
+    linked: []const u8,
+    prepared: bool,
+) !void {
+    const failure = result.value.object.get("source_failure");
+    if (failure == null) std.debug.print(
+        "late discovery: moved={any} count={d} " ++
+            "exit={d} error={any}\n",
+        .{
+            interleaving.moved,
+            interleaving.discoveries,
+            result.exit_code,
+            result.value.object.get("error_code"),
+        },
+    );
+    try std.testing.expect(interleaving.moved);
+    try std.testing.expectEqual(interleaving.trigger, interleaving.discoveries);
+    try std.testing.expectEqual(@as(u8, 3), result.exit_code);
+    try std.testing.expectEqualStrings(
+        "UnavailableWorktree",
+        result.value.object.get("error_code").?.string,
+    );
+    try std.testing.expect(failure != null);
+    try std.testing.expectEqualStrings(linked, failure.?.object.get("source_root").?.string);
+    try std.testing.expectEqualStrings(
+        "UnavailableWorktree",
+        failure.?.object.get("error_code").?.string,
+    );
+    if (prepared) {
+        try std.testing.expect(result.value.object.get("preparation") != null);
+        try std.testing.expect(result.value.object.get("storage_mutated").?.bool);
+    }
+}
 
 test "empty owner establishes native source custody and keeps canonical progress independent" {
     const allocator = std.testing.allocator;
