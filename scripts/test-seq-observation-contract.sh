@@ -1159,3 +1159,59 @@ if token_read=$(CODEX_HOME="$expression_home" "$binary" observe \
   exit 1
 fi
 jq -e '.code == "ObservationStreamingLineageShapeUnsupported"' <<<"$token_read" >/dev/null
+
+two_lineage_home="$work/two-lineage-home"
+mkdir -p "$two_lineage_home/sessions"
+lineage_session() {
+  local meta=$1 second=2
+  shift
+  printf '{"timestamp":"2026-07-26T10:00:00Z","type":"session_meta","payload":%s}\n' "$meta"
+  for message in "$@"; do
+    jq -cn --arg message "$message" --arg at "2026-07-26T10:00:0${second}Z" \
+      '{timestamp: $at, type: "event_msg", payload: {type: "agent_message", message: $message}}'
+    second=$((second + 1))
+  done
+}
+lineage_session '{"id":"F","cwd":"/repo"}' ft >"$two_lineage_home/sessions/f.jsonl"
+lineage_session '{"id":"C","cwd":"/repo"}' T >"$two_lineage_home/sessions/c.jsonl"
+lineage_session '{"id":"X","cwd":"/repo","forked_from_id":"F","parent_thread_id":"C"}' T xt \
+  >"$two_lineage_home/sessions/x.jsonl"
+jq -n '
+  def keep: [{source: 0, field: "session_id", name: "session_id", type: "string",
+      nullable: false}, {source: 0, field: "text", name: "text", type: "string",
+      nullable: true}];
+  def lineage(parent): {left: "session_id", right: "session_id", node: "session_id",
+    parent: parent};
+  {schema: "seq-observation-definition/v1", id: "example/two-lineage",
+   requires: {abi: "seq-observation-abi/v1", operators: ["filter", "join", "scan"]},
+   parameters: {}, selectors: ["path", "root", "session-id"], inputs: [],
+   relations: [{name: "sessions",
+       fields: ["session_id", "parent_session_id", "control_parent_session_id"]},
+     {name: "messages", fields: ["session_id", "role", "text"]}],
+   pipeline: [{op: "scan", relation: "sessions", "as": "s"},
+     {op: "scan", relation: "messages", "as": "m"},
+     {op: "filter", input: "m", "as": "a",
+       where: [{field: "role", op: "exact", value: "assistant"}]},
+     {op: "join", inputs: ["a", "a", "s"], "as": "h", fields: keep,
+       on: {kind: "anti", keys: [{left: "text", right: "text"}],
+         lineage: lineage("parent_session_id")}},
+     {op: "join", inputs: ["h", "h", "s"], "as": "c", fields: keep,
+       on: {kind: "anti", keys: [{left: "text", right: "text"}],
+         lineage: lineage("control_parent_session_id")}}],
+   projections: {rows: {relation: "c", schema: "example/two-lineage/v1",
+     fields: ["session_id", "text"], renderers: ["json"]}},
+   bounds: {max_rows: 100, max_output_bytes: 8192, max_fold_states: 4,
+     max_input_bytes: 1048576, max_graph_depth: 8, max_graph_nodes: 100,
+     max_diagnostics: 8}}' >"$work/two-lineage.json"
+"$binary" explain --definition "$work/two-lineage.json" --projection rows --format json |
+  jq -e '.strategy.kind == "materialized-graph"' >/dev/null
+CODEX_HOME="$two_lineage_home" "$binary" observe --definition "$work/two-lineage.json" \
+  --projection rows --format json |
+  jq -e '[.data.rows[] | "\(.session_id):\(.text)"] | sort == ["C:T", "F:ft", "X:xt"]' \
+  >/dev/null
+if two_lineage_scoped=$(CODEX_HOME="$two_lineage_home" "$binary" observe \
+  --definition "$work/two-lineage.json" --projection rows --session-id X --format json); then
+  echo "a scoped run streamed a lineage join over another parent" >&2
+  exit 1
+fi
+jq -e '.code == "ObservationStreamingLineageShapeUnsupported"' <<<"$two_lineage_scoped" >/dev/null

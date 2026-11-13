@@ -166,10 +166,10 @@ read. Ordering keys never match a null.
 
 A lineage definition streams (`partition-lineage-stream`) only when all of these hold:
 
-- its lineage join is an anti join whose left and right inputs are the same stage,
-  whose projection takes only fields of that input, whose keys are all equality keys
-  that pair a field of that input with itself, and whose lineage relates rows and
-  nodes by `session_id` and walks `parent_session_id`;
+- its projection reaches exactly one lineage join, an anti join whose left and right
+  inputs are the same stage, whose projection takes only fields of that input, whose
+  keys are all equality keys that pair a field of that input with itself, and whose
+  lineage relates rows and nodes by `session_id` and walks `parent_session_id`;
 - its local stages stay within one session: an `ordered_fold` is keyed by
   `session_id` and its `order_by` starts with `session_id`, `distinct` and joins
   are keyed by `session_id`, and a stage that outputs `session_id` copies it from

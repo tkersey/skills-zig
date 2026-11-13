@@ -106,50 +106,44 @@ pub fn streamingLineagePlan(
         return error.UnknownObservationProjection;
     const reachable = try reachableStages(allocator, definition_plan, native_plan, projection_name);
     defer allocator.free(reachable);
-    try requireValidJoins(allocator, definition_plan, native_plan, reachable);
-    for (native_plan.stages, 0..) |stage, stage_index| {
-        if (!reachable[stage_index] or stage.operation != .generic) continue;
-        const generic = stage.operation.generic;
-        if (generic.operator != .join) continue;
-        var spec = try compileJoin(
-            allocator,
-            native_plan,
-            definition_plan.steps[stage_index],
-            generic.canonical_config,
-        );
-        defer spec.deinit(allocator);
-        const lineage = spec.lineage orelse continue;
-        if (!streamableLineageJoin(native_plan, &spec)) return null;
-        if (!try carriesSessionColumns(allocator, native_plan, lineage.graph_stage)) return null;
-        const scan_stage = try streamablePartitionRoot(
+    var lineage_join = try soleLineageJoin(
+        allocator,
+        definition_plan,
+        native_plan,
+        reachable,
+    ) orelse return null;
+    defer lineage_join.spec.deinit(allocator);
+    const spec = &lineage_join.spec;
+    const lineage = spec.lineage.?;
+    if (!streamableLineageJoin(native_plan, spec)) return null;
+    if (!try carriesSessionColumns(allocator, native_plan, lineage.graph_stage)) return null;
+    const scan_stage = try streamablePartitionRoot(
+        allocator,
+        definition_plan,
+        native_plan,
+        spec.left_stage,
+    ) orelse return null;
+    const seed_stage = try streamingSeedScan(
+        allocator,
+        definition_plan,
+        native_plan,
+        native_plan.projections[projection_index].stage_index,
+        lineage_join.stage,
+        lineage.graph_stage,
+    ) orelse return null;
+    return .{
+        .scan_stage = scan_stage,
+        .local_stage = spec.left_stage,
+        .lineage_stage = lineage_join.stage,
+        .graph_stage = lineage.graph_stage,
+        .seed_stage = seed_stage,
+        .partition_order = try localPartitionOrder(
             allocator,
             definition_plan,
             native_plan,
             spec.left_stage,
-        ) orelse return null;
-        const seed_stage = try streamingSeedScan(
-            allocator,
-            definition_plan,
-            native_plan,
-            native_plan.projections[projection_index].stage_index,
-            @intCast(stage_index),
-            lineage.graph_stage,
-        ) orelse return null;
-        return .{
-            .scan_stage = scan_stage,
-            .local_stage = spec.left_stage,
-            .lineage_stage = @intCast(stage_index),
-            .graph_stage = lineage.graph_stage,
-            .seed_stage = seed_stage,
-            .partition_order = try localPartitionOrder(
-                allocator,
-                definition_plan,
-                native_plan,
-                spec.left_stage,
-            ),
-        };
-    }
-    return null;
+        ),
+    };
 }
 
 pub fn requireBoundParameters(
@@ -289,12 +283,17 @@ fn seedsSessionFields(field_indices: []const u16) bool {
     return true;
 }
 
-fn requireValidJoins(
+const LineageJoin = struct { stage: u16, spec: JoinSpec };
+
+fn soleLineageJoin(
     allocator: std.mem.Allocator,
     definition_plan: *const definition.Plan,
     native_plan: *const plan.Plan,
     reachable: []const bool,
-) !void {
+) !?LineageJoin {
+    var sole: ?LineageJoin = null;
+    errdefer if (sole) |*found| found.spec.deinit(allocator);
+    var lineage_joins: usize = 0;
     for (native_plan.stages, reachable, 0..) |stage, reached, stage_index| {
         if (!reached or stage.operation != .generic) continue;
         if (stage.operation.generic.operator != .join) continue;
@@ -304,8 +303,16 @@ fn requireValidJoins(
             definition_plan.steps[stage_index],
             stage.operation.generic.canonical_config,
         );
-        spec.deinit(allocator);
+        if (spec.lineage != null) lineage_joins += 1;
+        if (spec.lineage == null or sole != null) {
+            spec.deinit(allocator);
+            continue;
+        }
+        sole = .{ .stage = @intCast(stage_index), .spec = spec };
     }
+    if (lineage_joins == 1) return sole;
+    if (sole) |*found| found.spec.deinit(allocator);
+    return null;
 }
 
 fn streamableLineageJoin(native_plan: *const plan.Plan, spec: *const JoinSpec) bool {
@@ -4476,6 +4483,11 @@ fn testLineageExpressionStreams(case: LineageExpressionCase) !bool {
         allocator.free(source);
         source = replaced;
     }
+    return testDefinitionStreams(source);
+}
+
+fn testDefinitionStreams(source: []const u8) !bool {
+    const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "definition.json", .data = source });
@@ -4529,5 +4541,65 @@ test "streaming eligibility reads expressions through the evaluators' grammar" {
     };
     for (cases) |case| {
         try std.testing.expectEqual(case.streams, try testLineageExpressionStreams(case));
+    }
+}
+
+const two_lineage_template =
+    \\{"schema":"seq-observation-definition/v1","id":"test/two-lineage",
+    \\ "requires":{"abi":"seq-observation-abi/v1","operators":["filter","join","scan"]},
+    \\ "parameters":{},"selectors":[],"inputs":[],
+    \\ "relations":[{"name":"sessions",
+    \\   "fields":["session_id","parent_session_id","control_parent_session_id"]},
+    \\   {"name":"messages","fields":["session_id","role","text"]}],
+    \\ "pipeline":[{"op":"scan","relation":"sessions","as":"s"},
+    \\   {"op":"scan","relation":"messages","as":"m"},
+    \\   {"op":"filter","input":"m","as":"a",
+    \\    "where":[{"field":"role","op":"exact","value":"assistant"}]},
+    \\   {"op":"join","inputs":["a","a","s"],"as":"h",
+    \\    "on":{"kind":"anti","keys":[{"left":"text","right":"text"}],
+    \\      "lineage":{"left":"session_id","right":"session_id","node":"session_id",
+    \\        "parent":"parent_session_id"}},
+    \\    "fields":[{"source":0,"field":"session_id","name":"session_id","type":"string",
+    \\      "nullable":false},{"source":0,"field":"text","name":"text","type":"string",
+    \\      "nullable":true}]},
+    \\   {"op":"join","inputs":["h","h","s"],"as":"c",
+    \\    "on":{"kind":"anti","keys":[{"left":"text","right":"text"}],
+    \\      "lineage":{"left":"session_id","right":"session_id","node":"session_id",
+    \\        "parent":"@PARENT@"}},
+    \\    "fields":[{"source":0,"field":"session_id","name":"session_id","type":"string",
+    \\      "nullable":false},{"source":0,"field":"text","name":"text","type":"string",
+    \\      "nullable":true}]}],
+    \\ "projections":{"rows":{"relation":"@PROJECTED@","schema":"test/two-lineage/v1",
+    \\   "fields":["session_id","text"],"renderers":["json"]}},
+    \\ "bounds":{"max_rows":100,"max_output_bytes":4096,"max_fold_states":4,
+    \\   "max_input_bytes":1048576,"max_graph_depth":8,"max_graph_nodes":100,
+    \\   "max_diagnostics":8}}
+;
+
+test "a plan that reaches more than one lineage join never streams" {
+    const cases = [_]struct { parent: []const u8, projected: []const u8, streams: bool }{
+        .{ .parent = "control_parent_session_id", .projected = "c", .streams = false },
+        .{ .parent = "parent_session_id", .projected = "c", .streams = false },
+        .{ .parent = "control_parent_session_id", .projected = "h", .streams = true },
+    };
+    const allocator = std.testing.allocator;
+    for (cases) |case| {
+        const parented = try std.mem.replaceOwned(
+            u8,
+            allocator,
+            two_lineage_template,
+            "@PARENT@",
+            case.parent,
+        );
+        defer allocator.free(parented);
+        const source = try std.mem.replaceOwned(
+            u8,
+            allocator,
+            parented,
+            "@PROJECTED@",
+            case.projected,
+        );
+        defer allocator.free(source);
+        try std.testing.expectEqual(case.streams, try testDefinitionStreams(source));
     }
 }
