@@ -240,10 +240,24 @@ pub fn discoverObserved(
     for (roots) |root| {
         for (retired) |path| {
             const full = try std.fs.path.join(owned, &.{ root, path });
-            if (try existsWithoutFollowing(io, full))
-                return error.RetiredSourceRequiresOwnerImporter;
+            const exists = existsWithoutFollowing(io, full) catch |err|
+                return diagnosticError(allocator, diagnostic, root, err);
+            if (exists)
+                return diagnosticError(
+                    allocator,
+                    diagnostic,
+                    root,
+                    error.RetiredSourceRequiresOwnerImporter,
+                );
         }
-        const source = try sourceForRoot(allocator, owned, io, root, target) orelse continue;
+        const source = try sourceForRoot(
+            allocator,
+            owned,
+            io,
+            root,
+            target,
+            diagnostic,
+        ) orelse continue;
         try result.append(owned, source);
     }
     if (target) |current| {
@@ -267,27 +281,34 @@ fn sourceForRoot(
     io: std.Io,
     root: []const u8,
     target: ?host.ContextValue,
+    diagnostic: ?*Diagnostic,
 ) !?preparation.Source {
     const marker_path = try std.fs.path.join(owned, &.{ root, ".ledger-root.json" });
     var source: preparation.Source = .{ .root = root };
     var control: ?std.Io.Dir = null;
     defer if (control) |directory| directory.close(io);
-    if (try existsWithoutFollowing(io, marker_path)) {
-        const marker = try catalog.readJson(Marker, allocator, io, marker_path, 4096);
+    const marked = existsWithoutFollowing(io, marker_path) catch |err|
+        return diagnosticError(allocator, diagnostic, root, err);
+    if (marked) {
+        const marker = catalog.readJson(Marker, allocator, io, marker_path, 4096) catch |err|
+            return diagnosticError(allocator, diagnostic, root, err);
         defer marker.deinit();
         if (!std.mem.eql(u8, marker.value.schema, "ledger-storage-root/v1"))
-            return error.InvalidSourceRootIdentity;
-        control = try catalog.checkedRoot(allocator, io, root, marker.value.store_id);
+            return diagnosticError(allocator, diagnostic, root, error.InvalidSourceRootIdentity);
+        control = catalog.checkedRoot(allocator, io, root, marker.value.store_id) catch |err|
+            return diagnosticError(allocator, diagnostic, root, err);
         source.store_id = try owned.dupe(u8, marker.value.store_id);
     } else if (target != null) {
         const path = try std.fs.path.join(owned, &.{ root, ".ledger" });
         control = catalog.openDirectory(io, path, false) catch |err| switch (err) {
             error.FileNotFound => null,
-            else => return err,
+            else => return diagnosticError(allocator, diagnostic, root, err),
         };
     }
     if (control) |directory| {
-        if (try targetOwnsControl(allocator, io, target, directory)) return null;
+        const is_target = targetOwnsControl(allocator, io, target, directory) catch |err|
+            return diagnosticError(allocator, diagnostic, target.?.store_root, err);
+        if (is_target) return null;
     }
     return source;
 }
@@ -755,6 +776,8 @@ fn testSourceMarkerFailures(
     linked: []const u8,
     target: host.ContextValue,
 ) !void {
+    var diagnostic: Diagnostic = .{};
+    defer diagnostic.deinit(allocator);
     try testWrite(
         linked,
         ".ledger-root.json",
@@ -762,8 +785,24 @@ fn testSourceMarkerFailures(
     );
     try std.testing.expectError(
         error.InvalidSourceRootIdentity,
-        discover(allocator, io, environment, root, target, "owner/events.jsonl", &.{}, false),
+        discoverObserved(
+            allocator,
+            io,
+            environment,
+            root,
+            target,
+            "owner/events.jsonl",
+            &.{},
+            false,
+            &diagnostic,
+        ),
     );
+    try std.testing.expectEqualStrings(
+        "InvalidSourceRootIdentity",
+        diagnostic.error_code orelse "missing-source-diagnostic",
+    );
+    try std.testing.expect(diagnostic.source_root != null);
+    try std.testing.expectEqualStrings(linked, diagnostic.source_root.?);
     try testWrite(
         root,
         ".ledger-root.json",
@@ -772,8 +811,54 @@ fn testSourceMarkerFailures(
     );
     try std.testing.expectError(
         error.StorageRootIdentityMismatch,
-        discover(allocator, io, environment, root, target, "owner/events.jsonl", &.{}, false),
+        discoverObserved(
+            allocator,
+            io,
+            environment,
+            root,
+            target,
+            "owner/events.jsonl",
+            &.{},
+            false,
+            &diagnostic,
+        ),
     );
+    try std.testing.expectEqualStrings(root, diagnostic.source_root.?);
+    try std.testing.expectEqualStrings("StorageRootIdentityMismatch", diagnostic.error_code.?);
+}
+
+test "host sources attribute retired source refusals to the known root" {
+    var temporary = try workspace.testPlainDirectory();
+    defer temporary.cleanup();
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const root = try temporary.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(root);
+    try temporary.dir.writeFile(io, .{ .sub_path = "retired.jsonl", .data = "retained history\n" });
+    var environment = std.process.Environ.Map.init(allocator);
+    defer environment.deinit();
+    var diagnostic: Diagnostic = .{};
+    defer diagnostic.deinit(allocator);
+    try std.testing.expectError(error.RetiredSourceRequiresOwnerImporter, discoverObserved(
+        allocator,
+        io,
+        &environment,
+        root,
+        null,
+        "owner/events.jsonl",
+        &.{"retired.jsonl"},
+        false,
+        &diagnostic,
+    ));
+    try std.testing.expectEqualStrings(
+        "RetiredSourceRequiresOwnerImporter",
+        diagnostic.error_code orelse "missing-source-diagnostic",
+    );
+    try std.testing.expect(diagnostic.source_root != null);
+    try std.testing.expectEqualStrings(root, diagnostic.source_root.?);
+    const bytes = try temporary.dir.readFileAlloc(io, "retired.jsonl", allocator, .limited(1024));
+    defer allocator.free(bytes);
+    try std.testing.expectEqualStrings("retained history\n", bytes);
 }
 
 test "host sources select archived events and bindings without unrelated reads" {

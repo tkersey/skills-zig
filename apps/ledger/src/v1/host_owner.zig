@@ -361,7 +361,7 @@ fn admitPresentOwner(
     associations: *const host.workspace.Associations,
     selected: host.ContextValue,
 ) !OwnerReadiness {
-    const allocator = result.arena.allocator();
+    const allocator = result.arena.child_allocator;
     try result.setContext(selected);
     try result.put("source_coverage", "not_checked");
     try pending.checkPendingContext(
@@ -418,7 +418,7 @@ fn busyHealth(health: doctor.Result) ?[]const u8 {
 }
 
 fn recoverSelectedOwner(result: *Result, io: std.Io, selected: host.ContextValue) !void {
-    const allocator = result.arena.allocator();
+    const allocator = result.arena.child_allocator;
     const control = try storage_root.checkedRoot(
         allocator,
         io,
@@ -887,6 +887,12 @@ const SourceCoordination = struct {
     io: std.Io,
     held: std.ArrayList(Held) = .empty,
 
+    const Failure = struct {
+        source_root: []const u8,
+        owner: []const u8,
+        error_code: []const u8,
+    };
+
     const Held = struct {
         source: preparation.Source,
         root: std.Io.Dir,
@@ -912,13 +918,21 @@ const SourceCoordination = struct {
         confirmed: bool,
     ) !SourceCoordination {
         for (0..writer_attempts_max) |attempt| {
-            if (acquireOnce(result, io, plan, sources, target, confirmed)) |guards| {
+            var failure: ?Failure = null;
+            if (acquireOnce(result, io, plan, sources, target, confirmed, &failure)) |guards| {
                 _ = result.value.object.swapRemove("source_failure");
                 return guards;
             } else |err| {
                 if ((err != error.LockBusy and err != error.EventStoreBusy) or
-                    attempt == writer_attempts_max - 1) return err;
-                try waitForWriter(io, attempt);
+                    attempt == writer_attempts_max - 1)
+                {
+                    if (failure) |value| try result.put("source_failure", value);
+                    return err;
+                }
+                waitForWriter(io, attempt) catch |wait_err| {
+                    if (failure) |value| try result.put("source_failure", value);
+                    return wait_err;
+                };
             }
         }
         unreachable;
@@ -931,8 +945,9 @@ const SourceCoordination = struct {
         sources: []const preparation.Source,
         target: ?std.Io.Dir,
         confirmed: bool,
+        failure: *?Failure,
     ) !SourceCoordination {
-        var guards: SourceCoordination = .{ .allocator = result.arena.allocator(), .io = io };
+        var guards: SourceCoordination = .{ .allocator = result.arena.child_allocator, .io = io };
         errdefer guards.deinit();
         if (confirmed or plan.storage_plan.?.slots[0].layout == .segmented) return guards;
         for (sources) |source| {
@@ -948,11 +963,11 @@ const SourceCoordination = struct {
             var mutated = false;
             const held = guards.acquireSource(source, plan, &mutated) catch |err| {
                 try observeSourceMutation(result, mutated);
-                try result.put("source_failure", .{
+                failure.* = .{
                     .source_root = source.root,
                     .owner = plan.definition_plan.id,
                     .error_code = @errorName(err),
-                });
+                };
                 return err;
             };
             guards.held.appendAssumeCapacity(held);
@@ -1429,7 +1444,7 @@ fn prepareNative(
     confirm_no_writers: bool,
     restore_bound_history: bool,
 ) !void {
-    const allocator = result.arena.allocator();
+    const allocator = result.arena.child_allocator;
     const selection: storage_root.Selection = .{
         .argv = &.{},
         .control = control,
@@ -1791,6 +1806,113 @@ test "empty source coordination excludes participating writers through held cust
         plan.storage_plan.?.slots[0].relative_path,
     );
     lock.close(io);
+}
+
+const OwnerRetryMemory = struct {
+    var active: ?*OwnerRetryMemory = null;
+
+    io: std.Io,
+    counted: *std.testing.FailingAllocator,
+    guard: ?std.Io.File,
+    samples: [16]usize = undefined,
+    count: usize = 0,
+
+    fn deinit(self: *OwnerRetryMemory) void {
+        if (self.guard) |guard| guard.close(self.io);
+    }
+
+    fn sleep(_: ?*anyopaque, _: std.Io.Timeout) std.Io.Cancelable!void {
+        const self = active.?;
+        std.debug.assert(self.count < self.samples.len);
+        self.samples[self.count] = self.counted.allocated_bytes - self.counted.freed_bytes;
+        self.count += 1;
+        if (self.count == self.samples.len) {
+            self.guard.?.close(self.io);
+            self.guard = null;
+        }
+    }
+};
+
+test "owner contention retries release discarded inspection memory" {
+    try testOwnerRetryMemory(.inspection);
+}
+
+test "source contention retries release discarded coordination memory" {
+    try testOwnerRetryMemory(.coordination);
+}
+
+test "preparation contention retries release discarded preparation memory" {
+    try testOwnerRetryMemory(.preparation);
+}
+
+fn testOwnerRetryMemory(mode: enum { inspection, coordination, preparation }) !void {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var temporary = try host.workspace.testPlainDirectory();
+    defer temporary.cleanup();
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const owned = arena.allocator();
+    const root = try temporary.dir.realPathFileAlloc(io, ".", owned);
+    try testOwnerInputs(temporary.dir);
+    var environment = std.process.Environ.Map.init(allocator);
+    defer environment.deinit();
+    var options = try testOwnerOptions(owned, root);
+    options.ensure = true;
+    var initialized = try execute(allocator, io, &environment, options);
+    defer initialized.deinit();
+    try std.testing.expectEqual(@as(u8, 0), initialized.exit_code);
+    const target = initialized.value.object.get("store_root").?.string;
+    try testAppendOwner(&environment, options.definition, target);
+    const control = try host.catalog.checkedRoot(
+        allocator,
+        io,
+        target,
+        initialized.value.object.get("store_id").?.string,
+    );
+    defer control.close(io);
+    const source_control = try temporary.dir.openDir(io, "workspace/.ledger", .{});
+    defer source_control.close(io);
+    options.reconcile = mode != .inspection;
+    var counted = std.testing.FailingAllocator.init(allocator, .{});
+    var observation: OwnerRetryMemory = .{
+        .io = io,
+        .counted = &counted,
+        .guard = try durable.acquireCasAdvisoryLock(
+            .anchored(io, if (mode == .coordination) source_control else control),
+            allocator,
+            if (mode == .coordination) "example/events.jsonl" else ".preparation",
+        ),
+    };
+    defer observation.deinit();
+    OwnerRetryMemory.active = &observation;
+    defer OwnerRetryMemory.active = null;
+    var vtable = io.vtable.*;
+    vtable.sleep = OwnerRetryMemory.sleep;
+    var injected = io;
+    injected.vtable = &vtable;
+    var selected = try execute(counted.allocator(), injected, &environment, options);
+    defer selected.deinit();
+    try std.testing.expectEqual(observation.samples.len, observation.count);
+    try std.testing.expectEqual(@as(u8, 0), selected.exit_code);
+    if (mode == .inspection)
+        try std.testing.expect(
+            selected.value.object.get("owner_health").?.object.get("healthy").?.bool,
+        );
+    if (mode == .preparation)
+        try std.testing.expectEqualStrings(
+            "covered",
+            selected.value.object.get("preparation").?.object.get("outcome").?.string,
+        );
+    try std.testing.expect(selected.value.object.get("source_failure") == null);
+    try std.testing.expect(!selected.value.object.get("storage_mutated").?.bool);
+    for (observation.samples[1..]) |live| {
+        if (live > observation.samples[0] + 4096) std.debug.print(
+            "retry memory grew from {d} to {d} bytes\n",
+            .{ observation.samples[0], live },
+        );
+        try std.testing.expect(live <= observation.samples[0] + 4096);
+    }
 }
 
 test "owner preparation keeps incomplete historic coordination and source failures explicit" {
