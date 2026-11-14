@@ -1394,6 +1394,9 @@ fn tryInitializeEmptyOwner(
     );
     const locator = try std.fs.path.join(allocator, &.{ controls_path, "registration.json" });
     if (try host.catalog.exists(io, locator)) return false;
+    for (sources.trees) |tree| {
+        if (try host.workspace.hasLegacyHistory(allocator, io, tree, retired)) return false;
+    }
     var coordination = try SourceCoordination.acquire(
         result,
         io,
@@ -1456,7 +1459,6 @@ const EmptyOwnerHistory = struct {
             else => return err,
         };
         defer initialized.deinit();
-        // A concurrently selected owner still needs its ordinary health and coverage route.
         if (!initialized.value.storage_mutated) return false;
         try result.setContext(initialized.value);
         try result.put("source_coverage", "checked");
@@ -3075,6 +3077,91 @@ fn testAppendOwnerInput(
     );
     defer result.deinit(allocator);
     try std.testing.expect(result.validation_result.valid and result.storage_mutated);
+}
+
+test "workspace history retains preparation identity without writer confirmation" {
+    try testPreparationRetryIdentity(false, false);
+}
+
+test "workspace history retains preparation identity with writer confirmation" {
+    try testPreparationRetryIdentity(true, false);
+}
+
+test "linked history retains preparation identity without writer confirmation" {
+    try testPreparationRetryIdentity(false, true);
+}
+
+test "linked history retains preparation identity with writer confirmation" {
+    try testPreparationRetryIdentity(true, true);
+}
+
+fn testPreparationRetryIdentity(confirmed: bool, linked: bool) !void {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var temporary = try host.workspace.testPlainDirectory();
+    defer temporary.cleanup();
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const owned = arena.allocator();
+    const root = try temporary.dir.realPathFileAlloc(io, ".", owned);
+    try testOwnerInputs(temporary.dir);
+    var options = try testOwnerOptions(owned, root);
+    options.ensure = true;
+    options.confirm_no_writers = confirmed;
+    var environment = std.process.Environ.Map.init(allocator);
+    defer environment.deinit();
+    if (linked) try testPreparationRetryFamily(owned, &environment, root, options);
+    const unrelated = if (linked) "linked/.ledger/other-owner" else "workspace/.ledger/other-owner";
+    try temporary.dir.createDirPath(io, unrelated);
+    const fault = host.catalog.TestPublicationFault;
+    var vtable = io.vtable.*;
+    fault.install(&vtable, .before_rename);
+    var injected = io;
+    injected.vtable = &vtable;
+    var failed = try execute(allocator, injected, &environment, options);
+    defer failed.deinit();
+    try std.testing.expect(fault.reached);
+    try std.testing.expectEqual(@as(u8, 3), failed.exit_code);
+    try std.testing.expectEqualStrings(
+        "HardwareFailure",
+        failed.value.object.get("error_code").?.string,
+    );
+    try std.testing.expect(failed.value.object.get("storage_mutated").?.bool);
+    var before = try host.list(allocator, io, options.context.catalog_root);
+    defer before.deinit();
+    try std.testing.expectEqual(@as(usize, 1), before.value.pending.len);
+    try std.testing.expectEqual(@as(usize, 0), before.value.stores.len);
+    const pending_id = before.value.pending[0].registration.store_id;
+    var retry = try execute(allocator, io, &environment, options);
+    defer retry.deinit();
+    try std.testing.expectEqual(@as(u8, 0), retry.exit_code);
+    try std.testing.expectEqualStrings(pending_id, retry.value.object.get("store_id").?.string);
+    try std.testing.expect(retry.value.object.get("cataloged").?.bool);
+    var after = try host.list(allocator, io, options.context.catalog_root);
+    defer after.deinit();
+    try std.testing.expectEqual(@as(usize, 1), after.value.stores.len);
+    try std.testing.expectEqualStrings(pending_id, after.value.stores[0].store_id);
+    const retained = try temporary.dir.openDir(io, unrelated, .{});
+    defer retained.close(io);
+}
+
+fn testPreparationRetryFamily(
+    allocator: std.mem.Allocator,
+    environment: *const std.process.Environ.Map,
+    root: []const u8,
+    options: Options,
+) !void {
+    const io = std.testing.io;
+    const workspace = options.context.workspace.?;
+    const linked = try std.fs.path.join(allocator, &.{ root, "linked" });
+    _ = try host.workspace.git(allocator, io, environment, workspace, &.{ "init", "-q" });
+    _ = try host.workspace.git(allocator, io, environment, workspace, &.{
+        "-c",     "user.name=Fixture", "-c",  "user.email=fixture@example.invalid",
+        "commit", "--allow-empty",     "-qm", "fixture",
+    });
+    _ = try host.workspace.git(allocator, io, environment, workspace, &.{
+        "worktree", "add", "--detach", linked,
+    });
 }
 
 test "owner registration retains observed membership across publication failures" {
