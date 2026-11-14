@@ -1362,6 +1362,194 @@ fn registerSegmentedCoverage(
     return registerCoveredContext(result, io, environment, publication, selected);
 }
 
+fn tryInitializeEmptyOwner(
+    result: *Result,
+    io: std.Io,
+    environment: *const std.process.Environ.Map,
+    options: Options,
+    plan: *const compiled.PlanSet,
+    bindings: *const parameters.Bindings,
+    associations: *const host.workspace.Associations,
+    retired: []const []const u8,
+) !bool {
+    const allocator = result.arena.allocator();
+    var sources = try discoverSources(
+        result,
+        allocator,
+        io,
+        environment,
+        options.context.workspace,
+        null,
+        plan.storage_plan.?.slots[0].relative_path,
+        retired,
+        false,
+    );
+    defer sources.deinit();
+    const root = associations.workspace_root orelse return false;
+    const controls_path = try pending.controlsPath(
+        allocator,
+        root,
+        associations.git_common_dir,
+        options.context.catalog_root,
+    );
+    const locator = try std.fs.path.join(allocator, &.{ controls_path, "registration.json" });
+    if (try host.catalog.exists(io, locator)) return false;
+    var coordination = try SourceCoordination.acquire(
+        result,
+        io,
+        plan,
+        sources.sources,
+        null,
+        options.confirm_no_writers,
+    );
+    defer coordination.deinit();
+    const controls = try allocator.alloc(?std.Io.Dir, sources.sources.len);
+    @memset(controls, null);
+    defer for (controls) |control| if (control) |dir| dir.close(io);
+    for (sources.sources, controls) |source, *control| {
+        control.* = try openCoverageSource(allocator, io, source);
+    }
+    const history: EmptyOwnerHistory = .{
+        .result = result,
+        .plan = plan,
+        .bindings = bindings,
+        .sources = &sources,
+        .controls = controls,
+        .associations = associations,
+        .coordination = &coordination,
+        .confirmed = options.confirm_no_writers,
+    };
+    if (!try history.empty(io)) return false;
+    return history.initialize(io, environment, options, retired);
+}
+
+const EmptyOwnerHistory = struct {
+    result: *Result,
+    plan: *const compiled.PlanSet,
+    bindings: *const parameters.Bindings,
+    sources: *const discovery.Sources,
+    controls: []const ?std.Io.Dir,
+    associations: *const host.workspace.Associations,
+    coordination: *const SourceCoordination,
+    confirmed: bool,
+
+    fn initialize(
+        self: EmptyOwnerHistory,
+        io: std.Io,
+        environment: *const std.process.Environ.Map,
+        options: Options,
+        retired: []const []const u8,
+    ) !bool {
+        const result = self.result;
+        const allocator = result.arena.allocator();
+        var initialize_options = options.context;
+        initialize_options.legacy_paths = retired;
+        try result.beginMutation();
+        var initialized = host.initializeChecked(
+            allocator,
+            io,
+            environment,
+            initialize_options,
+            self,
+        ) catch |err| switch (err) {
+            error.PendingInitializationRequiresPreparation => return false,
+            else => return err,
+        };
+        defer initialized.deinit();
+        // A concurrently selected owner still needs its ordinary health and coverage route.
+        if (!initialized.value.storage_mutated) return false;
+        try result.setContext(initialized.value);
+        try result.put("source_coverage", "checked");
+        return true;
+    }
+
+    fn empty(self: EmptyOwnerHistory, io: std.Io) !bool {
+        var arena = std.heap.ArenaAllocator.init(self.result.arena.child_allocator);
+        defer arena.deinit();
+        const allocator = arena.allocator();
+        var budget: storage_root.ReadBudget = .{
+            .max_bytes = history_limits.max_read_bytes,
+            .max_files = history_limits.max_files * 16,
+        };
+        for (self.controls) |control| {
+            const directory = control orelse {
+                if (!self.confirmed) return error.PreparationRequiresQuiescence;
+                continue;
+            };
+            var scope = storage_root.Scope.init(.anchored(io, directory));
+            scope.fs.read_budget = &budget;
+            var history = try captureCoverageHistory(
+                &scope,
+                allocator,
+                self.plan,
+                self.bindings,
+                !self.confirmed,
+            );
+            defer history.deinit(allocator);
+            if (history.exists) return false;
+        }
+        return true;
+    }
+
+    pub fn check(
+        self: EmptyOwnerHistory,
+        _: std.mem.Allocator,
+        io: std.Io,
+        environment: *const std.process.Environ.Map,
+        associations: *const host.workspace.Associations,
+        retired: []const []const u8,
+    ) !void {
+        var arena = std.heap.ArenaAllocator.init(self.result.arena.child_allocator);
+        defer arena.deinit();
+        const allocator = arena.allocator();
+        var current = try host.workspace.resolve(
+            allocator,
+            io,
+            environment,
+            associations.workspace_root,
+        );
+        defer current.deinit();
+        if (!host.catalog.optionalEqual(current.workspace_root, self.associations.workspace_root) or
+            !host.catalog.optionalEqual(current.git_common_dir, self.associations.git_common_dir))
+            return error.WorkspaceCoverageChangedAfterPreparation;
+        if (current.git_common_dir) |common| {
+            const registration = try std.fs.path.join(
+                allocator,
+                &.{ common, host.catalog.registration_name },
+            );
+            if (try host.catalog.exists(io, registration))
+                return error.ExistingRegistrationRequiresImport;
+        }
+        var sources = try discoverSources(
+            self.result,
+            allocator,
+            io,
+            environment,
+            current.workspace_root,
+            null,
+            self.plan.storage_plan.?.slots[0].relative_path,
+            retired,
+            false,
+        );
+        defer sources.deinit();
+        if (sources.sources.len != self.sources.sources.len)
+            return error.WorkspaceCoverageChangedAfterPreparation;
+        for (sources.sources, self.sources.sources, self.controls) |now, before, previous| {
+            if (!std.mem.eql(u8, now.root, before.root) or
+                !host.catalog.optionalEqual(now.store_id, before.store_id))
+                return error.WorkspaceCoverageChangedAfterPreparation;
+            const control = try openCoverageSource(allocator, io, now);
+            defer if (control) |dir| dir.close(io);
+            if ((control == null) != (previous == null))
+                return error.SourceChangedDuringPreparation;
+            if (control) |dir| if (!try durable.sameDirectoryObject(io, previous.?, dir))
+                return error.SourceChangedDuringPreparation;
+        }
+        try self.coordination.revalidate();
+        if (!try self.empty(io)) return error.SourceChangedDuringPreparation;
+    }
+};
+
 fn prepare(
     result: *Result,
     io: std.Io,
@@ -1379,19 +1567,17 @@ fn prepare(
     defer if (target) |*value| value.deinit();
     var include_archives = discover_archives;
     const selected = existing orelse blk: {
-        var sources = try discoverSources(
+        if (try tryInitializeEmptyOwner(
             result,
-            allocator,
             io,
             environment,
-            options.context.workspace,
-            null,
-            plan.storage_plan.?.slots[0].relative_path,
+            options,
+            plan,
+            bindings,
+            associations,
             retired,
-            false,
-        );
-        defer sources.deinit();
-        try result.put("storage_mutated", @as(?bool, null));
+        )) return;
+        try result.beginMutation();
         target = try pending.prepareTarget(allocator, io, environment, options.context, true);
         const current = target.?.context.value;
         const registration = try registerCoveredOwner(
@@ -1812,6 +1998,194 @@ fn expectLateDiscoveryDiagnostic(
         try std.testing.expect(result.value.object.get("preparation") != null);
         try std.testing.expect(result.value.object.get("storage_mutated").?.bool);
     }
+}
+
+const EmptyInitializationInterleaving = struct {
+    var active: ?*EmptyInitializationInterleaving = null;
+    io: std.Io,
+    directory: std.Io.Dir,
+    replace_control: bool,
+    fired: bool = false,
+
+    fn rename(
+        userdata: ?*anyopaque,
+        from: std.Io.Dir,
+        name: []const u8,
+        to: std.Io.Dir,
+        leaf: []const u8,
+    ) std.Io.Dir.RenamePreserveError!void {
+        const self = active.?;
+        try self.io.vtable.dirRenamePreserve(userdata, from, name, to, leaf);
+        if (!std.mem.startsWith(u8, name, ".initializing-")) return;
+        self.fired = true;
+        const source = if (self.replace_control) "linked/.ledger" else "linked";
+        const moved = if (self.replace_control) "linked/.ledger-old" else "moved";
+        self.directory.rename(source, self.directory, moved, self.io) catch |err|
+            std.debug.panic("late source move: {s}", .{@errorName(err)});
+        if (self.replace_control) self.directory.createDir(
+            self.io,
+            source,
+            .default_dir,
+        ) catch |err| std.debug.panic("late source replacement: {s}", .{@errorName(err)});
+    }
+};
+
+test "empty initialization rechecks source identity and family before catalog publication" {
+    try testEmptyInitializationRecheck(false);
+    try testEmptyInitializationRecheck(true);
+}
+
+fn testEmptyInitializationRecheck(replace_control: bool) !void {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var temporary = try host.workspace.testPlainDirectory();
+    defer temporary.cleanup();
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const owned = arena.allocator();
+    const root = try temporary.dir.realPathFileAlloc(io, ".", owned);
+    try testOwnerInputs(temporary.dir);
+    var environment = std.process.Environ.Map.init(allocator);
+    defer environment.deinit();
+    var options = try testOwnerOptions(owned, root);
+    options.ensure = true;
+    const workspace = options.context.workspace.?;
+    const linked = try std.fs.path.join(owned, &.{ root, "linked" });
+    _ = try host.workspace.git(owned, io, &environment, workspace, &.{ "init", "-q" });
+    _ = try host.workspace.git(owned, io, &environment, workspace, &.{
+        "-c",     "user.name=Fixture", "-c",  "user.email=fixture@example.invalid",
+        "commit", "--allow-empty",     "-qm", "fixture",
+    });
+    _ = try host.workspace.git(owned, io, &environment, workspace, &.{
+        "worktree", "add", "--detach", linked,
+    });
+    var interleaving: EmptyInitializationInterleaving = .{
+        .io = io,
+        .directory = temporary.dir,
+        .replace_control = replace_control,
+    };
+    EmptyInitializationInterleaving.active = &interleaving;
+    defer EmptyInitializationInterleaving.active = null;
+    var vtable = io.vtable.*;
+    vtable.dirRenamePreserve = EmptyInitializationInterleaving.rename;
+    var injected = io;
+    injected.vtable = &vtable;
+    var result = try execute(allocator, injected, &environment, options);
+    defer result.deinit();
+    try std.testing.expect(interleaving.fired);
+    try std.testing.expectEqual(@as(u8, 3), result.exit_code);
+    try std.testing.expectEqualStrings(
+        if (replace_control) "SourceChangedDuringPreparation" else "UnavailableWorktree",
+        result.value.object.get("error_code").?.string,
+    );
+    try std.testing.expect(result.value.object.get("storage_mutated").?.bool);
+    if (!replace_control) try expectSourceFailure(&result, linked);
+    var catalog = try host.catalog.read(allocator, io, options.context.catalog_root);
+    defer catalog.deinit();
+    try std.testing.expectEqual(@as(usize, 0), catalog.value.stores.map.count());
+}
+
+test "empty owner admission preserves capacity beside completed preparation reservations" {
+    try testOwnerPreparationCapacity(true);
+}
+
+test "empty owner admission preserves capacity beside retained preparation reservations" {
+    try testOwnerPreparationCapacity(false);
+}
+
+fn seedOwnerReservations(
+    owned: std.mem.Allocator,
+    environment: *const std.process.Environ.Map,
+    context: host.Options,
+    root: []const u8,
+    completed: bool,
+) !void {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    for (0..128) |index| {
+        var reservation_options = context;
+        reservation_options.workspace = try std.fmt.allocPrint(owned, "{s}/owner-{d}", .{
+            root, index,
+        });
+        const directory = try host.catalog.openDirectory(
+            io,
+            reservation_options.workspace.?,
+            true,
+        );
+        directory.close(io);
+        var target = try pending.prepareTarget(
+            allocator,
+            io,
+            environment,
+            reservation_options,
+            true,
+        );
+        defer target.deinit();
+        if (completed) {
+            var registered = try host.registerRoot(
+                allocator,
+                io,
+                environment,
+                reservation_options,
+                target.context.value.store_root,
+                target.context.value.store_id,
+            );
+            registered.deinit();
+        }
+    }
+}
+
+fn testOwnerPreparationCapacity(completed: bool) !void {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var temporary = try host.workspace.testPlainDirectory();
+    defer temporary.cleanup();
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const owned = arena.allocator();
+    const root = try temporary.dir.realPathFileAlloc(io, ".", owned);
+    try testOwnerInputs(temporary.dir);
+    var environment = std.process.Environ.Map.init(allocator);
+    defer environment.deinit();
+    var options = try testOwnerOptions(owned, root);
+    options.ensure = true;
+    try seedOwnerReservations(owned, &environment, options.context, root, completed);
+    var admitted = try execute(allocator, io, &environment, options);
+    defer admitted.deinit();
+    if (admitted.exit_code != 0) std.debug.print("capacity: {any}\n", .{
+        admitted.value.object.get("error_code"),
+    });
+    try std.testing.expectEqual(@as(u8, 0), admitted.exit_code);
+    try std.testing.expect(admitted.value.object.get("cataloged").?.bool);
+    const controls = try pending.controlsPath(
+        owned,
+        options.context.workspace.?,
+        null,
+        options.context.catalog_root,
+    );
+    try std.testing.expect(!try host.catalog.exists(io, controls));
+    var listed = try host.list(allocator, io, options.context.catalog_root);
+    defer listed.deinit();
+    try std.testing.expectEqual(@as(usize, if (completed) 129 else 1), listed.value.stores.len);
+    try std.testing.expectEqual(@as(usize, if (completed) 0 else 128), listed.value.pending.len);
+    options.context.workspace = try std.fs.path.join(owned, &.{ root, "owner-130" });
+    const directory = try host.catalog.openDirectory(io, options.context.workspace.?, true);
+    directory.close(io);
+    var rejected = try execute(allocator, io, &environment, options);
+    defer rejected.deinit();
+    try std.testing.expectEqual(@as(u8, 3), rejected.exit_code);
+    try std.testing.expectEqualStrings(
+        "CustodyDiscoveryBoundExceeded",
+        rejected.value.object.get("error_code").?.string,
+    );
+    try std.testing.expect(rejected.value.object.get("storage_mutated").?.bool);
+    try std.testing.expectError(error.PendingCustodyDiscoveryBoundExceeded, pending.prepareTarget(
+        allocator,
+        io,
+        &environment,
+        options.context,
+        true,
+    ));
 }
 
 test "empty owner families preserve discovery capacity without widening the import bound" {

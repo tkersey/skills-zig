@@ -403,6 +403,30 @@ pub fn initialize(
     environment: *const std.process.Environ.Map,
     options: Options,
 ) !Context {
+    return initializeChecked(allocator, io, environment, options, WorkspaceHistory{});
+}
+
+const WorkspaceHistory = struct {
+    pub fn check(
+        _: WorkspaceHistory,
+        allocator: std.mem.Allocator,
+        io: std.Io,
+        environment: *const std.process.Environ.Map,
+        associations: *const workspace.Associations,
+        legacy_paths: []const []const u8,
+    ) !void {
+        try rejectKnownHistory(allocator, io, environment, associations, legacy_paths);
+    }
+};
+
+// The caller keeps the custody supporting its history check alive through publication.
+pub fn initializeChecked(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    environment: *const std.process.Environ.Map,
+    options: Options,
+    history: anytype,
+) !Context {
     var associations = try workspace.resolve(allocator, io, environment, options.workspace);
     defer associations.deinit();
     {
@@ -421,7 +445,7 @@ pub fn initialize(
             );
         }
     }
-    try rejectKnownHistory(allocator, io, environment, &associations, options.legacy_paths);
+    try history.check(allocator, io, environment, &associations, options.legacy_paths);
     var lock = try catalog.Lock.acquire(io, options.catalog_root);
     defer lock.deinit();
     var selected = try lock.read(allocator);
@@ -438,7 +462,7 @@ pub fn initialize(
             true,
         );
     }
-    try admitInitialization(allocator, io, environment, options, &associations, &lock);
+    try admitInitialization(allocator, io, environment, options, &associations, &lock, history);
     return publishInitialization(
         allocator,
         io,
@@ -447,6 +471,7 @@ pub fn initialize(
         &associations,
         &lock,
         &selected,
+        history,
     );
 }
 
@@ -457,8 +482,9 @@ fn admitInitialization(
     options: Options,
     associations: *const workspace.Associations,
     lock: *const catalog.Lock,
+    history: anytype,
 ) !void {
-    try rejectKnownHistory(allocator, io, environment, associations, options.legacy_paths);
+    try history.check(allocator, io, environment, associations, options.legacy_paths);
     try admitAllocation(allocator, io, options, associations, lock);
 }
 
@@ -508,6 +534,7 @@ fn publishInitialization(
     associations: *const workspace.Associations,
     lock: *const catalog.Lock,
     selected: *catalog.Catalog,
+    history: anytype,
 ) !Context {
     lock.dir.createDir(io, "repos", .fromMode(0o700)) catch |err| switch (err) {
         error.PathAlreadyExists => {},
@@ -524,10 +551,10 @@ fn publishInitialization(
     defer stage.close(io);
     const control = try prepareInitializationStage(allocator, io, stage, &id);
     defer control.close(io);
-    try rejectKnownHistory(allocator, io, environment, associations, options.legacy_paths);
+    try history.check(allocator, io, environment, associations, options.legacy_paths);
     try repos.renamePreserve(stage_name, repos, &id, io);
     try catalog.sync(io, repos);
-    try rejectKnownHistory(allocator, io, environment, associations, options.legacy_paths);
+    try history.check(allocator, io, environment, associations, options.legacy_paths);
     const home = try lock.dir.realPathFileAlloc(io, ".", allocator);
     defer allocator.free(home);
     const root = try std.fs.path.join(allocator, &.{ home, "repos", &id });
