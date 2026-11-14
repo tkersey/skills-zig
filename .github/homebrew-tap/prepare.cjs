@@ -13,6 +13,14 @@ function versionParts(version) {
   return version.split('.').map(BigInt);
 }
 
+function releaseTagFromVersion(app, version, requestedTag) {
+  assert.ok(['ledger', 'seq'].includes(app), 'Unsupported tap product');
+  versionParts(version.trim());
+  const tag = `${app}-v${version.trim()}`;
+  if (requestedTag) assert.equal(requestedTag, tag, 'Requested tag differs from release commit VERSION');
+  return tag;
+}
+
 function releaseTagFromRun(app, run, artifacts) {
   assert.ok(['ledger', 'seq'].includes(app), 'Unsupported tap product');
   assert.equal(run.status, 'completed');
@@ -100,7 +108,7 @@ function main() {
   if (commit) {
     assert.match(commit, /^[0-9a-f]{40}$/);
     const content = JSON.parse(gh('api', `repos/${repository}/contents/apps/${app}/VERSION?ref=${commit}`));
-    tag = `${app}-v${Buffer.from(content.content, 'base64').toString('utf8').trim()}`;
+    tag = releaseTagFromVersion(app, Buffer.from(content.content, 'base64').toString('utf8'), tag);
   }
   assert.ok(tag, 'RELEASE_TAG, RELEASE_COMMIT or RELEASE_RUN_ID is required');
   assert.ok(tag.startsWith(`${app}-v`));
@@ -139,5 +147,5 @@ function main() {
   }
 }
 
-module.exports = { prepareFormula, releaseTagFromRun };
+module.exports = { prepareFormula, releaseTagFromRun, releaseTagFromVersion };
 if (require.main === module) main();
