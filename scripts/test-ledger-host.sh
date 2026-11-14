@@ -562,10 +562,12 @@ for family_size in 36 40 60 72; do
     context --catalog-root "$bounded/home" --workspace "$bounded/repo" --reconcile-owner \
       --definition "$definition" --owner-manifest "$manifest"
   )
-  assert_json '.source_coverage == "checked" and .owner_health.healthy and
-    (has("preparation") | not)'
+  assert_json '.source_coverage == "checked" and (has("preparation") | not)'
   test "$("$json" -r '.store_id' "$scratch/result.json")" = "$bounded_id"
   test "$("$json" -r '.store_root' "$scratch/result.json")" = "$bounded_root"
+  context --catalog-root "$bounded/home" --workspace "$bounded/repo" --read-only \
+    --definition "$definition" --owner-manifest "$manifest"
+  assert_json '.owner_health.healthy and .storage_mutated == false'
   project --store-root "$bounded_root" --store-id "$bounded_id" >"$scratch/bounded-target.json"
   cmp "$scratch/bounded-source.json" "$scratch/bounded-target.json"
   snapshot "$bounded/repo/.ledger" >"$scratch/bounded-after.snapshot"

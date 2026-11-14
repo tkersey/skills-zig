@@ -825,15 +825,10 @@ fn registerCoveredSources(
         .max_bytes = history_limits.max_read_bytes,
         .max_files = history_limits.max_files * 16,
     };
-    var target_scope = storage_root.Scope.init(.anchored(io, target_dir));
-    target_scope.fs.read_budget = &budget;
-    var target_history = try captureCoverageHistory(
-        &target_scope,
-        allocator,
-        plan,
-        bindings,
-        target_present and !confirm_no_writers,
-    );
+    var scope = storage_root.Scope.init(.anchored(io, target_dir));
+    scope.fs.read_budget = &budget;
+    const coordinated = target_present and !confirm_no_writers;
+    var target_history = try captureCoverageHistory(&scope, allocator, plan, bindings, coordinated);
     defer target_history.deinit(allocator);
     const controls = try allocator.alloc(?std.Io.Dir, sources.sources.len);
     defer allocator.free(controls);
@@ -1193,13 +1188,8 @@ fn captureCoverageSources(
             } else if (!source.archive and !confirm_no_writers) {
                 return error.PreparationRequiresQuiescence;
             }
-            if (source.archive) try preparation.validateArchive(
-                io,
-                allocator,
-                source,
-                history,
-                budget,
-            );
+            if (source.archive)
+                try preparation.validateArchive(io, allocator, source, history, budget);
         }
     }
 }
@@ -1216,8 +1206,11 @@ fn captureCoordinatedSource(
     budget: *storage_root.ReadBudget,
     waits: *usize,
 ) !void {
-    var coordination: SourceCoordination = .{ .allocator = allocator, .io = io };
-    var held = acquired: while (true) {
+    var coordination: SourceCoordination = .{
+        .allocator = result.arena.child_allocator,
+        .io = io,
+    };
+    var held = acquired: for (0..writer_attempts_max) |_| {
         var mutated = false;
         const value = coordination.acquireSource(source, plan, &mutated) catch |err| {
             try SourceCoordination.observeSourceMutation(result, mutated);
@@ -1248,7 +1241,7 @@ fn captureCoordinatedSource(
         try SourceCoordination.observeSourceMutation(result, mutated);
         _ = result.value.object.swapRemove("source_failure");
         break :acquired value;
-    };
+    } else unreachable;
     defer held.root.close(io);
     defer held.locks.deinit();
     errdefer held.control.close(io);
@@ -3308,7 +3301,11 @@ const CoveragePublicationInterleaving = struct {
 
     fn writeBinding(self: *const CoveragePublicationInterleaving) !void {
         const allocator = std.testing.allocator;
-        const root = try host.catalog.openDirectory(self.io, self.options.context.workspace.?, false);
+        const root = try host.catalog.openDirectory(
+            self.io,
+            self.options.context.workspace.?,
+            false,
+        );
         defer root.close(self.io);
         const control = try root.openDir(self.io, ".ledger", .{});
         defer control.close(self.io);
@@ -3320,7 +3317,11 @@ const CoveragePublicationInterleaving = struct {
             self.slot,
         );
         defer paths.deinit(allocator);
-        const writer = try durable.acquireCasAdvisoryLock(scope.fs, allocator, paths.legacy_binding);
+        const writer = try durable.acquireCasAdvisoryLock(
+            scope.fs,
+            allocator,
+            paths.legacy_binding,
+        );
         writer.close(self.io);
     }
 
