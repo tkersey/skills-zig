@@ -552,6 +552,29 @@ cmp "$scratch/bounded-source.json" "$scratch/bounded-target.json"
 snapshot "$bounded/repo/.ledger" >"$scratch/bounded-after.snapshot"
 cmp "$scratch/bounded-before.snapshot" "$scratch/bounded-after.snapshot"
 
+printf '%s\n' 'host CLI: covered family capacity under 256 descriptors'
+for family_size in 36 40 60 72; do
+  for ((; index<family_size; index++)); do
+    git -C "$bounded/repo" worktree add -q --detach "$bounded/work-$index"
+  done
+  (
+    ulimit -n 256
+    context --catalog-root "$bounded/home" --workspace "$bounded/repo" --reconcile-owner \
+      --definition "$definition" --owner-manifest "$manifest"
+  )
+  assert_json '.source_coverage == "checked" and .owner_health.healthy and
+    (has("preparation") | not)'
+  test "$("$json" -r '.store_id' "$scratch/result.json")" = "$bounded_id"
+  test "$("$json" -r '.store_root' "$scratch/result.json")" = "$bounded_root"
+  project --store-root "$bounded_root" --store-id "$bounded_id" >"$scratch/bounded-target.json"
+  cmp "$scratch/bounded-source.json" "$scratch/bounded-target.json"
+  snapshot "$bounded/repo/.ledger" >"$scratch/bounded-after.snapshot"
+  cmp "$scratch/bounded-before.snapshot" "$scratch/bounded-after.snapshot"
+  for ((source_index=1; source_index<family_size; source_index++)); do
+    test ! -e "$bounded/work-$source_index/.ledger/example/events.jsonl"
+  done
+done
+
 printf '%s\n' 'host CLI: empty family capacity does not widen native import'
 wide="$scratch/wide"
 make_repo "$wide/repo"

@@ -821,49 +821,6 @@ fn registerCoveredSources(
         selected.store_id,
     );
     defer target_dir.close(io);
-    var coordination = try SourceCoordination.acquire(
-        result,
-        io,
-        plan,
-        sources.sources,
-        target_dir,
-        confirm_no_writers,
-    );
-    defer coordination.deinit();
-    return registerCoordinatedCoverage(
-        result,
-        allocator,
-        io,
-        environment,
-        selected,
-        plan,
-        bindings,
-        sources,
-        confirm_no_writers,
-        target_present,
-        discover_archives,
-        target_dir,
-        &coordination,
-        publication,
-    );
-}
-
-fn registerCoordinatedCoverage(
-    result: *Result,
-    allocator: std.mem.Allocator,
-    io: std.Io,
-    environment: *const std.process.Environ.Map,
-    selected: host.ContextValue,
-    plan: *const compiled.PlanSet,
-    bindings: *const parameters.Bindings,
-    sources: *const discovery.Sources,
-    confirm_no_writers: bool,
-    target_present: bool,
-    discover_archives: bool,
-    target_dir: std.Io.Dir,
-    coordination: *const SourceCoordination,
-    publication: ?Options,
-) !bool {
     var budget: storage_root.ReadBudget = .{
         .max_bytes = history_limits.max_read_bytes,
         .max_files = history_limits.max_files * 16,
@@ -887,6 +844,7 @@ fn registerCoordinatedCoverage(
     @memset(histories, .{});
     defer for (histories) |*history| history.deinit(allocator);
     try captureCoverageSources(
+        result,
         allocator,
         io,
         plan,
@@ -895,6 +853,7 @@ fn registerCoordinatedCoverage(
         controls,
         histories,
         &budget,
+        target_dir,
         confirm_no_writers,
     );
     var covered = true;
@@ -912,7 +871,6 @@ fn registerCoordinatedCoverage(
         controls,
         discover_archives,
     );
-    try coordination.revalidate();
     try recheckTarget(allocator, io, selected, target_dir);
     if (!covered) return false;
     return registerCoveredContext(result, io, environment, publication, selected);
@@ -1173,6 +1131,7 @@ fn recheckTarget(
 }
 
 fn captureCoverageSources(
+    result: *Result,
     allocator: std.mem.Allocator,
     io: std.Io,
     plan: *const compiled.PlanSet,
@@ -1181,12 +1140,33 @@ fn captureCoverageSources(
     controls: []?std.Io.Dir,
     histories: []preparation.History,
     budget: *storage_root.ReadBudget,
+    target: std.Io.Dir,
     confirm_no_writers: bool,
 ) !void {
+    var waits: usize = 0;
     for ([_]bool{ true, false }) |archive| {
         for (sources, controls, histories) |source, *control, *history| {
             if (source.archive != archive) continue;
             control.* = try openCoverageSource(allocator, io, source);
+            const coordinate = !source.archive and !confirm_no_writers and
+                (if (control.*) |dir| !try durable.sameDirectoryObject(io, dir, target) else true);
+            if (coordinate) {
+                if (control.*) |dir| dir.close(io);
+                control.* = null;
+                try captureCoordinatedSource(
+                    result,
+                    allocator,
+                    io,
+                    plan,
+                    bindings,
+                    source,
+                    control,
+                    history,
+                    budget,
+                    &waits,
+                );
+                continue;
+            }
             if (control.*) |dir| {
                 var source_scope = storage_root.Scope.init(.anchored(io, dir));
                 source_scope.fs.read_budget = budget;
@@ -1222,6 +1202,63 @@ fn captureCoverageSources(
             );
         }
     }
+}
+
+fn captureCoordinatedSource(
+    result: *Result,
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    plan: *const compiled.PlanSet,
+    bindings: *const parameters.Bindings,
+    source: preparation.Source,
+    control: *?std.Io.Dir,
+    history: *preparation.History,
+    budget: *storage_root.ReadBudget,
+    waits: *usize,
+) !void {
+    var coordination: SourceCoordination = .{ .allocator = allocator, .io = io };
+    var held = acquired: while (true) {
+        var mutated = false;
+        const value = coordination.acquireSource(source, plan, &mutated) catch |err| {
+            try SourceCoordination.observeSourceMutation(result, mutated);
+            const failure: SourceCoordination.Failure = .{
+                .source_root = source.root,
+                .owner = plan.definition_plan.id,
+                .error_code = @errorName(err),
+            };
+            if ((err != error.LockBusy and err != error.EventStoreBusy) or
+                waits.* == writer_attempts_max - 1)
+            {
+                try result.put("source_failure", failure);
+                return err;
+            }
+            waitForWriter(io, waits.*) catch |wait_err| {
+                try result.put("source_failure", failure);
+                return wait_err;
+            };
+            waits.* += 1;
+            continue;
+        };
+        errdefer {
+            var locks = value.locks;
+            locks.deinit();
+            value.control.close(io);
+            value.root.close(io);
+        }
+        try SourceCoordination.observeSourceMutation(result, mutated);
+        _ = result.value.object.swapRemove("source_failure");
+        break :acquired value;
+    };
+    defer held.root.close(io);
+    defer held.locks.deinit();
+    errdefer held.control.close(io);
+    var scope = storage_root.Scope.init(.anchored(io, held.control));
+    scope.fs.read_budget = budget;
+    var captured = try captureCoverageHistory(&scope, allocator, plan, bindings, true);
+    errdefer captured.deinit(allocator);
+    try coordination.revalidateOne(held);
+    control.* = held.control;
+    history.* = captured;
 }
 
 fn openCoverageSource(
@@ -3255,8 +3292,10 @@ const CoveragePublicationInterleaving = struct {
     environment: *const std.process.Environ.Map,
     options: Options,
     event: []const u8,
+    slot: []const u8,
     fired: bool = false,
     append_error: ?anyerror = null,
+    binding_error: ?anyerror = null,
 
     fn append(self: *const CoveragePublicationInterleaving) !void {
         return testAppendOwnerInput(
@@ -3265,6 +3304,24 @@ const CoveragePublicationInterleaving = struct {
             self.options.context.workspace.?,
             self.event,
         );
+    }
+
+    fn writeBinding(self: *const CoveragePublicationInterleaving) !void {
+        const allocator = std.testing.allocator;
+        const root = try host.catalog.openDirectory(self.io, self.options.context.workspace.?, false);
+        defer root.close(self.io);
+        const control = try root.openDir(self.io, ".ledger", .{});
+        defer control.close(self.io);
+        var scope = storage_root.Scope.init(.anchored(self.io, control));
+        var paths = try @import("ledger_v1_core").segmented_event_log.Paths.init(
+            &scope,
+            allocator,
+            ".",
+            self.slot,
+        );
+        defer paths.deinit(allocator);
+        const writer = try durable.acquireCasAdvisoryLock(scope.fs, allocator, paths.legacy_binding);
+        writer.close(self.io);
     }
 
     fn rename(
@@ -3279,6 +3336,9 @@ const CoveragePublicationInterleaving = struct {
             self.fired = true;
             self.append() catch |err| {
                 self.append_error = err;
+            };
+            self.writeBinding() catch |err| {
+                self.binding_error = err;
             };
         }
         return self.io.vtable.dirRename(userdata, from, name, to, leaf);
@@ -3299,6 +3359,8 @@ const CoveragePublicationInterleaving = struct {
         try std.testing.expect(
             writer_error == error.LockBusy or writer_error == error.EventStoreBusy,
         );
+        try std.testing.expectEqual(error.LockBusy, self.binding_error orelse
+            return error.TestExpectedError);
     }
 };
 
@@ -3343,6 +3405,7 @@ fn testCoveragePublication(existing: bool, segmented: bool) !void {
         .io = io,
         .environment = &environment,
         .options = options,
+        .slot = if (segmented) "example/chained-events.jsonl" else "example/events.jsonl",
         .event = if (segmented)
             @embedFile("fixtures/chained-event-one.json")
         else
@@ -3368,6 +3431,7 @@ fn testCoveragePublication(existing: bool, segmented: bool) !void {
     defer target.close(io);
     try std.testing.expect(!try host.catalog.existsAt(io, target, payload));
     try interleaving.append();
+    try interleaving.writeBinding();
     try std.testing.expect(try host.catalog.existsAt(io, source, payload));
 }
 
