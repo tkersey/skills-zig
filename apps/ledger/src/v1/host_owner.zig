@@ -268,7 +268,7 @@ fn runSelectedPlan(
                 .preparation => try requireWorkspaceForMissingOwner(result, io, options, current),
             }
         }
-        const coverage = try existingCoverage(
+        const registration = try registerCoveredOwner(
             result,
             io,
             environment,
@@ -278,11 +278,10 @@ fn runSelectedPlan(
             associations,
             current,
             retired,
+            .covered,
         );
-        discover_archives = !coverage.target_present;
-        if (coverage.covered) {
-            return registerCoveredContext(result, io, environment, options, current);
-        }
+        discover_archives = !registration.target_present;
+        if (registration.registered) return;
     }
     if (!options.ensure) return error.OwnerPreparationRequired;
     _ = try preparation.selectedSlot(&plan.storage_plan.?);
@@ -480,12 +479,14 @@ fn blockedReadiness(result: *Result, failure: []const u8) !OwnerReadiness {
     return .blocked;
 }
 
-const Coverage = struct {
-    covered: bool = false,
+const CoveredRegistration = struct {
+    registered: bool = false,
     target_present: bool = false,
+
+    const Mode = enum { covered, absent_covered };
 };
 
-fn existingCoverage(
+fn registerCoveredOwner(
     result: *Result,
     io: std.Io,
     environment: *const std.process.Environ.Map,
@@ -495,7 +496,8 @@ fn existingCoverage(
     associations: *const host.workspace.Associations,
     selected: host.ContextValue,
     retired: []const []const u8,
-) !Coverage {
+    mode: CoveredRegistration.Mode,
+) !CoveredRegistration {
     const allocator = result.arena.allocator();
     try result.setContext(selected);
     try pending.checkPendingContext(
@@ -521,8 +523,10 @@ fn existingCoverage(
     }
     if (!health.healthy or health.pending_transactions != 0) return .{};
     const present = health.slots[0].state != .missing;
-    const covered = if (present)
-        try localCovered(
+    const publication: ?Options = if (!health.preparation_pending and
+        (mode == .covered or !present)) options else null;
+    const registered = if (present)
+        try registerLocalCoverage(
             result,
             allocator,
             io,
@@ -531,9 +535,10 @@ fn existingCoverage(
             plan,
             bindings,
             options.confirm_no_writers,
+            publication,
         )
     else
-        try missingCovered(
+        try registerMissingCoverage(
             result,
             allocator,
             io,
@@ -543,9 +548,10 @@ fn existingCoverage(
             plan,
             bindings,
             retired,
+            publication,
         );
     return .{
-        .covered = covered and !health.preparation_pending,
+        .registered = registered,
         .target_present = present,
     };
 }
@@ -579,7 +585,7 @@ fn discoverSources(
     };
 }
 
-fn missingCovered(
+fn registerMissingCoverage(
     result: *Result,
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -589,6 +595,7 @@ fn missingCovered(
     plan: *const compiled.PlanSet,
     bindings: *const parameters.Bindings,
     retired: []const []const u8,
+    publication: ?Options,
 ) !bool {
     var sources = try discoverSources(
         result,
@@ -603,7 +610,7 @@ fn missingCovered(
     );
     defer sources.deinit();
     if (plan.storage_plan.?.slots[0].layout == .segmented) {
-        try requireSegmentedSourcesAbsent(
+        return registerSegmentedCoverage(
             result,
             allocator,
             io,
@@ -613,10 +620,10 @@ fn missingCovered(
             &sources,
             options.confirm_no_writers,
             true,
+            publication,
         );
-        return true;
     }
-    return coverSources(
+    return registerCoveredSources(
         result,
         allocator,
         io,
@@ -628,6 +635,7 @@ fn missingCovered(
         options.confirm_no_writers,
         false,
         true,
+        publication,
     );
 }
 
@@ -635,14 +643,16 @@ fn registerCoveredContext(
     result: *Result,
     io: std.Io,
     environment: *const std.process.Environ.Map,
-    options: Options,
+    publication: ?Options,
     selected: host.ContextValue,
-) !void {
+) !bool {
+    const options = publication orelse return false;
     try registerContext(result, io, environment, options, selected);
     try result.put(
         "source_coverage",
         if (options.context.workspace != null) "checked" else "not_checked",
     );
+    return true;
 }
 
 fn registerContext(
@@ -735,7 +745,7 @@ fn inspect(
     );
 }
 
-fn localCovered(
+fn registerLocalCoverage(
     result: *Result,
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -744,8 +754,10 @@ fn localCovered(
     plan: *const compiled.PlanSet,
     bindings: *const parameters.Bindings,
     confirm_no_writers: bool,
+    publication: ?Options,
 ) !bool {
-    const root = selected.workspace_root orelse return true;
+    const root = selected.workspace_root orelse
+        return registerCoveredContext(result, io, environment, publication, selected);
     var sources = try discoverSources(
         result,
         allocator,
@@ -759,7 +771,7 @@ fn localCovered(
     );
     defer sources.deinit();
     if (plan.storage_plan.?.slots[0].layout == .segmented) {
-        try requireSegmentedSourcesAbsent(
+        return registerSegmentedCoverage(
             result,
             allocator,
             io,
@@ -769,10 +781,10 @@ fn localCovered(
             &sources,
             confirm_no_writers,
             false,
+            publication,
         );
-        return true;
     }
-    return coverSources(
+    return registerCoveredSources(
         result,
         allocator,
         io,
@@ -784,10 +796,11 @@ fn localCovered(
         confirm_no_writers,
         true,
         false,
+        publication,
     );
 }
 
-fn coverSources(
+fn registerCoveredSources(
     result: *Result,
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -799,6 +812,7 @@ fn coverSources(
     confirm_no_writers: bool,
     target_present: bool,
     discover_archives: bool,
+    publication: ?Options,
 ) !bool {
     const target_dir = try storage_root.checkedRoot(
         allocator,
@@ -816,7 +830,7 @@ fn coverSources(
         confirm_no_writers,
     );
     defer coordination.deinit();
-    return coverCoordinatedSources(
+    return registerCoordinatedCoverage(
         result,
         allocator,
         io,
@@ -830,10 +844,11 @@ fn coverSources(
         discover_archives,
         target_dir,
         &coordination,
+        publication,
     );
 }
 
-fn coverCoordinatedSources(
+fn registerCoordinatedCoverage(
     result: *Result,
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -847,6 +862,7 @@ fn coverCoordinatedSources(
     discover_archives: bool,
     target_dir: std.Io.Dir,
     coordination: *const SourceCoordination,
+    publication: ?Options,
 ) !bool {
     var budget: storage_root.ReadBudget = .{
         .max_bytes = history_limits.max_read_bytes,
@@ -898,7 +914,8 @@ fn coverCoordinatedSources(
     );
     try coordination.revalidate();
     try recheckTarget(allocator, io, selected, target_dir);
-    return covered;
+    if (!covered) return false;
+    return registerCoveredContext(result, io, environment, publication, selected);
 }
 
 const SourceCoordination = struct {
@@ -1274,7 +1291,7 @@ fn captureCoverageHistory(
     );
 }
 
-fn requireSegmentedSourcesAbsent(
+fn registerSegmentedCoverage(
     result: *Result,
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -1284,7 +1301,8 @@ fn requireSegmentedSourcesAbsent(
     sources: *const discovery.Sources,
     confirm_no_writers: bool,
     discover_archives: bool,
-) !void {
+    publication: ?Options,
+) !bool {
     const controls = try allocator.alloc(?std.Io.Dir, sources.sources.len);
     defer allocator.free(controls);
     @memset(controls, null);
@@ -1341,6 +1359,7 @@ fn requireSegmentedSourcesAbsent(
         controls,
         discover_archives,
     );
+    return registerCoveredContext(result, io, environment, publication, selected);
 }
 
 fn prepare(
@@ -1375,8 +1394,7 @@ fn prepare(
         try result.put("storage_mutated", @as(?bool, null));
         target = try pending.prepareTarget(allocator, io, environment, options.context, true);
         const current = target.?.context.value;
-        // Newly allocated custody uses the same coverage law as an existing empty owner.
-        const coverage = try existingCoverage(
+        const registration = try registerCoveredOwner(
             result,
             io,
             environment,
@@ -1386,10 +1404,10 @@ fn prepare(
             associations,
             current,
             retired,
+            .absent_covered,
         );
-        if (coverage.covered and !coverage.target_present)
-            return registerCoveredContext(result, io, environment, options, current);
-        include_archives = !coverage.target_present;
+        if (registration.registered) return;
+        include_archives = !registration.target_present;
         break :blk current;
     };
     try prepareSelected(
@@ -2636,6 +2654,20 @@ fn testAppendOwner(
     definition_path: []const u8,
     root: []const u8,
 ) !void {
+    return testAppendOwnerInput(
+        environment,
+        definition_path,
+        root,
+        "{\"kind\":\"one\",\"value\":1}",
+    );
+}
+
+fn testAppendOwnerInput(
+    environment: *const std.process.Environ.Map,
+    definition_path: []const u8,
+    root: []const u8,
+    event: []const u8,
+) !void {
     const allocator = std.testing.allocator;
     var scope = storage_root.Scope.init(.init(std.testing.io, std.Io.Dir.cwd()));
     var plans = try cli.loadDefinitionWithCache(
@@ -2664,7 +2696,7 @@ fn testAppendOwner(
         if (plans.protocol_plan) |*protocol| protocol else null,
         "append",
         root,
-        &.{.{ .name = "event", .bytes = "{\"kind\":\"one\",\"value\":1}" }},
+        &.{.{ .name = "event", .bytes = event }},
         &bindings,
     );
     defer result.deinit(allocator);
@@ -2736,4 +2768,149 @@ test "owner registration retains observed membership across publication failures
             );
         }
     }
+}
+
+const CoveragePublicationInterleaving = struct {
+    var active: ?*CoveragePublicationInterleaving = null;
+
+    io: std.Io,
+    environment: *const std.process.Environ.Map,
+    options: Options,
+    event: []const u8,
+    fired: bool = false,
+    append_error: ?anyerror = null,
+
+    fn append(self: *const CoveragePublicationInterleaving) !void {
+        return testAppendOwnerInput(
+            self.environment,
+            self.options.definition,
+            self.options.context.workspace.?,
+            self.event,
+        );
+    }
+
+    fn rename(
+        userdata: ?*anyopaque,
+        from: std.Io.Dir,
+        name: []const u8,
+        to: std.Io.Dir,
+        leaf: []const u8,
+    ) std.Io.Dir.RenameError!void {
+        const self = active.?;
+        if (!self.fired and std.mem.eql(u8, leaf, host.catalog.filename)) {
+            self.fired = true;
+            self.append() catch |err| {
+                self.append_error = err;
+            };
+        }
+        return self.io.vtable.dirRename(userdata, from, name, to, leaf);
+    }
+
+    fn verify(self: *const CoveragePublicationInterleaving, result: *const Result) !void {
+        try std.testing.expect(self.fired);
+        try std.testing.expectEqual(@as(u8, 0), result.exit_code);
+        try std.testing.expect(result.value.object.get("cataloged").?.bool);
+        try std.testing.expectEqualStrings(
+            "checked",
+            result.value.object.get("source_coverage").?.string,
+        );
+        const writer_error = self.append_error orelse {
+            std.debug.print("native writer committed during catalog publication\n", .{});
+            return error.TestExpectedError;
+        };
+        try std.testing.expect(
+            writer_error == error.LockBusy or writer_error == error.EventStoreBusy,
+        );
+    }
+};
+
+test "new empty owner retains source custody through catalog publication" {
+    try testCoveragePublication(false, false);
+}
+
+test "existing empty owner retains source custody through catalog publication" {
+    try testCoveragePublication(true, false);
+}
+
+test "existing segmented owner retains source custody through catalog publication" {
+    try testCoveragePublication(true, true);
+}
+
+fn testCoveragePublication(existing: bool, segmented: bool) !void {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var temporary = try host.workspace.testPlainDirectory();
+    defer temporary.cleanup();
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const owned = arena.allocator();
+    const root = try temporary.dir.realPathFileAlloc(io, ".", owned);
+    try testOwnerInputs(temporary.dir);
+    const payload = if (segmented)
+        try testSegmentedCoverageSource(owned, temporary.dir)
+    else
+        "example/events.jsonl";
+    var environment = std.process.Environ.Map.init(allocator);
+    defer environment.deinit();
+    var options = try testOwnerOptions(owned, root);
+    options.ensure = true;
+    if (existing) {
+        var initialized = try host.initialize(allocator, io, &environment, .{
+            .catalog_root = options.context.catalog_root,
+        });
+        defer initialized.deinit();
+        options.context.store_id = try owned.dupe(u8, initialized.value.store_id);
+    }
+    var interleaving: CoveragePublicationInterleaving = .{
+        .io = io,
+        .environment = &environment,
+        .options = options,
+        .event = if (segmented)
+            @embedFile("fixtures/chained-event-one.json")
+        else
+            @embedFile("fixtures/event-one.json"),
+    };
+    CoveragePublicationInterleaving.active = &interleaving;
+    defer CoveragePublicationInterleaving.active = null;
+    var vtable = io.vtable.*;
+    vtable.dirRename = CoveragePublicationInterleaving.rename;
+    var injected = io;
+    injected.vtable = &vtable;
+    var result = try execute(allocator, injected, &environment, options);
+    defer result.deinit();
+    try interleaving.verify(&result);
+    const source = try temporary.dir.openDir(io, "workspace/.ledger", .{});
+    defer source.close(io);
+    try std.testing.expect(!try host.catalog.existsAt(io, source, payload));
+    const target = try host.catalog.openDirectory(
+        io,
+        result.value.object.get("store_root").?.string,
+        false,
+    );
+    defer target.close(io);
+    try std.testing.expect(!try host.catalog.existsAt(io, target, payload));
+    try interleaving.append();
+    try std.testing.expect(try host.catalog.existsAt(io, source, payload));
+}
+
+fn testSegmentedCoverageSource(allocator: std.mem.Allocator, directory: std.Io.Dir) ![]const u8 {
+    const io = std.testing.io;
+    try testSegmentedDefinition(allocator, directory);
+    try directory.createDirPath(io, "workspace/.ledger");
+    const control = try directory.openDir(io, "workspace/.ledger", .{});
+    defer control.close(io);
+    var scope = storage_root.Scope.init(.anchored(io, control));
+    var paths = try @import("ledger_v1_core").segmented_event_log.Paths.init(
+        &scope,
+        allocator,
+        ".",
+        "example/chained-events.jsonl",
+    );
+    defer paths.deinit(allocator);
+    for ([_][]const u8{ paths.legacy_event, paths.legacy_binding, paths.manifest }) |path| {
+        try control.createDirPath(io, std.fs.path.dirname(path).?);
+        const guard = try durable.acquireCasAdvisoryLock(scope.fs, allocator, path);
+        guard.close(io);
+    }
+    return allocator.dupe(u8, paths.manifest);
 }
