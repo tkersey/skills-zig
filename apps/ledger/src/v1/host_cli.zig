@@ -12,7 +12,7 @@ const Help =
     \\    [--register-root <absolute-path> | --import-registration <absolute-path>]
     \\    [--legacy-path <relative-path>]... [--format json]
     \\  ledger context --catalog-root <absolute-path> [--workspace <absolute-path>]
-    \\    [--store-id <id>] --ensure-owner|--read-only|--repair-archive
+    \\    [--store-id <id>] --ensure-owner|--reconcile-owner|--read-only|--repair-archive
     \\    --definition <absolute-path> --owner-manifest <absolute-path>
     \\    [--param <name>=<value>]... [--confirm-no-legacy-writers]
     \\  ledger context --catalog-root <absolute-path> --workspace <absolute-path>
@@ -26,7 +26,8 @@ const Help =
     \\Context lookup is read-only by default. The caller supplies storage location.
     \\Ensure may adopt an existing registration; initialization is explicit.
     \\Registration retains the existing root, identity, history, and directory layout.
-    \\Owner preparation preserves history and returns its native operation result.
+    \\Owner ensure admits healthy managed history or prepares a missing owner.
+    \\Owner reconciliation additionally checks discovered source-family coverage.
     \\Historical migration inspects by default; retired conversion stays with its owner.
     \\
 ;
@@ -41,6 +42,7 @@ const Mode = enum {
     import_registration,
     owner_read,
     owner_ensure,
+    owner_reconcile,
     archive_repair,
     migrate,
 };
@@ -130,6 +132,7 @@ pub fn run(
             .manifest = args.manifest.?,
             .parameters = args.parameters,
             .ensure = args.mode != .owner_read,
+            .reconcile = args.mode == .owner_reconcile,
             .repair_archive = args.mode == .archive_repair,
             .confirm_no_writers = args.confirm_no_writers,
         });
@@ -175,7 +178,13 @@ fn selected(
             args.options,
             args.path.?,
         ),
-        .list, .owner_read, .owner_ensure, .archive_repair, .migrate => unreachable,
+        .list,
+        .owner_read,
+        .owner_ensure,
+        .owner_reconcile,
+        .archive_repair,
+        .migrate,
+        => unreachable,
     };
     defer result.deinit();
     try emitJson(io, result.value);
@@ -261,9 +270,12 @@ const Parsing = struct {
         if (mode == .register and args.options.store_id == null) return error.MissingStoreIdentity;
         if (mode == .import_registration and args.options.store_id != null)
             return error.ImportRegistrationProvidesStoreIdentity;
+        if (mode == .owner_reconcile and args.options.workspace == null)
+            return error.ReconciliationRequiresWorkspace;
         if (self.legacy_paths.items.len != 0 and mode != .initialize)
             return error.LegacyPathsRequireInitialization;
-        const owner_mode = mode == .owner_read or mode == .owner_ensure or mode == .archive_repair;
+        const owner_mode = mode == .owner_read or mode == .owner_ensure or
+            mode == .owner_reconcile or mode == .archive_repair;
         if (mode != .migrate and
             (args.apply or args.framing_controls != null or self.import_receipts.items.len != 0))
             return error.MigrationOptionsRequireMigration;
@@ -283,7 +295,8 @@ const Parsing = struct {
             if (self.manifests.items.len > 1) return error.OwnerSelectionRequiresOneManifest;
             if (!owner_mode and self.parameters.items.len != 0) return error.ParametersRequireOwner;
             if (self.definitions.items.len > 1) return error.OwnerSelectionRequiresOneDefinition;
-            if (args.confirm_no_writers and mode != .owner_ensure and mode != .archive_repair)
+            if (args.confirm_no_writers and mode != .owner_ensure and
+                mode != .owner_reconcile and mode != .archive_repair)
                 return error.QuiescenceRequiresPreparation;
         }
     }
@@ -305,6 +318,7 @@ const Parsing = struct {
 const modes = std.StaticStringMap(Mode).initComptime(.{
     .{ "--migrate", .migrate },
     .{ "--ensure-owner", .owner_ensure },
+    .{ "--reconcile-owner", .owner_reconcile },
     .{ "--read-only", .owner_read },
     .{ "--repair-archive", .archive_repair },
     .{ "--ensure", .ensure },
@@ -383,6 +397,28 @@ test "context CLI requires explicit location and effect selection" {
     defer args.deinit(allocator);
     try std.testing.expectEqual(Mode.resolve, args.mode);
     try std.testing.expect(!args.mutating());
+}
+
+test "owner reconciliation requires an explicit source workspace" {
+    const allocator = std.testing.allocator;
+    try std.testing.expectError(error.ReconciliationRequiresWorkspace, parse(allocator, &.{
+        "--catalog-root",         "/explicit",
+        "--store-id",             "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "--reconcile-owner",      "--definition",
+        "/owner/definition.json", "--owner-manifest",
+        "/owner/migration.json",
+    }));
+    var args = try parse(allocator, &.{
+        "--catalog-root",         "/explicit",
+        "--workspace",            "/work",
+        "--store-id",             "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "--reconcile-owner",      "--definition",
+        "/owner/definition.json", "--owner-manifest",
+        "/owner/migration.json",
+    });
+    defer args.deinit(allocator);
+    try std.testing.expectEqual(Mode.owner_reconcile, args.mode);
+    try std.testing.expect(args.mutating());
 }
 
 test {

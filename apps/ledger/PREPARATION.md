@@ -72,17 +72,27 @@ parity remain required for both forms.
 
 Native host context distinguishes verified Git identity from a plain workspace;
 failed Git discovery with Git metadata present cannot allocate replacement custody.
-Existing catalog lookup does not require sibling availability. Owner coverage does:
+Existing catalog lookup and healthy present owner ensure do not require sibling
+availability. Explicit `context --reconcile-owner` coverage does:
 healthy selected history is compared against bounded live Git-family candidates,
 using native bindings and one aggregate read allowance, without inspecting archives
 or inferring conversion from retained retired files. A longer live history requires
 reconciliation and cannot advance a healthy target through preparation.
-Live history comparison, including an empty local family, requires the existing
-native guards or explicit writer quiescence. The genuinely new-owner route checks
-this before allocating custody. Unresolved source publication blocks admission while
-the guards are retained. Ordinary context lookup and direct managed reads retain
-their separate routes without asserting source-family coverage.
-Catalog selection during initialization still enters the same owner admission.
+Actual live history requires qualified native guards or actual writer quiescence.
+For an absent monolithic owner in an accessible source, owner preparation creates
+the native advisory resources through the lock API and acquires shared event and
+binding custody before accepting its absence. Shared custody is retained through
+final revalidation and publication. Source coordination mutation is reported
+separately and contributes to the host's aggregate mutation result; source payloads
+are never modified. Residual binding, pending publication, missing roots, and
+changed identities cannot use the empty-source route. First preparation retains
+one pending target identity across interruption, including after source coordination.
+Ordinary healthy owner access reports source coverage as not checked, independently
+of selector syntax. Strict reconciliation and absent-owner preparation retain the
+full source requirements. Successful preparation or reconciliation with a workspace
+reports checked coverage of that observed family. Direct-ID archive restoration
+reports not checked because it does not inspect a live source family. None of these
+observations is a permanent fence against later legacy writes.
 Manifest-selected archive evidence cannot become empty history when its payload
 is missing. Explicit archive repair requires the surviving original binding and
 selected archive evidence; that binding remains required through native publication.
