@@ -1122,6 +1122,22 @@ const SourceCoordination = struct {
         return true;
     }
 
+    fn lendDirectories(self: *const SourceCoordination, sources: []preparation.Source) void {
+        for (sources) |*source| {
+            for (self.held.items) |held| {
+                if (source.archive != held.source.archive or
+                    !std.mem.eql(u8, source.root, held.source.root) or
+                    (source.store_id == null) != (held.source.store_id == null) or
+                    !std.mem.eql(u8, source.store_id orelse "", held.source.store_id orelse ""))
+                {
+                    continue;
+                }
+                source.borrowed_directories = .{ .root = held.root, .control = held.control };
+                break;
+            }
+        }
+    }
+
     fn revalidate(self: *const SourceCoordination) !void {
         for (self.held.items) |held| try self.revalidateOne(held);
     }
@@ -1653,6 +1669,7 @@ fn prepareSelected(
         options.confirm_no_writers,
     );
     defer coordination.deinit();
+    coordination.lendDirectories(sources.sources);
     try prepareNative(
         result,
         io,

@@ -31,6 +31,12 @@ pub const Source = struct {
     root: []const u8,
     store_id: ?[]const u8 = null,
     archive: bool = false,
+    borrowed_directories: ?Directories = null,
+
+    pub const Directories = struct {
+        root: std.Io.Dir,
+        control: std.Io.Dir,
+    };
 };
 
 pub const Options = struct {
@@ -91,8 +97,28 @@ const OpenedSource = struct {
     source: Source,
     root: std.Io.Dir,
     control: ?std.Io.Dir,
+    owns_directories: bool = true,
 
     fn open(
+        io: std.Io,
+        allocator: std.mem.Allocator,
+        source: Source,
+        budget: *storage_root.ReadBudget,
+    ) !OpenedSource {
+        if (source.borrowed_directories) |directories| {
+            const opened: OpenedSource = .{
+                .source = source,
+                .root = directories.root,
+                .control = directories.control,
+                .owns_directories = false,
+            };
+            try opened.revalidate(io, allocator, budget);
+            return opened;
+        }
+        return openOwned(io, allocator, source, budget);
+    }
+
+    fn openOwned(
         io: std.Io,
         allocator: std.mem.Allocator,
         source: Source,
@@ -116,8 +142,10 @@ const OpenedSource = struct {
     }
 
     fn deinit(self: *OpenedSource, io: std.Io) void {
-        if (self.control) |control| control.close(io);
-        self.root.close(io);
+        if (self.owns_directories) {
+            if (self.control) |control| control.close(io);
+            self.root.close(io);
+        }
         self.* = undefined;
     }
 
@@ -127,7 +155,7 @@ const OpenedSource = struct {
         allocator: std.mem.Allocator,
         budget: *storage_root.ReadBudget,
     ) !void {
-        var current = try OpenedSource.open(io, allocator, self.source, budget);
+        var current = try OpenedSource.openOwned(io, allocator, self.source, budget);
         defer current.deinit(io);
         if (!try durable_store.sameDirectoryObject(io, self.root, current.root)) {
             return error.PreparationSourceChanged;
@@ -1215,6 +1243,99 @@ fn controlRelative(
 fn completePrefix(prefix: []const u8, full: []const u8) bool {
     if (!std.mem.startsWith(u8, full, prefix)) return false;
     return prefix.len == full.len or prefix.len == 0 or prefix[prefix.len - 1] == '\n';
+}
+
+test "borrowed preparation directories reject replacements and survive cleanup" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    for ([_]bool{ false, true }) |replace_root| {
+        var temporary = std.testing.tmpDir(.{});
+        defer temporary.cleanup();
+        try temporary.dir.createDirPath(io, "source/.ledger");
+        try temporary.dir.createDirPath(io, "other/.ledger");
+        const root = try temporary.dir.openDir(io, "source", .{});
+        defer root.close(io);
+        const control = try root.openDir(io, ".ledger", .{});
+        defer control.close(io);
+        const other = try temporary.dir.openDir(io, "other", .{});
+        defer other.close(io);
+        const path = try root.realPathFileAlloc(io, ".", allocator);
+        defer allocator.free(path);
+        var budget: storage_root.ReadBudget = .{ .max_bytes = 4096, .max_files = 16 };
+        var source: Source = .{
+            .root = path,
+            .borrowed_directories = .{ .root = other, .control = control },
+        };
+        try std.testing.expectError(
+            error.PreparationSourceChanged,
+            OpenedSource.open(io, allocator, source, &budget),
+        );
+        source.borrowed_directories = .{ .root = root, .control = other };
+        try std.testing.expectError(
+            error.PreparationSourceChanged,
+            OpenedSource.open(io, allocator, source, &budget),
+        );
+        source.borrowed_directories = .{ .root = root, .control = control };
+        var opened = try OpenedSource.open(io, allocator, source, &budget);
+        try opened.revalidate(io, allocator, &budget);
+        var owned = try OpenedSource.open(io, allocator, .{ .root = path }, &budget);
+        owned.deinit(io);
+        if (replace_root) {
+            try temporary.dir.renamePreserve("source", temporary.dir, "retired", io);
+            try temporary.dir.createDirPath(io, "source/.ledger");
+        } else {
+            try root.renamePreserve(".ledger", root, "retired", io);
+            try root.createDirPath(io, ".ledger");
+        }
+        try std.testing.expectError(
+            error.PreparationSourceChanged,
+            opened.revalidate(io, allocator, &budget),
+        );
+        opened.deinit(io);
+        try std.testing.expectEqual(.directory, (try root.statFile(io, ".", .{})).kind);
+        try std.testing.expectEqual(.directory, (try control.statFile(io, ".", .{})).kind);
+    }
+}
+
+test "borrowed preparation directories retain managed identity and read accounting" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    try temporary.dir.createDirPath(io, ".ledger");
+    const control = try temporary.dir.openDir(io, ".ledger", .{});
+    defer control.close(io);
+    const path = try temporary.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(path);
+    const marker = "{\"schema\":\"ledger-storage-root/v1\",\"store_id\":\"source-id\"}";
+    try temporary.dir.writeFile(io, .{ .sub_path = ".ledger-root.json", .data = marker });
+    var budget: storage_root.ReadBudget = .{ .max_bytes = 4096, .max_files = 16 };
+    var source: Source = .{
+        .root = path,
+        .store_id = "source-id",
+        .borrowed_directories = .{ .root = temporary.dir, .control = control },
+    };
+    var opened = try OpenedSource.open(io, allocator, source, &budget);
+    defer opened.deinit(io);
+    try std.testing.expect(budget.bytes >= marker.len);
+    try std.testing.expect(budget.files > 0);
+    source.store_id = "different-id";
+    try std.testing.expectError(
+        error.StorageRootIdentityMismatch,
+        OpenedSource.open(io, allocator, source, &budget),
+    );
+    source.store_id = "source-id";
+    var tiny_budget: storage_root.ReadBudget = .{ .max_bytes = 1, .max_files = 16 };
+    try std.testing.expectError(
+        error.ReadBudgetExceeded,
+        OpenedSource.open(io, allocator, source, &tiny_budget),
+    );
+    try temporary.dir.deleteFile(io, ".ledger-root.json");
+    try std.testing.expectError(
+        error.StorageRootUnregistered,
+        opened.revalidate(io, allocator, &budget),
+    );
+    try std.testing.expectEqual(.directory, (try control.statFile(io, ".", .{})).kind);
 }
 
 test "preparation prefix requires complete records and compatible native metadata" {

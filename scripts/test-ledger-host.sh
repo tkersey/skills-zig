@@ -527,4 +527,48 @@ blocked UnsupportedPreparationLayout context --catalog-root "$segmented/unknown-
   --owner-manifest "$segmented/owner/migration.json"
 test ! -e "$segmented/unknown-home"
 
+printf '%s\n' 'host CLI: full source capacity under 256 descriptors'
+bounded="$scratch/bounded"
+make_repo "$bounded/repo"
+for ((index=1; index<32; index++)); do
+  git -C "$bounded/repo" worktree add -q --detach "$bounded/work-$index"
+done
+context --catalog-root "$bounded/home" --workspace "$bounded/repo" --initialize
+bounded_id=$("$json" -r '.store_id' "$scratch/result.json")
+bounded_root=$("$json" -r '.store_root' "$scratch/result.json")
+capture "$bounded/repo" bounded-source 32
+project --repo "$bounded/repo" >"$scratch/bounded-source.json"
+snapshot "$bounded/repo/.ledger" >"$scratch/bounded-before.snapshot"
+(
+  ulimit -n 256
+  context --catalog-root "$bounded/home" --workspace "$bounded/repo" --ensure-owner \
+    --definition "$definition" --owner-manifest "$manifest"
+)
+assert_json '.source_coverage == "checked" and .preparation.outcome == "prepared" and
+  (.preparation.observations | length) == 32 and .preparation.records == 1'
+test "$("$json" -r '.store_id' "$scratch/result.json")" = "$bounded_id"
+project --store-root "$bounded_root" --store-id "$bounded_id" >"$scratch/bounded-target.json"
+cmp "$scratch/bounded-source.json" "$scratch/bounded-target.json"
+snapshot "$bounded/repo/.ledger" >"$scratch/bounded-after.snapshot"
+cmp "$scratch/bounded-before.snapshot" "$scratch/bounded-after.snapshot"
+
+printf '%s\n' 'host CLI: empty family capacity does not widen native import'
+wide="$scratch/wide"
+make_repo "$wide/repo"
+for ((index=1; index<33; index++)); do
+  git -C "$wide/repo" worktree add -q --detach "$wide/work-$index"
+done
+(
+  ulimit -n 256
+  context --catalog-root "$wide/home" --workspace "$wide/repo" --ensure-owner \
+    --definition "$definition" --owner-manifest "$manifest"
+)
+assert_json '.source_coverage == "checked"'
+capture "$wide/repo" wide-source 33
+(
+  ulimit -n 256
+  blocked PreparationSourceBoundExceeded context --catalog-root "$wide/home" \
+    --workspace "$wide/repo" --ensure-owner --definition "$definition" --owner-manifest "$manifest"
+)
+
 printf '%s\n' 'host CLI regression checks passed'

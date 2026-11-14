@@ -419,7 +419,6 @@ const WorkspaceHistory = struct {
     }
 };
 
-// The caller keeps the custody supporting its history check alive through publication.
 pub fn initializeChecked(
     allocator: std.mem.Allocator,
     io: std.Io,
