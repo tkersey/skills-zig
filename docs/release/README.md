@@ -90,14 +90,27 @@ The initial Homebrew formula is a separate tap handoff after the first release.
 Homebrew formula updates are intentionally handled in a separate tap repository.
 This repo does not support installing its CLIs into user-global paths from source builds.
 Build artifacts are only allowed under repo-local `zig-out/bin`; shipped installs must flow through a tagged release plus the tap formula update.
-The `Update Ledger tap` workflow runs after a successful `Release ledger`
-workflow. It reads the version from the successful run's commit, verifies that
-the release tag still resolves to that commit, downloads both published archives,
-and checks their SHA256 digests against GitHub's release metadata. It changes
-only the version and platform checksums in `Formula/ledger.rb`, then opens or
-updates a version-specific PR in `tkersey/homebrew-tap`. Older releases cannot
-downgrade the formula already on the tap's main branch. Tap PRs still require
-normal review and macOS/Linux CI before merge.
+The `Release ledger` publish job explicitly dispatches `Update Ledger tap` on
+`main` after both platform archives have been published. The handoff carries the
+exact release tag and commit; dispatch failure fails the publishing job instead
+of leaving an unobserved completion-event handoff. The tap workflow verifies the
+tag against the commit's VERSION and tag target, downloads both archives, and
+checks their SHA256 digests against GitHub's release metadata. It changes only
+the version and platform checksums in `Formula/ledger.rb`, then opens or updates
+a version-specific PR in `tkersey/homebrew-tap`. Older releases cannot downgrade
+the formula already on the tap's main branch.
+
+Ledger updates automatically squash-merge only after verifying the exact PR head,
+repository/branch, sole changed file, and formula bytes against the verified
+release. An active tap ruleset without bypass actors must require both
+`test-bot (macos-latest)` and `test-bot (ubuntu-latest)` from GitHub Actions
+(app ID 15368) and resolved review conversations. Active change requests or review
+requests block the merge. The job waits up to eight minutes for both checks on the
+verified head, revalidates, then uses an exact-head merge guard. It does not arm
+GitHub auto-merge for unverified successor commits. GitHub also enforces the
+required checks. Manual retries use the same verification and merge path.
+Repo settings are configured through GitHub. The workflow verifies the effective
+status-check and review-thread requirements before merging.
 
 The `Update Seq tap` workflow runs after a successful `Release seq` workflow.
 It identifies the release tag from the run's two platform archive artifacts,
@@ -115,8 +128,8 @@ Use a fine-grained personal access token scoped only to
 to trigger its normal CI. A missing credential fails the tap workflow without
 changing the already-published release.
 
-The workflow must be on this repository's default branch to receive release
-completion events. To retry a published release without rebuilding it, dispatch
+The tap workflows must be on this repository's default branch for their
+automatic handoffs. To retry a published release without rebuilding it, dispatch
 `Update Ledger tap` on `main` with `tag_name=ledger-v<VERSION>`, or
 `Update Seq tap` with `tag_name=seq-v<VERSION>`. Manual retries
 also verify both published assets and refuse draft or prerelease releases.

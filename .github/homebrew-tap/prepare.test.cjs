@@ -1,7 +1,7 @@
 const assert = require('node:assert/strict');
 const { createHash } = require('node:crypto');
 const { test } = require('node:test');
-const { prepareFormula, releaseTagFromRun } = require('./prepare.cjs');
+const { prepareFormula, releaseTagFromRun, releaseTagFromVersion } = require('./prepare.cjs');
 
 for (const app of ['ledger', 'seq']) {
   function fixture(version = '1.7.0', current = '1.6.0') {
@@ -155,3 +155,11 @@ end
     }
   });
 }
+
+test('an explicitly dispatched tag must match the bound commit version', () => {
+  assert.equal(releaseTagFromVersion('ledger', '1.8.1\n', 'ledger-v1.8.1'), 'ledger-v1.8.1');
+  assert.equal(releaseTagFromVersion('ledger', '1.8.1\n'), 'ledger-v1.8.1');
+  assert.throws(() => releaseTagFromVersion('ledger', '1.8.1', 'ledger-v1.8.0'));
+  assert.throws(() => releaseTagFromVersion('ledger', '1.8.1', 'seq-v1.8.1'));
+  assert.throws(() => releaseTagFromVersion('ledger', '01.8.1'));
+});
