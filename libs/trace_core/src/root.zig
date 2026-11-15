@@ -913,7 +913,8 @@ pub fn readDiscoveryPrefixAlloc(
     var offset: usize = 0;
     var first_end: usize = 0;
     var claude_end: ?usize = null;
-    while (true) {
+    var lines_left = claude_parser.prefix_lines_max + 1;
+    while (lines_left > 0) : (lines_left -= 1) {
         defer scratch.reset();
         const next = lines.next() catch |err| {
             if (lines.line_number == 0) return err;
