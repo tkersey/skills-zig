@@ -1580,3 +1580,9 @@ test "reported exit codes require the complete leading line" {
     try std.testing.expectEqual(@as(?i64, null), reportedExitCode("Exit code 2x"));
     try std.testing.expectEqual(@as(?i64, null), reportedExitCode("boom"));
 }
+
+pub fn isPrefixSeed(root: std.json.ObjectMap) bool {
+    const kind = Kind.fromType(stringField(root, "type"));
+    return kind.isConversation() and stringField(root, "sessionId") != null and
+        stringField(root, "cwd") != null and stringField(root, "timestamp") != null;
+}

@@ -17,6 +17,7 @@ pub const Options = struct {
     structured_limits: structured.Limits = .{},
     max_input_bytes: usize = 64 * 1024 * 1024 * 1024,
     discovery_prefix_limit: usize = max_discovery_prefix_bytes,
+    sidecar_dir: ?std.Io.Dir = null,
 };
 
 pub const SessionSelection = struct {
@@ -37,6 +38,9 @@ pub const SelectedParse = struct {
 pub const SessionIdentity = struct {
     session_id: ?[]u8,
     parent_session_id: ?[]u8,
+    root_session_id: ?[]u8 = null,
+    start_time: ?[]u8 = null,
+    source: trace_core.TraceSource = .none,
     control_parent_session_id: ?[]u8 = null,
     forked_from_session_id: ?[]u8 = null,
     parent_relation: ?[]u8 = null,
@@ -46,6 +50,7 @@ pub const SessionIdentity = struct {
     file_size: usize,
     source_mtime_ns: i128 = 0,
     repo_matches: bool = true,
+    sidecar_mtime_ns: ?i128 = null,
 
     pub fn deinit(self: *SessionIdentity, allocator: std.mem.Allocator) void {
         if (self.session_id) |value| allocator.free(value);
@@ -53,6 +58,8 @@ pub const SessionIdentity = struct {
         if (self.control_parent_session_id) |value| allocator.free(value);
         if (self.forked_from_session_id) |value| allocator.free(value);
         if (self.parent_relation) |value| allocator.free(value);
+        if (self.root_session_id) |value| allocator.free(value);
+        if (self.start_time) |value| allocator.free(value);
         self.* = undefined;
     }
 };
@@ -76,18 +83,22 @@ pub fn discoverSessionIdentity(
         options.discovery_prefix_limit,
     );
     defer input.deinit(allocator);
-    const prefix = readDiscoveryPrefixAlloc(allocator, input.reader(), options) catch |err|
+    var prefix = readDiscoveryPrefixAlloc(allocator, input.reader(), options) catch |err|
         return input.sourceError(err);
-    defer allocator.free(prefix);
+    defer prefix.deinit(allocator);
     const mtime = stat.mtime.nanoseconds;
-    var summary = try parseDiscoveryLine(io, allocator, path, prefix, mtime, options);
+    var discovery_options = options;
+    discovery_options.sidecar_dir = dir;
+    var summary = try parseDiscoveryLine(io, allocator, path, prefix.parsed(), mtime, discovery_options);
     defer summary.deinit(allocator);
     var identity: SessionIdentity = .{
         .session_id = null,
         .parent_session_id = null,
         .lineage_conflict = summary.session.lineage_conflict,
         .subagent_history_start_ordinal = summary.session.subagent_history_start_ordinal,
-        .bytes_read = prefix.len,
+        .bytes_read = prefix.bytes.len,
+        .source = summary.source,
+        .sidecar_mtime_ns = sidecarMtime(summary.claude_sidecar),
         .file_size = std.math.cast(usize, stat.size) orelse
             return error.ObservationInputByteBoundExceeded,
         .source_mtime_ns = stat.mtime.nanoseconds,
@@ -99,7 +110,8 @@ pub fn discoverSessionIdentity(
     errdefer identity.deinit(allocator);
     inline for (.{
         "session_id",             "parent_session_id", "control_parent_session_id",
-        "forked_from_session_id", "parent_relation",
+        "forked_from_session_id", "parent_relation",   "root_session_id",
+        "start_time",
     }) |field| {
         if (@field(summary.session, field)) |value| {
             @field(identity, field) = try allocator.dupe(u8, value);
@@ -127,6 +139,7 @@ pub const ParsedTrace = struct {
     metrics: trace_core.StreamMetrics,
     corpus_digest: [71]u8,
     source_mtime_ns: i128,
+    sidecar_mtime_ns: ?i128 = null,
 
     pub fn deinit(self: *ParsedTrace, allocator: std.mem.Allocator) void {
         self.trace.deinit(allocator);
@@ -260,6 +273,8 @@ fn parseAdmittedFile(
     selection: ?SessionSelection,
     parser: anytype,
 ) !SelectedParse {
+    var admitted_options = options;
+    if (admitted_options.sidecar_dir == null) admitted_options.sidecar_dir = dir;
     if (selection) |selected| {
         if (!canonicalPathPassesSessionSelection(path, selected)) {
             return skippedSelection(false, 0);
@@ -282,7 +297,7 @@ fn parseAdmittedFile(
         path,
         stat,
         input.reader(),
-        options,
+        admitted_options,
         selection,
         parser,
     ) catch |err| return input.sourceError(err);
@@ -298,8 +313,8 @@ fn admitSelectedInput(
     selection: ?SessionSelection,
     parser: anytype,
 ) !SelectedParse {
-    const prefix = try readSelectionPrefixAlloc(allocator, source, selection, options);
-    defer allocator.free(prefix);
+    var prefix = try readSelectionPrefixAlloc(allocator, source, selection, options);
+    defer prefix.deinit(allocator);
     const preselection = if (selection) |selected|
         try preselectSession(
             io,
@@ -319,10 +334,10 @@ fn admitSelectedInput(
         return error.ObservationInputByteBoundExceeded;
     }
     var remainder = source.limited(
-        .limited((options.max_input_bytes +| 1) -| prefix.len),
+        .limited((options.max_input_bytes +| 1) -| prefix.bytes.len),
         &.{},
     );
-    var replay_reader = PrefixReader.init(prefix, &remainder.interface);
+    var replay_reader = PrefixReader.init(prefix.bytes, &remainder.interface);
     return .{
         .parsed = try parser.parse(
             io,
@@ -363,11 +378,13 @@ fn parseSelectedRelations(
     if (metrics.bytes_read > options.max_input_bytes) {
         return error.ObservationInputByteBoundExceeded;
     }
+    corpus_hasher.addSidecar(trace.claude_sidecar);
     return .{
         .trace = trace,
         .metrics = metrics,
         .corpus_digest = corpus_hasher.digest(),
         .source_mtime_ns = modified_at,
+        .sidecar_mtime_ns = sidecarMtime(trace.claude_sidecar),
     };
 }
 
@@ -474,10 +491,10 @@ test "a discovery read admits exactly the first lines the parser's line limit ad
             try std.testing.expectError(error.ObservationDiscoveryByteBoundExceeded, result);
             continue;
         }
-        const prefix = try result;
-        defer allocator.free(prefix);
-        try std.testing.expect(std.mem.startsWith(u8, prefix, source.items[0..length]));
-        try std.testing.expectEqualSlices(u8, source.items, prefix);
+        var prefix = try result;
+        defer prefix.deinit(allocator);
+        try std.testing.expect(std.mem.startsWith(u8, prefix.bytes, source.items[0..length]));
+        try std.testing.expectEqualSlices(u8, source.items, prefix.bytes);
     }
 }
 
@@ -631,6 +648,7 @@ pub fn relationParseOptions(
     var result = trace_core.TraceParseOptions{
         .ongoing_threshold_secs = options.ongoing_threshold_secs,
         .as_of_ns = options.as_of_ns,
+        .sidecar_dir = options.sidecar_dir,
         .include_occurrences = false,
         .include_message_bodies = false,
         .include_tool_output_parts = false,
@@ -672,20 +690,20 @@ fn readSelectionPrefixAlloc(
     reader: *std.Io.Reader,
     selection: ?SessionSelection,
     options: Options,
-) ![]u8 {
+) !trace_core.DiscoveryPrefix {
     if (selection != null and requiresSummaryPreselection(selection.?)) {
         return readDiscoveryPrefixAlloc(allocator, reader, options);
     }
-    return allocator.alloc(u8, 0);
+    return .{ .bytes = try allocator.alloc(u8, 0), .parse_len = 0 };
 }
 
 fn readDiscoveryPrefixAlloc(
     allocator: std.mem.Allocator,
     source: *std.Io.Reader,
     options: Options,
-) ![]u8 {
+) !trace_core.DiscoveryPrefix {
     const limit = options.discovery_prefix_limit;
-    return trace_core.readFirstLinePrefixAlloc(allocator, source, limit) catch |err| switch (err) {
+    return trace_core.readDiscoveryPrefixAlloc(allocator, source, limit) catch |err| switch (err) {
         error.LineTooLong => error.ObservationDiscoveryByteBoundExceeded,
         else => err,
     };
@@ -751,11 +769,13 @@ fn parseSelectedReader(
     if (metrics.bytes_read > options.max_input_bytes) {
         return error.ObservationInputByteBoundExceeded;
     }
+    corpus_hasher.addSidecar(trace.claude_sidecar);
     return ParsedTrace{
         .trace = trace,
         .metrics = metrics,
         .corpus_digest = corpus_hasher.digest(),
         .source_mtime_ns = source_mtime_ns,
+        .sidecar_mtime_ns = sidecarMtime(trace.claude_sidecar),
     };
 }
 
@@ -863,15 +883,18 @@ fn parseDiscoveryLine(
     source_mtime_ns: i128,
     options: Options,
 ) !trace_core.CanonicalSessionTrace {
-    const line_end = if (std.mem.indexOfScalar(u8, prefix, '\n')) |index| index + 1 else prefix.len;
-    var reader = std.Io.Reader.fixed(prefix[0..line_end]);
+    var reader = std.Io.Reader.fixed(prefix);
     return trace_core.parseSessionSummaryTraceReader(
         io,
         allocator,
         path,
         &reader,
         source_mtime_ns,
-        .{ .ongoing_threshold_secs = options.ongoing_threshold_secs, .as_of_ns = options.as_of_ns },
+        .{
+            .ongoing_threshold_secs = options.ongoing_threshold_secs,
+            .as_of_ns = options.as_of_ns,
+            .sidecar_dir = options.sidecar_dir,
+        },
     );
 }
 
@@ -882,12 +905,20 @@ fn preselectSession(
     source_mtime_ns: i128,
     options: Options,
     selection: SessionSelection,
-    prefix: []const u8,
+    discovery: trace_core.DiscoveryPrefix,
 ) !Preselection {
     if (!requiresSummaryPreselection(selection)) {
         return .{};
     }
-    var summary = try parseDiscoveryLine(io, allocator, path, prefix, source_mtime_ns, options);
+    const prefix = discovery.bytes;
+    var summary = try parseDiscoveryLine(
+        io,
+        allocator,
+        path,
+        discovery.parsed(),
+        source_mtime_ns,
+        options,
+    );
     defer summary.deinit(allocator);
     if (selection.session_id) |wanted| {
         if (!exactSessionPasses(summary.session.session_id, wanted)) {
@@ -1862,6 +1893,7 @@ pub fn traceParseOptions(
     return .{
         .ongoing_threshold_secs = options.ongoing_threshold_secs,
         .as_of_ns = options.as_of_ns,
+        .sidecar_dir = options.sidecar_dir,
         .include_raw = relation == .source_events and
             containsField(demanded_fields, 8),
         .include_occurrence_payloads = (relation == .source_events and
@@ -1916,6 +1948,13 @@ const CorpusHasher = struct {
         std.mem.writeInt(u64, &length, @intCast(line.len), .big);
         self.hasher.update(&length);
         self.hasher.update(line);
+    }
+
+    fn addSidecar(self: *CorpusHasher, sidecar: ?trace_core.claude_parser.Sidecar) void {
+        const evidence = sidecar orelse return;
+        self.hasher.update("\x00claude-sidecar\x00");
+        self.hasher.update(if (evidence.present) "\x01" else "\x00");
+        self.hasher.update(&evidence.digest);
     }
 
     fn digest(self: CorpusHasher) [71]u8 {
@@ -2712,4 +2751,9 @@ test "trace adapter applies temporal selectors to physical event rows" {
         "observed",
         result.rows().row(0)[2].string,
     );
+}
+
+pub fn sidecarMtime(sidecar: ?trace_core.claude_parser.Sidecar) ?i128 {
+    const evidence = sidecar orelse return null;
+    return if (evidence.present) evidence.mtime_ns else null;
 }

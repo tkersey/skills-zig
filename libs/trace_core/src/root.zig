@@ -874,6 +874,65 @@ fn appendMalformedWarning(
     try trace.warnings.append(allocator, warning);
 }
 
+pub const DiscoveryPrefix = struct {
+    bytes: []u8,
+    parse_len: usize,
+
+    pub fn deinit(self: *DiscoveryPrefix, allocator: std.mem.Allocator) void {
+        allocator.free(self.bytes);
+        self.* = undefined;
+    }
+
+    pub fn parsed(self: DiscoveryPrefix) []const u8 {
+        return self.bytes[0..self.parse_len];
+    }
+};
+
+pub fn readDiscoveryPrefixAlloc(
+    allocator: std.mem.Allocator,
+    reader: *std.Io.Reader,
+    max_line_bytes: usize,
+) !DiscoveryPrefix {
+    var consumed: std.ArrayList(u8) = .empty;
+    errdefer consumed.deinit(allocator);
+    var collector = ConsumedBytes{ .allocator = allocator, .bytes = &consumed };
+    var lines = try jsonl_stream.Stream.init(allocator, reader, .{
+        .max_line_bytes = max_line_bytes,
+        .chunk_observer = collector.observer(),
+    });
+    defer lines.deinit();
+    var scratch = ParseScratch.init(allocator);
+    defer scratch.deinit();
+    var offset: usize = 0;
+    var first_end: usize = 0;
+    var claude_end: ?usize = null;
+    while (true) {
+        defer scratch.reset();
+        const next = lines.next() catch |err| {
+            if (lines.line_number == 0) return err;
+            break;
+        };
+        const record = next orelse break;
+        offset +|= record.bytes.len + 1;
+        if (record.number == 1) first_end = offset;
+        if (record.number > claude_parser.prefix_lines_max) break;
+        if (offset > claude_parser.prefix_bytes_max and record.number > 1) break;
+        const line = std.mem.trim(u8, record.bytes, " \t\r\n");
+        if (line.len == 0) continue;
+        const root = (scratch.parse(line) catch |err| switch (err) {
+            error.OutOfMemory => return err,
+            else => null,
+        }) orelse continue;
+        const line_signature = claude_parser.signature(root, record.number);
+        if (claude_end == null and (line_signature == .codex or line_signature == .pi)) break;
+        if (line_signature == .claude or claude_end != null) claude_end = offset;
+        if (claude_end != null and claude_parser.isPrefixSeed(root)) break;
+    }
+    const bytes = try consumed.toOwnedSlice(allocator);
+    const parse_len = @min(claude_end orelse first_end, bytes.len);
+    return .{ .bytes = bytes, .parse_len = parse_len };
+}
+
 pub fn readFirstLinePrefixAlloc(
     allocator: std.mem.Allocator,
     reader: *std.Io.Reader,
@@ -1083,11 +1142,13 @@ fn parseSessionLines(
     };
     var scratch = ParseScratch.init(allocator);
     defer scratch.deinit();
+    var line_end_offset: usize = 0;
     var lines = try jsonl_stream.Stream.init(allocator, reader, .{});
     defer lines.deinit();
     while (try lines.next()) |record| {
         defer scratch.reset();
         try visit(context, record.bytes, record.number);
+        line_end_offset +|= record.bytes.len + 1;
         const line = std.mem.trim(u8, record.bytes, " \t\r\n");
         if (line.len == 0) continue;
         if (state.decided == .codex and
@@ -1104,7 +1165,7 @@ fn parseSessionLines(
         } orelse continue;
         state.saw_record = true;
         const line_signature = claude_parser.signature(root, record.number);
-        const end_offset = lines.bytes_read;
+        const end_offset = line_end_offset;
         if (state.decided == null) {
             if (line_signature == .neutral and state.buffers(line.len, end_offset, record.number)) {
                 try state.buffer(allocator, line, record.number, end_offset);

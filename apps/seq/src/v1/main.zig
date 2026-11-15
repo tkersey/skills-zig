@@ -1776,6 +1776,7 @@ const StreamingGraphState = struct {
         path: []const u8,
         digest: [71]u8,
         source_mtime_ns: i128,
+        sidecar_mtime_ns: ?i128,
     };
 
     fn deinit(self: *StreamingGraphState) void {
@@ -1803,24 +1804,25 @@ const StreamingGraphState = struct {
                 self.corpus_entries.items[admitted].path_index < item.path_index)
             {
                 const entry = self.corpus_entries.items[admitted];
-                self.metrics.source_metadata.add(entry.path, entry.source_mtime_ns);
+                self.metrics.source_metadata.add(entry.path, entry.source_mtime_ns, entry.sidecar_mtime_ns);
                 admitted += 1;
             }
             const parsed = admitted < self.corpus_entries.items.len and
                 self.corpus_entries.items[admitted].path_index == item.path_index;
             if (parsed) {
                 const entry = self.corpus_entries.items[admitted];
-                self.metrics.source_metadata.add(entry.path, entry.source_mtime_ns);
+                self.metrics.source_metadata.add(entry.path, entry.source_mtime_ns, entry.sidecar_mtime_ns);
                 admitted += 1;
             } else {
                 self.metrics.source_metadata.add(
                     self.paths[item.path_index],
                     item.identity.source_mtime_ns,
+                    item.identity.sidecar_mtime_ns,
                 );
             }
         }
         for (self.corpus_entries.items[admitted..]) |entry| {
-            self.metrics.source_metadata.add(entry.path, entry.source_mtime_ns);
+            self.metrics.source_metadata.add(entry.path, entry.source_mtime_ns, entry.sidecar_mtime_ns);
         }
     }
 
@@ -1862,6 +1864,7 @@ const StreamingGraphState = struct {
             .path = task.path,
             .digest = parsed.corpus_digest,
             .source_mtime_ns = parsed.source_mtime_ns,
+            .sidecar_mtime_ns = parsed.sidecar_mtime_ns,
         });
         try self.appendPartition(parsed, task, reducer);
     }
@@ -2583,7 +2586,11 @@ fn admitTraceSession(
     parsed: *const seq.trace_adapter.ParsedTrace,
 ) !void {
     try countTraceSession(metrics, parsed);
-    metrics.source_metadata.add(parsed.trace.session.path, parsed.source_mtime_ns);
+    metrics.source_metadata.add(
+        parsed.trace.session.path,
+        parsed.source_mtime_ns,
+        parsed.sidecar_mtime_ns,
+    );
 }
 
 fn countTraceSession(
@@ -2997,13 +3004,17 @@ const SourceMetadataHasher = struct {
         break :init value;
     },
 
-    fn add(self: *SourceMetadataHasher, path: []const u8, mtime_ns: i128) void {
+    fn add(self: *SourceMetadataHasher, path: []const u8, mtime_ns: i128, sidecar_mtime_ns: ?i128) void {
         var length: [8]u8 = undefined;
         std.mem.writeInt(u64, &length, @intCast(path.len), .big);
         self.hasher.update(&length);
         self.hasher.update(path);
         var modified: [16]u8 = undefined;
         std.mem.writeInt(i128, &modified, mtime_ns, .big);
+        self.hasher.update(&modified);
+        const sidecar = sidecar_mtime_ns orelse return;
+        std.mem.writeInt(i128, &modified, sidecar, .big);
+        self.hasher.update("\x00claude-sidecar\x00");
         self.hasher.update(&modified);
     }
 
@@ -3533,13 +3544,16 @@ test "aggregate input reservation admits the exact bound and rejects before over
 
 test "source metadata identity binds the modification time independently of bytes" {
     var first = SourceMetadataHasher{};
-    first.add("/session.jsonl", 10);
+    first.add("/session.jsonl", 10, null);
     var same = SourceMetadataHasher{};
-    same.add("/session.jsonl", 10);
+    same.add("/session.jsonl", 10, null);
     var changed = SourceMetadataHasher{};
-    changed.add("/session.jsonl", 11);
+    changed.add("/session.jsonl", 11, null);
     try std.testing.expectEqualStrings(&first.digest(), &same.digest());
     try std.testing.expect(!std.mem.eql(u8, &first.digest(), &changed.digest()));
+    var sidecar = SourceMetadataHasher{};
+    sidecar.add("/session.jsonl", 10, 12);
+    try std.testing.expect(!std.mem.eql(u8, &first.digest(), &sidecar.digest()));
 }
 
 fn testObservation(selectors: seq.native.Options) ObserveArgs {
