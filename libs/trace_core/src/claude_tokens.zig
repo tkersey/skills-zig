@@ -30,6 +30,7 @@ const Message = struct {
     lines: std.ArrayList(u32) = .empty,
     link: Link = .absent,
     authorship: ?Authorship = null,
+    invalid_id: bool = false,
 };
 
 const Link = union(enum) {
@@ -65,7 +66,9 @@ pub fn account(
         if (!record.isModelResponse()) continue;
         if (record.request_ref.present()) |ref| try tables.named.put(arena, ref, {});
         const key = record.message_id.present() orelse {
-            try rows.append(arena, invalidIdRow(record, position));
+            var invalid = Message{ .key = "", .invalid_id = true };
+            try invalid.lines.append(arena, position);
+            try messages.append(arena, invalid);
             continue;
         };
         const entry = try by_key.getOrPut(arena, key);
@@ -91,7 +94,10 @@ pub fn account(
     const here_records = try arena.alloc(bool, records.len);
     @memset(here_records, false);
     for (messages.items) |message| {
-        try rows.append(arena, answeredRow(records, message));
+        try rows.append(arena, if (message.invalid_id)
+            invalidIdRow(records[message.lines.items[0]], message)
+        else
+            answeredRow(records, message));
         if (message.authorship == .here) {
             for (message.lines.items) |line| here_records[line] = true;
         }
@@ -121,13 +127,12 @@ fn noteRequest(arena: std.mem.Allocator, tables: *Tables, record: Record, positi
     }
 }
 
-fn invalidIdRow(record: Record, position: u32) Row {
-    var quantity = Quantity{ .present = record.quantity.present, .state = .invalid };
-    quantity.present = record.quantity.present;
+fn invalidIdRow(record: Record, message: Message) Row {
     return .{
         .kind = .invalid_id,
-        .record = position,
-        .quantity = quantity,
+        .record = message.lines.items[0],
+        .authorship = message.authorship,
+        .quantity = .{ .present = record.quantity.present, .state = .invalid },
         .has_last_usage = record.quantity.present,
     };
 }
