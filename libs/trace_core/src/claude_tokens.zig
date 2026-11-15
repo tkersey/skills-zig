@@ -41,12 +41,13 @@ const Link = union(enum) {
 };
 
 const RequestEntry = struct { first: u32, count: u32 };
+const RefEntry = struct { last_message: u32, messages: u32 };
 
 const Tables = struct {
     requests: std.StringHashMapUnmanaged(RequestEntry) = .empty,
     unreadable_request: bool = false,
     named: std.StringHashMapUnmanaged(void) = .empty,
-    ref_messages: std.StringHashMapUnmanaged(u32) = .empty,
+    ref_messages: std.StringHashMapUnmanaged(RefEntry) = .empty,
 };
 
 pub fn account(
@@ -78,7 +79,9 @@ pub fn account(
         }
         try messages.items[entry.value_ptr.*].lines.append(arena, position);
     }
-    for (messages.items) |*message| try noteMessageRef(arena, &tables, records, message);
+    for (messages.items, 0..) |*message, ordinal| {
+        try noteMessageRefs(arena, &tables, records, message, @intCast(ordinal));
+    }
     for (messages.items) |*message| classifyLink(&tables, records, message);
     for (messages.items) |*message| {
         message.authorship = authorship(records, messages.items, message, &tables);
@@ -150,15 +153,25 @@ fn consistentRef(records: []const Record, message: *const Message) ?[]const u8 {
     return ref;
 }
 
-fn noteMessageRef(
+fn noteMessageRefs(
     arena: std.mem.Allocator,
     tables: *Tables,
     records: []const Record,
-    message: *Message,
+    message: *const Message,
+    ordinal: u32,
 ) !void {
-    const ref = consistentRef(records, message) orelse return;
-    const entry = try tables.ref_messages.getOrPut(arena, ref);
-    entry.value_ptr.* = if (entry.found_existing) entry.value_ptr.* + 1 else 1;
+    for (message.lines.items) |line| {
+        const ref = records[line].request_ref.present() orelse continue;
+        const entry = try tables.ref_messages.getOrPut(arena, ref);
+        if (!entry.found_existing) {
+            entry.value_ptr.* = .{ .last_message = ordinal, .messages = 1 };
+        } else if (entry.value_ptr.last_message != ordinal) {
+            entry.value_ptr.* = .{
+                .last_message = ordinal,
+                .messages = entry.value_ptr.messages + 1,
+            };
+        }
+    }
 }
 
 fn classifyLink(tables: *const Tables, records: []const Record, message: *Message) void {
@@ -174,7 +187,8 @@ fn classifyLink(tables: *const Tables, records: []const Record, message: *Messag
         message.link = .inconsistent;
         return;
     };
-    if ((tables.ref_messages.get(ref) orelse 0) > 1) {
+    const named_by: u32 = if (tables.ref_messages.get(ref)) |entry| entry.messages else 0;
+    if (named_by > 1) {
         message.link = .inconsistent;
         return;
     }

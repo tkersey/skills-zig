@@ -10,6 +10,10 @@ pub const QuantityState = usage.QuantityState;
 
 pub const prefix_lines_max: usize = 256;
 pub const prefix_bytes_max: usize = 4 * 1024 * 1024;
+
+pub fn withinPrefix(line: usize, end_offset: usize) bool {
+    return line <= prefix_lines_max and (line == 1 or end_offset <= prefix_bytes_max);
+}
 pub const sidecar_bytes_max: usize = 64 * 1024;
 pub const request_record_version_min = Version{ .major = 2, .minor = 1, .patch = 319 };
 pub const adapter_id = "claude-code-transcript-jsonl/v1";
@@ -44,7 +48,7 @@ pub fn signature(root: std.json.ObjectMap, line_number: usize) Signature {
     return .neutral;
 }
 
-fn isPiHeader(root: std.json.ObjectMap) bool {
+pub fn isPiHeader(root: std.json.ObjectMap) bool {
     return eql(stringField(root, "type"), "session") and stringField(root, "id") != null;
 }
 
@@ -246,6 +250,7 @@ pub const ResultBlock = struct {
 pub const Record = struct {
     line: usize,
     end_offset: usize,
+    content_digest: [32]u8 = @splat(0),
     occurrence: ?usize = null,
     kind: Kind,
     timestamp: ?[]const u8 = null,
@@ -769,7 +774,6 @@ pub const Discovery = struct {
     sidecar_bytes: usize = 0,
     parent_agent: ?[]u8 = null,
     tool_use: ?[]u8 = null,
-    parent_present: ?bool = null,
 
     pub fn clone(self: Discovery, allocator: std.mem.Allocator) !Discovery {
         var copy = self;
@@ -804,21 +808,27 @@ pub const Limitations = struct {
     worker_parent_missing: bool = false,
 };
 
-const PathIdentity = struct {
+pub const PathIdentity = struct {
     stem: []const u8,
+    transcript: bool = false,
     agent: ?[]const u8 = null,
     current_layout: bool = false,
     layout_root: ?[]const u8 = null,
 
-    fn read(path: []const u8) PathIdentity {
+    pub fn layoutNamed(self: PathIdentity) bool {
+        return self.transcript and (isUuid(self.stem) or self.agent != null);
+    }
+
+    pub fn read(path: []const u8) PathIdentity {
         const name = std.fs.path.basename(path);
-        const stem = if (std.mem.endsWith(u8, name, ".jsonl.zst"))
-            name[0 .. name.len - ".jsonl.zst".len]
-        else if (std.mem.endsWith(u8, name, ".jsonl"))
-            name[0 .. name.len - ".jsonl".len]
-        else
-            name;
-        var identity = PathIdentity{ .stem = stem };
+        var identity = PathIdentity{ .stem = name };
+        for ([_][]const u8{ ".jsonl.zst", ".jsonl" }) |extension| {
+            if (!std.mem.endsWith(u8, name, extension)) continue;
+            identity.stem = name[0 .. name.len - extension.len];
+            identity.transcript = true;
+            break;
+        }
+        const stem = identity.stem;
         if (!std.mem.startsWith(u8, stem, "agent-") or stem.len == "agent-".len) return identity;
         identity.agent = stem["agent-".len..];
         const directory = std.fs.path.dirname(path) orelse return identity;
@@ -851,7 +861,7 @@ const Prefix = struct {
 
     fn observe(self: *Prefix, record: Record, index: usize) void {
         if (self.done) return;
-        if (record.line > prefix_lines_max or record.end_offset > prefix_bytes_max) {
+        if (!withinPrefix(record.line, record.end_offset)) {
             self.done = true;
             return;
         }
@@ -921,6 +931,8 @@ pub const ClaudeParser = struct {
     ) !void {
         const extractor = Extractor{ .arena = self.arena() };
         var record = try extractor.record(root, line_number, end_offset);
+        const Sha256 = std.crypto.hash.sha2.Sha256;
+        if (record.uuid != null) Sha256.hash(line, &record.content_digest, .{});
         if (!self.summary and self.options.include_occurrences) {
             record.occurrence = try self.appendOccurrence(root, record, line);
         }
@@ -1090,7 +1102,7 @@ pub const ClaudeParser = struct {
         const discovery = if (self.options.claude_discovery) |given|
             try given.clone(self.allocator)
         else
-            try self.readDiscovery(io, identity.root, layout);
+            try self.readDiscovery(io, layout);
         self.trace.claude_discovery = discovery;
         if (self.options.claude_discovery == null) {
             self.trace.claude_discovery_bytes = discovery.sidecar_bytes;
@@ -1119,56 +1131,42 @@ pub const ClaudeParser = struct {
         } else {
             try replaceNullable(self.allocator, &session.control_parent_session_id, root);
         }
-        if (facts.parent_present == false) {
+        if (self.options.discovery_prefix) return;
+        const parent_root = root orelse return;
+        if (!try self.parentAdmitted(parent_root, facts, layout)) {
             session.lineage_conflict = true;
             self.trace.claude_limitations.worker_parent_missing = true;
         }
     }
 
-    fn readDiscovery(
+    fn parentAdmitted(
         self: *ClaudeParser,
-        io: std.Io,
-        root: ?[]const u8,
+        root: []const u8,
+        facts: Discovery,
         layout: PathIdentity,
-    ) !Discovery {
-        var discovery = Discovery{};
-        errdefer discovery.deinit(self.allocator);
-        const directory = std.fs.path.dirname(self.trace.session.path) orelse ".";
-        if (layout.current_layout) {
-            try self.readSidecar(io, layout.agent.?, &discovery);
-            if (discovery.sidecar != .parsed) return discovery;
-        }
-        const parent_root = root orelse return discovery;
-        if (discovery.parent_agent) |parent| {
-            const stem = try std.fmt.allocPrint(self.arena(), "agent-{s}", .{parent});
-            discovery.parent_present = try self.transcriptExists(io, directory, stem);
+    ) !bool {
+        const admission = self.options.admission orelse return false;
+        var directory = std.fs.path.dirname(self.trace.session.path) orelse ".";
+        var stem = root;
+        if (facts.parent_agent) |parent| {
+            stem = try std.fmt.allocPrint(self.arena(), "agent-{s}", .{parent});
         } else if (layout.current_layout) {
             const session_directory = std.fs.path.dirname(directory) orelse ".";
-            const base = std.fs.path.dirname(session_directory) orelse ".";
-            discovery.parent_present = try self.transcriptExists(io, base, parent_root);
-        } else {
-            discovery.parent_present = try self.transcriptExists(io, directory, parent_root);
+            directory = std.fs.path.dirname(session_directory) orelse ".";
         }
-        return discovery;
-    }
-
-    fn transcriptExists(
-        self: *ClaudeParser,
-        io: std.Io,
-        directory: []const u8,
-        stem: []const u8,
-    ) !bool {
         for ([_][]const u8{ ".jsonl", ".jsonl.zst" }) |extension| {
             const name = try std.mem.concat(self.arena(), u8, &.{ stem, extension });
             const path = try std.fs.path.join(self.arena(), &.{ directory, name });
-            const handle = self.options.sidecar_dir orelse std.Io.Dir.cwd();
-            const stat = (if (std.fs.path.isAbsolute(path))
-                std.Io.Dir.cwd().statFile(io, path, .{})
-            else
-                handle.statFile(io, path, .{})) catch continue;
-            if (stat.kind == .file) return true;
+            if (try admission.admits(path)) return true;
         }
         return false;
+    }
+
+    fn readDiscovery(self: *ClaudeParser, io: std.Io, layout: PathIdentity) !Discovery {
+        var discovery = Discovery{};
+        errdefer discovery.deinit(self.allocator);
+        if (layout.current_layout) try self.readSidecar(io, layout.agent.?, &discovery);
+        return discovery;
     }
 
     fn readSidecar(
@@ -1777,21 +1775,21 @@ fn daysFromCivil(year_in: i32, month: u8, day: u8) i64 {
     return era * 146_097 + day_of_era - 719_468;
 }
 
-fn dupOpt(allocator: std.mem.Allocator, value: ?[]const u8) !?[]u8 {
+pub fn dupOpt(allocator: std.mem.Allocator, value: ?[]const u8) !?[]u8 {
     return if (value) |text| try allocator.dupe(u8, text) else null;
 }
 
-fn freeOpt(allocator: std.mem.Allocator, value: ?[]u8) void {
+pub fn freeOpt(allocator: std.mem.Allocator, value: ?[]u8) void {
     if (value) |text| allocator.free(text);
 }
 
-fn replaceOpt(allocator: std.mem.Allocator, slot: *?[]u8, value: []const u8) !void {
+pub fn replaceOpt(allocator: std.mem.Allocator, slot: *?[]u8, value: []const u8) !void {
     const replacement = try allocator.dupe(u8, value);
     freeOpt(allocator, slot.*);
     slot.* = replacement;
 }
 
-fn replaceNullable(allocator: std.mem.Allocator, slot: *?[]u8, value: ?[]const u8) !void {
+pub fn replaceNullable(allocator: std.mem.Allocator, slot: *?[]u8, value: ?[]const u8) !void {
     if (value) |text| {
         try replaceOpt(allocator, slot, text);
     } else {

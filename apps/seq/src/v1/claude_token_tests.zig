@@ -569,3 +569,23 @@ test "unsupported-iterations and quantity-validation" {
     try expectUsable(ok, "final", q(6, 2, 3, 4, 10));
     try expectSession(&quantity, null, null, null);
 }
+
+const shared_ref_id = "cb000000-0000-4000-8000-00000000001b";
+const shared_ref_bytes =
+    \\{"type":"user","uuid":"sr-u1","parentUuid":null,"isSidechain":false,"sessionId":"cb000000-0000-4000-8000-00000000001b","timestamp":"2026-11-01T19:00:00.000Z","cwd":"/tmp/fx-proj","version":"2.1.325","message":{"role":"user","content":"Do the task."},"turnOrigin":"human"}
+    \\{"type":"api-request","id":"rq-s","sessionId":"cb000000-0000-4000-8000-00000000001b","timestamp":"2026-11-01T19:00:01.000Z","version":"2.1.325"}
+    \\{"type":"assistant","uuid":"sr-a1","parentUuid":"sr-u1","isSidechain":false,"sessionId":"cb000000-0000-4000-8000-00000000001b","timestamp":"2026-11-01T19:00:02.000Z","cwd":"/tmp/fx-proj","version":"2.1.325","message":{"model":"claude-test-model","type":"message","role":"assistant","id":"msg_s1","stop_reason":"end_turn","usage":{"input_tokens":1,"cache_read_input_tokens":0,"cache_creation_input_tokens":4,"output_tokens":2},"content":[{"type":"text","text":"One."}]},"requestRef":"rq-s","apiBlockIndex":0}
+    \\{"type":"assistant","uuid":"sr-a2","parentUuid":"sr-a1","isSidechain":false,"sessionId":"cb000000-0000-4000-8000-00000000001b","timestamp":"2026-11-01T19:00:02.000Z","cwd":"/tmp/fx-proj","version":"2.1.325","message":{"model":"claude-test-model","type":"message","role":"assistant","id":"msg_s1","stop_reason":"end_turn","usage":{"input_tokens":1,"cache_read_input_tokens":0,"cache_creation_input_tokens":4,"output_tokens":2},"content":[{"type":"text","text":"Two."}]},"apiBlockIndex":1}
+    \\{"type":"user","uuid":"sr-u2","parentUuid":"sr-a2","isSidechain":false,"sessionId":"cb000000-0000-4000-8000-00000000001b","timestamp":"2026-11-01T19:00:03.000Z","cwd":"/tmp/fx-proj","version":"2.1.325","message":{"role":"user","content":"Again."},"turnOrigin":"human"}
+    \\{"type":"assistant","uuid":"sr-a3","parentUuid":"sr-u2","isSidechain":false,"sessionId":"cb000000-0000-4000-8000-00000000001b","timestamp":"2026-11-01T19:00:04.000Z","cwd":"/tmp/fx-proj","version":"2.1.325","message":{"model":"claude-test-model","type":"message","role":"assistant","id":"msg_s2","stop_reason":"end_turn","usage":{"input_tokens":1,"cache_read_input_tokens":0,"cache_creation_input_tokens":4,"output_tokens":2},"content":[{"type":"text","text":"Three."}]},"requestRef":"rq-s","apiBlockIndex":0}
+    \\
+;
+
+test "shared request ref: a mixed earlier message still unplaces a consistent holder" {
+    var trace = try load(shared_ref_id, shared_ref_bytes);
+    defer trace.deinit(testing.allocator);
+    try testing.expectEqual(@as(usize, 2), trace.token_events.items.len);
+    const same = q(5, 0, 4, 2, 7);
+    try expectUsable(try expectRow(&trace, "msg_s1", "unplaced", 3), "final", same);
+    try expectUsable(try expectRow(&trace, "msg_s2", "unplaced", 6), "final", same);
+}

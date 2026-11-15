@@ -1046,6 +1046,36 @@ const GraphObservationContext = struct {
     args: *const ObserveArgs,
     plans: *const seq.compiled_plan.PlanSet,
     bindings: *const definition_core.parameters.Bindings,
+    admission: ?*seq.native.Admission = null,
+
+    fn init(
+        io: std.Io,
+        dir: std.Io.Dir,
+        allocator: std.mem.Allocator,
+        arena: *std.heap.ArenaAllocator,
+        args: *const ObserveArgs,
+        plans: *const seq.compiled_plan.PlanSet,
+        bindings: *const definition_core.parameters.Bindings,
+    ) GraphObservationContext {
+        return .{
+            .io = io,
+            .dir = dir,
+            .allocator = allocator,
+            .arena = arena,
+            .args = args,
+            .plans = plans,
+            .bindings = bindings,
+        };
+    }
+
+    fn traceOptions(
+        self: *const GraphObservationContext,
+        max_input_bytes: usize,
+    ) seq.trace_adapter.Options {
+        var options = self.args.traceOptions(max_input_bytes);
+        if (self.admission) |admission| options.admission = admission.interface();
+        return options;
+    }
 
     fn execute(
         self: *const GraphObservationContext,
@@ -1267,6 +1297,23 @@ fn resolveGraphPaths(
 
 const GraphSelection = enum { corpus, physical };
 
+fn graphSessionSelection(
+    selectors: seq.native.Options,
+    selection: GraphSelection,
+    sessions_only: bool,
+) seq.trace_adapter.SessionSelection {
+    return switch (selection) {
+        .corpus => .{ .repo = selectors.repo },
+        .physical => .{
+            .session_id = selectors.session_id,
+            .repo = selectors.repo,
+            .since_ms = selectors.since_ms,
+            .until_ms = selectors.until_ms,
+            .filter_time = sessions_only,
+        },
+    };
+}
+
 fn readMaterializedGraphPaths(
     graph: *const GraphObservationContext,
     rows: *MaterializedGraphScans,
@@ -1283,6 +1330,7 @@ fn readMaterializedGraphPaths(
         .corpus => .{},
         .physical => .{ .since_ms = selectors.since_ms, .until_ms = selectors.until_ms },
     };
+    const session_selection = graphSessionSelection(selectors, selection, sessions_only);
     for (paths) |path| {
         if (seq.opencode_adapter.recognizes(path)) {
             return error.GraphObservationOpenCodeUnsupported;
@@ -1294,17 +1342,8 @@ fn readMaterializedGraphPaths(
             graph.allocator,
             rows.relations.items,
             path,
-            graph.args.traceOptions(input_bound -| metrics.corpus_bytes),
-            switch (selection) {
-                .corpus => .{ .repo = selectors.repo },
-                .physical => .{
-                    .session_id = selectors.session_id,
-                    .repo = selectors.repo,
-                    .since_ms = selectors.since_ms,
-                    .until_ms = selectors.until_ms,
-                    .filter_time = sessions_only,
-                },
-            },
+            graph.traceOptions(input_bound -| metrics.corpus_bytes),
+            session_selection,
         );
         defer if (selected.parsed) |*parsed| parsed.deinit(graph.allocator);
         try recordTraceRead(metrics, selected);
@@ -1409,15 +1448,7 @@ fn executeMaterializedGraphObservation(
     errdefer allocator.destroy(arena);
     arena.* = .init(allocator);
     errdefer arena.deinit();
-    const graph: GraphObservationContext = .{
-        .io = io,
-        .dir = dir,
-        .allocator = allocator,
-        .arena = arena,
-        .args = args,
-        .plans = context,
-        .bindings = bindings,
-    };
+    var graph = GraphObservationContext.init(io, dir, allocator, arena, args, context, bindings);
     var rows = try MaterializedGraphScans.init(&graph, scan_stages);
     defer rows.deinit(&graph);
     const physical_selection = try seq.relation_graph.selectsPhysically(
@@ -1434,7 +1465,19 @@ fn executeMaterializedGraphObservation(
     try recordFamilyDiscovery(&metrics, family);
     var digest_set = CorpusSetHasher{};
     const selection: GraphSelection = if (physical_selection) .physical else .corpus;
+    const sessions_only = rows.relations.items.len == 1 and rows.relations.items[0] == .sessions;
+    var admission = try seq.native.Admission.initAlloc(
+        io,
+        dir,
+        allocator,
+        paths.items,
+        graphSessionSelection(args.selectors, selection, sessions_only),
+        args.freshnessOptions(),
+    );
+    defer admission.deinit();
+    graph.admission = &admission;
     try readMaterializedGraphPaths(&graph, &rows, paths.items, &metrics, &digest_set, selection);
+    try recordFamilyDiscovery(&metrics, admission.reads);
     if (physical_selection and args.selectors.session_id != null) {
         if (metrics.sessions == 0) return error.SessionNotFound;
         if (metrics.sessions != 1) return error.AmbiguousSessionTarget;
@@ -1576,6 +1619,21 @@ const DiscoveredSessions = struct {
     indices: std.StringHashMap(usize),
     identity_bytes: usize = 0,
 
+    fn admission(
+        self: *const DiscoveredSessions,
+        io: std.Io,
+        dir: std.Io.Dir,
+        allocator: std.mem.Allocator,
+        paths: []const []const u8,
+    ) !seq.native.Admission {
+        var admitted: std.ArrayList([]const u8) = .empty;
+        defer admitted.deinit(allocator);
+        for (self.items[0..self.initialized_count]) |item| {
+            if (item.identity.repo_matches) try admitted.append(allocator, paths[item.path_index]);
+        }
+        return seq.native.Admission.initAlloc(io, dir, allocator, admitted.items, null, .{});
+    }
+
     fn init(
         io: std.Io,
         dir: std.Io.Dir,
@@ -1702,7 +1760,7 @@ fn createStreamingParseTasks(
             .dir = graph.dir,
             .path = path,
             .relation = graph.plans.native_plan.stages[schedule.scan_stage].operation.scan.relation,
-            .options = graph.args.traceOptions(if (compressed)
+            .options = graph.traceOptions(if (compressed)
                 graph.plans.definition_plan.bounds.max_input_bytes
             else
                 item.identity.file_size),
@@ -1787,7 +1845,8 @@ const StreamingGraphState = struct {
     source_rows: usize = 0,
     materialized_rows: usize,
     session_seed: ?*seq.relation_graph.ScanInput = null,
-    usage_column: ?usize = null,
+    seed_columns: SeedColumns = .{},
+
     corpus_entries: std.ArrayList(CorpusEntry) = .empty,
     discovered: []const DiscoveredSession = &.{},
     paths: []const []const u8 = &.{},
@@ -1799,6 +1858,25 @@ const StreamingGraphState = struct {
         source_mtime_ns: i128,
         sidecar_mtime_ns: ?i128,
     };
+
+    fn patchSeed(
+        self: *StreamingGraphState,
+        task: *const StreamingParseTask,
+        session: *const seq.trace_adapter.SessionRecord,
+    ) !void {
+        const columns = self.seed_columns;
+        if (columns.usage == null and columns.lineage == null) return;
+        const seed = self.session_seed orelse return error.ObservationPhysicalParseMissing;
+        const row = task.session_seed_row orelse return error.ObservationPhysicalParseMissing;
+        const values = seed.table.values[row * seed.table.width ..][0..seed.table.width];
+        if (columns.usage) |column| {
+            values[column] = if (session.source_format == .pi_session_jsonl)
+                .null
+            else
+                .{ .integer = session.token_usage_observation_count };
+        }
+        if (columns.lineage) |column| values[column] = .{ .boolean = session.lineage_conflict };
+    }
 
     fn deinit(self: *StreamingGraphState) void {
         self.interner.deinit(self.graph.table_allocator);
@@ -1882,16 +1960,7 @@ const StreamingGraphState = struct {
         };
         try self.metrics.admitAdapter(seq.trace_adapter.adapterId(&parsed.trace));
         try countTraceSession(&self.metrics, parsed);
-        if (self.usage_column) |column| {
-            const seed = self.session_seed orelse return error.ObservationPhysicalParseMissing;
-            const row = task.session_seed_row orelse return error.ObservationPhysicalParseMissing;
-            const offset = row * seed.table.width + column;
-            std.debug.assert(offset < seed.table.values.len);
-            seed.table.values[offset] = if (parsed.trace.session.source_format == .pi_session_jsonl)
-                .null
-            else
-                .{ .integer = parsed.trace.session.token_usage_observation_count };
-        }
+        try self.patchSeed(task, &parsed.trace.session);
         try self.corpus_entries.append(self.graph.allocator, .{
             .path_index = task.path_index,
             .path = task.path,
@@ -2015,11 +2084,27 @@ fn runStreamingParseTasks(
     }
 }
 
-fn tokenUsageColumn(context: *const seq.compiled_plan.PlanSet, session_stage: u16) ?usize {
+const SeedColumns = struct {
+    usage: ?usize = null,
+    lineage: ?usize = null,
+
+    fn init(context: *const seq.compiled_plan.PlanSet, session_stage: u16) SeedColumns {
+        return .{
+            .usage = sessionSeedColumn(context, session_stage, "token_usage_observation_count"),
+            .lineage = sessionSeedColumn(context, session_stage, "lineage_conflict"),
+        };
+    }
+};
+
+fn sessionSeedColumn(
+    context: *const seq.compiled_plan.PlanSet,
+    session_stage: u16,
+    wanted: []const u8,
+) ?usize {
     const session_scan = context.native_plan.stages[session_stage].operation.scan;
     for (session_scan.field_indices, 0..) |field, column| {
         const name = seq.physical.Relation.sessions.fields()[field].name;
-        if (std.mem.eql(u8, name, "token_usage_observation_count")) return column;
+        if (std.mem.eql(u8, name, wanted)) return column;
     }
     return null;
 }
@@ -2037,20 +2122,15 @@ fn executeStreamingGraphObservation(
     errdefer allocator.destroy(arena);
     arena.* = .init(allocator);
     errdefer arena.deinit();
-    const graph: GraphObservationContext = .{
-        .io = io,
-        .dir = dir,
-        .allocator = allocator,
-        .arena = arena,
-        .args = args,
-        .plans = context,
-        .bindings = bindings,
-    };
+    var graph = GraphObservationContext.init(io, dir, allocator, arena, args, context, bindings);
     var family = seq.native.DiscoveryReads{};
     var paths = try resolveGraphPaths(allocator, io, dir, args, false, &family);
     defer seq.native.freePaths(allocator, &paths);
     var discovered = try DiscoveredSessions.init(io, dir, allocator, paths.items, args);
     defer discovered.deinit(allocator);
+    var admission = try discovered.admission(io, dir, allocator, paths.items);
+    defer admission.deinit();
+    graph.admission = &admission;
     var session_seed = [_]seq.relation_graph.ScanInput{
         try buildSessionSeed(&graph, schedule, &discovered, paths.items),
     };
@@ -2075,7 +2155,7 @@ fn executeStreamingGraphObservation(
         .schedule = schedule,
         .materialized_rows = lineage_graph.materialized_rows,
         .session_seed = &session_seed[0],
-        .usage_column = tokenUsageColumn(context, session_seed[0].stage_index),
+        .seed_columns = .init(context, session_seed[0].stage_index),
     };
     if (args.selectors.session_id) |wanted| try requireDiscoveredSession(&discovered, wanted);
     try state.recordDiscovery(&discovered, paths.items);
@@ -2338,6 +2418,15 @@ fn executePhysicalObservation(
     var metrics = PhysicalMetrics{};
     try recordFamilyDiscovery(&metrics, resolution_reads);
     var digest_set = CorpusSetHasher{};
+    var admission = try seq.native.Admission.initAlloc(
+        io,
+        dir,
+        allocator,
+        paths.items,
+        physicalSessionSelection(args, program, relation),
+        args.freshnessOptions(),
+    );
+    defer admission.deinit();
     for (paths.items) |path| {
         const feed = try feedPhysicalFile(
             io,
@@ -2351,16 +2440,26 @@ fn executePhysicalObservation(
             &runner,
             &digest_set,
             &metrics,
+            &admission,
         );
         if (feed == .stop and args.selectors.session_id == null) break;
     }
+    try recordFamilyDiscovery(&metrics, admission.reads);
     if (args.selectors.session_id != null) {
         if (metrics.sessions == 0) return error.SessionNotFound;
         if (metrics.sessions != 1) return error.AmbiguousSessionTarget;
     }
+    return physicalExecution(&runner, &metrics, digest_set);
+}
+
+fn physicalExecution(
+    runner: *seq.execution.Runner,
+    metrics: *const PhysicalMetrics,
+    digest_set: CorpusSetHasher,
+) !ObservationExecution {
     return .{
         .result = try runner.finish(),
-        .runner = runner,
+        .runner = runner.*,
         .corpus_adapter = metrics.adapter orelse source_adapter_version,
         .corpus_digest = digest_set.digest(),
         .corpus_files = metrics.files,
@@ -2412,6 +2511,7 @@ fn feedPhysicalFile(
     runner: *seq.execution.Runner,
     digest_set: *CorpusSetHasher,
     metrics: *PhysicalMetrics,
+    admission: *seq.native.Admission,
 ) !seq.execution.Feed {
     if (seq.opencode_adapter.recognizes(path)) {
         return feedOpenCodeFile(
@@ -2439,6 +2539,7 @@ fn feedPhysicalFile(
         runner,
         digest_set,
         metrics,
+        admission,
     );
 }
 
@@ -2520,6 +2621,21 @@ fn prunableExcludedSessionId(
     return excluded;
 }
 
+fn physicalSessionSelection(
+    args: *const ObserveArgs,
+    program: *const seq.execution.Program,
+    relation: seq.physical.Relation,
+) seq.trace_adapter.SessionSelection {
+    return .{
+        .session_id = args.selectors.session_id,
+        .exclude_session_id = prunableExcludedSessionId(args, program),
+        .repo = args.selectors.repo,
+        .since_ms = args.selectors.since_ms,
+        .until_ms = args.selectors.until_ms,
+        .filter_time = relation == .sessions,
+    };
+}
+
 fn feedTraceFile(
     io: std.Io,
     dir: std.Io.Dir,
@@ -2532,22 +2648,18 @@ fn feedTraceFile(
     runner: *seq.execution.Runner,
     digest_set: *CorpusSetHasher,
     metrics: *PhysicalMetrics,
+    admission: *seq.native.Admission,
 ) !seq.execution.Feed {
+    var options = args.traceOptions(bounds.max_input_bytes -| metrics.corpus_bytes);
+    options.admission = admission.interface();
     const selected = try seq.trace_adapter.parseFileSelected(
         io,
         dir,
         allocator,
         program,
         path,
-        args.traceOptions(bounds.max_input_bytes -| metrics.corpus_bytes),
-        .{
-            .session_id = args.selectors.session_id,
-            .exclude_session_id = prunableExcludedSessionId(args, program),
-            .repo = args.selectors.repo,
-            .since_ms = args.selectors.since_ms,
-            .until_ms = args.selectors.until_ms,
-            .filter_time = relation == .sessions,
-        },
+        options,
+        physicalSessionSelection(args, program, relation),
     );
     try recordTraceRead(metrics, selected);
     var parsed = selected.parsed orelse return .continue_scanning;
@@ -4148,4 +4260,36 @@ fn resolvePhysicalPaths(
     selectors.session_id = null;
     selectors.discovery_reads = reads;
     return seq.native.resolveTargetPaths(allocator, io, dir, selectors, false);
+}
+
+test "streaming seed rows take lineage conflicts and token coverage from the body parse" {
+    var values = [_]seq.execution.Value{ .null, .{ .boolean = false }, .null, .{ .boolean = false } };
+    var seed = seq.relation_graph.ScanInput{
+        .stage_index = 0,
+        .table = .{ .values = &values, .width = 2 },
+    };
+    var state: StreamingGraphState = .{
+        .graph = undefined,
+        .schedule = undefined,
+        .materialized_rows = 0,
+        .session_seed = &seed,
+        .seed_columns = .{ .usage = 0, .lineage = 1 },
+    };
+    const task = StreamingParseTask{
+        .io = std.testing.io,
+        .dir = undefined,
+        .path = "worker.jsonl",
+        .relation = .sessions,
+        .options = .{},
+        .reserved_bytes = 0,
+        .session_seed_row = 1,
+        .repo = null,
+    };
+    var session = std.mem.zeroInit(seq.trace_adapter.SessionRecord, .{});
+    session.lineage_conflict = true;
+    session.token_usage_observation_count = 3;
+    try state.patchSeed(&task, &session);
+    try std.testing.expect(values[0] == .null and !values[1].boolean);
+    try std.testing.expectEqual(@as(i64, 3), values[2].integer);
+    try std.testing.expect(values[3].boolean);
 }

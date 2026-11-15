@@ -732,3 +732,36 @@ test "compaction boundary is bridged inside its turn" {
     try expectHidden(&trace, &.{5});
     try testing.expectEqual(@as(?i64, 1), (try occurrenceAt(&trace, 6)).turn_index);
 }
+
+const repeat_prompt =
+    \\{"parentUuid":null,"isSidechain":false,"type":"user","uuid":"du-p1","timestamp":"2026-11-10T10:00:01.000Z","cwd":"/work/demo","sessionId":"5e55f00d-0000-4000-8000-00000000c1a0","version":"2.1.325","message":{"role":"user","content":"q1"},"turnOrigin":"human"}
+    \\
+;
+const repeat_reply =
+    \\{"parentUuid":"du-p1","isSidechain":false,"type":"assistant","uuid":"du-a1","timestamp":"2026-11-10T10:00:02.000Z","cwd":"/work/demo","sessionId":"5e55f00d-0000-4000-8000-00000000c1a0","version":"2.1.325","message":{"id":"msg-du-1","type":"message","role":"assistant","model":"claude-test-1","content":[{"type":"text","text":"one"}],"stop_reason":"end_turn","usage":{"input_tokens":10,"cache_read_input_tokens":0,"cache_creation_input_tokens":0,"output_tokens":5}}}
+    \\
+;
+const altered_reply =
+    \\{"parentUuid":"du-p1","isSidechain":false,"type":"assistant","uuid":"du-a1","timestamp":"2026-11-10T10:00:02.000Z","cwd":"/work/demo","sessionId":"5e55f00d-0000-4000-8000-00000000c1a0","version":"2.1.325","message":{"id":"msg-du-1","type":"message","role":"assistant","model":"claude-test-1","content":[{"type":"text","text":"two"}],"stop_reason":"end_turn","usage":{"input_tokens":10,"cache_read_input_tokens":0,"cache_creation_input_tokens":0,"output_tokens":5}}}
+    \\
+;
+
+fn duplicateUuidWarnings(trace: *const Trace, suffix: []const u8) usize {
+    var count: usize = 0;
+    for (trace.warnings.items) |warning| {
+        if (std.mem.endsWith(u8, warning, suffix)) count += 1;
+    }
+    return count;
+}
+
+test "duplicate uuid warns only when a different record reuses it" {
+    const warning = "duplicate Claude record uuid";
+    const repeated = repeat_prompt ++ repeat_reply ++ repeat_reply ++ repeat_prompt;
+    var same = try load(repeated, .stale);
+    defer same.deinit(testing.allocator);
+    try testing.expectEqual(@as(usize, 0), duplicateUuidWarnings(&same, warning));
+    var changed = try load(repeat_prompt ++ repeat_reply ++ altered_reply ++ repeat_reply, .stale);
+    defer changed.deinit(testing.allocator);
+    try testing.expectEqual(@as(usize, 1), duplicateUuidWarnings(&changed, warning));
+    try testing.expectEqual(@as(usize, 1), duplicateUuidWarnings(&changed, ":3: " ++ warning));
+}

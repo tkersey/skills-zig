@@ -2,6 +2,14 @@ const std = @import("std");
 const jsonl_stream = @import("jsonl_core");
 pub const SessionInput = @import("session_input.zig").SessionInput;
 pub const claude_parser = @import("claude_parser.zig");
+const stringField = claude_parser.stringField;
+const objectField = claude_parser.objectField;
+const boolField = claude_parser.boolField;
+const dupOpt = claude_parser.dupOpt;
+const freeOpt = claude_parser.freeOpt;
+const replaceOpt = claude_parser.replaceOpt;
+const replaceNullable = claude_parser.replaceNullable;
+const isPiSessionHeader = claude_parser.isPiHeader;
 
 pub const TraceFormat = enum {
     new_044_plus,
@@ -62,6 +70,16 @@ pub const TraceParseOptions = struct {
     sidecar_dir: ?std.Io.Dir = null,
     discovery_prefix: bool = false,
     claude_discovery: ?*const claude_parser.Discovery = null,
+    admission: ?Admission = null,
+};
+
+pub const Admission = struct {
+    context: *anyopaque,
+    admitsFn: *const fn (context: *anyopaque, path: []const u8) anyerror!bool,
+
+    pub fn admits(self: Admission, path: []const u8) !bool {
+        return self.admitsFn(self.context, path);
+    }
 };
 
 pub const StreamMetrics = struct {
@@ -920,14 +938,13 @@ pub fn readDiscoveryPrefixAlloc(
     var lines_left = claude_parser.prefix_lines_max + 1;
     while (lines_left > 0) : (lines_left -= 1) {
         defer scratch.reset();
-        const next = lines.next() catch |err| {
-            if (lines.line_number == 0) return err;
-            break;
+        const next = lines.next() catch |err| switch (err) {
+            error.LineTooLong => if (lines.line_number == 0) return err else break,
+            else => return err,
         };
         const record = next orelse break;
         offset +|= record.bytes.len + 1;
-        if (record.number > claude_parser.prefix_lines_max) break;
-        if (offset > claude_parser.prefix_bytes_max and record.number > 1) break;
+        if (!claude_parser.withinPrefix(record.number, offset)) break;
         parse_end = offset;
         const line = std.mem.trim(u8, record.bytes, " \t\r\n");
         if (line.len == 0) continue;
@@ -1022,12 +1039,6 @@ const SourceState = struct {
     fn deinit(self: *SourceState, allocator: std.mem.Allocator) void {
         for (self.pending.items) |pending| allocator.free(pending.bytes);
         self.pending.deinit(allocator);
-    }
-
-    fn buffers(self: *const SourceState, end_offset: usize, number: usize) bool {
-        return number <= claude_parser.prefix_lines_max and
-            end_offset <= claude_parser.prefix_bytes_max and
-            self.pending.items.len < claude_parser.prefix_lines_max;
     }
 
     fn buffer(
@@ -1173,11 +1184,12 @@ fn parseSessionLines(
         const line_signature = claude_parser.signature(root, record.number);
         const end_offset = line_end_offset;
         if (state.decided == null) {
-            if (line_signature == .neutral and state.buffers(end_offset, record.number)) {
+            const within = claude_parser.withinPrefix(record.number, end_offset);
+            if (line_signature == .neutral and within) {
                 try state.buffer(allocator, line, record.number, end_offset);
                 continue;
             }
-            state.decide(line_signature);
+            state.decide(if (within) line_signature else .neutral);
             try sinks.replay(parser, &state);
         }
         try state.admit(line_signature);
@@ -1234,11 +1246,6 @@ fn turnContextObject(record: ParsedRecord) ?std.json.ObjectMap {
     const entry_type = record.root_type orelse return null;
     if (!std.mem.eql(u8, entry_type, "turn_context")) return null;
     return record.payload orelse record.root;
-}
-
-fn isPiSessionHeader(root: std.json.ObjectMap) bool {
-    return std.mem.eql(u8, stringField(root, "type") orelse "", "session") and
-        stringField(root, "id") != null;
 }
 
 fn isPiStandaloneEntry(root: std.json.ObjectMap) bool {
@@ -1949,19 +1956,6 @@ fn addPiUsage(target: anytype, usage: PiUsage) bool {
         valid = addPiCounter(&@field(target, field), @field(usage, field)) and valid;
     }
     return valid;
-}
-
-fn replaceNullable(
-    allocator: std.mem.Allocator,
-    target: *?[]u8,
-    value: ?[]const u8,
-) !void {
-    if (value) |text| {
-        try replaceOpt(allocator, target, text);
-    } else {
-        freeOpt(allocator, target.*);
-        target.* = null;
-    }
 }
 
 const TraceParser = struct {
@@ -3018,22 +3012,6 @@ fn noteTokenUsageObservation(session: *SessionRecord, info: std.json.ObjectMap) 
     }
 }
 
-fn objectField(root: std.json.ObjectMap, key: []const u8) ?std.json.ObjectMap {
-    const value = root.get(key) orelse return null;
-    return switch (value) {
-        .object => |obj| obj,
-        else => null,
-    };
-}
-
-fn stringField(root: std.json.ObjectMap, key: []const u8) ?[]const u8 {
-    const value = root.get(key) orelse return null;
-    return switch (value) {
-        .string => |s| s,
-        else => null,
-    };
-}
-
 fn valueObject(value: std.json.Value) ?std.json.ObjectMap {
     return switch (value) {
         .object => |obj| obj,
@@ -3061,25 +3039,9 @@ fn intField(root: std.json.ObjectMap, key: []const u8) ?i64 {
     };
 }
 
-fn boolField(root: std.json.ObjectMap, key: []const u8) ?bool {
-    const value = root.get(key) orelse return null;
-    return switch (value) {
-        .bool => |v| v,
-        else => null,
-    };
-}
-
 fn nestedObject(root: std.json.ObjectMap, a: []const u8, b: []const u8) ?std.json.ObjectMap {
     const first = objectField(root, a) orelse return null;
     return objectField(first, b);
-}
-
-fn dupOpt(allocator: std.mem.Allocator, value: ?[]const u8) !?[]u8 {
-    return if (value) |v| try allocator.dupe(u8, v) else null;
-}
-
-fn replaceOpt(allocator: std.mem.Allocator, slot: *?[]u8, value: []const u8) !void {
-    slot.* = try dupReplace(allocator, slot.*, value);
 }
 
 fn dupReplace(allocator: std.mem.Allocator, old: ?[]u8, value: []const u8) ![]u8 {
@@ -5040,10 +5002,6 @@ fn bestTimestamp(root: std.json.ObjectMap) ?[]const u8 {
 
 fn stringifyJsonValue(allocator: std.mem.Allocator, value: std.json.Value) ![]u8 {
     return std.json.Stringify.valueAlloc(allocator, value, .{});
-}
-
-fn freeOpt(allocator: std.mem.Allocator, value: ?[]u8) void {
-    if (value) |v| allocator.free(v);
 }
 
 const pi_test_trace =

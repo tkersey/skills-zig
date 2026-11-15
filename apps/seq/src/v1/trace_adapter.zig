@@ -2,6 +2,7 @@ const std = @import("std");
 const definition_core = @import("definition_core");
 const trace_core = @import("trace_core");
 pub const SessionInput = trace_core.SessionInput;
+pub const SessionRecord = trace_core.SessionRecord;
 const definition = @import("definition.zig");
 const execution = @import("execution.zig");
 const physical = @import("physical.zig");
@@ -19,6 +20,7 @@ pub const Options = struct {
     discovery_prefix_limit: usize = max_discovery_prefix_bytes,
     sidecar_dir: ?std.Io.Dir = null,
     claude_discovery: ?*const trace_core.claude_parser.Discovery = null,
+    admission: ?trace_core.Admission = null,
 };
 
 pub const SessionSelection = struct {
@@ -314,6 +316,69 @@ fn parseAdmittedFile(
     ) catch |err| return input.sourceError(err);
 }
 
+pub const SelectionVerdict = struct {
+    passes: bool,
+    bytes_read: usize = 0,
+    file_opened: bool = false,
+};
+
+pub fn selectionVerdict(
+    io: std.Io,
+    dir: std.Io.Dir,
+    allocator: std.mem.Allocator,
+    path: []const u8,
+    options: Options,
+    selection: SessionSelection,
+) !SelectionVerdict {
+    if (!canonicalPathPassesSessionSelection(path, selection)) return .{ .passes = false };
+    if (!requiresSummaryPreselection(selection)) return .{ .passes = true };
+    var scoped = options;
+    scoped.admission = null;
+    if (scoped.sidecar_dir == null) scoped.sidecar_dir = dir;
+    const file = try openTraceFile(io, dir, path);
+    defer file.close(io);
+    const stat = try file.stat(io);
+    var raw = file.reader(io, &.{});
+    var input = try SessionInput.init(
+        allocator,
+        path,
+        &raw.interface,
+        options.discovery_prefix_limit,
+    );
+    defer input.deinit(allocator);
+    const source = input.reader();
+    return preselectVerdict(io, allocator, path, stat, source, scoped, selection) catch |err|
+        return input.sourceError(err);
+}
+
+fn preselectVerdict(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    path: []const u8,
+    stat: std.Io.File.Stat,
+    source: *std.Io.Reader,
+    options: Options,
+    selection: SessionSelection,
+) !SelectionVerdict {
+    var prefix = try readDiscoveryPrefixAlloc(allocator, source, options);
+    defer prefix.deinit(allocator);
+    var preselection = try preselectSession(
+        io,
+        allocator,
+        path,
+        stat.mtime.nanoseconds,
+        options,
+        selection,
+        prefix,
+    );
+    defer preselection.deinit(allocator);
+    return .{
+        .passes = preselection.passes,
+        .bytes_read = preselection.bytes_read +| preselection.discovery_bytes,
+        .file_opened = true,
+    };
+}
+
 fn admitSelectedInput(
     io: std.Io,
     allocator: std.mem.Allocator,
@@ -360,7 +425,11 @@ fn admitSelectedInput(
         stat.mtime.nanoseconds,
         body_options,
     );
+    errdefer parsed.deinit(allocator);
     parsed.metrics.bytes_read +|= preselection.discovery_bytes;
+    if (parsed.metrics.bytes_read > options.max_input_bytes) {
+        return error.ObservationInputByteBoundExceeded;
+    }
     return .{
         .parsed = parsed,
         .discovery_bytes_read = 0,
@@ -394,7 +463,7 @@ fn parseSelectedRelations(
     if (metrics.bytes_read > options.max_input_bytes) {
         return error.ObservationInputByteBoundExceeded;
     }
-    corpus_hasher.addDiscovery(trace.claude_discovery);
+    corpus_hasher.addDiscovery(&trace);
     metrics.bytes_read +|= trace.claude_discovery_bytes;
     if (metrics.bytes_read > options.max_input_bytes) {
         return error.ObservationInputByteBoundExceeded;
@@ -670,6 +739,7 @@ pub fn relationParseOptions(
         .as_of_ns = options.as_of_ns,
         .sidecar_dir = options.sidecar_dir,
         .claude_discovery = options.claude_discovery,
+        .admission = options.admission,
         .include_occurrences = false,
         .include_message_bodies = false,
         .include_tool_output_parts = false,
@@ -790,7 +860,7 @@ fn parseSelectedReader(
     if (metrics.bytes_read > options.max_input_bytes) {
         return error.ObservationInputByteBoundExceeded;
     }
-    corpus_hasher.addDiscovery(trace.claude_discovery);
+    corpus_hasher.addDiscovery(&trace);
     metrics.bytes_read +|= trace.claude_discovery_bytes;
     if (metrics.bytes_read > options.max_input_bytes) {
         return error.ObservationInputByteBoundExceeded;
@@ -1936,6 +2006,7 @@ pub fn traceParseOptions(
         .as_of_ns = options.as_of_ns,
         .sidecar_dir = options.sidecar_dir,
         .claude_discovery = options.claude_discovery,
+        .admission = options.admission,
         .include_raw = relation == .source_events and
             containsField(demanded_fields, 8),
         .include_occurrence_payloads = (relation == .source_events and
@@ -1992,15 +2063,12 @@ const CorpusHasher = struct {
         self.hasher.update(line);
     }
 
-    fn addDiscovery(self: *CorpusHasher, discovery: ?trace_core.claude_parser.Discovery) void {
-        const facts = discovery orelse return;
+    fn addDiscovery(self: *CorpusHasher, trace: *const trace_core.CanonicalSessionTrace) void {
+        const facts = trace.claude_discovery orelse return;
         self.hasher.update("\x00claude-discovery\x00");
         const state: u8 = if (facts.sidecar) |value| @as(u8, @backingInt(value)) + 1 else 0;
-        const parent: u8 = if (facts.parent_present) |present|
-            @as(u8, @intFromBool(present)) + 1
-        else
-            0;
-        self.hasher.update(&.{ state, parent });
+        const missing = trace.claude_limitations.worker_parent_missing;
+        self.hasher.update(&.{ state, @intFromBool(missing) });
         self.hasher.update(&facts.sidecar_digest);
     }
 

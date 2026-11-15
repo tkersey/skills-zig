@@ -646,12 +646,14 @@ fn runRelation(
         require_single,
     );
     defer freePaths(allocator, &paths);
+    var admitted = try Admission.initAlloc(io, dir, allocator, paths.items, null, .{});
+    defer admitted.deinit();
 
     try writer.writeByte('[');
     var first = true;
     var remaining = options.limit;
     const selection = relationRowSelection(options, relation, &remaining);
-    const trace_options = traceOptions(relation);
+    const trace_options = traceOptions(relation, admitted.interface());
     for (paths.items) |path| {
         if (selection.remaining != null and remaining == 0) break;
         if (opencode_adapter.recognizes(path)) {
@@ -721,12 +723,14 @@ fn runSessionDetail(
     if (opencode_adapter.recognizes(paths.items[0])) {
         return error.OpenCodeSessionDetailUnavailable;
     }
+    var admitted = try Admission.initAlloc(io, dir, allocator, paths.items, null, .{});
+    defer admitted.deinit();
     var trace = trace_core.parseSessionTrace(
         io,
         dir,
         allocator,
         paths.items[0],
-        .{},
+        .{ .admission = admitted.interface() },
     ) catch |err| return sourceFailure(options, paths.items[0], err);
     defer trace.deinit(allocator);
     try trace_adapter.writeTraceDetailJson(writer, &trace);
@@ -752,6 +756,8 @@ fn runSessionGraph(
     if (options.format != .dot) return error.UnsupportedNativeFormat;
     var paths = try resolveTargetPaths(allocator, io, dir, options, false);
     defer freePaths(allocator, &paths);
+    var admitted = try Admission.initAlloc(io, dir, allocator, paths.items, null, .{});
+    defer admitted.deinit();
     var arena_state = std.heap.ArenaAllocator.init(allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
@@ -765,7 +771,7 @@ fn runSessionGraph(
             dir,
             allocator,
             path,
-            traceOptions(.session_edges),
+            traceOptions(.session_edges, admitted.interface()),
         ) catch |err| return sourceFailure(options, path, err);
         defer trace.deinit(allocator);
         try rejectTraceWarnings(&trace, options);
@@ -808,7 +814,6 @@ const GraphCorpus = struct {
 
 const WorkerAssertion = struct {
     parent: []const u8,
-    call: ?[]const u8,
     contradicted: bool = false,
 };
 
@@ -822,12 +827,12 @@ fn writeReconciledEdges(
     for (edges) |edge| {
         const entry = try workers.getOrPut(arena, edge.worker);
         if (!entry.found_existing) {
-            entry.value_ptr.* = .{ .parent = edge.parent, .call = edge.call };
+            entry.value_ptr.* = .{ .parent = edge.parent };
             continue;
         }
-        const same_parent = std.mem.eql(u8, entry.value_ptr.parent, edge.parent);
-        const same_call = optionalEql(entry.value_ptr.call, edge.call);
-        if (!same_parent or !same_call) entry.value_ptr.contradicted = true;
+        if (!std.mem.eql(u8, entry.value_ptr.parent, edge.parent)) {
+            entry.value_ptr.contradicted = true;
+        }
     }
     var written: std.StringHashMapUnmanaged(void) = .empty;
     var count: usize = 0;
@@ -841,11 +846,6 @@ fn writeReconciledEdges(
         try writeGraphEdge(writer, edge, workers.get(edge.worker).?.contradicted);
         count += 1;
     }
-}
-
-fn optionalEql(left: ?[]const u8, right: ?[]const u8) bool {
-    if (left == null or right == null) return left == null and right == null;
-    return std.mem.eql(u8, left.?, right.?);
 }
 
 fn writeGraphEdge(writer: *std.Io.Writer, edge: GraphEdgeView, contradicted: bool) !void {
@@ -888,6 +888,8 @@ fn runFindSession(
     if (options.format != .json) return error.UnsupportedNativeFormat;
     var paths = try resolveTargetPaths(allocator, io, dir, options, false);
     defer freePaths(allocator, &paths);
+    var admitted = try Admission.initAlloc(io, dir, allocator, paths.items, null, .{});
+    defer admitted.deinit();
 
     try writer.writeByte('[');
     var first = true;
@@ -918,7 +920,7 @@ fn runFindSession(
             dir,
             allocator,
             path,
-            traceOptions(.messages),
+            traceOptions(.messages, admitted.interface()),
         ) catch |err| return sourceFailure(options, path, err);
         defer trace.deinit(allocator);
         try rejectTraceWarnings(&trace, options);
@@ -1108,6 +1110,8 @@ fn runQueryObject(
         false,
     );
     defer freePaths(allocator, &paths);
+    var admitted = try Admission.initAlloc(io, dir, allocator, paths.items, null, .{});
+    defer admitted.deinit();
     for (paths.items) |path| {
         const feed_result = try feedQueryPath(
             io,
@@ -1117,6 +1121,7 @@ fn runQueryObject(
             query_options,
             &compilation,
             &runner,
+            admitted.interface(),
         );
         if (feed_result == .stop) break;
     }
@@ -1137,6 +1142,7 @@ fn feedQueryPath(
     options: Options,
     compilation: *const QueryCompilation,
     runner: *execution.Runner,
+    admission: trace_core.Admission,
 ) !execution.Feed {
     if (opencode_adapter.recognizes(path)) {
         return feedOpenCodeQueryPath(
@@ -1152,7 +1158,7 @@ fn feedQueryPath(
     const trace_options = trace_adapter.traceParseOptions(
         compilation.relation,
         compilation.program.source_field_indices,
-        .{},
+        .{ .admission = admission },
     );
     var trace = (if (compilation.relation == .sessions)
         trace_core.parseSessionSummaryTrace(io, dir, allocator, path, trace_options)
@@ -2155,15 +2161,7 @@ fn modifiedBefore(io: std.Io, dir: std.Io.Dir, path: []const u8, since_ms: ?i64)
 }
 
 pub fn isClaudeLayoutPath(path: []const u8) bool {
-    const name = std.fs.path.basename(path);
-    const stem = if (std.mem.endsWith(u8, name, ".jsonl.zst"))
-        name[0 .. name.len - ".jsonl.zst".len]
-    else if (std.mem.endsWith(u8, name, ".jsonl"))
-        name[0 .. name.len - ".jsonl".len]
-    else
-        return false;
-    if (trace_core.claude_parser.isUuid(stem)) return true;
-    return std.mem.startsWith(u8, stem, "agent-") and stem.len > "agent-".len;
+    return trace_core.claude_parser.PathIdentity.read(path).layoutNamed();
 }
 
 fn discoverClaudeIdentity(
@@ -2173,13 +2171,21 @@ fn discoverClaudeIdentity(
     path: []const u8,
     reads: ?*DiscoveryReads,
 ) !?trace_adapter.SessionIdentity {
+    return probeClaudeIdentity(allocator, io, dir, path, reads) catch |err| switch (err) {
+        error.OutOfMemory, error.ObservationMetricOverflow => return err,
+        else => return null,
+    };
+}
+
+fn probeClaudeIdentity(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    dir: std.Io.Dir,
+    path: []const u8,
+    reads: ?*DiscoveryReads,
+) !?trace_adapter.SessionIdentity {
     if (!isClaudeLayoutPath(path)) return null;
-    const discovery = trace_adapter.discoverSessionIdentity(io, dir, allocator, path, .{}, null);
-    var identity = discovery catch |err|
-        switch (err) {
-            error.OutOfMemory => return err,
-            else => return null,
-        };
+    var identity = try trace_adapter.discoverSessionIdentity(io, dir, allocator, path, .{}, null);
     errdefer identity.deinit(allocator);
     if (reads) |sink| try sink.charge(identity.bytes_read);
     if (identity.source == .claude) return identity;
@@ -2289,13 +2295,11 @@ fn claudeTranscriptStem(wanted: []const u8) ?[]const u8 {
 }
 
 fn basenameStemEquals(path: []const u8, stem: []const u8) bool {
-    const name = std.fs.path.basename(path);
-    for ([_][]const u8{ ".jsonl", ".jsonl.zst" }) |extension| {
-        if (name.len == stem.len + extension.len and std.mem.startsWith(u8, name, stem) and
-            std.mem.endsWith(u8, name, extension)) return true;
-    }
-    return false;
+    const identity = trace_core.claude_parser.PathIdentity.read(path);
+    return identity.transcript and std.mem.eql(u8, identity.stem, stem);
 }
+
+const NamedProbe = enum { match, other_claude, not_claude };
 
 fn retainNamedClaudeSession(
     io: std.Io,
@@ -2304,15 +2308,20 @@ fn retainNamedClaudeSession(
     paths: *std.ArrayList([]u8),
     wanted: []const u8,
     reads: ?*DiscoveryReads,
+    probes: []?NamedProbe,
 ) !bool {
     const stem = claudeTranscriptStem(wanted) orelse return false;
     var confirmed: ?usize = null;
+    var ambiguous = false;
     for (paths.items, 0..) |path, index| {
         if (!basenameStemEquals(path, stem)) continue;
-        if (!try claudeIdentityMatches(allocator, io, dir, path, wanted, reads)) continue;
-        if (confirmed != null) return false;
+        const probe = try claudeIdentityProbe(allocator, io, dir, path, wanted, reads);
+        probes[index] = probe;
+        if (probe != .match) continue;
+        if (confirmed != null) ambiguous = true;
         confirmed = index;
     }
+    if (ambiguous) return false;
     const keep = confirmed orelse return false;
     for (paths.items, 0..) |path, index| {
         if (index != keep) allocator.free(path);
@@ -2322,19 +2331,19 @@ fn retainNamedClaudeSession(
     return true;
 }
 
-fn claudeIdentityMatches(
+fn claudeIdentityProbe(
     allocator: std.mem.Allocator,
     io: std.Io,
     dir: std.Io.Dir,
     path: []const u8,
     wanted: []const u8,
     reads: ?*DiscoveryReads,
-) !bool {
+) !NamedProbe {
     const discovered = try discoverClaudeIdentity(allocator, io, dir, path, reads);
-    var identity = discovered orelse return false;
+    var identity = discovered orelse return .not_claude;
     defer identity.deinit(allocator);
-    const actual = identity.session_id orelse return false;
-    return std.mem.eql(u8, actual, wanted);
+    const actual = identity.session_id orelse return .other_claude;
+    return if (std.mem.eql(u8, actual, wanted)) .match else .other_claude;
 }
 
 fn retainSessionId(
@@ -2347,11 +2356,14 @@ fn retainSessionId(
     options: Options,
 ) !void {
     const reads = options.discovery_reads;
-    if (try retainNamedClaudeSession(io, dir, allocator, paths, wanted, reads)) return;
-    var write_index: usize = 0;
-    var failure: ?anyerror = null;
-    for (paths.items) |path| {
-        const verdict = try sessionPathVerdict(
+    const probes = try allocator.alloc(?NamedProbe, paths.items.len);
+    defer allocator.free(probes);
+    @memset(probes, null);
+    if (try retainNamedClaudeSession(io, dir, allocator, paths, wanted, reads, probes)) return;
+    const verdicts = try allocator.alloc(PathVerdict, paths.items.len);
+    defer allocator.free(verdicts);
+    for (paths.items, probes, verdicts) |path, probe, *verdict| {
+        verdict.* = try sessionPathVerdict(
             io,
             dir,
             allocator,
@@ -2359,7 +2371,12 @@ fn retainSessionId(
             wanted,
             live_native_root,
             options,
+            probe,
         );
+    }
+    var write_index: usize = 0;
+    var failure: ?anyerror = null;
+    for (paths.items, verdicts) |path, verdict| {
         switch (verdict) {
             .keep => {
                 paths.items[write_index] = path;
@@ -2386,6 +2403,7 @@ fn sessionPathVerdict(
     wanted: []const u8,
     live_native_root: bool,
     options: Options,
+    probe: ?NamedProbe,
 ) !PathVerdict {
     if (opencode_adapter.recognizes(path)) {
         var session_id_buffer: [64]u8 = undefined;
@@ -2396,6 +2414,11 @@ fn sessionPathVerdict(
     if (live_native_root and
         isCanonicalRolloutBasename(std.fs.path.basename(path)) and
         !rolloutBasenameMatchesSessionId(path, wanted)) return .drop;
+    if (probe) |known| switch (known) {
+        .match => return .keep,
+        .other_claude => return .drop,
+        .not_claude => return summaryPathVerdict(io, dir, allocator, path, wanted, options),
+    };
     const reads = options.discovery_reads;
     if (try discoverClaudeIdentity(allocator, io, dir, path, reads)) |found| {
         var identity = found;
@@ -2403,7 +2426,18 @@ fn sessionPathVerdict(
         const actual = identity.session_id orelse return .drop;
         return if (std.mem.eql(u8, actual, wanted)) .keep else .drop;
     }
-    const summary_options = traceOptions(.sessions);
+    return summaryPathVerdict(io, dir, allocator, path, wanted, options);
+}
+
+fn summaryPathVerdict(
+    io: std.Io,
+    dir: std.Io.Dir,
+    allocator: std.mem.Allocator,
+    path: []const u8,
+    wanted: []const u8,
+    options: Options,
+) !PathVerdict {
+    const summary_options = traceOptions(.sessions, null);
     const parsed = trace_core.parseSessionSummaryTrace(io, dir, allocator, path, summary_options);
     var trace = parsed catch |err|
         return .{ .failed = sourceFailure(options, path, err) };
@@ -2690,8 +2724,11 @@ fn containsIgnoreCase(
     return false;
 }
 
-fn traceOptions(relation: physical.Relation) trace_core.TraceParseOptions {
-    return trace_adapter.relationParseOptions(&.{relation}, .{});
+fn traceOptions(
+    relation: physical.Relation,
+    admission: ?trace_core.Admission,
+) trace_core.TraceParseOptions {
+    return trace_adapter.relationParseOptions(&.{relation}, .{ .admission = admission });
 }
 
 fn environmentValue(
@@ -2713,7 +2750,7 @@ test "relations that expose source event identity retain occurrences" {
         .structured_values,
         .token_events,
     }) |relation| {
-        try std.testing.expect(traceOptions(relation).include_occurrences);
+        try std.testing.expect(traceOptions(relation, null).include_occurrences);
     }
 }
 
@@ -3694,6 +3731,77 @@ test "default Codex discovery includes archives while explicit roots retain thei
     try std.testing.expect(std.mem.endsWith(u8, selected.items[0], "sessions/live.jsonl"));
 }
 
+pub const Admission = struct {
+    io: std.Io,
+    dir: std.Io.Dir,
+    allocator: std.mem.Allocator,
+    candidates: std.StringHashMapUnmanaged([]const u8) = .empty,
+    selection: ?trace_adapter.SessionSelection = null,
+    options: trace_adapter.Options = .{},
+    verdicts: std.StringHashMapUnmanaged(bool) = .empty,
+    reads: DiscoveryReads = .{},
+
+    pub fn initAlloc(
+        io: std.Io,
+        dir: std.Io.Dir,
+        allocator: std.mem.Allocator,
+        paths: []const []const u8,
+        selection: ?trace_adapter.SessionSelection,
+        options: trace_adapter.Options,
+    ) !Admission {
+        var admission = Admission{
+            .io = io,
+            .dir = dir,
+            .allocator = allocator,
+            .selection = selection,
+            .options = options,
+        };
+        errdefer admission.deinit();
+        const capacity = std.math.cast(u32, paths.len) orelse return error.OutOfMemory;
+        try admission.candidates.ensureTotalCapacity(allocator, capacity);
+        for (paths) |path| {
+            const key = try std.fs.path.resolveAlloc(allocator, &.{path});
+            const entry = admission.candidates.getOrPutAssumeCapacity(key);
+            if (entry.found_existing) allocator.free(key) else entry.value_ptr.* = path;
+        }
+        return admission;
+    }
+
+    pub fn deinit(self: *Admission) void {
+        var keys = self.candidates.keyIterator();
+        while (keys.next()) |key| self.allocator.free(key.*);
+        self.candidates.deinit(self.allocator);
+        self.verdicts.deinit(self.allocator);
+    }
+
+    pub fn interface(self: *Admission) trace_core.Admission {
+        return .{ .context = self, .admitsFn = admits };
+    }
+
+    fn admits(context: *anyopaque, path: []const u8) anyerror!bool {
+        const self: *Admission = @ptrCast(@alignCast(context));
+        var buffer: [2 * std.fs.max_path_bytes]u8 = undefined;
+        var scratch = std.heap.FixedBufferAllocator.init(&buffer);
+        const key = try std.fs.path.resolveAlloc(scratch.allocator(), &.{path});
+        const entry = self.candidates.getEntry(key) orelse return false;
+        const selection = self.selection orelse return true;
+        const cached = try self.verdicts.getOrPut(self.allocator, entry.key_ptr.*);
+        if (cached.found_existing) return cached.value_ptr.*;
+        errdefer _ = self.verdicts.remove(entry.key_ptr.*);
+        const verdict = try trace_adapter.selectionVerdict(
+            self.io,
+            self.dir,
+            self.allocator,
+            entry.value_ptr.*,
+            self.options,
+            selection,
+        );
+        if (verdict.file_opened) try self.reads.charge(verdict.bytes_read);
+        cached.value_ptr.* = verdict.passes;
+        return verdict.passes;
+    }
+};
+
 pub const DiscoveryReads = struct {
     bytes: usize = 0,
     opened: usize = 0,
@@ -3712,9 +3820,7 @@ const FamilyLayout = struct {
 
 fn claudeFamilyLayout(path: []const u8, root: []const u8) ?FamilyLayout {
     const directory = std.fs.path.dirname(path) orelse return null;
-    const name = std.fs.path.basename(path);
-    if (!std.mem.startsWith(u8, name, "agent-")) return .{ .base = directory, .root = root };
-    if (!std.mem.eql(u8, std.fs.path.basename(directory), "subagents")) {
+    if (!trace_core.claude_parser.PathIdentity.read(path).current_layout) {
         return .{ .base = directory, .root = root };
     }
     const session_directory = std.fs.path.dirname(directory) orelse return null;
@@ -3745,7 +3851,9 @@ pub fn claudeFamilyPathsAlloc(
     for (paths.items) |path| {
         if (std.mem.eql(u8, path, selected)) return paths;
     }
-    try paths.append(allocator, try allocator.dupe(u8, selected));
+    const owned = try allocator.dupe(u8, selected);
+    errdefer allocator.free(owned);
+    try paths.append(allocator, owned);
     std.mem.sort([]u8, paths.items, {}, lessThanPath);
     return paths;
 }
@@ -3762,9 +3870,12 @@ fn appendClaudeMain(
         defer allocator.free(name);
         const path = try std.fs.path.join(allocator, &.{ layout.base, name });
         errdefer allocator.free(path);
-        const stat = dir.statFile(io, path, .{}) catch {
-            allocator.free(path);
-            continue;
+        const stat = dir.statFile(io, path, .{}) catch |err| switch (err) {
+            error.FileNotFound, error.NotDir => {
+                allocator.free(path);
+                continue;
+            },
+            else => return err,
         };
         if (stat.kind != .file) {
             allocator.free(path);
@@ -3783,7 +3894,10 @@ fn appendClaudeWorkers(
     paths: *std.ArrayList([]u8),
     discovery: *DiscoveryReads,
 ) !void {
-    var handle = dir.openDir(io, directory, .{ .iterate = true }) catch return;
+    var handle = dir.openDir(io, directory, .{ .iterate = true }) catch |err| switch (err) {
+        error.FileNotFound, error.NotDir => return,
+        else => return err,
+    };
     defer handle.close(io);
     var entries = handle.iterate();
     var visited: usize = 0;
@@ -3813,7 +3927,7 @@ fn flatWorkerBelongs(
     root: []const u8,
     discovery: *DiscoveryReads,
 ) !bool {
-    const discovered = try discoverClaudeIdentity(allocator, io, dir, path, discovery);
+    const discovered = try probeClaudeIdentity(allocator, io, dir, path, discovery);
     var identity = discovered orelse return false;
     defer identity.deinit(allocator);
     const actual = identity.root_session_id orelse return false;
@@ -3823,5 +3937,81 @@ fn flatWorkerBelongs(
 pub fn rejectSourceConflict(options: Options) !void {
     if (options.source != null and (options.root != null or options.path != null)) {
         return error.ConflictingSourceSelectors;
+    }
+}
+
+test "session graph reconciliation marks contradictions only for disagreeing parents" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    var output: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer output.deinit();
+    const resumed = [_]GraphEdgeView{
+        .{ .parent = "root", .worker = "root/agent-w", .call = "call-a" },
+        .{ .parent = "root", .worker = "root/agent-w", .call = "call-b" },
+    };
+    try writeReconciledEdges(arena_state.allocator(), &output.writer, &resumed, 10);
+    try std.testing.expect(std.mem.indexOf(u8, output.written(), "contradiction") == null);
+    output.clearRetainingCapacity();
+    const disagreeing = [_]GraphEdgeView{
+        .{ .parent = "root", .worker = "root/agent-w", .call = "call-a" },
+        .{ .parent = "root/agent-x", .worker = "root/agent-w", .call = "call-a" },
+    };
+    try writeReconciledEdges(arena_state.allocator(), &output.writer, &disagreeing, 10);
+    const marked = std.mem.count(u8, output.written(), "contradiction=true");
+    try std.testing.expectEqual(@as(usize, 2), marked);
+}
+
+const regression_root = "d0000000-0000-4000-8000-000000000001";
+const regression_transcript = @embedFile(
+    "fixtures/claude/worker/proj/" ++ regression_root ++ ".jsonl",
+);
+
+test "session id lookup probes each named Claude candidate once" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const allocator = std.testing.allocator;
+    const names = [_][]const u8{
+        "a/" ++ regression_root ++ ".jsonl",
+        "b/" ++ regression_root ++ ".jsonl",
+    };
+    var paths: std.ArrayList([]u8) = .empty;
+    defer freePaths(allocator, &paths);
+    for (names) |name| {
+        try tmp.dir.createDirPath(std.testing.io, std.fs.path.dirname(name).?);
+        try tmp.dir.writeFile(std.testing.io, .{ .sub_path = name, .data = regression_transcript });
+        try paths.append(allocator, try allocator.dupe(u8, name));
+    }
+    var reads = DiscoveryReads{};
+    try retainSessionId(
+        std.testing.io,
+        tmp.dir,
+        allocator,
+        &paths,
+        regression_root,
+        false,
+        .{ .discovery_reads = &reads },
+    );
+    try std.testing.expectEqual(@as(usize, 2), paths.items.len);
+    try std.testing.expectEqual(@as(usize, 2), reads.opened);
+}
+
+test "family admission reports an undecodable flat sibling instead of dropping it" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const allocator = std.testing.allocator;
+    const main_path = "proj/" ++ regression_root ++ ".jsonl";
+    try tmp.dir.createDirPath(std.testing.io, "proj");
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = main_path, .data = regression_transcript });
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "proj/agent-broken.jsonl.zst",
+        .data = "not a zstd frame",
+    });
+    var reads = DiscoveryReads{};
+    if (claudeFamilyPathsAlloc(allocator, std.testing.io, tmp.dir, main_path, &reads)) |admitted| {
+        var paths = admitted orelse return error.TestExpectedFamily;
+        freePaths(allocator, &paths);
+        return error.TestExpectedAdmissionFailure;
+    } else |err| {
+        try std.testing.expect(err != error.OutOfMemory);
     }
 }

@@ -485,18 +485,25 @@ sessions named `<root-session>/agent-<id>`; their direct parent comes from the
 adjacent `agent-<id>.meta.json` sidecar, and their root from the directory (or,
 for legacy flat `agent-<id>.jsonl` files, from the recorded `sessionId`). A
 worker whose sidecar is missing or unreadable, whose recorded identity
-contradicts its path, or whose parent transcript is absent sets
-`lineage_conflict`. Spawner-side `session_edges` come only from `Agent`/`Task`
+contradicts its path, or whose parent transcript is not admitted sets
+`lineage_conflict`. Admission is the observation's own file selection: the
+command's target paths, a physically selected observation's paths after its
+session, repo and time selectors, or a graph corpus after its repo selector. A
+worker read through an explicit one-file path therefore reports a missing parent. Spawner-side `session_edges` come only from `Agent`/`Task`
 calls in responses that this transcript's request records prove it made.
 `session_edges` keeps each file's assertion separately. A spawner's claim and a worker's
 sidecar live in different files, so a per-file `lineage_conflict` cannot see their
 disagreement; consumers that read both reconcile them. `seq session-graph --format
 dot` names a Claude corpus `claude_sessions`, prints agreeing assertions once, and
-marks every edge of a worker whose assertions disagree on parent or call with
-`[contradiction=true]`; it never chooses between them. The `seq/request-usage`
+marks every edge of a worker whose assertions disagree on its parent with
+`[contradiction=true]`; it never chooses between them. Assertions that name the
+same parent under different calls, such as a resumed worker, agree. The `seq/request-usage`
 definition treats such a worker as a lineage conflict for worker-scoped totals.
-Sidecar contents and parent-transcript presence are discovery facts: they are read
-once, bound into the corpus digest, and reused by the body read.
+Sidecar contents are discovery facts: they are read once, bound into the corpus
+digest, and reused by the body read. Parent admission is decided by the body read,
+which also writes it into the corpus digest. A streaming lineage plan's discovered
+`sessions` rows take `lineage_conflict` from that body read for every session it
+reads.
 `--session-id` accepts a session UUID or a worker ID.
 
 Turns open at an input that got a reply (a model response, an API error or an

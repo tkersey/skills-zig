@@ -149,25 +149,24 @@ pub fn read(message: std.json.ObjectMap) Quantity {
     const top = readCounters(object);
     var counters = top.counters;
     var state = top.state;
-    var compaction_output = false;
+    var void_reasoning = false;
     if (object.get("iterations")) |iterations| switch (iterations) {
         .null => {},
-        .array => |items| {
+        .array => |items| if (items.items.len > 0) {
             const sum = sumIterations(items);
             state = if (top.state == .invalid) .invalid else sum.state;
             if (sum.state == .usable and top.state != .invalid) {
-                if (!top.counters.isZero() and !std.meta.eql(top.counters, sum.messages)) {
-                    state = .invalid;
-                }
+                const top_zero = top.counters.isZero();
+                if (!top_zero and !std.meta.eql(top.counters, sum.messages)) state = .invalid;
                 counters = sum.all;
-                compaction_output = sum.compaction_output;
+                void_reasoning = top_zero or sum.compaction_output;
             }
         },
         else => state = .invalid,
     };
     result.state = state;
     if (state != .usable) return result;
-    normalize(&result, counters, object, compaction_output);
+    normalize(&result, counters, object, void_reasoning);
     return result;
 }
 
@@ -175,7 +174,7 @@ fn normalize(
     result: *Quantity,
     counters: Counters,
     object: std.json.ObjectMap,
-    compaction_output: bool,
+    void_reasoning: bool,
 ) void {
     const read_and_write = std.math.add(i64, counters.cache_read, counters.cache_creation) catch {
         result.state = .invalid;
@@ -192,7 +191,7 @@ fn normalize(
     result.cached = counters.cache_read;
     result.cache_creation = counters.cache_creation;
     result.output = counters.output;
-    result.reasoning = if (compaction_output) null else reasoningTokens(object);
+    result.reasoning = if (void_reasoning) null else reasoningTokens(object);
     if (result.reasoning) |reasoning| {
         if (reasoning > result.output) result.state = .invalid;
     }
@@ -242,6 +241,25 @@ test "a zero top level with iterations is a fork-zeroed or compaction-only respo
     );
     try std.testing.expectEqual(QuantityState.usable, quantity.state);
     try std.testing.expectEqual(@as(i64, 5), quantity.input);
+}
+
+test "a zero top level counted from iterations reports no top-level reasoning" {
+    const quantity = try quantityFromJson(
+        \\{"usage":{"input_tokens":0,"cache_read_input_tokens":0,"cache_creation_input_tokens":0,"output_tokens":0,"output_tokens_details":{"thinking_tokens":0},"iterations":[{"type":"message","input_tokens":4,"output_tokens":2,"cache_read_input_tokens":1,"cache_creation_input_tokens":0}]}}
+    );
+    try std.testing.expectEqual(QuantityState.usable, quantity.state);
+    try std.testing.expectEqual(@as(i64, 2), quantity.output);
+    try std.testing.expectEqual(@as(?i64, null), quantity.reasoning);
+}
+
+test "an empty iterations array counts the top level like an absent one" {
+    const quantity = try quantityFromJson(
+        \\{"usage":{"input_tokens":3,"cache_read_input_tokens":2,"cache_creation_input_tokens":1,"output_tokens":5,"output_tokens_details":{"thinking_tokens":2},"iterations":[]}}
+    );
+    try std.testing.expectEqual(QuantityState.usable, quantity.state);
+    try std.testing.expectEqual(@as(i64, 6), quantity.input);
+    try std.testing.expectEqual(@as(i64, 11), quantity.total);
+    try std.testing.expectEqual(@as(?i64, 2), quantity.reasoning);
 }
 
 test "quantity states classify drift before any reduction" {

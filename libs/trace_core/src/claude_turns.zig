@@ -68,7 +68,7 @@ fn indexUuids(
     graph: *Graph,
 ) !std.StringHashMapUnmanaged(u32) {
     var uuids: std.StringHashMapUnmanaged(u32) = .empty;
-    var seen: std.StringHashMapUnmanaged(void) = .empty;
+    var seen: std.StringHashMapUnmanaged(u32) = .empty;
     defer seen.deinit(arena);
     var duplicates: std.ArrayList(usize) = .empty;
     var missing: std.ArrayList(usize) = .empty;
@@ -79,7 +79,15 @@ fn indexUuids(
             continue;
         };
         const occurrence = try seen.getOrPut(arena, uuid);
-        if (occurrence.found_existing) try duplicates.append(arena, record.line);
+        if (!occurrence.found_existing) {
+            occurrence.value_ptr.* = @intCast(index);
+        } else if (!std.mem.eql(
+            u8,
+            &records[occurrence.value_ptr.*].content_digest,
+            &record.content_digest,
+        )) {
+            try duplicates.append(arena, record.line);
+        }
         if (!graph.modeled[index]) continue;
         const entry = try uuids.getOrPut(arena, uuid);
         if (!entry.found_existing) entry.value_ptr.* = @intCast(index);

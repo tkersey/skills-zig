@@ -259,7 +259,7 @@ test "discovery facts: a body parse reuses supplied facts instead of rereading t
     defer tmp.cleanup();
     const files = workerTree();
     try support.writeTree(tmp.dir, &files);
-    var supplied = trace_core.claude_parser.Discovery{ .sidecar = .parsed, .parent_present = true };
+    var supplied = trace_core.claude_parser.Discovery{ .sidecar = .parsed };
     var parent = "zz00000000000001".*;
     supplied.parent_agent = &parent;
     var options = support.options();
@@ -372,4 +372,100 @@ test "time pruning: since never prunes a Claude file without a prefix timestamp"
     try testing.expect(std.mem.endsWith(u8, paths.items[0], untimed));
     try testing.expectEqual(@as(usize, 2), reads.opened);
     try testing.expect(reads.bytes > 0);
+}
+
+fn parseAdmitted(
+    dir: std.Io.Dir,
+    path: []const u8,
+    admitted: []const []const u8,
+    selection: ?trace_adapter.SessionSelection,
+) !Trace {
+    var admission = try native.Admission.initAlloc(
+        testing.io,
+        dir,
+        allocator,
+        admitted,
+        selection,
+        .{},
+    );
+    defer admission.deinit();
+    var options = support.options();
+    options.admission = admission.interface();
+    return trace_core.parseSessionTrace(testing.io, dir, allocator, path, options);
+}
+
+test "parent admission: a worker's parent is present only when its transcript is admitted" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const files = workerTree();
+    try support.writeTree(tmp.dir, &files);
+    const worker = files[1].path;
+    const dotted_root = "./proj/" ++ worker_root ++ ".jsonl";
+    var family = try parseAdmitted(tmp.dir, worker, &.{ dotted_root, worker }, null);
+    defer family.deinit(allocator);
+    try testing.expect(!family.session.lineage_conflict);
+    try testing.expect(!family.claude_limitations.worker_parent_missing);
+    var alone = try parseAdmitted(tmp.dir, worker, &.{worker}, null);
+    defer alone.deinit(allocator);
+    try testing.expect(alone.session.lineage_conflict);
+    try testing.expect(alone.claude_limitations.worker_parent_missing);
+    const elsewhere = trace_adapter.SessionSelection{ .repo = "/elsewhere" };
+    var filtered = try parseAdmitted(tmp.dir, worker, &.{ files[0].path, worker }, elsewhere);
+    defer filtered.deinit(allocator);
+    try testing.expect(filtered.session.lineage_conflict);
+    try testing.expect(filtered.claude_limitations.worker_parent_missing);
+    var bare = try parseIn(tmp.dir, worker);
+    defer bare.deinit(allocator);
+    try testing.expect(bare.claude_limitations.worker_parent_missing);
+}
+
+const neutral_line = "{\"type\":\"mystery-note\",\"sessionId\":\"x\"}\n";
+const claude_line = blk: {
+    const transcript = @embedFile(worker_base ++ worker_root ++ ".jsonl");
+    break :blk transcript[0..std.mem.indexOfScalar(u8, transcript, '\n').?];
+};
+
+fn neutralThenClaude(neutral_count: usize) ![]u8 {
+    var bytes: std.ArrayList(u8) = .empty;
+    errdefer bytes.deinit(allocator);
+    for (0..neutral_count) |_| try bytes.appendSlice(allocator, neutral_line);
+    try bytes.appendSlice(allocator, claude_line);
+    return bytes.toOwnedSlice(allocator);
+}
+
+test "prefix bound: the body classifies a signature exactly as discovery bounds it" {
+    try testing.expect(std.mem.endsWith(u8, claude_line, "}"));
+    const inside = try neutralThenClaude(trace_core.claude_parser.prefix_lines_max - 1);
+    defer allocator.free(inside);
+    var trace = try support.parse(allocator, "inside.jsonl", inside, .stale);
+    defer trace.deinit(allocator);
+    try testing.expectEqual(trace_core.TraceSource.claude, trace.source);
+    const past = try neutralThenClaude(trace_core.claude_parser.prefix_lines_max);
+    defer allocator.free(past);
+    try testing.expectError(
+        error.UnsupportedSessionFormat,
+        support.parse(allocator, "past.jsonl", past, .stale),
+    );
+}
+
+fn failAfterBuffer(
+    _: *std.Io.Reader,
+    _: *std.Io.Writer,
+    _: std.Io.Limit,
+) std.Io.Reader.StreamError!usize {
+    return error.ReadFailed;
+}
+
+test "discovery prefix: a read failure after the first line is reported, not truncated" {
+    var buffer = (neutral_line ++ neutral_line).*;
+    var reader = std.Io.Reader{
+        .vtable = &.{ .stream = failAfterBuffer },
+        .buffer = &buffer,
+        .seek = 0,
+        .end = buffer.len,
+    };
+    try testing.expectError(
+        error.ReadFailed,
+        trace_core.readDiscoveryPrefixAlloc(allocator, &reader, 1024),
+    );
 }

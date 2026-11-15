@@ -28,6 +28,24 @@ fn parseFile(dir: std.Io.Dir, path: []const u8) !Trace {
     return trace_core.parseSessionTrace(testing.io, dir, allocator, path, support.options());
 }
 
+fn parseInFamily(dir: std.Io.Dir, files: []const support.TreeFile, path: []const u8) !Trace {
+    var paths: [8][]const u8 = undefined;
+    std.debug.assert(files.len <= paths.len);
+    for (files, 0..) |file, index| paths[index] = file.path;
+    var admission = try native.Admission.initAlloc(
+        testing.io,
+        dir,
+        allocator,
+        paths[0..files.len],
+        null,
+        .{},
+    );
+    defer admission.deinit();
+    var options = support.options();
+    options.admission = admission.interface();
+    return trace_core.parseSessionTrace(testing.io, dir, allocator, path, options);
+}
+
 fn expectString(expected: []const u8, actual: ?[]const u8) !void {
     try testing.expect(actual != null);
     try testing.expectEqualStrings(expected, actual.?);
@@ -565,7 +583,7 @@ test "worker: sidecar toolUseId gives child-side and spawner-side edge rows" {
     try expectString(root_w, spawn.parent_session_id);
     try expectString(worker_w, spawn.worker_session_id);
     try testing.expect(spawn.spawned_at != null);
-    var worker = try parseFile(tmp.dir, files[1].path);
+    var worker = try parseInFamily(tmp.dir, &files, files[1].path);
     defer worker.deinit(allocator);
     try testing.expectEqual(@as(usize, 0), worker.warnings.items.len);
     try expectString(worker_w, worker.session.session_id);
@@ -613,7 +631,7 @@ test "nested-worker: parentAgentId gives the intermediate parent" {
     try testing.expect(edgeWithCall(&outer, "toolu_inner") == null);
     try testing.expectEqual(@as(i64, 0), outer.session.spawned_worker_count);
     try testing.expectEqual(@as(usize, 0), outer.claude_limitations.unlocated_spawn_count);
-    var inner = try parseFile(tmp.dir, files[3].path);
+    var inner = try parseInFamily(tmp.dir, &files, files[3].path);
     defer inner.deinit(allocator);
     try testing.expectEqual(@as(usize, 0), inner.warnings.items.len);
     try expectString(inner_id, inner.session.session_id);
@@ -642,7 +660,7 @@ test "harness-worker: a sidecar with neither field has the root parent and no ed
         base ++ "agent-cccc0000000000003.meta.json",
     });
     try support.writeTree(tmp.dir, &files);
-    var worker = try parseFile(tmp.dir, files[1].path);
+    var worker = try parseInFamily(tmp.dir, &files, files[1].path);
     defer worker.deinit(allocator);
     try testing.expectEqual(@as(usize, 0), worker.warnings.items.len);
     try expectString(root_h ++ "/agent-cccc0000000000003", worker.session.session_id);
@@ -791,7 +809,7 @@ test "legacy-worker: flat layout takes its root from sessionId; no unauthored ed
         "proj/agent-9a8b7c6d.jsonl",
     });
     try support.writeTree(tmp.dir, &files);
-    var worker = try parseFile(tmp.dir, files[1].path);
+    var worker = try parseInFamily(tmp.dir, &files, files[1].path);
     defer worker.deinit(allocator);
     try testing.expectEqual(@as(usize, 0), worker.warnings.items.len);
     try expectString(root_l ++ "/agent-9a8b7c6d", worker.session.session_id);
