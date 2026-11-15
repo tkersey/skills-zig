@@ -488,9 +488,15 @@ worker whose sidecar is missing or unreadable, whose recorded identity
 contradicts its path, or whose parent transcript is absent sets
 `lineage_conflict`. Spawner-side `session_edges` come only from `Agent`/`Task`
 calls in responses that this transcript's request records prove it made.
-`seq session-graph --format dot` names a Claude corpus `claude_sessions` and marks both
-edges with `[contradiction=true]` when a spawner and a sidecar assert different
-parents for one worker; it never chooses between them.
+`session_edges` keeps each file's assertion separately. A spawner's claim and a worker's
+sidecar live in different files, so a per-file `lineage_conflict` cannot see their
+disagreement; consumers that read both reconcile them. `seq session-graph --format
+dot` names a Claude corpus `claude_sessions`, prints agreeing assertions once, and
+marks every edge of a worker whose assertions disagree on parent or call with
+`[contradiction=true]`; it never chooses between them. The `seq/request-usage`
+definition treats such a worker as a lineage conflict for worker-scoped totals.
+Sidecar contents and parent-transcript presence are discovery facts: they are read
+once, bound into the corpus digest, and reused by the body read.
 `--session-id` accepts a session UUID or a worker ID.
 
 Turns open at an input that got a reply (a model response, an API error or an

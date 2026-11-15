@@ -248,6 +248,16 @@ if claude_missing=$(CLAUDE_CONFIG_DIR="$claude_config" CODEX_THREAD_ID=codex-hin
   exit 1
 fi
 jq -e '.code == "CurrentSessionUnavailable"' <<<"$claude_missing" >/dev/null
+if claude_explain=$("$binary" explain --definition "$message_definition" --projection rows \
+  --source claude-code --format json); then
+  exit 1
+fi
+jq -e '.code == "ExplainDoesNotReadCorpus"' <<<"$claude_explain" >/dev/null
+if claude_undeclared=$("$binary" observe --definition "$message_definition" --projection rows \
+  --source claude-code --param needle=a --format json); then
+  exit 1
+fi
+jq -e '.code == "ObservationSelectorNotDeclared"' <<<"$claude_undeclared" >/dev/null
 
 external_output=$("$binary" observe \
   --definition "$external_definition" \

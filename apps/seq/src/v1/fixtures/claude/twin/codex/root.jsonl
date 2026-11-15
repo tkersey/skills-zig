@@ -1,0 +1,8 @@
+{"timestamp":"2026-11-01T10:00:00Z","type":"session_meta","payload":{"id":"7f000000-0000-4000-8000-000000000001","cwd":"/twin","model":"twin-model"}}
+{"timestamp":"2026-11-01T10:00:00Z","type":"event_msg","payload":{"type":"task_started","turn_id":"tw-turn"}}
+{"timestamp":"2026-11-01T10:00:00Z","type":"turn_context","payload":{"turn_id":"tw-turn","cwd":"/twin","model":"twin-model","effort":"high"}}
+{"timestamp":"2026-11-01T10:00:00Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"List the files."}]}}
+{"timestamp":"2026-11-01T10:00:01Z","type":"response_item","payload":{"type":"function_call","name":"exec_command","call_id":"call-tw-ls","arguments":"{\"cmd\":\"ls\"}"}}
+{"timestamp":"2026-11-01T10:00:02Z","type":"response_item","payload":{"type":"function_call_output","call_id":"call-tw-ls","output":"a\nb"}}
+{"timestamp":"2026-11-01T10:00:03Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"There are two files: "},{"type":"output_text","text":"a and b."}]}}
+{"timestamp":"2026-11-01T10:00:03Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"tw-turn"}}

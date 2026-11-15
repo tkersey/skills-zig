@@ -1,0 +1,6 @@
+{"timestamp":"2026-11-01T10:00:04Z","type":"session_meta","payload":{"id":"twin-worker","cwd":"/twin","model":"twin-model","source":{"subagent":{"thread_spawn":{"parent_thread_id":"7f000000-0000-4000-8000-000000000001","depth":1}}}}}
+{"timestamp":"2026-11-01T10:00:04Z","type":"event_msg","payload":{"type":"task_started","turn_id":"tw-worker-turn"}}
+{"timestamp":"2026-11-01T10:00:04Z","type":"turn_context","payload":{"turn_id":"tw-worker-turn","cwd":"/twin","model":"twin-model","effort":"high"}}
+{"timestamp":"2026-11-01T10:00:04Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"Check b."}]}}
+{"timestamp":"2026-11-01T10:00:05Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"b is fine."}]}}
+{"timestamp":"2026-11-01T10:00:05Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"tw-worker-turn"}}
