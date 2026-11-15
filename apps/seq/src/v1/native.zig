@@ -47,44 +47,44 @@ pub const Command = enum {
 pub fn help(command: Command) []const u8 {
     return switch (command) {
         .sessions =>
-        \\usage: seq sessions [--root <dir>] [--repo <dir>]
+        \\usage: seq sessions [--source codex|claude-code|pi | --root <dir>] [--repo <dir>]
         \\  [--contains <text>] [--since <time>] [--until <time>]
         \\  [--last <duration>] [--limit <rows>] [--format json]
         \\
         ,
         .turns =>
-        \\usage: seq turns [--root <dir>] [--session-id <id> | --path <file>]
+        \\usage: seq turns [--source codex|claude-code|pi | --root <dir>] [--session-id <id> | --path <file>]
         \\  [--contains <text>] [--status <status>] [--since <time>]
         \\  [--until <time>] [--last <duration>] [--limit <rows>]
         \\  [--format json]
         \\
         ,
         .session_detail =>
-        \\usage: seq session-detail [--root <dir>]
+        \\usage: seq session-detail [--source codex|claude-code|pi | --root <dir>]
         \\  [--session-id <id> | --path <file>] [--format json]
         \\
         ,
         .tool_lifecycle =>
-        \\usage: seq tool-lifecycle [--root <dir>]
+        \\usage: seq tool-lifecycle [--source codex|claude-code|pi | --root <dir>]
         \\  [--session-id <id> | --path <file>] [--limit <rows>]
         \\  [--format json]
         \\
         ,
         .session_graph =>
-        \\usage: seq session-graph [--root <dir>]
+        \\usage: seq session-graph [--source codex|claude-code|pi | --root <dir>]
         \\  [--session-id <id> | --path <file>] [--limit <rows>]
         \\  [--format json|dot]
         \\
         ,
         .tail =>
-        \\usage: seq tail --once [--root <dir>]
+        \\usage: seq tail --once [--source codex|claude-code|pi | --root <dir>]
         \\  [--current | --session-id <id> | --path <file>]
         \\  [--limit <rows>] [--format json]
         \\
         ,
         .find_session =>
         \\usage: seq find-session (--prompt <text> | --session-id <id>)
-        \\  [--root <dir>] [--since <time>] [--until <time>]
+        \\  [--source codex|claude-code|pi | --root <dir>] [--since <time>] [--until <time>]
         \\  [--last <duration>] [--limit <rows>] [--format json]
         \\
         ,
@@ -97,14 +97,14 @@ pub fn help(command: Command) []const u8 {
         \\
         ,
         .query =>
-        \\usage: seq query --spec <json|@file> [--root <dir>]
+        \\usage: seq query --spec <json|@file> [--source codex|claude-code|pi | --root <dir>]
         \\  [--session-id <id> | --path <file>] [--repo <dir>]
         \\  [--since <time>] [--until <time>] [--last <duration>]
         \\  [--format json]
         \\
         ,
         .index =>
-        \\usage: seq index [build|refresh|status] [--root <dir>]
+        \\usage: seq index [build|refresh|status] [--source codex|claude-code|pi | --root <dir>]
         \\  [--format json]
         \\
         ,
@@ -124,8 +124,22 @@ const Format = enum {
     }
 };
 
+pub const Source = enum {
+    codex,
+    claude_code,
+    pi,
+
+    pub fn parse(raw: []const u8) !Source {
+        if (std.mem.eql(u8, raw, "codex")) return .codex;
+        if (std.mem.eql(u8, raw, "claude-code")) return .claude_code;
+        if (std.mem.eql(u8, raw, "pi")) return .pi;
+        return error.UnsupportedSourceSelector;
+    }
+};
+
 pub const Options = struct {
     root: ?[]const u8 = null,
+    source: ?Source = null,
     path: ?[]const u8 = null,
     session_id: ?[]const u8 = null,
     prompt: ?[]const u8 = null,
@@ -367,6 +381,7 @@ const NativeOption = enum {
     current,
     once,
     root,
+    source,
     path,
     session_id,
     prompt,
@@ -385,6 +400,7 @@ const NativeOption = enum {
         if (std.mem.eql(u8, raw, "--current")) return .current;
         if (std.mem.eql(u8, raw, "--once")) return .once;
         if (std.mem.eql(u8, raw, "--root")) return .root;
+        if (std.mem.eql(u8, raw, "--source")) return .source;
         if (std.mem.eql(u8, raw, "--path")) return .path;
         if (std.mem.eql(u8, raw, "--session-id")) return .session_id;
         if (std.mem.eql(u8, raw, "--prompt")) return .prompt;
@@ -418,6 +434,7 @@ fn applyNativeOption(
         },
         .once => options.once = true,
         .root => options.root = value.?,
+        .source => options.source = try Source.parse(value.?),
         .path => options.path = value.?,
         .session_id => options.session_id = value.?,
         .prompt => options.prompt = value.?,
@@ -443,6 +460,9 @@ fn parseNativeLimit(raw: []const u8) !usize {
 }
 
 fn validateNativeSelectors(options: *Options, io: std.Io) !void {
+    if (options.source != null and (options.root != null or options.path != null)) {
+        return error.ConflictingSourceSelectors;
+    }
     if (options.path != null and
         (options.session_id != null or options.current))
     {
@@ -487,7 +507,7 @@ fn parseOptions(command: Command, argv: []const []const u8, io: std.Io) !Options
 fn optionAllowed(command: Command, option: NativeOption) bool {
     return switch (option) {
         .current, .once => command == .tail,
-        .root => switch (command) {
+        .root, .source => switch (command) {
             .sessions,
             .turns,
             .session_detail,
@@ -735,7 +755,10 @@ fn runSessionGraph(
     if (options.format != .dot) return error.UnsupportedNativeFormat;
     var paths = try resolveTargetPaths(allocator, io, dir, options, false);
     defer freePaths(allocator, &paths);
-    try writer.writeAll("digraph codex_sessions {\n");
+    var body: std.Io.Writer.Allocating = .init(allocator);
+    defer body.deinit();
+    var claude_corpus = false;
+    var other_corpus = false;
     var remaining = options.limit;
     for (paths.items) |path| {
         if (remaining == 0) break;
@@ -748,18 +771,26 @@ fn runSessionGraph(
         ) catch |err| return sourceFailure(options, path, err);
         defer trace.deinit(allocator);
         try rejectTraceWarnings(&trace, options);
+        switch (trace.source) {
+            .claude => claude_corpus = true,
+            .codex, .pi => other_corpus = true,
+            .none => {},
+        }
         for (trace.graph_edges.items) |edge| {
             if (remaining == 0) break;
             const parent = edge.parent_session_id orelse continue;
             const worker = edge.worker_session_id orelse edge.agent_path orelse continue;
-            try writer.writeAll("  ");
-            try definition_core.canonical_json.writeCanonicalString(writer, parent);
-            try writer.writeAll(" -> ");
-            try definition_core.canonical_json.writeCanonicalString(writer, worker);
-            try writer.writeAll(";\n");
+            try body.writer.writeAll("  ");
+            try definition_core.canonical_json.writeCanonicalString(&body.writer, parent);
+            try body.writer.writeAll(" -> ");
+            try definition_core.canonical_json.writeCanonicalString(&body.writer, worker);
+            try body.writer.writeAll(";\n");
             remaining -= 1;
         }
     }
+    const graph_name = if (claude_corpus and !other_corpus) "claude_sessions" else "codex_sessions";
+    try writer.print("digraph {s} {{\n", .{graph_name});
+    try writer.writeAll(body.written());
     try writer.writeAll("}\n");
 }
 
@@ -1838,30 +1869,91 @@ fn runIndex(
 const CurrentSession = struct {
     path: ?[]const u8 = null,
     id: ?[]const u8 = null,
-    pi: bool = false,
+    family: ?Source = null,
 
-    fn fromEnvironment(environment: ?*const std.process.Environ.Map) !CurrentSession {
-        const codex_id = environmentValue(environment, "CODEX_THREAD_ID");
-        const pi_path = environmentValue(environment, "PI_SESSION_FILE");
-        const pi_id = environmentValue(environment, "PI_SESSION_ID");
-        const pi = pi_path != null or pi_id != null;
-        if (codex_id != null and pi) return error.AmbiguousCurrentSessionSource;
-        if (codex_id == null and !pi) return error.CurrentSessionUnavailable;
-        return .{ .path = pi_path, .id = codex_id orelse pi_id, .pi = pi };
+    fn fromEnvironment(
+        environment: ?*const std.process.Environ.Map,
+        requested: ?Source,
+    ) !CurrentSession {
+        const codex = CurrentSession{
+            .id = environmentValue(environment, "CODEX_THREAD_ID"),
+            .family = .codex,
+        };
+        const pi = CurrentSession{
+            .path = environmentValue(environment, "PI_SESSION_FILE"),
+            .id = environmentValue(environment, "PI_SESSION_ID"),
+            .family = .pi,
+        };
+        const claude = CurrentSession{
+            .id = environmentValue(environment, "CLAUDE_CODE_SESSION_ID"),
+            .family = .claude_code,
+        };
+        if (requested) |source| {
+            const selected = switch (source) {
+                .codex => codex,
+                .pi => pi,
+                .claude_code => claude,
+            };
+            if (!selected.present()) return error.CurrentSessionUnavailable;
+            return selected;
+        }
+        var found: ?CurrentSession = null;
+        for ([_]CurrentSession{ codex, pi, claude }) |candidate| {
+            if (!candidate.present()) continue;
+            if (found != null) return error.AmbiguousCurrentSessionSource;
+            found = candidate;
+        }
+        return found orelse error.CurrentSessionUnavailable;
     }
 
-    fn rootAlloc(
-        self: CurrentSession,
-        allocator: std.mem.Allocator,
-        options: Options,
-        io: std.Io,
-        dir: std.Io.Dir,
-    ) ![]u8 {
-        if (self.pi and options.root == null) {
-            return resolvePiRootAlloc(allocator, options.environment, io, dir);
-        }
+    fn present(self: CurrentSession) bool {
+        return self.path != null or self.id != null;
+    }
+};
+
+fn effectiveSource(options: Options, current: CurrentSession) Source {
+    return current.family orelse options.source orelse .codex;
+}
+
+pub fn resolveSourceRootAlloc(
+    allocator: std.mem.Allocator,
+    options: Options,
+    source: Source,
+    io: std.Io,
+    dir: std.Io.Dir,
+) ![]u8 {
+    if (options.root != null) {
         return resolveRootAlloc(allocator, options.environment, options.root, io, dir);
     }
+    return switch (source) {
+        .codex => resolveRootAlloc(allocator, options.environment, null, io, dir),
+        .pi => resolvePiRootAlloc(allocator, options.environment, io, dir),
+        .claude_code => resolveClaudeRootAlloc(allocator, options.environment, io, dir),
+    };
+}
+
+fn resolveClaudeRootAlloc(
+    allocator: std.mem.Allocator,
+    environment: ?*const std.process.Environ.Map,
+    io: std.Io,
+    dir: std.Io.Dir,
+) ![]u8 {
+    if (environmentValue(environment, "CLAUDE_CONFIG_DIR")) |config| {
+        const base = try absolutePathAlloc(allocator, environment, config, io, dir);
+        defer allocator.free(base);
+        return std.fs.path.join(allocator, &.{ base, "projects" });
+    }
+    const home = environmentValue(environment, "HOME") orelse
+        return error.EnvironmentVariableNotFound;
+    const base = try absolutePathAlloc(allocator, environment, home, io, dir);
+    defer allocator.free(base);
+    return std.fs.path.join(allocator, &.{ base, ".claude", "projects" });
+}
+
+const RootFacts = struct {
+    source: Source,
+    live_codex_root: bool,
+    live_claude_root: bool,
 };
 
 pub fn resolveTargetPaths(
@@ -1872,7 +1964,7 @@ pub fn resolveTargetPaths(
     require_single: bool,
 ) !std.ArrayList([]u8) {
     const current = if (options.current)
-        try CurrentSession.fromEnvironment(options.environment)
+        try CurrentSession.fromEnvironment(options.environment, options.source)
     else
         CurrentSession{};
     if (options.path orelse current.path) |path| {
@@ -1884,19 +1976,18 @@ pub fn resolveTargetPaths(
         );
         return paths;
     }
-    const root = try current.rootAlloc(allocator, options, io, dir);
+    const source = effectiveSource(options, current);
+    const root = try resolveSourceRootAlloc(allocator, options, source, io, dir);
     defer allocator.free(root);
-    const live_native_root = !current.pi and
-        try isLiveNativeSessionRoot(allocator, options, root, io, dir);
-    var paths = try collectTargetJsonlPaths(
-        allocator,
-        io,
-        dir,
-        root,
-        options,
-    );
+    const facts = RootFacts{
+        .source = source,
+        .live_codex_root = source == .codex and
+            try isLiveNativeSessionRoot(allocator, options, root, io, dir),
+        .live_claude_root = source == .claude_code and options.root == null,
+    };
+    var paths = try collectTargetJsonlPaths(allocator, io, dir, root, options);
     errdefer freePaths(allocator, &paths);
-    const archive = if (options.root == null and !current.pi)
+    const archive = if (options.root == null and source == .codex)
         try archiveRootAlloc(allocator, root)
     else
         null;
@@ -1904,26 +1995,10 @@ pub fn resolveTargetPaths(
     if (archive != null) try appendArchivedPaths(allocator, io, dir, archive.?, &paths);
     const exact_session_id = options.session_id orelse current.id;
     if (exact_session_id == null) {
-        retainCanonicalRolloutWindow(
-            allocator,
-            io,
-            dir,
-            &paths,
-            options,
-            live_native_root,
-            archive,
-        );
+        try retainCanonicalRolloutWindow(allocator, io, dir, &paths, options, facts, archive);
     }
     if (exact_session_id) |wanted| {
-        try retainSessionId(
-            io,
-            dir,
-            allocator,
-            &paths,
-            wanted,
-            live_native_root,
-            options,
-        );
+        try retainSessionId(io, dir, allocator, &paths, wanted, facts.live_codex_root, options);
     }
     if (require_single or exact_session_id != null) {
         if (paths.items.len == 0) return error.SessionNotFound;
@@ -1955,25 +2030,22 @@ fn retainCanonicalRolloutWindow(
     dir: std.Io.Dir,
     paths: *std.ArrayList([]u8),
     options: Options,
-    live_native_root: bool,
+    facts: RootFacts,
     archive: ?[]const u8,
-) void {
+) !void {
     if (options.since_ms == null and options.until_ms == null) return;
     var write_index: usize = 0;
     for (paths.items) |path| {
-        const modified_ms: ?i64 = if (live_native_root and
+        const modified_ms: ?i64 = if (facts.live_codex_root and
             options.since_ms != null)
             modifiedMillis(io, dir, path)
         else
             null;
         const archived = archive != null and
             std.mem.eql(u8, std.fs.path.dirname(path) orelse "", archive.?);
-        if (canonicalRolloutPathPassesWindow(
-            path,
-            options,
-            modified_ms,
-            archived,
-        )) {
+        const passes = canonicalRolloutPathPassesWindow(path, options, modified_ms, archived) and
+            try claudePathPassesWindow(allocator, io, dir, path, options, facts);
+        if (passes) {
             paths.items[write_index] = path;
             write_index += 1;
         } else {
@@ -1981,6 +2053,40 @@ fn retainCanonicalRolloutWindow(
         }
     }
     paths.items.len = write_index;
+}
+
+const claude_window_margin_ms: i64 = 2 * std.time.ms_per_day;
+
+fn claudePathPassesWindow(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    dir: std.Io.Dir,
+    path: []const u8,
+    options: Options,
+    facts: RootFacts,
+) !bool {
+    if (isCanonicalRolloutBasename(std.fs.path.basename(path))) return true;
+    if (opencode_adapter.recognizes(path)) return true;
+    if (facts.live_claude_root) {
+        if (options.since_ms) |since| {
+            const lower = std.math.sub(i64, since, claude_window_margin_ms) catch return true;
+            if (modifiedMillis(io, dir, path)) |modified| {
+                if (modified < lower) return false;
+            }
+        }
+    }
+    const until = options.until_ms orelse return true;
+    const upper = std.math.add(i64, until, claude_window_margin_ms) catch return true;
+    var identity = trace_adapter.discoverSessionIdentity(io, dir, allocator, path, .{}, null) catch |err|
+        switch (err) {
+            error.OutOfMemory => return err,
+            else => return true,
+        };
+    defer identity.deinit(allocator);
+    if (identity.source != .claude) return true;
+    const start = identity.start_time orelse return true;
+    const start_ms = seq_time.parseIsoTimestampMillis(start) orelse return true;
+    return start_ms <= upper;
 }
 
 fn modifiedMillis(io: std.Io, dir: std.Io.Dir, path: []const u8) ?i64 {
@@ -2076,6 +2182,55 @@ fn compareDates(left: seq_time.Date, right: seq_time.Date) std.math.Order {
     return std.math.order(left.day, right.day);
 }
 
+fn claudeTranscriptStem(wanted: []const u8) ?[]const u8 {
+    if (trace_core.claude_parser.isUuid(wanted)) return wanted;
+    const separator = std.mem.indexOf(u8, wanted, "/agent-") orelse return null;
+    if (!trace_core.claude_parser.isUuid(wanted[0..separator])) return null;
+    if (wanted.len == separator + "/agent-".len) return null;
+    return wanted[separator + 1 ..];
+}
+
+fn basenameStemEquals(path: []const u8, stem: []const u8) bool {
+    const name = std.fs.path.basename(path);
+    for ([_][]const u8{ ".jsonl", ".jsonl.zst" }) |extension| {
+        if (name.len == stem.len + extension.len and std.mem.startsWith(u8, name, stem) and
+            std.mem.endsWith(u8, name, extension)) return true;
+    }
+    return false;
+}
+
+fn retainNamedClaudeSession(
+    io: std.Io,
+    dir: std.Io.Dir,
+    allocator: std.mem.Allocator,
+    paths: *std.ArrayList([]u8),
+    wanted: []const u8,
+) !bool {
+    const stem = claudeTranscriptStem(wanted) orelse return false;
+    var confirmed: ?usize = null;
+    for (paths.items, 0..) |path, index| {
+        if (!basenameStemEquals(path, stem)) continue;
+        var identity = trace_adapter.discoverSessionIdentity(io, dir, allocator, path, .{}, null) catch |err|
+            switch (err) {
+                error.OutOfMemory => return err,
+                else => continue,
+            };
+        defer identity.deinit(allocator);
+        if (identity.source != .claude) continue;
+        const actual = identity.session_id orelse continue;
+        if (!std.mem.eql(u8, actual, wanted)) continue;
+        if (confirmed != null) return false;
+        confirmed = index;
+    }
+    const keep = confirmed orelse return false;
+    for (paths.items, 0..) |path, index| {
+        if (index != keep) allocator.free(path);
+    }
+    paths.items[0] = paths.items[keep];
+    paths.items.len = 1;
+    return true;
+}
+
 fn retainSessionId(
     io: std.Io,
     dir: std.Io.Dir,
@@ -2085,6 +2240,7 @@ fn retainSessionId(
     live_native_root: bool,
     options: Options,
 ) !void {
+    if (try retainNamedClaudeSession(io, dir, allocator, paths, wanted)) return;
     var write_index: usize = 0;
     var failure: ?anyerror = null;
     for (paths.items) |path| {
@@ -3418,4 +3574,140 @@ test "default Codex discovery includes archives while explicit roots retain thei
     defer freePaths(allocator, &selected);
     try std.testing.expectEqual(@as(usize, 1), selected.items.len);
     try std.testing.expect(std.mem.endsWith(u8, selected.items[0], "sessions/live.jsonl"));
+}
+
+pub const FamilyDiscovery = struct {
+    bytes: usize = 0,
+    opened: usize = 0,
+
+    fn charge(self: *FamilyDiscovery, bytes: usize) !void {
+        self.bytes = std.math.add(usize, self.bytes, bytes) catch
+            return error.ObservationMetricOverflow;
+        self.opened += 1;
+    }
+};
+
+const FamilyLayout = struct {
+    base: []const u8,
+    root: []const u8,
+};
+
+fn claudeFamilyLayout(path: []const u8, root: []const u8) ?FamilyLayout {
+    const directory = std.fs.path.dirname(path) orelse return null;
+    const name = std.fs.path.basename(path);
+    if (!std.mem.startsWith(u8, name, "agent-")) return .{ .base = directory, .root = root };
+    if (!std.mem.eql(u8, std.fs.path.basename(directory), "subagents")) {
+        return .{ .base = directory, .root = root };
+    }
+    const session_directory = std.fs.path.dirname(directory) orelse return null;
+    const base = std.fs.path.dirname(session_directory) orelse return null;
+    return .{ .base = base, .root = root };
+}
+
+pub fn claudeFamilyPathsAlloc(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    dir: std.Io.Dir,
+    selected: []const u8,
+    discovery: *FamilyDiscovery,
+) !?std.ArrayList([]u8) {
+    var identity = trace_adapter.discoverSessionIdentity(io, dir, allocator, selected, .{}, null) catch |err|
+        switch (err) {
+            error.OutOfMemory => return err,
+            else => return null,
+        };
+    defer identity.deinit(allocator);
+    try discovery.charge(identity.bytes_read);
+    if (identity.source != .claude) return null;
+    const root = identity.root_session_id orelse return null;
+    const layout = claudeFamilyLayout(selected, root) orelse return null;
+    var paths: std.ArrayList([]u8) = .empty;
+    errdefer freePaths(allocator, &paths);
+    try appendClaudeMain(allocator, io, dir, layout, &paths);
+    const workers = try std.fs.path.join(allocator, &.{ layout.base, root, "subagents" });
+    defer allocator.free(workers);
+    try appendClaudeWorkers(allocator, io, dir, workers, null, &paths, discovery);
+    try appendClaudeWorkers(allocator, io, dir, layout.base, root, &paths, discovery);
+    std.mem.sort([]u8, paths.items, {}, lessThanPath);
+    for (paths.items) |path| {
+        if (std.mem.eql(u8, path, selected)) return paths;
+    }
+    try paths.append(allocator, try allocator.dupe(u8, selected));
+    std.mem.sort([]u8, paths.items, {}, lessThanPath);
+    return paths;
+}
+
+fn appendClaudeMain(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    dir: std.Io.Dir,
+    layout: FamilyLayout,
+    paths: *std.ArrayList([]u8),
+) !void {
+    for ([_][]const u8{ ".jsonl", ".jsonl.zst" }) |extension| {
+        const name = try std.mem.concat(allocator, u8, &.{ layout.root, extension });
+        defer allocator.free(name);
+        const path = try std.fs.path.join(allocator, &.{ layout.base, name });
+        errdefer allocator.free(path);
+        const stat = dir.statFile(io, path, .{}) catch {
+            allocator.free(path);
+            continue;
+        };
+        if (stat.kind != .file) {
+            allocator.free(path);
+            continue;
+        }
+        try paths.append(allocator, path);
+    }
+}
+
+fn appendClaudeWorkers(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    dir: std.Io.Dir,
+    directory: []const u8,
+    recorded_root: ?[]const u8,
+    paths: *std.ArrayList([]u8),
+    discovery: *FamilyDiscovery,
+) !void {
+    var handle = dir.openDir(io, directory, .{ .iterate = true }) catch return;
+    defer handle.close(io);
+    var entries = handle.iterate();
+    var visited: usize = 0;
+    while (try entries.next(io)) |entry| {
+        visited += 1;
+        if (visited > session_entry_visit_max) return error.SessionTraversalBoundExceeded;
+        if (entry.kind != .file or !isSessionSourcePath(entry.name)) continue;
+        if (!std.mem.startsWith(u8, entry.name, "agent-")) continue;
+        if (paths.items.len == session_candidate_max) return error.SessionCandidateBoundExceeded;
+        const path = try std.fs.path.join(allocator, &.{ directory, entry.name });
+        errdefer allocator.free(path);
+        if (recorded_root) |root| {
+            if (!try flatWorkerBelongs(allocator, io, dir, path, root, discovery)) {
+                allocator.free(path);
+                continue;
+            }
+        }
+        try paths.append(allocator, path);
+    }
+}
+
+fn flatWorkerBelongs(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    dir: std.Io.Dir,
+    path: []const u8,
+    root: []const u8,
+    discovery: *FamilyDiscovery,
+) !bool {
+    var identity = trace_adapter.discoverSessionIdentity(io, dir, allocator, path, .{}, null) catch |err|
+        switch (err) {
+            error.OutOfMemory => return err,
+            else => return false,
+        };
+    defer identity.deinit(allocator);
+    try discovery.charge(identity.bytes_read);
+    if (identity.source != .claude) return false;
+    const actual = identity.root_session_id orelse return false;
+    return std.mem.eql(u8, actual, root);
 }

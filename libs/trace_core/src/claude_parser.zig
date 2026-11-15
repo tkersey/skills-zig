@@ -687,6 +687,7 @@ pub const Limitations = struct {
     inline_sidechain_records: usize = 0,
     unlocated_spawn_count: usize = 0,
     worker_parent_unread: bool = false,
+    worker_parent_missing: bool = false,
 };
 
 const PathIdentity = struct {
@@ -925,6 +926,9 @@ pub const ClaudeParser = struct {
             try self.applySidecar(io, &identity);
         } else {
             try replaceNullable(self.allocator, &session.control_parent_session_id, identity.root);
+            if (identity.root) |root| {
+                try self.requireParent(io, std.fs.path.dirname(session.path) orelse ".", root);
+            }
         }
         return identity;
     }
@@ -966,13 +970,33 @@ pub const ClaudeParser = struct {
         };
         identity.sidecar_call = fields.tool_use;
         const root = identity.root orelse return;
+        const directory = std.fs.path.dirname(session.path) orelse ".";
         if (fields.parent_agent) |parent| {
             const id = try std.fmt.allocPrint(self.allocator, "{s}/agent-{s}", .{ root, parent });
             freeOpt(self.allocator, session.control_parent_session_id);
             session.control_parent_session_id = id;
+            const stem = try std.fmt.allocPrint(self.arena(), "agent-{s}", .{parent});
+            try self.requireParent(io, directory, stem);
         } else {
             try replaceOpt(self.allocator, &session.control_parent_session_id, root);
+            const session_directory = std.fs.path.dirname(directory) orelse ".";
+            try self.requireParent(io, std.fs.path.dirname(session_directory) orelse ".", root);
         }
+    }
+
+    fn requireParent(self: *ClaudeParser, io: std.Io, directory: []const u8, stem: []const u8) !void {
+        for ([_][]const u8{ ".jsonl", ".jsonl.zst" }) |extension| {
+            const name = try std.mem.concat(self.arena(), u8, &.{ stem, extension });
+            const path = try std.fs.path.join(self.arena(), &.{ directory, name });
+            const handle = self.options.sidecar_dir orelse std.Io.Dir.cwd();
+            const stat = (if (std.fs.path.isAbsolute(path))
+                std.Io.Dir.cwd().statFile(io, path, .{})
+            else
+                handle.statFile(io, path, .{})) catch continue;
+            if (stat.kind == .file) return;
+        }
+        self.trace.session.lineage_conflict = true;
+        self.trace.claude_limitations.worker_parent_missing = true;
     }
 
     const SidecarFields = struct {

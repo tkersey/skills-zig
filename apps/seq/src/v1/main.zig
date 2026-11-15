@@ -5,7 +5,7 @@ const seq = @import("seq_v1_core");
 const durable_store = @import("durable_store");
 
 const Version = std.mem.trim(u8, app_meta.version, " \t\r\n");
-const source_adapter_version = "seq-source-adapter-set/v3";
+const source_adapter_version = "seq-source-adapter-set/v4";
 const max_output_cells: usize = 4_000_000;
 const ongoing_threshold_secs: i64 = 60;
 
@@ -22,7 +22,8 @@ const Help =
     \\
     \\observation commands:
     \\  seq observe --definition <file> --projection <name>
-    \\    [--root <dir>] [--session-id <id> | --path <file>] [--repo <dir>]
+    \\    [--source codex|claude-code|pi | --root <dir>]
+    \\    [--session-id <id> | --path <file>] [--repo <dir>]
     \\    [--since <time>] [--until <time>] [--last <duration>]
     \\    [--input <name>=<file|->]... [--param <name>=<value>]...
     \\    [--format json]
@@ -45,6 +46,9 @@ const Help =
     \\metadata commands:
     \\  seq capabilities [--format json|text]
     \\  seq version
+    \\
+    \\Sources: codex (default), claude-code, pi. --source chooses a default root;
+    \\explicit roots and paths detect content.
     \\
     \\Definitions are passive JSON. Seq reports observations and limitations
     \\without granting authority.
@@ -943,6 +947,13 @@ fn emitObservationResult(
     execution_ns: u64,
     projection_bounded: bool,
 ) !u8 {
+    var limitation_arena = std.heap.ArenaAllocator.init(allocator);
+    defer limitation_arena.deinit();
+    const limitations = try observationLimitationsAlloc(
+        limitation_arena.allocator(),
+        execution,
+        projection_bounded,
+    );
     var execution_stats = definition_core.result.ExecutionStats{
         .execution_ns = execution_ns,
         .physical_passes = 1,
@@ -977,10 +988,7 @@ fn emitObservationResult(
             .execution_stats = execution_stats,
             .discovery_files_opened = execution.discovery_files_opened,
             .discovery_bytes_read = execution.discovery_bytes_read,
-            .limitations = observationLimitations(
-                execution.warning_count,
-                projection_bounded,
-            ),
+            .limitations = limitations,
         },
         &execution_stats,
     );
@@ -1005,6 +1013,7 @@ const ObservationExecution = struct {
     discovery_bytes_read: usize = 0,
     source_metadata_digest: [71]u8,
     warning_count: usize = 0,
+    claude_limitations: ClaudeLimitationCounts = .{},
     graph_arena: ?*std.heap.ArenaAllocator = null,
     graph_result_owned: bool = false,
     projection_bounded: bool = false,
@@ -1100,6 +1109,7 @@ const GraphObservationContext = struct {
             .source_metadata_digest = metrics.source_metadata.digest(),
             .warning_count = metrics.warnings,
             .graph_arena = self.arena,
+            .claude_limitations = metrics.claude,
         };
     }
 };
@@ -1216,6 +1226,7 @@ fn resolveGraphPaths(
     dir: std.Io.Dir,
     args: *const ObserveArgs,
     physical_selection: bool,
+    discovery: *seq.native.FamilyDiscovery,
 ) !std.ArrayList([]u8) {
     if (physical_selection) {
         var selectors = args.selectors;
@@ -1235,11 +1246,17 @@ fn resolveGraphPaths(
     for (paths.items) |path| {
         if (std.mem.eql(u8, path, selected_path)) return paths;
     }
-    // An explicit file outside the default corpus defines its own source scope.
-    // An explicit root still supplies the caller-selected lineage candidates.
     if (args.selectors.root == null) {
         seq.native.freePaths(allocator, &paths);
         paths = .empty;
+        const family = try seq.native.claudeFamilyPathsAlloc(
+            allocator,
+            io,
+            dir,
+            selected_path,
+            discovery,
+        );
+        if (family) |admitted| return admitted;
     }
     // Native discovery keeps its traversal bounds; this adds at most one file.
     const owned_path = try allocator.dupe(u8, selected_path);
@@ -1409,10 +1426,12 @@ fn executeMaterializedGraphObservation(
         &context.native_plan,
         args.projection,
     );
-    var paths = try resolveGraphPaths(allocator, io, dir, args, physical_selection);
+    var family = seq.native.FamilyDiscovery{};
+    var paths = try resolveGraphPaths(allocator, io, dir, args, physical_selection, &family);
     defer seq.native.freePaths(allocator, &paths);
     try rows.reserve(&graph, paths.items.len);
     var metrics = PhysicalMetrics{};
+    try recordFamilyDiscovery(&metrics, family);
     var digest_set = CorpusSetHasher{};
     const selection: GraphSelection = if (physical_selection) .physical else .corpus;
     try readMaterializedGraphPaths(&graph, &rows, paths.items, &metrics, &digest_set, selection);
@@ -2013,7 +2032,8 @@ fn executeStreamingGraphObservation(
         .plans = context,
         .bindings = bindings,
     };
-    var paths = try resolveGraphPaths(allocator, io, dir, args, false);
+    var family = seq.native.FamilyDiscovery{};
+    var paths = try resolveGraphPaths(allocator, io, dir, args, false, &family);
     defer seq.native.freePaths(allocator, &paths);
     var discovered = try DiscoveredSessions.init(io, dir, allocator, paths.items, args);
     defer discovered.deinit(allocator);
@@ -2046,6 +2066,7 @@ fn executeStreamingGraphObservation(
     if (args.selectors.session_id) |wanted| try requireDiscoveredSession(&discovered, wanted);
     try state.recordDiscovery(&discovered, paths.items);
     defer state.deinit();
+    try recordFamilyDiscovery(&state.metrics, family);
     const tasks = try createStreamingParseTasks(
         &graph,
         schedule,
@@ -2342,6 +2363,7 @@ fn executePhysicalObservation(
         .discovery_bytes_read = metrics.discovery_bytes,
         .source_metadata_digest = metrics.source_metadata.digest(),
         .warning_count = metrics.warnings,
+        .claude_limitations = metrics.claude,
     };
 }
 
@@ -2356,6 +2378,7 @@ const PhysicalMetrics = struct {
     source_metadata: SourceMetadataHasher = .{},
     warnings: usize = 0,
     adapter: ?[]const u8 = null,
+    claude: ClaudeLimitationCounts = .{},
 
     fn admitAdapter(self: *PhysicalMetrics, vote: ?[]const u8) !void {
         const adapter = vote orelse return;
@@ -2555,6 +2578,14 @@ fn recordTraceRead(metrics: *PhysicalMetrics, selected: seq.trace_adapter.Select
     try recordDiscoveryBytes(metrics, selected.discovery_bytes_read);
 }
 
+fn recordFamilyDiscovery(metrics: *PhysicalMetrics, family: seq.native.FamilyDiscovery) !void {
+    try recordDiscoveryBytes(metrics, family.bytes);
+    metrics.opened = std.math.add(usize, metrics.opened, family.opened) catch
+        return error.ObservationMetricOverflow;
+    metrics.discovery_opened = std.math.add(usize, metrics.discovery_opened, family.opened) catch
+        return error.ObservationMetricOverflow;
+}
+
 fn recordDiscoveryBytes(metrics: *PhysicalMetrics, bytes: usize) !void {
     metrics.discovery_bytes = std.math.add(usize, metrics.discovery_bytes, bytes) catch
         return error.ObservationMetricOverflow;
@@ -2604,6 +2635,7 @@ fn countTraceSession(
     ) catch return error.ObservationMetricOverflow;
     metrics.files += 1;
     metrics.sessions += 1;
+    try metrics.claude.add(parsed.trace.claude_limitations);
 }
 
 fn feedTraceRows(
@@ -2796,6 +2828,7 @@ const ObserveOption = enum {
     projection,
     path,
     root,
+    source,
     session_id,
     repo,
     since,
@@ -2810,6 +2843,7 @@ const ObserveOption = enum {
         if (std.mem.eql(u8, token, "--projection")) return .projection;
         if (std.mem.eql(u8, token, "--path")) return .path;
         if (std.mem.eql(u8, token, "--root")) return .root;
+        if (std.mem.eql(u8, token, "--source")) return .source;
         if (std.mem.eql(u8, token, "--session-id")) return .session_id;
         if (std.mem.eql(u8, token, "--repo")) return .repo;
         if (std.mem.eql(u8, token, "--since")) return .since;
@@ -2864,6 +2898,10 @@ const ObserveParseState = struct {
                 value,
                 error.DuplicateRootOption,
             ),
+            .source => {
+                if (self.selectors.source != null) return error.DuplicateSourceOption;
+                self.selectors.source = try seq.native.Source.parse(value);
+            },
             .session_id => try setOnce(
                 &self.selectors.session_id,
                 value,
@@ -2913,6 +2951,11 @@ const ObserveParseState = struct {
                 self.selectors.session_id != null))
         {
             return error.ConflictingSessionSelectors;
+        }
+        if (self.selectors.source != null and
+            (self.selectors.root != null or self.selectors.path != null))
+        {
+            return error.ConflictingSourceSelectors;
         }
         try seq.native.resolveTemporalBounds(&self.selectors, io);
         const input_specs = try self.inputs.toOwnedSlice(allocator);
@@ -3254,6 +3297,7 @@ fn emitCapabilities(io: std.Io, argv: []const []const u8) !u8 {
             "\"observation_abis\":[\"{s}\"],\"source_adapters\":" ++
             "[\"codex-rollout-jsonl/v1\"," ++
             "\"pi-session-jsonl/v1\"," ++
+            "\"claude-code-transcript-jsonl/v1\"," ++
             "\"opencode-prompt-history-jsonl/v1\"," ++
             "\"immutable-relation-json/v1\"]," ++
             "\"source_encodings\":[\"jsonl\",\"jsonl.zst\"],\"operators\":[",
@@ -3595,14 +3639,14 @@ test "graph discovery normalizes selectors and unions an explicit file with line
     try std.testing.expectEqualStrings(selected, args.selectors.path.?);
     try std.testing.expectEqualStrings(session_root, args.selectors.root.?);
     try std.testing.expectEqualStrings(root, args.selectors.repo.?);
-    var paths = try resolveGraphPaths(allocator, io, tmp.dir, &args, false);
+    var paths = try testGraphPaths(allocator, io, tmp.dir, &args, false);
     defer seq.native.freePaths(allocator, &paths);
     try std.testing.expectEqual(@as(usize, 2), paths.items.len);
     try std.testing.expectEqualStrings("ancestor.jsonl", std.fs.path.basename(paths.items[0]));
     try std.testing.expectEqualStrings(selected, paths.items[1]);
     var selected_inside = args;
     selected_inside.selectors.path = paths.items[0];
-    var deduplicated = try resolveGraphPaths(allocator, io, tmp.dir, &selected_inside, false);
+    var deduplicated = try testGraphPaths(allocator, io, tmp.dir, &selected_inside, false);
     defer seq.native.freePaths(allocator, &deduplicated);
     try std.testing.expectEqual(@as(usize, 1), deduplicated.items.len);
     try std.testing.expectEqualStrings(paths.items[0], deduplicated.items[0]);
@@ -3622,7 +3666,7 @@ test "graph discovery keeps an explicit file when the default corpus is absent" 
     var args = testObservation(.{ .path = "pi.jsonl", .environment = &environment });
     var normalized = try ObservationPaths.init(allocator, io, tmp.dir, &args.selectors);
     defer normalized.deinit(allocator);
-    var paths = try resolveGraphPaths(allocator, io, tmp.dir, &args, false);
+    var paths = try testGraphPaths(allocator, io, tmp.dir, &args, false);
     defer seq.native.freePaths(allocator, &paths);
     try std.testing.expectEqual(@as(usize, 1), paths.items.len);
     try std.testing.expectEqualStrings(args.selectors.path.?, paths.items[0]);
@@ -3645,7 +3689,7 @@ test "an outside explicit file excludes default corpus while an inside file reta
     var outside = testObservation(.{ .path = "pi.jsonl", .environment = &environment });
     var outside_paths = try ObservationPaths.init(allocator, io, tmp.dir, &outside.selectors);
     defer outside_paths.deinit(allocator);
-    var selected = try resolveGraphPaths(allocator, io, tmp.dir, &outside, false);
+    var selected = try testGraphPaths(allocator, io, tmp.dir, &outside, false);
     defer seq.native.freePaths(allocator, &selected);
     try std.testing.expectEqual(@as(usize, 1), selected.items.len);
     try std.testing.expectEqualStrings(outside.selectors.path.?, selected.items[0]);
@@ -3655,12 +3699,12 @@ test "an outside explicit file excludes default corpus while an inside file reta
     });
     var inside_paths = try ObservationPaths.init(allocator, io, tmp.dir, &inside.selectors);
     defer inside_paths.deinit(allocator);
-    var lineage = try resolveGraphPaths(allocator, io, tmp.dir, &inside, false);
+    var lineage = try testGraphPaths(allocator, io, tmp.dir, &inside, false);
     defer seq.native.freePaths(allocator, &lineage);
     try std.testing.expectEqual(@as(usize, 2), lineage.items.len);
     try std.testing.expectEqualStrings(inside.selectors.path.?, lineage.items[0]);
     try std.testing.expectEqualStrings("two.jsonl", std.fs.path.basename(lineage.items[1]));
-    var single_source = try resolveGraphPaths(allocator, io, tmp.dir, &inside, true);
+    var single_source = try testGraphPaths(allocator, io, tmp.dir, &inside, true);
     defer seq.native.freePaths(allocator, &single_source);
     try std.testing.expectEqual(@as(usize, 1), single_source.items.len);
     try std.testing.expectEqualStrings(inside.selectors.path.?, single_source.items[0]);
@@ -3998,4 +4042,69 @@ test "command diagnostics preserve supplied I/O failure identity" {
         try std.testing.expectEqual(1, witness.calls);
         try std.testing.expectEqual(failure == error.BrokenPipe, isClosedPipe(failure));
     }
+}
+
+fn testGraphPaths(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    dir: std.Io.Dir,
+    args: *const ObserveArgs,
+    physical_selection: bool,
+) !std.ArrayList([]u8) {
+    var family = seq.native.FamilyDiscovery{};
+    return resolveGraphPaths(allocator, io, dir, args, physical_selection, &family);
+}
+
+const ClaudeLimitationCounts = struct {
+    inline_sidechain_records: usize = 0,
+    unlocated_spawn_count: usize = 0,
+    worker_parent_unread: usize = 0,
+    worker_parent_missing: usize = 0,
+
+    fn add(self: *ClaudeLimitationCounts, file: seq.trace_adapter.ClaudeLimitations) !void {
+        self.inline_sidechain_records = std.math.add(
+            usize,
+            self.inline_sidechain_records,
+            file.inline_sidechain_records,
+        ) catch return error.ObservationMetricOverflow;
+        self.unlocated_spawn_count = std.math.add(
+            usize,
+            self.unlocated_spawn_count,
+            file.unlocated_spawn_count,
+        ) catch return error.ObservationMetricOverflow;
+        if (file.worker_parent_unread) self.worker_parent_unread += 1;
+        if (file.worker_parent_missing) self.worker_parent_missing += 1;
+    }
+
+    fn appendLimitations(
+        self: ClaudeLimitationCounts,
+        allocator: std.mem.Allocator,
+        limitations: *std.ArrayList([]const u8),
+    ) !void {
+        const entries = [_]struct { name: []const u8, count: usize }{
+            .{ .name = "claude_inline_sidechain_records", .count = self.inline_sidechain_records },
+            .{ .name = "claude_unlocated_spawn_count", .count = self.unlocated_spawn_count },
+            .{ .name = "claude_worker_parent_unread", .count = self.worker_parent_unread },
+            .{ .name = "claude_worker_parent_missing", .count = self.worker_parent_missing },
+        };
+        for (entries) |entry| {
+            if (entry.count == 0) continue;
+            const text = try std.fmt.allocPrint(allocator, "{s}: {d}", .{ entry.name, entry.count });
+            try limitations.append(allocator, text);
+        }
+    }
+};
+
+fn observationLimitationsAlloc(
+    allocator: std.mem.Allocator,
+    execution: *const ObservationExecution,
+    projection_bounded: bool,
+) ![]const []const u8 {
+    var limitations: std.ArrayList([]const u8) = .empty;
+    try limitations.appendSlice(
+        allocator,
+        observationLimitations(execution.warning_count, projection_bounded),
+    );
+    try execution.claude_limitations.appendLimitations(allocator, &limitations);
+    return limitations.items;
 }

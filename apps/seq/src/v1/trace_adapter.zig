@@ -2757,3 +2757,4 @@ pub fn sidecarMtime(sidecar: ?trace_core.claude_parser.Sidecar) ?i128 {
     const evidence = sidecar orelse return null;
     return if (evidence.present) evidence.mtime_ns else null;
 }
+pub const ClaudeLimitations = trace_core.claude_parser.Limitations;
