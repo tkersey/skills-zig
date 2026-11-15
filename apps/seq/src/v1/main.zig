@@ -794,12 +794,12 @@ fn runObserve(
             args.projection,
         );
         const resolved_root = if (args.selectors.path == null or !physical_selection)
-            try seq.native.resolveRootAlloc(allocator, environment, args.selectors.root, io, dir)
+            try resolveObservationRootAlloc(allocator, &args, io, dir)
         else
             null;
         defer if (resolved_root) |root| allocator.free(root);
         args.resolved_root = resolved_root;
-        const archive_root = if (resolved_root != null and args.selectors.root == null)
+        const archive_root = if (resolved_root != null and observesCodexDefaultRoot(&args))
             try seq.native.archiveRootAlloc(allocator, resolved_root.?)
         else
             null;
@@ -815,14 +815,13 @@ fn runObserve(
             &bindings,
         );
     }
-    return emitLinearObservation(io, dir, allocator, environment, &args, &context, &bindings);
+    return emitLinearObservation(io, dir, allocator, &args, &context, &bindings);
 }
 
 fn emitLinearObservation(
     io: std.Io,
     dir: std.Io.Dir,
     allocator: std.mem.Allocator,
-    environment: *const std.process.Environ.Map,
     args: *ObserveArgs,
     context: *const seq.compiled_plan.PlanSet,
     bindings: *const definition_core.parameters.Bindings,
@@ -836,12 +835,12 @@ fn emitLinearObservation(
     );
     defer program.deinit(allocator);
     const resolved_root = if (program.source == .physical and args.selectors.path == null)
-        try seq.native.resolveRootAlloc(allocator, environment, args.selectors.root, io, dir)
+        try resolveObservationRootAlloc(allocator, args, io, dir)
     else
         null;
     defer if (resolved_root) |root| allocator.free(root);
     args.resolved_root = resolved_root;
-    const archive_root = if (resolved_root != null and args.selectors.root == null)
+    const archive_root = if (resolved_root != null and observesCodexDefaultRoot(args))
         try seq.native.archiveRootAlloc(allocator, resolved_root.?)
     else
         null;
@@ -4107,4 +4106,18 @@ fn observationLimitationsAlloc(
     );
     try execution.claude_limitations.appendLimitations(allocator, &limitations);
     return limitations.items;
+}
+
+fn resolveObservationRootAlloc(
+    allocator: std.mem.Allocator,
+    args: *const ObserveArgs,
+    io: std.Io,
+    dir: std.Io.Dir,
+) ![]u8 {
+    const source = args.selectors.source orelse .codex;
+    return seq.native.resolveSourceRootAlloc(allocator, args.selectors, source, io, dir);
+}
+
+fn observesCodexDefaultRoot(args: *const ObserveArgs) bool {
+    return args.selectors.root == null and (args.selectors.source orelse .codex) == .codex;
 }

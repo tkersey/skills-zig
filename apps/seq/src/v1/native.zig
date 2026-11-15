@@ -1815,13 +1815,8 @@ fn runIndex(
     options: Options,
 ) !void {
     if (options.format != .json) return error.UnsupportedNativeFormat;
-    const root = try resolveRootAlloc(
-        allocator,
-        options.environment,
-        options.root,
-        io,
-        dir,
-    );
+    const source = options.source orelse .codex;
+    const root = try resolveSourceRootAlloc(allocator, options, source, io, dir);
     defer allocator.free(root);
     const action = options.action orelse "build";
     if (!std.mem.eql(u8, action, "build") and
@@ -1853,7 +1848,7 @@ fn runIndex(
     try writer.writeAll("{\"schema\":\"seq-index-result/v1\",\"root\":");
     try definition_core.canonical_json.writeCanonicalString(writer, root);
     try writer.writeAll(",\"archive_root\":");
-    if (options.root == null) {
+    if (options.root == null and source == .codex) {
         const archive = try archiveRootAlloc(allocator, root);
         defer allocator.free(archive);
         try definition_core.canonical_json.writeCanonicalString(writer, archive);
