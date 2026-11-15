@@ -314,7 +314,7 @@ fn gatherEvidence(
     if (evidence.last_response) |last| {
         evidence.message_lines = try messageLines(arena, records, path, last);
     }
-    for (evidence.after) |candidate| {
+    for (path) |candidate| {
         const record = records[candidate];
         if (record.isRetryNotice() or record.isReQueryPrompt()) evidence.re_query_after = candidate;
     }
@@ -386,8 +386,8 @@ fn decide(
     if (lastAfter(records, evidence.after, floor, isTurnLimit)) |found| {
         return .{ .status = .aborted, .reason = "claude_max_turns_reached", .record = found };
     }
-    if (floor != null) return null;
     const last = evidence.last_response orelse return null;
+    if (floor) |limit| if (last <= limit) return null;
     const response = records[last];
     if (response.stop.recorded()) |stop| {
         if (declaresCall(records, evidence.message_lines)) return null;
