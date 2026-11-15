@@ -1438,7 +1438,6 @@ pub const ClaudeParser = struct {
             errdefer tool.deinit(self.allocator);
             tool.lifecycle_status = .inferred;
             try self.trace.tools.append(self.allocator, tool);
-            if (turn) |owner| self.trace.turns.items[owner].tool_count += 1;
             try core.retainNewestTools(self.allocator, self.trace, self.options.max_tools);
             break :blk self.findTool(result.call_id) orelse return;
         };

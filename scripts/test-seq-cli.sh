@@ -17,6 +17,9 @@ temp_base=$(cd "${TMPDIR:-/tmp}" && pwd -P)
 cache_dir=$(mktemp -d "$temp_base/seq-v1-smoke.XXXXXX")
 trap 'test -n "${cache_dir:-}" && rm -rf -- "$cache_dir"' EXIT
 export SEQ_CACHE_DIR="$cache_dir/cache"
+fixture_root="$cache_dir/fixture-root"
+cp -R apps/seq/src/v1/fixtures "$fixture_root"
+rm -rf -- "$fixture_root/claude"
 
 check_output=$("$binary" definition check \
   --definition "$message_definition" \
@@ -197,6 +200,55 @@ then
 fi
 grep -Fq '"code":"PiCumulativeTokenEventsUnavailable"' <<<"$pi_usage_error"
 
+claude_fixtures=apps/seq/src/v1/fixtures/claude
+"$binary" capabilities --format json |
+  jq -e '.source_adapters | any(.[]; . == "claude-code-transcript-jsonl/v1")' >/dev/null
+claude_turns=$("$binary" turns --path "$claude_fixtures/turn-outcomes.jsonl" --format json)
+jq -e 'map(.status_reason) == ["claude_end_turn", "claude_tool_ended_turn",
+  "claude_interrupted", "claude_text_end", "claude_superseded", "stale_ongoing_file"]' \
+  <<<"$claude_turns" >/dev/null
+jq -e 'map(.origin) == ["human", "sdk", "human", "human", "human", "human"]' \
+  <<<"$claude_turns" >/dev/null
+claude_tokens=$("$binary" query --path "$claude_fixtures/request-records.jsonl" \
+  --spec '{"dataset":"token_events","select":["request_key","request_record","usage_model","usage_finality","quantity_state","has_total_usage","total_tokens"],"format":"json"}')
+jq -e 'length == 2 and all(.[]; .request_record == "here" and .usage_model == "per-request" and
+  .usage_finality == "final" and .quantity_state == "usable" and .has_total_usage == false)' \
+  <<<"$claude_tokens" >/dev/null
+claude_observation=$("$binary" observe --definition "$message_definition" --projection rows \
+  --path "$claude_fixtures/turn-outcomes.jsonl" --param needle=a --format json)
+grep -Fq '"adapter":"claude-code-transcript-jsonl/v1"' <<<"$claude_observation"
+if claude_conflict=$("$binary" sessions --source claude-code --root "$claude_fixtures" \
+  --format json); then
+  exit 1
+fi
+jq -e '.code == "ConflictingSourceSelectors"' <<<"$claude_conflict" >/dev/null
+claude_config="$cache_dir/claude-config"
+claude_project="$claude_config/projects/-repo"
+claude_current_id=b1000000-0000-4000-8000-000000000001
+mkdir -p "$claude_project"
+cp "$claude_fixtures/fork-parent/$claude_current_id.jsonl" "$claude_project/"
+claude_default=$(CLAUDE_CONFIG_DIR="$claude_config" "$binary" sessions --source claude-code \
+  --format json)
+jq -e --arg id "$claude_current_id" 'length == 1 and .[0].session_id == $id' \
+  <<<"$claude_default" >/dev/null
+claude_tail=$(CLAUDE_CONFIG_DIR="$claude_config" CLAUDE_CODE_SESSION_ID="$claude_current_id" \
+  "$binary" tail --current --once --limit 1 --format json)
+grep -Fq '"format":"claude_code_jsonl"' <<<"$claude_tail"
+if claude_ambiguous=$(CLAUDE_CONFIG_DIR="$claude_config" CODEX_THREAD_ID=codex-hint \
+  CLAUDE_CODE_SESSION_ID="$claude_current_id" "$binary" tail --current --once --format json); then
+  exit 1
+fi
+jq -e '.code == "AmbiguousCurrentSessionSource"' <<<"$claude_ambiguous" >/dev/null
+claude_selected=$(CLAUDE_CONFIG_DIR="$claude_config" CODEX_THREAD_ID=codex-hint \
+  CLAUDE_CODE_SESSION_ID="$claude_current_id" "$binary" tail --current --once --source claude-code \
+  --limit 1 --format json)
+grep -Fq "\"session_id\":\"$claude_current_id\"" <<<"$claude_selected"
+if claude_missing=$(CLAUDE_CONFIG_DIR="$claude_config" CODEX_THREAD_ID=codex-hint \
+  "$binary" tail --current --once --source claude-code --format json); then
+  exit 1
+fi
+jq -e '.code == "CurrentSessionUnavailable"' <<<"$claude_missing" >/dev/null
+
 external_output=$("$binary" observe \
   --definition "$external_definition" \
   --projection rows \
@@ -228,7 +280,7 @@ grep -Fq '"relation":"messages"' <<<"$explain_output"
 grep -Fq '"corpus_read":false' <<<"$explain_output"
 
 sessions_output=$("$binary" sessions \
-  --root apps/seq/src/v1/fixtures \
+  --root "$fixture_root" \
   --format json)
 grep -Fq '"session_id":"fixture-session"' <<<"$sessions_output"
 
@@ -307,7 +359,7 @@ grep -Fq '"entry_type":"session_meta"' <<<"$tail_output"
 grep -Fq '"entry_type":"event_msg"' <<<"$tail_output"
 
 find_output=$("$binary" find-session \
-  --root apps/seq/src/v1/fixtures \
+  --root "$fixture_root" \
   --session-id fixture-session \
   --format json)
 grep -Fq '"session_id":"fixture-session"' <<<"$find_output"
@@ -329,7 +381,7 @@ schema_output=$("$binary" dataset-schema \
 grep -Fq '"field":"json_pointer"' <<<"$schema_output"
 
 query_output=$("$binary" query \
-  --root apps/seq/src/v1/fixtures \
+  --root "$fixture_root" \
   --spec '{"dataset":"messages","where":[{"field":"text","op":"contains","value":"failure","case_insensitive":true}],"select":["session_id","role","text"],"limit":5,"format":"json"}')
 grep -Fq \
   '{"session_id":"fixture-session","role":"assistant","text":"Observed FAILURE evidence"}' \
