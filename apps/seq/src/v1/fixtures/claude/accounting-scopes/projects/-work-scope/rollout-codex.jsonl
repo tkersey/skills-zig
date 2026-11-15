@@ -1,0 +1,2 @@
+{"timestamp":"2026-11-10T16:00:00.000Z","type":"session_meta","payload":{"id":"019a0000-0000-7000-8000-00000000c0de","timestamp":"2026-11-10T16:00:00.000Z","cwd":"/work/codex","originator":"codex_cli_rs","cli_version":"0.50.0"}}
+{"timestamp":"2026-11-10T16:00:01.000Z","type":"event_msg","payload":{"type":"task_started"}}

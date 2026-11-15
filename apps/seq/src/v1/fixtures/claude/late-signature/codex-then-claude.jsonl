@@ -1,0 +1,4 @@
+{"type":"mystery-note","sessionId":"neutral","n":0}
+{"type":"mystery-note","sessionId":"neutral","n":1}
+{"timestamp":"2026-11-10T16:00:00.000Z","type":"session_meta","payload":{"id":"019a0000-0000-7000-8000-00000000c0de","timestamp":"2026-11-10T16:00:00.000Z","cwd":"/work/codex","originator":"codex_cli_rs","cli_version":"0.50.0"}}
+{"parentUuid":null,"isSidechain":false,"type":"user","uuid":"rec-l01","timestamp":"2026-11-10T16:00:00.000Z","cwd":"/work/alpha","sessionId":"5e551000-0000-4000-8000-00000000000d","version":"2.1.325","gitBranch":"main","message":{"role":"user","content":"Late Claude"},"userType":"external","turnOrigin":"human"}

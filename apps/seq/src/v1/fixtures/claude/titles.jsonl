@@ -1,0 +1,6 @@
+{"parentUuid":null,"isSidechain":false,"type":"user","uuid":"rec-n01","timestamp":"2026-11-10T12:00:00.000Z","cwd":"/work/alpha","sessionId":"5e551000-0000-4000-8000-000000000004","version":"2.1.325","gitBranch":"main","message":{"role":"user","content":"Name me"},"userType":"external","turnOrigin":"human"}
+{"type":"ai-title","aiTitle":"Generated one","sessionId":"5e551000-0000-4000-8000-000000000004"}
+{"type":"custom-title","customTitle":"Named first","sessionId":"5e551000-0000-4000-8000-000000000004"}
+{"parentUuid":"rec-n01","isSidechain":false,"type":"assistant","uuid":"rec-n02","timestamp":"2026-11-10T12:00:01.000Z","cwd":"/work/alpha","sessionId":"5e551000-0000-4000-8000-000000000004","version":"2.1.325","gitBranch":"main","message":{"model":"claude-test-one","id":"msg_n1","type":"message","role":"assistant","content":[{"type":"text","text":"Done."}],"stop_reason":"end_turn","stop_sequence":null,"usage":{"input_tokens":10,"cache_creation_input_tokens":0,"cache_read_input_tokens":0,"output_tokens":5,"service_tier":"standard"}},"apiBlockIndex":0,"requestId":"req_msg_n1","effort":"high"}
+{"type":"custom-title","customTitle":"Named second","sessionId":"5e551000-0000-4000-8000-000000000004"}
+{"type":"ai-title","aiTitle":"Generated two","sessionId":"5e551000-0000-4000-8000-000000000004"}
