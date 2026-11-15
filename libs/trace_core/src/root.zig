@@ -723,7 +723,14 @@ test "Claude transcripts are admitted and contradicting signatures still fail" {
         "{\"type\":\"event_msg\",\"payload\":{\"type\":\"task_started\"}}\n";
     inline for (.{ parseSessionTraceReader, parseSessionSummaryTraceReader }) |parse| {
         var reader: std.Io.Reader = .fixed(claude);
-        var trace = try parse(std.testing.io, std.testing.allocator, "claude.jsonl", &reader, 0, .{});
+        var trace = try parse(
+            std.testing.io,
+            std.testing.allocator,
+            "claude.jsonl",
+            &reader,
+            0,
+            .{},
+        );
         defer trace.deinit(std.testing.allocator);
         try std.testing.expectEqual(TraceSource.claude, trace.source);
         try std.testing.expectEqualStrings("claude", trace.session.session_id.?);
@@ -1044,7 +1051,11 @@ const SourceState = struct {
     ) !void {
         const owned = try allocator.dupe(u8, line);
         errdefer allocator.free(owned);
-        try self.pending.append(allocator, .{ .bytes = owned, .number = number, .end_offset = end_offset });
+        try self.pending.append(allocator, .{
+            .bytes = owned,
+            .number = number,
+            .end_offset = end_offset,
+        });
         self.pending_bytes += line.len;
     }
 
@@ -1111,7 +1122,14 @@ const LineSinks = struct {
         for (state.pending.items) |pending| {
             defer scratch.reset();
             const root = (try scratch.parse(pending.bytes)).?;
-            try self.apply(parser, state.decided.?, root, pending.number, pending.end_offset, pending.bytes);
+            try self.apply(
+                parser,
+                state.decided.?,
+                root,
+                pending.number,
+                pending.end_offset,
+                pending.bytes,
+            );
         }
         for (state.pending.items) |pending| self.allocator.free(pending.bytes);
         state.pending.clearRetainingCapacity();

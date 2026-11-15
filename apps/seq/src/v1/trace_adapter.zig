@@ -89,7 +89,14 @@ pub fn discoverSessionIdentity(
     const mtime = stat.mtime.nanoseconds;
     var discovery_options = options;
     discovery_options.sidecar_dir = dir;
-    var summary = try parseDiscoveryLine(io, allocator, path, prefix.parsed(), mtime, discovery_options);
+    var summary = try parseDiscoveryLine(
+        io,
+        allocator,
+        path,
+        prefix.parsed(),
+        mtime,
+        discovery_options,
+    );
     defer summary.deinit(allocator);
     var identity: SessionIdentity = .{
         .session_id = null,

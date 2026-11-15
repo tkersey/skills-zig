@@ -2072,7 +2072,14 @@ fn claudePathPassesWindow(
     }
     const until = options.until_ms orelse return true;
     const upper = std.math.add(i64, until, claude_window_margin_ms) catch return true;
-    var identity = trace_adapter.discoverSessionIdentity(io, dir, allocator, path, .{}, null) catch |err|
+    var identity = trace_adapter.discoverSessionIdentity(
+        io,
+        dir,
+        allocator,
+        path,
+        .{},
+        null,
+    ) catch |err|
         switch (err) {
             error.OutOfMemory => return err,
             else => return true,
@@ -2205,7 +2212,14 @@ fn retainNamedClaudeSession(
     var confirmed: ?usize = null;
     for (paths.items, 0..) |path, index| {
         if (!basenameStemEquals(path, stem)) continue;
-        var identity = trace_adapter.discoverSessionIdentity(io, dir, allocator, path, .{}, null) catch |err|
+        var identity = trace_adapter.discoverSessionIdentity(
+            io,
+            dir,
+            allocator,
+            path,
+            .{},
+            null,
+        ) catch |err|
             switch (err) {
                 error.OutOfMemory => return err,
                 else => continue,
@@ -3606,7 +3620,14 @@ pub fn claudeFamilyPathsAlloc(
     selected: []const u8,
     discovery: *FamilyDiscovery,
 ) !?std.ArrayList([]u8) {
-    var identity = trace_adapter.discoverSessionIdentity(io, dir, allocator, selected, .{}, null) catch |err|
+    var identity = trace_adapter.discoverSessionIdentity(
+        io,
+        dir,
+        allocator,
+        selected,
+        .{},
+        null,
+    ) catch |err|
         switch (err) {
             error.OutOfMemory => return err,
             else => return null,
@@ -3695,7 +3716,14 @@ fn flatWorkerBelongs(
     root: []const u8,
     discovery: *FamilyDiscovery,
 ) !bool {
-    var identity = trace_adapter.discoverSessionIdentity(io, dir, allocator, path, .{}, null) catch |err|
+    var identity = trace_adapter.discoverSessionIdentity(
+        io,
+        dir,
+        allocator,
+        path,
+        .{},
+        null,
+    ) catch |err|
         switch (err) {
             error.OutOfMemory => return err,
             else => return false,

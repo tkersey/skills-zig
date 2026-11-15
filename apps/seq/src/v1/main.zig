@@ -1822,14 +1822,22 @@ const StreamingGraphState = struct {
                 self.corpus_entries.items[admitted].path_index < item.path_index)
             {
                 const entry = self.corpus_entries.items[admitted];
-                self.metrics.source_metadata.add(entry.path, entry.source_mtime_ns, entry.sidecar_mtime_ns);
+                self.metrics.source_metadata.add(
+                    entry.path,
+                    entry.source_mtime_ns,
+                    entry.sidecar_mtime_ns,
+                );
                 admitted += 1;
             }
             const parsed = admitted < self.corpus_entries.items.len and
                 self.corpus_entries.items[admitted].path_index == item.path_index;
             if (parsed) {
                 const entry = self.corpus_entries.items[admitted];
-                self.metrics.source_metadata.add(entry.path, entry.source_mtime_ns, entry.sidecar_mtime_ns);
+                self.metrics.source_metadata.add(
+                    entry.path,
+                    entry.source_mtime_ns,
+                    entry.sidecar_mtime_ns,
+                );
                 admitted += 1;
             } else {
                 self.metrics.source_metadata.add(
@@ -1840,7 +1848,11 @@ const StreamingGraphState = struct {
             }
         }
         for (self.corpus_entries.items[admitted..]) |entry| {
-            self.metrics.source_metadata.add(entry.path, entry.source_mtime_ns, entry.sidecar_mtime_ns);
+            self.metrics.source_metadata.add(
+                entry.path,
+                entry.source_mtime_ns,
+                entry.sidecar_mtime_ns,
+            );
         }
     }
 
@@ -3046,7 +3058,12 @@ const SourceMetadataHasher = struct {
         break :init value;
     },
 
-    fn add(self: *SourceMetadataHasher, path: []const u8, mtime_ns: i128, sidecar_mtime_ns: ?i128) void {
+    fn add(
+        self: *SourceMetadataHasher,
+        path: []const u8,
+        mtime_ns: i128,
+        sidecar_mtime_ns: ?i128,
+    ) void {
         var length: [8]u8 = undefined;
         std.mem.writeInt(u64, &length, @intCast(path.len), .big);
         self.hasher.update(&length);
@@ -4088,7 +4105,11 @@ const ClaudeLimitationCounts = struct {
         };
         for (entries) |entry| {
             if (entry.count == 0) continue;
-            const text = try std.fmt.allocPrint(allocator, "{s}: {d}", .{ entry.name, entry.count });
+            const text = try std.fmt.allocPrint(
+                allocator,
+                "{s}: {d}",
+                .{ entry.name, entry.count },
+            );
             try limitations.append(allocator, text);
         }
     }

@@ -258,7 +258,8 @@ pub fn evaluate(
     const path = index.paths[turn];
     const owned = index.owned[turn];
     const active = graph.active_turn == turn;
-    const evidence = try gatherEvidence(arena, records, path, active and freshness.request_in_flight);
+    const in_flight = active and freshness.request_in_flight;
+    const evidence = try gatherEvidence(arena, records, path, in_flight);
     var outcome = Outcome{};
     if (evidence.last_response) |last| {
         outcome.model = records[last].model;
@@ -286,7 +287,10 @@ pub fn evaluate(
         outcome.reason = if (freshness.fresh) "fresh_ongoing_turn" else "stale_ongoing_file";
     } else {
         outcome.status = .aborted;
-        outcome.reason = if (graph.on_active[anchor]) "claude_superseded" else "claude_inactive_branch";
+        outcome.reason = if (graph.on_active[anchor])
+            "claude_superseded"
+        else
+            "claude_inactive_branch";
     }
     return outcome;
 }
@@ -394,7 +398,12 @@ fn decide(
     const legacy_text_end = response.hasText() and
         (response.stop == .absent or response.stop == .null_value);
     if (!legacy_text_end) return null;
-    return .{ .status = .complete, .reason = "claude_text_end", .record = last, .by_response = true };
+    return .{
+        .status = .complete,
+        .reason = "claude_text_end",
+        .record = last,
+        .by_response = true,
+    };
 }
 
 fn isInterruption(record: Record) bool {
@@ -494,7 +503,11 @@ fn answerFor(
     return lastTextAnswer(arena, records, path);
 }
 
-fn lastTextAnswer(arena: std.mem.Allocator, records: []const Record, path: []const u32) !?[]const u8 {
+fn lastTextAnswer(
+    arena: std.mem.Allocator,
+    records: []const Record,
+    path: []const u32,
+) !?[]const u8 {
     var position = path.len;
     while (position > 0) {
         position -= 1;
@@ -508,7 +521,11 @@ fn lastTextAnswer(arena: std.mem.Allocator, records: []const Record, path: []con
 
 const Keyed = struct { key: ?i64, block: parser.Block };
 
-pub fn assemble(arena: std.mem.Allocator, records: []const Record, lines: []const u32) !?[]const u8 {
+pub fn assemble(
+    arena: std.mem.Allocator,
+    records: []const Record,
+    lines: []const u32,
+) !?[]const u8 {
     var entries: std.ArrayList(Keyed) = .empty;
     var all_keyed = true;
     for (lines) |position| {

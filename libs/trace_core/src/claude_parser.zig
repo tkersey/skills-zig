@@ -395,10 +395,7 @@ pub const Extractor = struct {
         index: usize,
     ) !ResultBlock {
         const is_error = boolField(block, "is_error") orelse false;
-        const mcp_end = if (objectField(root, "mcpMeta")) |mcp|
-            if (objectField(mcp, "_meta")) |meta| boolField(meta, "claude/endTurn") orelse false else false
-        else
-            false;
+        const mcp_end = mcpEndsTurn(root);
         const flagged = boolField(root, "toolEndsTurn") orelse false;
         var parts: std.ArrayList(OutputPart) = .empty;
         var text: std.ArrayList(u8) = .empty;
@@ -460,7 +457,9 @@ pub const Extractor = struct {
         result.model = try self.dup(model);
         result.message_id = try self.dupText(Text.read(message, "id"));
         result.stop = StopReason.read(message);
-        if (result.stop == .value) result.stop = .{ .value = try self.arena.dupe(u8, result.stop.value) };
+        if (result.stop == .value) {
+            result.stop = .{ .value = try self.arena.dupe(u8, result.stop.value) };
+        }
         if (objectField(message, "usage")) |raw_usage| {
             result.service_tier = try self.dup(stringField(raw_usage, "service_tier"));
         }
@@ -480,7 +479,8 @@ pub const Extractor = struct {
             const block_type = stringField(block, "type") orelse "";
             if (std.mem.eql(u8, block_type, "text")) {
                 const text = stringField(block, "text") orelse "";
-                try result.append(self.arena, .{ .kind = .text, .text = try self.arena.dupe(u8, text) });
+                const owned = try self.arena.dupe(u8, text);
+                try result.append(self.arena, .{ .kind = .text, .text = owned });
             } else if (std.mem.eql(u8, block_type, "tool_use")) {
                 try result.append(self.arena, try self.toolUse(block));
             } else {
@@ -558,6 +558,12 @@ pub const Extractor = struct {
         };
     }
 };
+
+fn mcpEndsTurn(root: std.json.ObjectMap) bool {
+    const mcp = objectField(root, "mcpMeta") orelse return false;
+    const meta = objectField(mcp, "_meta") orelse return false;
+    return boolField(meta, "claude/endTurn") orelse false;
+}
 
 pub fn payloadJsonAlloc(
     allocator: std.mem.Allocator,
@@ -860,7 +866,9 @@ pub const ClaudeParser = struct {
         const identity = try self.resolveIdentity(io);
         const graph = try turns_mod.build(self.arena(), records, identity.worker);
         self.trace.claude_limitations.inline_sidechain_records = graph.inline_sidechain_records;
-        for (graph.missing_uuid_lines) |line| try self.warn(line, "Claude conversation record without uuid");
+        for (graph.missing_uuid_lines) |line| {
+            try self.warn(line, "Claude conversation record without uuid");
+        }
         for (graph.duplicate_uuid_lines) |line| try self.warn(line, "duplicate Claude record uuid");
         const accounting = try tokens_mod.account(self.arena(), records, identity.conflict);
         for (accounting.rows) |row| {
@@ -877,7 +885,14 @@ pub const ClaudeParser = struct {
         const index = try turns_mod.indexTurns(self.arena(), &graph);
         const outcomes = try self.arena().alloc(turns_mod.Outcome, graph.turns.len);
         for (outcomes, 0..) |*outcome, turn| {
-            outcome.* = try turns_mod.evaluate(self.arena(), records, &graph, &index, @intCast(turn), freshness);
+            outcome.* = try turns_mod.evaluate(
+                self.arena(),
+                records,
+                &graph,
+                &index,
+                @intCast(turn),
+                freshness,
+            );
         }
         try self.applySessionFields(&graph, outcomes, accounting);
         if (!self.summary) {
@@ -901,10 +916,14 @@ pub const ClaudeParser = struct {
     fn resolveIdentity(self: *ClaudeParser, io: std.Io) !Identity {
         const path_identity = PathIdentity.read(self.trace.session.path);
         const session = &self.trace.session;
-        var identity = Identity{ .worker = path_identity.agent != null, .agent = path_identity.agent };
+        var identity = Identity{
+            .worker = path_identity.agent != null,
+            .agent = path_identity.agent,
+        };
         try self.applyPrefixFields();
         const agent = path_identity.agent orelse {
-            const id = if (isUuid(path_identity.stem)) path_identity.stem else self.prefix.first_session_id;
+            const stem = path_identity.stem;
+            const id = if (isUuid(stem)) stem else self.prefix.first_session_id;
             try replaceNullable(self.allocator, &session.session_id, id);
             try replaceNullable(self.allocator, &session.root_session_id, id);
             identity.root = id;
@@ -984,7 +1003,12 @@ pub const ClaudeParser = struct {
         }
     }
 
-    fn requireParent(self: *ClaudeParser, io: std.Io, directory: []const u8, stem: []const u8) !void {
+    fn requireParent(
+        self: *ClaudeParser,
+        io: std.Io,
+        directory: []const u8,
+        stem: []const u8,
+    ) !void {
         for ([_][]const u8{ ".jsonl", ".jsonl.zst" }) |extension| {
             const name = try std.mem.concat(self.arena(), u8, &.{ stem, extension });
             const path = try std.fs.path.join(self.arena(), &.{ directory, name });
@@ -1014,31 +1038,49 @@ pub const ClaudeParser = struct {
         else
             directory_handle.openFile(io, sidecar_path, .{});
         const file = opened catch {
-            self.trace.claude_sidecar = .{ .present = false, .digest = digestOf(""), .mtime_ns = 0 };
+            self.trace.claude_sidecar = .{
+                .present = false,
+                .digest = digestOf(""),
+                .mtime_ns = 0,
+            };
             return null;
         };
         defer file.close(io);
         const stat = try file.stat(io);
         const mtime_ns = stat.mtime.nanoseconds;
         if (stat.size > sidecar_bytes_max) {
-            self.trace.claude_sidecar = .{ .present = true, .digest = digestOf(""), .mtime_ns = mtime_ns };
+            self.trace.claude_sidecar = .{
+                .present = true,
+                .digest = digestOf(""),
+                .mtime_ns = mtime_ns,
+            };
             return null;
         }
         var reader = file.reader(io, &.{});
         const limit: std.Io.Limit = .limited(sidecar_bytes_max);
-        const bytes = reader.interface.allocRemaining(self.arena(), limit) catch |err| switch (err) {
+        const remaining = reader.interface.allocRemaining(self.arena(), limit);
+        const bytes = remaining catch |err| switch (err) {
             error.OutOfMemory => return err,
             else => {
-                self.trace.claude_sidecar = .{ .present = true, .digest = digestOf(""), .mtime_ns = mtime_ns };
+                self.trace.claude_sidecar = .{
+                    .present = true,
+                    .digest = digestOf(""),
+                    .mtime_ns = mtime_ns,
+                };
                 return null;
             },
         };
-        self.trace.claude_sidecar = .{ .present = true, .digest = digestOf(bytes), .mtime_ns = mtime_ns };
+        self.trace.claude_sidecar = .{
+            .present = true,
+            .digest = digestOf(bytes),
+            .mtime_ns = mtime_ns,
+        };
         return parseSidecar(self.arena(), bytes);
     }
 
     fn parseSidecar(arena_allocator: std.mem.Allocator, bytes: []const u8) !?SidecarFields {
-        const value = std.json.parseFromSliceLeaky(std.json.Value, arena_allocator, bytes, .{}) catch |err|
+        const parsed = std.json.parseFromSliceLeaky(std.json.Value, arena_allocator, bytes, .{});
+        const value = parsed catch |err|
             switch (err) {
                 error.OutOfMemory => return err,
                 else => return null,
@@ -1073,7 +1115,8 @@ pub const ClaudeParser = struct {
         for (self.records.items) |record| {
             if (record.timestamp) |timestamp| {
                 const millis = timestampMillis(timestamp);
-                if (session.end_time == null or (millis != null and (latest_ms == null or millis.? >= latest_ms.?))) {
+                const later = millis != null and (latest_ms == null or millis.? >= latest_ms.?);
+                if (session.end_time == null or later) {
                     try replaceOpt(self.allocator, &session.end_time, timestamp);
                     if (millis) |value| latest_ms = value;
                 }
@@ -1095,10 +1138,14 @@ pub const ClaudeParser = struct {
         }
         applyTotals(session, summer.totals());
         session.token_usage_observation_count = observations;
-        const active = graph.active_turn orelse if (graph.turns.len > 0) graph.turns.len - 1 else null;
+        const last_turn = if (graph.turns.len > 0) graph.turns.len - 1 else null;
+        const active = graph.active_turn orelse last_turn;
         const reason = if (active) |turn| outcomes[turn].reason else "no_turns";
         try replaceOpt(self.allocator, &session.status_reason, reason);
-        session.is_ongoing = if (graph.active_turn) |turn| outcomes[turn].status == .ongoing else false;
+        session.is_ongoing = if (graph.active_turn) |turn|
+            outcomes[turn].status == .ongoing
+        else
+            false;
     }
 
     fn applyTotals(target: anytype, totals: tokens_mod.Totals) void {
@@ -1200,7 +1247,10 @@ pub const ClaudeParser = struct {
                     const entry = try by_call.getOrPut(self.arena(), call_id);
                     if (entry.found_existing) continue;
                     entry.value_ptr.* = spawns.items.len;
-                    try spawns.append(self.arena(), .{ .declaration = @intCast(index), .block = block });
+                    try spawns.append(self.arena(), .{
+                        .declaration = @intCast(index),
+                        .block = block,
+                    });
                 }
             }
             for (record.results) |result| {
@@ -1330,7 +1380,8 @@ pub const ClaudeParser = struct {
     }
 
     fn newTool(self: *ClaudeParser, call_id: []const u8, turn: ?u32) !core.ToolLifecycleRecord {
-        var tool = core.ToolLifecycleRecord{ .path = try self.allocator.dupe(u8, self.trace.session.path) };
+        const path = try self.allocator.dupe(u8, self.trace.session.path);
+        var tool = core.ToolLifecycleRecord{ .path = path };
         errdefer tool.deinit(self.allocator);
         tool.session_id = try dupOpt(self.allocator, self.trace.session.session_id);
         tool.call_id = try self.allocator.dupe(u8, call_id);
@@ -1357,7 +1408,9 @@ pub const ClaudeParser = struct {
         tool.kind = toolKind(name);
         tool.namespace = try core.namespaceFromName(self.allocator, name);
         tool.arguments_json = try dupOpt(self.allocator, block.input_json);
-        if (std.mem.eql(u8, name, "Bash")) tool.command_text = try dupOpt(self.allocator, block.command);
+        if (std.mem.eql(u8, name, "Bash")) {
+            tool.command_text = try dupOpt(self.allocator, block.command);
+        }
         tool.started_at = try dupOpt(self.allocator, record.timestamp);
         tool.cwd = try dupOpt(self.allocator, record.cwd);
         tool.lifecycle_status = .declared;
@@ -1393,7 +1446,9 @@ pub const ClaudeParser = struct {
         try replaceOpt(self.allocator, &tool.output_text, result.text);
         try replaceNullable(self.allocator, &tool.completed_at, record.timestamp);
         tool.finalized_line = @intCast(record.line);
-        if (result.is_error and eql(tool.tool_name, "Bash")) tool.exit_code = reportedExitCode(result.first_text);
+        if (result.is_error and eql(tool.tool_name, "Bash")) {
+            tool.exit_code = reportedExitCode(result.first_text);
+        }
         tool.lifecycle_status = if (result.is_error) .failed else .completed;
         if (!self.options.include_tool_output_parts) return;
         const source_event_id = if (record.occurrence) |occurrence|
@@ -1428,7 +1483,9 @@ pub const ClaudeParser = struct {
                 false;
             const visible_input = opening and record.visibleOrigin() and record.text != null;
             occurrence.message_visible = visible_response or visible_input;
-            if (occurrence.message_visible) occurrence.message_id = try dupOpt(self.allocator, record.uuid);
+            if (occurrence.message_visible) {
+                occurrence.message_id = try dupOpt(self.allocator, record.uuid);
+            }
         }
     }
 
@@ -1452,7 +1509,10 @@ pub const ClaudeParser = struct {
             event.request_key = try dupOpt(self.allocator, row.key);
             event.request_record = if (row.authorship) |value| @tagName(value) else null;
             event.usage_finality = if (row.finality) |value| @tagName(value) else null;
-            event.quantity_state = if (row.kind == .unanswered) null else @tagName(row.quantity.state);
+            event.quantity_state = if (row.kind == .unanswered)
+                null
+            else
+                @tagName(row.quantity.state);
             if (row.quantity.usable()) fillCounters(&event, row.quantity);
             try self.trace.token_events.append(self.allocator, event);
         }

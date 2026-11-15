@@ -77,7 +77,9 @@ pub fn account(
     }
     for (messages.items) |*message| try noteMessageRef(arena, &tables, records, message);
     for (messages.items) |*message| classifyLink(&tables, records, message);
-    for (messages.items) |*message| message.authorship = authorship(records, messages.items, message, &tables);
+    for (messages.items) |*message| {
+        message.authorship = authorship(records, messages.items, message, &tables);
+    }
     var in_flight = false;
     for (records, 0..) |record, index| {
         if (record.kind != .api_request) continue;
@@ -309,10 +311,9 @@ pub const Summer = struct {
         }
         const quantity = row.quantity;
         self.counted += 1;
-        inline for (.{ .{ "input", "input" }, .{ "cached", "cached" }, .{ "output", "output" }, .{
-            "total", "total",
-        } }) |pair| {
-            @field(self, pair[0]) = std.math.add(i64, @field(self, pair[0]), @field(quantity, pair[1])) catch blk: {
+        inline for (.{ "input", "cached", "output", "total" }) |field| {
+            const current = @field(self, field);
+            @field(self, field) = std.math.add(i64, current, @field(quantity, field)) catch blk: {
                 self.usable = false;
                 break :blk 0;
             };

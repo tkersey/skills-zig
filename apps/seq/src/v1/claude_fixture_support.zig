@@ -70,7 +70,10 @@ pub fn writeTree(dir: std.Io.Dir, files: []const TreeFile) !void {
     }
 }
 
-pub fn turnByIndex(trace: *const trace_core.CanonicalSessionTrace, index: i64) *const trace_core.TurnRecord {
+pub fn turnByIndex(
+    trace: *const trace_core.CanonicalSessionTrace,
+    index: i64,
+) *const trace_core.TurnRecord {
     for (trace.turns.items) |*turn| {
         if (turn.turn_index == index) return turn;
     }
