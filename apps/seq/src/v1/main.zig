@@ -2354,7 +2354,8 @@ const PhysicalMetrics = struct {
     warnings: usize = 0,
     adapter: ?[]const u8 = null,
 
-    fn admitAdapter(self: *PhysicalMetrics, adapter: []const u8) !void {
+    fn admitAdapter(self: *PhysicalMetrics, vote: ?[]const u8) !void {
+        const adapter = vote orelse return;
         if (self.adapter) |current| {
             if (!std.mem.eql(u8, current, adapter)) {
                 return error.MixedPhysicalSourceAdapters;

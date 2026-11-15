@@ -1,14 +1,18 @@
 const std = @import("std");
 const jsonl_stream = @import("jsonl_core");
 pub const SessionInput = @import("session_input.zig").SessionInput;
+pub const claude_parser = @import("claude_parser.zig");
 
 pub const TraceFormat = enum {
     new_044_plus,
     mid_payload_meta,
     old_2025_08_root_meta,
     pi_session_jsonl,
+    claude_code_jsonl,
     unknown,
 };
+
+pub const TraceSource = enum { none, codex, pi, claude };
 
 pub const TurnStatus = enum {
     complete,
@@ -55,6 +59,7 @@ pub const TraceParseOptions = struct {
     /// matches the tool_lifecycle dataset's limit semantics without retaining
     /// large payloads for rows that cannot reach that result.
     max_tools: ?usize = null,
+    sidecar_dir: ?std.Io.Dir = null,
 };
 
 pub const StreamMetrics = struct {
@@ -177,6 +182,7 @@ pub const TurnRecord = struct {
     @"error": ?[]u8 = null,
     aborted_reason: ?[]u8 = null,
     spawned_worker_count: i64 = 0,
+    origin: ?[]u8 = null,
 
     pub fn deinit(self: *TurnRecord, allocator: std.mem.Allocator) void {
         freeOpt(allocator, self.session_id);
@@ -195,6 +201,7 @@ pub const TurnRecord = struct {
         freeOpt(allocator, self.thread_name);
         freeOpt(allocator, self.@"error");
         freeOpt(allocator, self.aborted_reason);
+        freeOpt(allocator, self.origin);
     }
 };
 
@@ -315,6 +322,7 @@ pub const TraceOccurrence = struct {
     message_visible: bool = true,
     private: bool = false,
     format: TraceFormat = .unknown,
+    message_id: ?[]u8 = null,
 
     pub fn init(
         allocator: std.mem.Allocator,
@@ -351,6 +359,7 @@ pub const TraceOccurrence = struct {
         freeOpt(allocator, self.payload_json);
         freeOpt(allocator, self.raw_json);
         freeOpt(allocator, self.text);
+        freeOpt(allocator, self.message_id);
     }
 
     pub fn sourceEventId(self: *const TraceOccurrence) []const u8 {
@@ -361,7 +370,7 @@ pub const TraceOccurrence = struct {
 pub const TokenEventRecord = struct {
     occurrence_index: usize,
     persisted_ordinal: ?u64 = null,
-    turn_index: i64,
+    turn_index: ?i64,
     input_tokens: ?i64 = null,
     cached_input_tokens: ?i64 = null,
     output_tokens: ?i64 = null,
@@ -379,12 +388,19 @@ pub const TokenEventRecord = struct {
     last_total_tokens: ?i64 = null,
     has_total_usage: bool = false,
     has_last_usage: bool = false,
+    usage_model: ?[]const u8 = null,
+    request_key: ?[]u8 = null,
+    request_record: ?[]const u8 = null,
+    usage_finality: ?[]const u8 = null,
+    quantity_state: ?[]const u8 = null,
+    cache_creation_input_tokens: ?i64 = null,
     model: ?[]u8 = null,
     service_tier: ?[]u8 = null,
 
     pub fn deinit(self: *TokenEventRecord, allocator: std.mem.Allocator) void {
         freeOpt(allocator, self.model);
         freeOpt(allocator, self.service_tier);
+        freeOpt(allocator, self.request_key);
     }
 };
 
@@ -455,6 +471,9 @@ pub const CanonicalSessionTrace = struct {
     occurrences: std.ArrayList(TraceOccurrence) = .empty,
     token_events: std.ArrayList(TokenEventRecord) = .empty,
     warnings: std.ArrayList([]u8) = .empty,
+    source: TraceSource = .none,
+    claude_limitations: claude_parser.Limitations = .{},
+    claude_sidecar: ?claude_parser.Sidecar = null,
 
     pub fn deinit(self: *CanonicalSessionTrace, allocator: std.mem.Allocator) void {
         self.session.deinit(allocator);
@@ -586,6 +605,8 @@ pub fn parseSessionTrace(
     path: []const u8,
     options: TraceParseOptions,
 ) !CanonicalSessionTrace {
+    var sidecar_options = options;
+    if (sidecar_options.sidecar_dir == null) sidecar_options.sidecar_dir = dir;
     const file = try dir.openFile(io, path, .{});
     defer file.close(io);
 
@@ -597,7 +618,7 @@ pub fn parseSessionTrace(
         path,
         &reader.interface,
         stat.mtime.nanoseconds,
-        options,
+        sidecar_options,
         false,
     );
 }
@@ -692,20 +713,31 @@ test "compressed file entry points preserve decoded evidence and input bounds" {
     try std.testing.expectEqualStrings("compressed", trace.session.session_id.?);
 }
 
-test "Claude transcript records fail instead of yielding empty Codex sessions" {
-    const source = "{\"type\":\"file-history-snapshot\"}\n" ++
+test "Claude transcripts are admitted and contradicting signatures still fail" {
+    const claude = "{\"type\":\"file-history-snapshot\"}\n" ++
         "{\"type\":\"user\",\"sessionId\":\"claude\",\"uuid\":\"message-1\"," ++
         "\"message\":{\"role\":\"user\",\"content\":\"hello\"}}\n";
+    const late_claude = "{\"type\":\"session_meta\",\"payload\":{\"id\":\"codex\"}}\n" ++
+        "{\"type\":\"user\",\"sessionId\":\"claude\",\"uuid\":\"message-1\"}\n";
+    const late_codex = "{\"type\":\"user\",\"sessionId\":\"claude\",\"uuid\":\"message-1\"}\n" ++
+        "{\"type\":\"event_msg\",\"payload\":{\"type\":\"task_started\"}}\n";
     inline for (.{ parseSessionTraceReader, parseSessionSummaryTraceReader }) |parse| {
-        var reader: std.Io.Reader = .fixed(source);
-        try std.testing.expectError(error.UnsupportedSessionFormat, parse(
-            std.testing.io,
-            std.testing.allocator,
-            "claude.jsonl",
-            &reader,
-            0,
-            .{},
-        ));
+        var reader: std.Io.Reader = .fixed(claude);
+        var trace = try parse(std.testing.io, std.testing.allocator, "claude.jsonl", &reader, 0, .{});
+        defer trace.deinit(std.testing.allocator);
+        try std.testing.expectEqual(TraceSource.claude, trace.source);
+        try std.testing.expectEqualStrings("claude", trace.session.session_id.?);
+        for ([_][]const u8{ late_claude, late_codex }) |source| {
+            var mixed: std.Io.Reader = .fixed(source);
+            try std.testing.expectError(error.UnsupportedSessionFormat, parse(
+                std.testing.io,
+                std.testing.allocator,
+                "mixed.jsonl",
+                &mixed,
+                0,
+                .{},
+            ));
+        }
     }
 }
 
@@ -898,7 +930,9 @@ pub fn parseSessionTraceReaderWithVisitorMetrics(
     defer parser.tool_lookup.deinit(allocator);
     var pi_parser = PiParser.init(allocator, &trace, options, false);
     defer pi_parser.deinit();
-    const source_is_pi = try parseSessionLines(
+    var claude = claude_parser.ClaudeParser.init(allocator, &trace, options, false);
+    defer claude.deinit();
+    trace.source = try parseSessionLines(
         allocator,
         &trace,
         reader,
@@ -907,14 +941,123 @@ pub fn parseSessionTraceReaderWithVisitorMetrics(
         metrics,
         &parser,
         &pi_parser,
+        &claude,
     );
-    if (source_is_pi) {
-        try pi_parser.finish(io, source_mtime_ns);
-    } else {
-        try finalizeTrace(io, allocator, &trace, source_mtime_ns, options);
+    switch (trace.source) {
+        .pi => try pi_parser.finish(io, source_mtime_ns),
+        .claude => try claude.finish(io, source_mtime_ns),
+        .codex, .none => try finalizeTrace(io, allocator, &trace, source_mtime_ns, options),
     }
     return trace;
 }
+
+const PendingLine = struct {
+    bytes: []u8,
+    number: usize,
+    end_offset: usize,
+};
+
+const SourceState = struct {
+    decided: ?TraceSource = null,
+    pending: std.ArrayList(PendingLine) = .empty,
+    pending_bytes: usize = 0,
+    saw_record: bool = false,
+    codex_vote: bool = false,
+
+    fn deinit(self: *SourceState, allocator: std.mem.Allocator) void {
+        for (self.pending.items) |pending| allocator.free(pending.bytes);
+        self.pending.deinit(allocator);
+    }
+
+    fn buffers(self: *const SourceState, line_bytes: usize, end_offset: usize, number: usize) bool {
+        _ = line_bytes;
+        return number <= claude_parser.prefix_lines_max and
+            end_offset <= claude_parser.prefix_bytes_max and
+            self.pending.items.len < claude_parser.prefix_lines_max;
+    }
+
+    fn buffer(
+        self: *SourceState,
+        allocator: std.mem.Allocator,
+        line: []const u8,
+        number: usize,
+        end_offset: usize,
+    ) !void {
+        const owned = try allocator.dupe(u8, line);
+        errdefer allocator.free(owned);
+        try self.pending.append(allocator, .{ .bytes = owned, .number = number, .end_offset = end_offset });
+        self.pending_bytes += line.len;
+    }
+
+    fn decide(self: *SourceState, line_signature: claude_parser.Signature) void {
+        self.decided = switch (line_signature) {
+            .neutral, .codex => .codex,
+            .pi => .pi,
+            .claude => .claude,
+        };
+    }
+
+    fn admit(self: *SourceState, line_signature: claude_parser.Signature) !void {
+        const decided = self.decided.?;
+        const conflicting = switch (decided) {
+            .codex => line_signature == .claude or line_signature == .pi,
+            .claude => line_signature == .codex or line_signature == .pi,
+            .pi => line_signature == .claude or line_signature == .codex,
+            .none => unreachable,
+        };
+        if (conflicting) return error.UnsupportedSessionFormat;
+        if (line_signature == .codex) self.codex_vote = true;
+    }
+
+    fn source(self: *const SourceState) !TraceSource {
+        const decided = self.decided orelse return .none;
+        if (decided != .codex) return decided;
+        if (self.codex_vote) return .codex;
+        if (self.saw_record) return error.UnclassifiedSessionFormat;
+        return .none;
+    }
+};
+
+const LineSinks = struct {
+    allocator: std.mem.Allocator,
+    trace: *CanonicalSessionTrace,
+    facts: *SessionFacts,
+    pi_parser: *PiParser,
+    claude: *claude_parser.ClaudeParser,
+
+    fn apply(
+        self: LineSinks,
+        parser: anytype,
+        source: TraceSource,
+        root: std.json.ObjectMap,
+        number: usize,
+        end_offset: usize,
+        line: []const u8,
+    ) !void {
+        switch (source) {
+            .pi => try self.pi_parser.apply(ParsedRecord.init(root, number, line)),
+            .claude => try self.claude.apply(root, number, end_offset, line),
+            .codex => {
+                const parsed_record = ParsedRecord.init(root, number, line);
+                try parser.apply(parsed_record);
+                try self.facts.apply(self.allocator, self.trace, parsed_record, parser.turnIndex());
+            },
+            .none => unreachable,
+        }
+    }
+
+    fn replay(self: LineSinks, parser: anytype, state: *SourceState) !void {
+        var scratch = ParseScratch.init(self.allocator);
+        defer scratch.deinit();
+        for (state.pending.items) |pending| {
+            defer scratch.reset();
+            const root = (try scratch.parse(pending.bytes)).?;
+            try self.apply(parser, state.decided.?, root, pending.number, pending.end_offset, pending.bytes);
+        }
+        for (state.pending.items) |pending| self.allocator.free(pending.bytes);
+        state.pending.clearRetainingCapacity();
+    }
+};
 
 fn parseSessionLines(
     allocator: std.mem.Allocator,
@@ -925,10 +1068,19 @@ fn parseSessionLines(
     metrics: *StreamMetrics,
     parser: anytype,
     pi_parser: *PiParser,
-) !bool {
+    claude: *claude_parser.ClaudeParser,
+) !TraceSource {
     var facts: SessionFacts = .{};
     defer facts.deinit(allocator);
-    var source_is_pi: ?bool = null;
+    var state = SourceState{};
+    defer state.deinit(allocator);
+    const sinks = LineSinks{
+        .allocator = allocator,
+        .trace = trace,
+        .facts = &facts,
+        .pi_parser = pi_parser,
+        .claude = claude,
+    };
     var scratch = ParseScratch.init(allocator);
     defer scratch.deinit();
     var lines = try jsonl_stream.Stream.init(allocator, reader, .{});
@@ -938,7 +1090,7 @@ fn parseSessionLines(
         try visit(context, record.bytes, record.number);
         const line = std.mem.trim(u8, record.bytes, " \t\r\n");
         if (line.len == 0) continue;
-        if (source_is_pi != null and !source_is_pi.? and
+        if (state.decided == .codex and
             try parser.skipsLine(scratch.arena.allocator(), line, &facts.workers))
         {
             continue;
@@ -950,20 +1102,26 @@ fn parseSessionLines(
                 continue;
             },
         } orelse continue;
-        try rejectUnsupportedSource(root);
-        if (source_is_pi == null) {
-            source_is_pi = primaryLine(record.number) and isPiSessionHeader(root);
+        state.saw_record = true;
+        const line_signature = claude_parser.signature(root, record.number);
+        const end_offset = lines.bytes_read;
+        if (state.decided == null) {
+            if (line_signature == .neutral and state.buffers(line.len, end_offset, record.number)) {
+                try state.buffer(allocator, line, record.number, end_offset);
+                continue;
+            }
+            state.decide(line_signature);
+            try sinks.replay(parser, &state);
         }
-        const parsed_record = ParsedRecord.init(root, record.number, line);
-        if (source_is_pi.?) {
-            try pi_parser.apply(parsed_record);
-            continue;
-        }
-        try parser.apply(parsed_record);
-        try facts.apply(allocator, trace, parsed_record, parser.turnIndex());
+        try state.admit(line_signature);
+        try sinks.apply(parser, state.decided.?, root, record.number, end_offset, line);
+    }
+    if (state.decided == null and state.pending.items.len > 0) {
+        state.decided = .codex;
+        try sinks.replay(parser, &state);
     }
     metrics.* = .{ .bytes_read = lines.bytes_read, .lines_seen = lines.line_number };
-    return source_is_pi orelse false;
+    return state.source();
 }
 
 const SessionFacts = struct {
@@ -1014,16 +1172,6 @@ fn turnContextObject(record: ParsedRecord) ?std.json.ObjectMap {
 fn isPiSessionHeader(root: std.json.ObjectMap) bool {
     return std.mem.eql(u8, stringField(root, "type") orelse "", "session") and
         stringField(root, "id") != null;
-}
-
-fn rejectUnsupportedSource(root: std.json.ObjectMap) !void {
-    if (stringField(root, "sessionId") != null and
-        stringField(root, "uuid") != null and
-        objectField(root, "message") != null and
-        oneOfString(stringField(root, "type") orelse "", &.{ "user", "assistant" }))
-    {
-        return error.UnsupportedSessionFormat;
-    }
 }
 
 fn isPiStandaloneEntry(root: std.json.ObjectMap) bool {
@@ -2120,6 +2268,8 @@ pub fn parseSessionSummaryTrace(
     path: []const u8,
     options: TraceParseOptions,
 ) !CanonicalSessionTrace {
+    var sidecar_options = options;
+    if (sidecar_options.sidecar_dir == null) sidecar_options.sidecar_dir = dir;
     const file = try dir.openFile(io, path, .{});
     defer file.close(io);
 
@@ -2131,7 +2281,7 @@ pub fn parseSessionSummaryTrace(
         path,
         &reader.interface,
         stat.mtime.nanoseconds,
-        options,
+        sidecar_options,
         true,
     );
 }
@@ -2205,7 +2355,9 @@ pub fn parseSessionSummaryTraceReaderWithVisitorMetrics(
     defer parser.deinit();
     var pi_parser = PiParser.init(allocator, &trace, options, true);
     defer pi_parser.deinit();
-    const source_is_pi = try parseSessionLines(
+    var claude = claude_parser.ClaudeParser.init(allocator, &trace, options, true);
+    defer claude.deinit();
+    trace.source = try parseSessionLines(
         allocator,
         &trace,
         reader,
@@ -2214,11 +2366,12 @@ pub fn parseSessionSummaryTraceReaderWithVisitorMetrics(
         metrics,
         &parser,
         &pi_parser,
+        &claude,
     );
-    if (source_is_pi) {
-        try pi_parser.finish(io, source_mtime_ns);
-    } else {
-        try parser.finish(io, source_mtime_ns, options);
+    switch (trace.source) {
+        .pi => try pi_parser.finish(io, source_mtime_ns),
+        .claude => try claude.finish(io, source_mtime_ns),
+        .codex, .none => try parser.finish(io, source_mtime_ns, options),
     }
     return trace;
 }
@@ -3801,7 +3954,7 @@ test "message text-part projection preserves ordered source boundaries" {
     try std.testing.expectEqualStrings("ab", joined_parts[0].text);
 }
 
-fn previewAlloc(allocator: std.mem.Allocator, text: []const u8) ![]u8 {
+pub fn previewAlloc(allocator: std.mem.Allocator, text: []const u8) ![]u8 {
     const trimmed = std.mem.trim(u8, text, " \t\r\n");
     const end = @min(trimmed.len, 120);
     return allocator.dupe(u8, trimmed[0..end]);
@@ -3873,7 +4026,7 @@ fn toolCandidateIsNoBetter(
     return candidate_turn <= worst_turn;
 }
 
-fn retainNewestTools(
+pub fn retainNewestTools(
     allocator: std.mem.Allocator,
     trace: *CanonicalSessionTrace,
     max_tools: ?usize,
@@ -4248,7 +4401,7 @@ fn exactIntegerField(object: std.json.ObjectMap, key: []const u8) ?i64 {
     };
 }
 
-fn finishToolOutputParts(allocator: std.mem.Allocator, rec: *ToolLifecycleRecord) !void {
+pub fn finishToolOutputParts(allocator: std.mem.Allocator, rec: *ToolLifecycleRecord) !void {
     if (rec.output_parts.items.len == 0) return;
     var output: std.ArrayList(u8) = .empty;
     defer output.deinit(allocator);
@@ -4798,7 +4951,7 @@ fn kindFromEndEvent(event_type: []const u8, existing_name: ?[]u8) ToolKind {
     return .unknown;
 }
 
-fn namespaceFromName(allocator: std.mem.Allocator, name: []const u8) !?[]u8 {
+pub fn namespaceFromName(allocator: std.mem.Allocator, name: []const u8) !?[]u8 {
     if (!std.mem.startsWith(u8, name, "mcp__")) return null;
     const rest = name["mcp__".len..];
     const split = std.mem.indexOf(u8, rest, "__") orelse return null;
@@ -5090,16 +5243,14 @@ test "Pi requires a validated first header and never synthesizes absent usage co
         \\{"type":"session","version":3,"id":"later"}
     ;
     const allocator = std.testing.allocator;
-    var other = try parseSessionTraceBytes(
+    try std.testing.expectError(error.UnclassifiedSessionFormat, parseSessionTraceBytes(
         std.testing.io,
         allocator,
         "pi.jsonl",
         invalid_header,
         0,
         .{},
-    );
-    defer other.deinit(allocator);
-    try std.testing.expectEqual(TraceFormat.unknown, other.session.source_format);
+    ));
     const source =
         \\{"type":"session","version":3,"id":"partial-usage"}
         \\{"type":"message","id":"u1","parentId":null,"message":{"role":"user","content":"question"}}
@@ -6664,11 +6815,15 @@ test "session identity comes only from the first line" {
                 "session_meta late after the first line establishes no session identity",
             ));
         }
-        var pi_traces = try workerGraphTestTraces(late_pi, spaced);
-        defer for (&pi_traces) |*trace| trace.deinit(std.testing.allocator);
-        for (&pi_traces) |*trace| {
-            try std.testing.expect(trace.session.source_format != .pi_session_jsonl);
-            try std.testing.expect(trace.session.session_id == null);
-        }
+        try std.testing.expectError(
+            error.UnclassifiedSessionFormat,
+            workerGraphTestTraces(late_pi, spaced),
+        );
     }
+}
+test {
+    _ = claude_parser;
+    _ = @import("claude_usage.zig");
+    _ = @import("claude_turns.zig");
+    _ = @import("claude_tokens.zig");
 }

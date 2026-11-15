@@ -134,10 +134,12 @@ pub const ParsedTrace = struct {
     }
 };
 
-pub fn adapterId(trace: *const trace_core.CanonicalSessionTrace) []const u8 {
-    return switch (trace.session.source_format) {
-        .pi_session_jsonl => "pi-session-jsonl/v1",
-        else => "codex-rollout-jsonl/v1",
+pub fn adapterId(trace: *const trace_core.CanonicalSessionTrace) ?[]const u8 {
+    return switch (trace.source) {
+        .pi => "pi-session-jsonl/v1",
+        .claude => trace_core.claude_parser.adapter_id,
+        .codex => "codex-rollout-jsonl/v1",
+        .none => null,
     };
 }
 
@@ -2014,7 +2016,7 @@ fn fillMessage(
 ) !void {
     for (fields, 0..) |field, index| {
         row[index] = switch (field) {
-            0 => .{ .string = occurrence.sourceEventId() },
+            0 => .{ .string = occurrence.message_id orelse occurrence.sourceEventId() },
             1 => optionalString(session.session_id),
             2 => optionalInteger(occurrence.turn_index),
             3 => optionalString(occurrence.role),
@@ -2060,6 +2062,7 @@ fn fillTurn(
             22 => optionalString(turn.@"error"),
             23 => optionalString(turn.aborted_reason),
             24 => .{ .integer = turn.spawned_worker_count },
+            25 => optionalString(turn.origin),
             else => return error.InvalidTracePhysicalFieldIndex,
         };
     }
@@ -2191,7 +2194,7 @@ fn fillTokenEvent(
     for (fields, 0..) |field, index| {
         row[index] = switch (field) {
             0 => optionalString(session.session_id),
-            1 => .{ .integer = event.turn_index },
+            1 => optionalInteger(event.turn_index),
             2 => optionalString(occurrence.timestamp),
             3 => optionalInteger(event.input_tokens),
             4 => optionalInteger(event.cached_input_tokens),
@@ -2233,6 +2236,12 @@ fn fillTokenEvent(
             else
                 null),
             30 => optionalString(session.parent_session_id),
+            31 => optionalString(event.usage_model),
+            32 => optionalString(event.request_key),
+            33 => optionalString(event.request_record),
+            34 => optionalString(event.usage_finality),
+            35 => optionalString(event.quantity_state),
+            36 => optionalInteger(event.cache_creation_input_tokens),
             else => return error.InvalidTracePhysicalFieldIndex,
         };
     }
