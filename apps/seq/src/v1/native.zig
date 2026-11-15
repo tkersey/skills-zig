@@ -461,9 +461,7 @@ fn parseNativeLimit(raw: []const u8) !usize {
 }
 
 fn validateNativeSelectors(options: *Options, io: std.Io) !void {
-    if (options.source != null and (options.root != null or options.path != null)) {
-        return error.ConflictingSourceSelectors;
-    }
+    try rejectSourceConflict(options.*);
     if (options.path != null and
         (options.session_id != null or options.current))
     {
@@ -738,6 +736,7 @@ fn runSessionDetail(
 const GraphEdgeView = struct {
     parent: []const u8,
     worker: []const u8,
+    call: ?[]const u8,
 };
 
 fn runSessionGraph(
@@ -757,10 +756,9 @@ fn runSessionGraph(
     defer arena_state.deinit();
     const arena = arena_state.allocator();
     var edges: std.ArrayList(GraphEdgeView) = .empty;
-    var claude_corpus = false;
-    var other_corpus = false;
+    var corpus = GraphCorpus{};
     for (paths.items) |path| {
-        if (edges.items.len == options.limit) break;
+        if (!corpus.claude and edges.items.len >= options.limit) break;
         if (opencode_adapter.recognizes(path)) continue;
         var trace = trace_core.parseSessionTrace(
             io,
@@ -771,41 +769,91 @@ fn runSessionGraph(
         ) catch |err| return sourceFailure(options, path, err);
         defer trace.deinit(allocator);
         try rejectTraceWarnings(&trace, options);
-        switch (trace.source) {
-            .claude => claude_corpus = true,
-            .codex, .pi => other_corpus = true,
-            .none => {},
-        }
+        corpus.note(trace.source);
         for (trace.graph_edges.items) |edge| {
-            if (edges.items.len == options.limit) break;
             const parent = edge.parent_session_id orelse continue;
             const worker = edge.worker_session_id orelse edge.agent_path orelse continue;
             try edges.append(arena, .{
                 .parent = try arena.dupe(u8, parent),
                 .worker = try arena.dupe(u8, worker),
+                .call = if (edge.call_id) |call| try arena.dupe(u8, call) else null,
             });
         }
     }
-    const claude_graph = claude_corpus and !other_corpus;
+    const claude_graph = corpus.claude and !corpus.other;
     const graph_name = if (claude_graph) "claude_sessions" else "codex_sessions";
     try writer.print("digraph {s} {{\n", .{graph_name});
-    for (edges.items) |edge| {
-        try writer.writeAll("  ");
-        try definition_core.canonical_json.writeCanonicalString(writer, edge.parent);
-        try writer.writeAll(" -> ");
-        try definition_core.canonical_json.writeCanonicalString(writer, edge.worker);
-        const contradicted = claude_graph and parentContradicted(edges.items, edge);
-        try writer.writeAll(if (contradicted) " [contradiction=true];\n" else ";\n");
+    if (claude_graph) {
+        try writeReconciledEdges(arena, writer, edges.items, options.limit);
+    } else {
+        for (edges.items[0..@min(edges.items.len, options.limit)]) |edge| {
+            try writeGraphEdge(writer, edge, false);
+        }
     }
     try writer.writeAll("}\n");
 }
 
-fn parentContradicted(edges: []const GraphEdgeView, edge: GraphEdgeView) bool {
-    for (edges) |other| {
-        if (!std.mem.eql(u8, other.worker, edge.worker)) continue;
-        if (!std.mem.eql(u8, other.parent, edge.parent)) return true;
+const GraphCorpus = struct {
+    claude: bool = false,
+    other: bool = false,
+
+    fn note(self: *GraphCorpus, source: trace_core.TraceSource) void {
+        switch (source) {
+            .claude => self.claude = true,
+            .codex, .pi => self.other = true,
+            .none => {},
+        }
     }
-    return false;
+};
+
+const WorkerAssertion = struct {
+    parent: []const u8,
+    call: ?[]const u8,
+    contradicted: bool = false,
+};
+
+fn writeReconciledEdges(
+    arena: std.mem.Allocator,
+    writer: *std.Io.Writer,
+    edges: []const GraphEdgeView,
+    limit: usize,
+) !void {
+    var workers: std.StringHashMapUnmanaged(WorkerAssertion) = .empty;
+    for (edges) |edge| {
+        const entry = try workers.getOrPut(arena, edge.worker);
+        if (!entry.found_existing) {
+            entry.value_ptr.* = .{ .parent = edge.parent, .call = edge.call };
+            continue;
+        }
+        const same_parent = std.mem.eql(u8, entry.value_ptr.parent, edge.parent);
+        const same_call = optionalEql(entry.value_ptr.call, edge.call);
+        if (!same_parent or !same_call) entry.value_ptr.contradicted = true;
+    }
+    var written: std.StringHashMapUnmanaged(void) = .empty;
+    var count: usize = 0;
+    for (edges) |edge| {
+        if (count == limit) break;
+        const key = try std.fmt.allocPrint(arena, "{s}\x00{s}\x00{s}", .{
+            edge.parent, edge.worker, edge.call orelse "",
+        });
+        const seen = try written.getOrPut(arena, key);
+        if (seen.found_existing) continue;
+        try writeGraphEdge(writer, edge, workers.get(edge.worker).?.contradicted);
+        count += 1;
+    }
+}
+
+fn optionalEql(left: ?[]const u8, right: ?[]const u8) bool {
+    if (left == null or right == null) return left == null and right == null;
+    return std.mem.eql(u8, left.?, right.?);
+}
+
+fn writeGraphEdge(writer: *std.Io.Writer, edge: GraphEdgeView, contradicted: bool) !void {
+    try writer.writeAll("  ");
+    try definition_core.canonical_json.writeCanonicalString(writer, edge.parent);
+    try writer.writeAll(" -> ");
+    try definition_core.canonical_json.writeCanonicalString(writer, edge.worker);
+    try writer.writeAll(if (contradicted) " [contradiction=true];\n" else ";\n");
 }
 
 fn runTail(
@@ -1287,9 +1335,7 @@ fn queryTargetOptions(
     if (options.session_id != null and options.current) {
         return error.ConflictingSessionSelectors;
     }
-    if (options.source != null and (options.root != null or options.path != null)) {
-        return error.ConflictingSourceSelectors;
-    }
+    try rejectSourceConflict(options);
     return options;
 }
 
@@ -3770,4 +3816,10 @@ fn flatWorkerBelongs(
     defer identity.deinit(allocator);
     const actual = identity.root_session_id orelse return false;
     return std.mem.eql(u8, actual, root);
+}
+
+pub fn rejectSourceConflict(options: Options) !void {
+    if (options.source != null and (options.root != null or options.path != null)) {
+        return error.ConflictingSourceSelectors;
+    }
 }

@@ -1714,6 +1714,8 @@ fn createStreamingParseTasks(
             .rank = ranks[item.path_index],
             .repo = graph.args.selectors.repo,
         });
+        const discovery = &discovered.items[index].identity.claude_discovery;
+        if (discovery.*) |*facts| tasks.items[tasks.items.len - 1].options.claude_discovery = facts;
     }
     const bound = graph.plans.definition_plan.bounds.max_input_bytes;
     shareSpareBudget(tasks.items, bound, reserved_bytes);
@@ -2967,11 +2969,7 @@ const ObserveParseState = struct {
         {
             return error.ConflictingSessionSelectors;
         }
-        if (self.selectors.source != null and
-            (self.selectors.root != null or self.selectors.path != null))
-        {
-            return error.ConflictingSourceSelectors;
-        }
+        try seq.native.rejectSourceConflict(self.selectors);
         try seq.native.resolveTemporalBounds(&self.selectors, io);
         const input_specs = try self.inputs.toOwnedSlice(allocator);
         errdefer allocator.free(input_specs);

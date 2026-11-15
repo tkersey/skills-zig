@@ -61,6 +61,7 @@ pub const TraceParseOptions = struct {
     max_tools: ?usize = null,
     sidecar_dir: ?std.Io.Dir = null,
     discovery_prefix: bool = false,
+    claude_discovery: ?*const claude_parser.Discovery = null,
 };
 
 pub const StreamMetrics = struct {
@@ -474,7 +475,8 @@ pub const CanonicalSessionTrace = struct {
     warnings: std.ArrayList([]u8) = .empty,
     source: TraceSource = .none,
     claude_limitations: claude_parser.Limitations = .{},
-    claude_sidecar: ?claude_parser.Sidecar = null,
+    claude_discovery: ?claude_parser.Discovery = null,
+    claude_discovery_bytes: usize = 0,
 
     pub fn deinit(self: *CanonicalSessionTrace, allocator: std.mem.Allocator) void {
         self.session.deinit(allocator);
@@ -493,6 +495,7 @@ pub const CanonicalSessionTrace = struct {
         self.token_events.deinit(allocator);
         for (self.warnings.items) |warning| allocator.free(warning);
         self.warnings.deinit(allocator);
+        if (self.claude_discovery) |*discovery| discovery.deinit(allocator);
     }
 };
 

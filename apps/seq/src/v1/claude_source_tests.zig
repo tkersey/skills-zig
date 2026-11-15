@@ -577,7 +577,7 @@ test "worker: sidecar toolUseId gives child-side and spawner-side edge rows" {
     try testing.expect(worker.session.parent_session_id == null);
     try testing.expect(!worker.claude_limitations.worker_parent_unread);
     try testing.expect(!worker.claude_limitations.worker_parent_missing);
-    try testing.expect(worker.claude_sidecar != null and worker.claude_sidecar.?.present);
+    try testing.expect(worker.claude_discovery.?.sidecar.? == .parsed);
     try testing.expectEqual(@as(usize, 1), worker.graph_edges.items.len);
     const child = edgeWithCall(&worker, "toolu_spawn_w") orelse return error.TestMissingEdge;
     try expectString(root_w, child.parent_session_id);

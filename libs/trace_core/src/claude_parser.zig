@@ -750,12 +750,41 @@ pub fn integerField(root: std.json.ObjectMap, key: []const u8) ?i64 {
 const turns_mod = @import("claude_turns.zig");
 const tokens_mod = @import("claude_tokens.zig");
 
-pub const Sidecar = struct {
-    present: bool,
-    digest: [71]u8,
-    mtime_ns: i128,
-    bytes: usize = 0,
+pub const SidecarState = enum { absent, unreadable, parsed };
+
+pub const Discovery = struct {
+    sidecar: ?SidecarState = null,
+    sidecar_digest: [71]u8 = empty_digest,
+    sidecar_mtime_ns: i128 = 0,
+    sidecar_bytes: usize = 0,
+    parent_agent: ?[]u8 = null,
+    tool_use: ?[]u8 = null,
+    parent_present: ?bool = null,
+
+    pub fn clone(self: Discovery, allocator: std.mem.Allocator) !Discovery {
+        var copy = self;
+        copy.parent_agent = null;
+        copy.tool_use = null;
+        errdefer copy.deinit(allocator);
+        copy.parent_agent = try dupOpt(allocator, self.parent_agent);
+        copy.tool_use = try dupOpt(allocator, self.tool_use);
+        return copy;
+    }
+
+    pub fn deinit(self: *Discovery, allocator: std.mem.Allocator) void {
+        freeOpt(allocator, self.parent_agent);
+        freeOpt(allocator, self.tool_use);
+        self.parent_agent = null;
+        self.tool_use = null;
+    }
+
+    pub fn sidecarMtime(self: Discovery) ?i128 {
+        const state = self.sidecar orelse return null;
+        return if (state == .absent) null else self.sidecar_mtime_ns;
+    }
 };
+
+const empty_digest: [71]u8 = "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855".*;
 
 pub const Limitations = struct {
     inline_sidechain_records: usize = 0,
@@ -1009,14 +1038,7 @@ pub const ClaudeParser = struct {
             try replaceOpt(self.allocator, &session.root_session_id, root);
         }
         try self.checkWorkerRecords(&identity);
-        if (path_identity.current_layout) {
-            try self.applySidecar(io, &identity);
-        } else {
-            try replaceNullable(self.allocator, &session.control_parent_session_id, identity.root);
-            if (identity.root) |root| {
-                try self.requireParent(io, std.fs.path.dirname(session.path) orelse ".", root);
-            }
-        }
+        try self.applyDiscovery(io, &identity, path_identity);
         return identity;
     }
 
@@ -1047,36 +1069,69 @@ pub const ClaudeParser = struct {
         }
     }
 
-    fn applySidecar(self: *ClaudeParser, io: std.Io, identity: *Identity) !void {
+    fn applyDiscovery(self: *ClaudeParser, io: std.Io, identity: *Identity, layout: PathIdentity) !void {
         const session = &self.trace.session;
-        const read = try self.readSidecar(io, identity.agent.?);
-        const fields = read orelse {
-            session.lineage_conflict = true;
-            self.trace.claude_limitations.worker_parent_unread = true;
-            return;
-        };
-        identity.sidecar_call = fields.tool_use;
-        const root = identity.root orelse return;
-        const directory = std.fs.path.dirname(session.path) orelse ".";
-        if (fields.parent_agent) |parent| {
-            const id = try std.fmt.allocPrint(self.allocator, "{s}/agent-{s}", .{ root, parent });
-            freeOpt(self.allocator, session.control_parent_session_id);
-            session.control_parent_session_id = id;
-            const stem = try std.fmt.allocPrint(self.arena(), "agent-{s}", .{parent});
-            try self.requireParent(io, directory, stem);
+        const discovery = if (self.options.claude_discovery) |given|
+            try given.clone(self.allocator)
+        else
+            try self.readDiscovery(io, identity.root, layout);
+        self.trace.claude_discovery = discovery;
+        if (self.options.claude_discovery == null) self.trace.claude_discovery_bytes = discovery.sidecar_bytes;
+        const facts = self.trace.claude_discovery.?;
+        const root = identity.root;
+        if (layout.current_layout) {
+            if (facts.sidecar != .parsed) {
+                session.lineage_conflict = true;
+                self.trace.claude_limitations.worker_parent_unread = true;
+                return;
+            }
+            identity.sidecar_call = facts.tool_use;
+            if (root) |value| {
+                if (facts.parent_agent) |parent| {
+                    const id = try std.fmt.allocPrint(self.allocator, "{s}/agent-{s}", .{ value, parent });
+                    freeOpt(self.allocator, session.control_parent_session_id);
+                    session.control_parent_session_id = id;
+                } else {
+                    try replaceOpt(self.allocator, &session.control_parent_session_id, value);
+                }
+            }
         } else {
-            try replaceOpt(self.allocator, &session.control_parent_session_id, root);
-            const session_directory = std.fs.path.dirname(directory) orelse ".";
-            try self.requireParent(io, std.fs.path.dirname(session_directory) orelse ".", root);
+            try replaceNullable(self.allocator, &session.control_parent_session_id, root);
+        }
+        if (facts.parent_present == false) {
+            session.lineage_conflict = true;
+            self.trace.claude_limitations.worker_parent_missing = true;
         }
     }
 
-    fn requireParent(
+    fn readDiscovery(
         self: *ClaudeParser,
         io: std.Io,
-        directory: []const u8,
-        stem: []const u8,
-    ) !void {
+        root: ?[]const u8,
+        layout: PathIdentity,
+    ) !Discovery {
+        var discovery = Discovery{};
+        errdefer discovery.deinit(self.allocator);
+        const directory = std.fs.path.dirname(self.trace.session.path) orelse ".";
+        if (layout.current_layout) {
+            try self.readSidecar(io, layout.agent.?, &discovery);
+            if (discovery.sidecar != .parsed) return discovery;
+        }
+        const parent_root = root orelse return discovery;
+        if (discovery.parent_agent) |parent| {
+            const stem = try std.fmt.allocPrint(self.arena(), "agent-{s}", .{parent});
+            discovery.parent_present = try self.transcriptExists(io, directory, stem);
+        } else if (layout.current_layout) {
+            const session_directory = std.fs.path.dirname(directory) orelse ".";
+            const base = std.fs.path.dirname(session_directory) orelse ".";
+            discovery.parent_present = try self.transcriptExists(io, base, parent_root);
+        } else {
+            discovery.parent_present = try self.transcriptExists(io, directory, parent_root);
+        }
+        return discovery;
+    }
+
+    fn transcriptExists(self: *ClaudeParser, io: std.Io, directory: []const u8, stem: []const u8) !bool {
         for ([_][]const u8{ ".jsonl", ".jsonl.zst" }) |extension| {
             const name = try std.mem.concat(self.arena(), u8, &.{ stem, extension });
             const path = try std.fs.path.join(self.arena(), &.{ directory, name });
@@ -1085,18 +1140,12 @@ pub const ClaudeParser = struct {
                 std.Io.Dir.cwd().statFile(io, path, .{})
             else
                 handle.statFile(io, path, .{})) catch continue;
-            if (stat.kind == .file) return;
+            if (stat.kind == .file) return true;
         }
-        self.trace.session.lineage_conflict = true;
-        self.trace.claude_limitations.worker_parent_missing = true;
+        return false;
     }
 
-    const SidecarFields = struct {
-        parent_agent: ?[]const u8 = null,
-        tool_use: ?[]const u8 = null,
-    };
-
-    fn readSidecar(self: *ClaudeParser, io: std.Io, agent: []const u8) !?SidecarFields {
+    fn readSidecar(self: *ClaudeParser, io: std.Io, agent: []const u8, discovery: *Discovery) !void {
         const directory = std.fs.path.dirname(self.trace.session.path) orelse ".";
         const name = try std.fmt.allocPrint(self.arena(), "agent-{s}.meta.json", .{agent});
         const sidecar_path = try std.fs.path.join(self.arena(), &.{ directory, name });
@@ -1105,47 +1154,31 @@ pub const ClaudeParser = struct {
             std.Io.Dir.openFileAbsolute(io, sidecar_path, .{})
         else
             directory_handle.openFile(io, sidecar_path, .{});
-        const file = opened catch {
-            self.trace.claude_sidecar = .{
-                .present = false,
-                .digest = digestOf(""),
-                .mtime_ns = 0,
-            };
-            return null;
-        };
+        discovery.sidecar = .absent;
+        const file = opened catch return;
         defer file.close(io);
+        discovery.sidecar = .unreadable;
         const stat = try file.stat(io);
-        const mtime_ns = stat.mtime.nanoseconds;
-        if (stat.size > sidecar_bytes_max) {
-            self.trace.claude_sidecar = .{
-                .present = true,
-                .digest = digestOf(""),
-                .mtime_ns = mtime_ns,
-            };
-            return null;
-        }
+        discovery.sidecar_mtime_ns = stat.mtime.nanoseconds;
+        if (stat.size > sidecar_bytes_max) return;
         var reader = file.reader(io, &.{});
-        const limit: std.Io.Limit = .limited(sidecar_bytes_max);
-        const remaining = reader.interface.allocRemaining(self.arena(), limit);
+        const remaining = reader.interface.allocRemaining(self.arena(), .limited(sidecar_bytes_max));
         const bytes = remaining catch |err| switch (err) {
             error.OutOfMemory => return err,
-            else => {
-                self.trace.claude_sidecar = .{
-                    .present = true,
-                    .digest = digestOf(""),
-                    .mtime_ns = mtime_ns,
-                };
-                return null;
-            },
+            else => return,
         };
-        self.trace.claude_sidecar = .{
-            .present = true,
-            .digest = digestOf(bytes),
-            .mtime_ns = mtime_ns,
-            .bytes = bytes.len,
-        };
-        return parseSidecar(self.arena(), bytes);
+        discovery.sidecar_digest = digestOf(bytes);
+        discovery.sidecar_bytes = bytes.len;
+        const fields = try parseSidecar(self.arena(), bytes) orelse return;
+        discovery.parent_agent = try dupOpt(self.allocator, fields.parent_agent);
+        discovery.tool_use = try dupOpt(self.allocator, fields.tool_use);
+        discovery.sidecar = .parsed;
     }
+
+    const SidecarFields = struct {
+        parent_agent: ?[]const u8 = null,
+        tool_use: ?[]const u8 = null,
+    };
 
     fn parseSidecar(arena_allocator: std.mem.Allocator, bytes: []const u8) !?SidecarFields {
         const parsed = std.json.parseFromSliceLeaky(std.json.Value, arena_allocator, bytes, .{});

@@ -18,6 +18,7 @@ pub const Options = struct {
     max_input_bytes: usize = 64 * 1024 * 1024 * 1024,
     discovery_prefix_limit: usize = max_discovery_prefix_bytes,
     sidecar_dir: ?std.Io.Dir = null,
+    claude_discovery: ?*const trace_core.claude_parser.Discovery = null,
 };
 
 pub const SessionSelection = struct {
@@ -41,6 +42,7 @@ pub const SessionIdentity = struct {
     root_session_id: ?[]u8 = null,
     start_time: ?[]u8 = null,
     source: trace_core.TraceSource = .none,
+    claude_discovery: ?trace_core.claude_parser.Discovery = null,
     control_parent_session_id: ?[]u8 = null,
     forked_from_session_id: ?[]u8 = null,
     parent_relation: ?[]u8 = null,
@@ -60,6 +62,7 @@ pub const SessionIdentity = struct {
         if (self.parent_relation) |value| allocator.free(value);
         if (self.root_session_id) |value| allocator.free(value);
         if (self.start_time) |value| allocator.free(value);
+        if (self.claude_discovery) |*discovery| discovery.deinit(allocator);
         self.* = undefined;
     }
 };
@@ -103,9 +106,9 @@ pub fn discoverSessionIdentity(
         .parent_session_id = null,
         .lineage_conflict = summary.session.lineage_conflict,
         .subagent_history_start_ordinal = summary.session.subagent_history_start_ordinal,
-        .bytes_read = prefix.bytes.len +| sidecarBytes(summary.claude_sidecar),
+        .bytes_read = prefix.bytes.len +| summary.claude_discovery_bytes,
         .source = summary.source,
-        .sidecar_mtime_ns = sidecarMtime(summary.claude_sidecar),
+        .sidecar_mtime_ns = discoveryMtime(summary.claude_discovery),
         .file_size = std.math.cast(usize, stat.size) orelse
             return error.ObservationInputByteBoundExceeded,
         .source_mtime_ns = stat.mtime.nanoseconds,
@@ -115,6 +118,7 @@ pub fn discoverSessionIdentity(
             true,
     };
     errdefer identity.deinit(allocator);
+    if (summary.claude_discovery) |facts| identity.claude_discovery = try facts.clone(allocator);
     inline for (.{
         "session_id",             "parent_session_id", "control_parent_session_id",
         "forked_from_session_id", "parent_relation",   "root_session_id",
@@ -322,7 +326,7 @@ fn admitSelectedInput(
 ) !SelectedParse {
     var prefix = try readSelectionPrefixAlloc(allocator, source, selection, options);
     defer prefix.deinit(allocator);
-    const preselection = if (selection) |selected|
+    var preselection = if (selection) |selected|
         try preselectSession(
             io,
             allocator,
@@ -334,9 +338,12 @@ fn admitSelectedInput(
         )
     else
         Preselection{};
+    defer preselection.deinit(allocator);
     if (!preselection.passes) {
         return skippedSelection(true, preselection.bytes_read);
     }
+    var body_options = options;
+    if (preselection.discovery) |*facts| body_options.claude_discovery = facts;
     if (!SessionInput.isCompressed(path) and stat.size > options.max_input_bytes) {
         return error.ObservationInputByteBoundExceeded;
     }
@@ -345,15 +352,17 @@ fn admitSelectedInput(
         &.{},
     );
     var replay_reader = PrefixReader.init(prefix.bytes, &remainder.interface);
+    var parsed = try parser.parse(
+        io,
+        allocator,
+        path,
+        &replay_reader.interface,
+        stat.mtime.nanoseconds,
+        body_options,
+    );
+    parsed.metrics.bytes_read +|= preselection.discovery_bytes;
     return .{
-        .parsed = try parser.parse(
-            io,
-            allocator,
-            path,
-            &replay_reader.interface,
-            stat.mtime.nanoseconds,
-            options,
-        ),
+        .parsed = parsed,
         .discovery_bytes_read = 0,
         .file_opened = true,
     };
@@ -385,8 +394,8 @@ fn parseSelectedRelations(
     if (metrics.bytes_read > options.max_input_bytes) {
         return error.ObservationInputByteBoundExceeded;
     }
-    corpus_hasher.addSidecar(trace.claude_sidecar);
-    metrics.bytes_read +|= sidecarBytes(trace.claude_sidecar);
+    corpus_hasher.addDiscovery(trace.claude_discovery);
+    metrics.bytes_read +|= trace.claude_discovery_bytes;
     if (metrics.bytes_read > options.max_input_bytes) {
         return error.ObservationInputByteBoundExceeded;
     }
@@ -395,7 +404,7 @@ fn parseSelectedRelations(
         .metrics = metrics,
         .corpus_digest = corpus_hasher.digest(),
         .source_mtime_ns = modified_at,
-        .sidecar_mtime_ns = sidecarMtime(trace.claude_sidecar),
+        .sidecar_mtime_ns = discoveryMtime(trace.claude_discovery),
     };
 }
 
@@ -660,6 +669,7 @@ pub fn relationParseOptions(
         .ongoing_threshold_secs = options.ongoing_threshold_secs,
         .as_of_ns = options.as_of_ns,
         .sidecar_dir = options.sidecar_dir,
+        .claude_discovery = options.claude_discovery,
         .include_occurrences = false,
         .include_message_bodies = false,
         .include_tool_output_parts = false,
@@ -780,8 +790,8 @@ fn parseSelectedReader(
     if (metrics.bytes_read > options.max_input_bytes) {
         return error.ObservationInputByteBoundExceeded;
     }
-    corpus_hasher.addSidecar(trace.claude_sidecar);
-    metrics.bytes_read +|= sidecarBytes(trace.claude_sidecar);
+    corpus_hasher.addDiscovery(trace.claude_discovery);
+    metrics.bytes_read +|= trace.claude_discovery_bytes;
     if (metrics.bytes_read > options.max_input_bytes) {
         return error.ObservationInputByteBoundExceeded;
     }
@@ -790,13 +800,19 @@ fn parseSelectedReader(
         .metrics = metrics,
         .corpus_digest = corpus_hasher.digest(),
         .source_mtime_ns = source_mtime_ns,
-        .sidecar_mtime_ns = sidecarMtime(trace.claude_sidecar),
+        .sidecar_mtime_ns = discoveryMtime(trace.claude_discovery),
     };
 }
 
 const Preselection = struct {
     passes: bool = true,
     bytes_read: usize = 0,
+    discovery: ?trace_core.claude_parser.Discovery = null,
+    discovery_bytes: usize = 0,
+
+    fn deinit(self: *Preselection, allocator: std.mem.Allocator) void {
+        if (self.discovery) |*facts| facts.deinit(allocator);
+    }
 };
 
 fn canonicalPathPassesSessionSelection(
@@ -926,7 +942,6 @@ fn preselectSession(
     if (!requiresSummaryPreselection(selection)) {
         return .{};
     }
-    const prefix = discovery.bytes;
     var summary = try parseDiscoveryLine(
         io,
         allocator,
@@ -936,22 +951,32 @@ fn preselectSession(
         options,
     );
     defer summary.deinit(allocator);
+    const read_bytes = discovery.bytes.len +| summary.claude_discovery_bytes;
+    if (!summaryPasses(summary, selection)) return .{ .passes = false, .bytes_read = read_bytes };
+    return .{
+        .bytes_read = discovery.bytes.len,
+        .discovery = if (summary.claude_discovery) |facts| try facts.clone(allocator) else null,
+        .discovery_bytes = summary.claude_discovery_bytes,
+    };
+}
+
+fn summaryPasses(summary: trace_core.CanonicalSessionTrace, selection: SessionSelection) bool {
     if (selection.session_id) |wanted| {
         if (!exactSessionPasses(summary.session.session_id, wanted)) {
-            return .{ .passes = false, .bytes_read = prefix.len };
+            return false;
         }
     }
     if (selection.exclude_session_id) |excluded| {
         if (summary.session.session_id) |actual| {
             if (std.mem.eql(u8, excluded, actual)) {
-                return .{ .passes = false, .bytes_read = prefix.len };
+                return false;
             }
         }
     }
     if (selection.repo) |repo| {
         if (summary.session.cwd) |cwd| {
             if (!pathEqualOrDescendant(cwd, repo)) {
-                return .{ .passes = false, .bytes_read = prefix.len };
+                return false;
             }
         }
     }
@@ -966,11 +991,11 @@ fn preselectSession(
                     (actual_ms == null or
                         actual_ms.? > selection.until_ms.?)))
             {
-                return .{ .passes = false, .bytes_read = prefix.len };
+                return false;
             }
         }
     }
-    return .{ .bytes_read = prefix.len };
+    return true;
 }
 
 fn exactSessionPasses(actual: ?[]const u8, wanted: []const u8) bool {
@@ -1910,6 +1935,7 @@ pub fn traceParseOptions(
         .ongoing_threshold_secs = options.ongoing_threshold_secs,
         .as_of_ns = options.as_of_ns,
         .sidecar_dir = options.sidecar_dir,
+        .claude_discovery = options.claude_discovery,
         .include_raw = relation == .source_events and
             containsField(demanded_fields, 8),
         .include_occurrence_payloads = (relation == .source_events and
@@ -1966,11 +1992,13 @@ const CorpusHasher = struct {
         self.hasher.update(line);
     }
 
-    fn addSidecar(self: *CorpusHasher, sidecar: ?trace_core.claude_parser.Sidecar) void {
-        const evidence = sidecar orelse return;
-        self.hasher.update("\x00claude-sidecar\x00");
-        self.hasher.update(if (evidence.present) "\x01" else "\x00");
-        self.hasher.update(&evidence.digest);
+    fn addDiscovery(self: *CorpusHasher, discovery: ?trace_core.claude_parser.Discovery) void {
+        const facts = discovery orelse return;
+        self.hasher.update("\x00claude-discovery\x00");
+        const state: u8 = if (facts.sidecar) |value| @as(u8, @backingInt(value)) + 1 else 0;
+        const parent: u8 = if (facts.parent_present) |present| @as(u8, @intFromBool(present)) + 1 else 0;
+        self.hasher.update(&.{ state, parent });
+        self.hasher.update(&facts.sidecar_digest);
     }
 
     fn digest(self: CorpusHasher) [71]u8 {
@@ -2769,13 +2797,8 @@ test "trace adapter applies temporal selectors to physical event rows" {
     );
 }
 
-pub fn sidecarMtime(sidecar: ?trace_core.claude_parser.Sidecar) ?i128 {
-    const evidence = sidecar orelse return null;
-    return if (evidence.present) evidence.mtime_ns else null;
+pub fn discoveryMtime(discovery: ?trace_core.claude_parser.Discovery) ?i128 {
+    const facts = discovery orelse return null;
+    return facts.sidecarMtime();
 }
 pub const ClaudeLimitations = trace_core.claude_parser.Limitations;
-
-fn sidecarBytes(sidecar: ?trace_core.claude_parser.Sidecar) usize {
-    const evidence = sidecar orelse return 0;
-    return evidence.bytes;
-}
