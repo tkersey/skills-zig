@@ -490,9 +490,11 @@ worker whose sidecar is missing or unreadable, whose recorded identity
 contradicts its path, or whose parent transcript is not admitted sets
 `lineage_conflict`. A parent is admitted when its transcript is among the paths
 the command or observation resolved: the corpus a native command resolved before
-narrowing it to an exact session, a physically selected observation's paths, a
-graph corpus or session family, or a streaming plan's discovered paths. Path resolution applies the file-admission policy (time
-pruning with the session ID cleared); row selectors such as `--session-id`,
+narrowing it to an exact session (unpruned, since an exact native target bypasses
+time pruning), a physically selected observation's paths, a graph corpus or
+session family, or a streaming plan's discovered paths. An observation's path
+resolution applies the file-admission policy (time pruning with the session ID
+cleared); row selectors such as `--session-id`,
 `--repo`, an exact time filter or the search exclusion narrow the selection and
 never make a parent missing. A worker read through an explicit one-file path
 therefore reports a missing parent. Spawner-side `session_edges` come only from `Agent`/`Task`

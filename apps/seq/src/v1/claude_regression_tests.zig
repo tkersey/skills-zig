@@ -612,3 +612,62 @@ test "a native exact worker target admits the corpus it was resolved from" {
     defer allocator.free(parent);
     try testing.expect(try admitted.admits(parent));
 }
+
+const shadowed_spawn = blk: {
+    const transcript = @embedFile(worker_base ++ worker_root ++ ".jsonl");
+    const first = std.mem.indexOfScalar(u8, transcript, '\n').? + 1;
+    const declaration =
+        \\{"type":"assistant","uuid":"rec-rx","parentUuid":"rec-r01","sessionId":"d0000000-0000-4000-8000-000000000001","cwd":"/w","timestamp":"2026-11-01T00:00:00Z","message":{"id":"msg_x","role":"assistant","model":"x","stop_reason":"tool_use","content":[{"type":"tool_use","id":"toolu_spawn_w","name":"Bash","input":{}}]}}
+        \\
+    ;
+    break :blk transcript[0..first] ++ declaration ++ transcript[first..];
+};
+
+test "spawns: a call ID first declared as another tool is not a spawn" {
+    var trace = try support.parse(allocator, worker_root ++ ".jsonl", shadowed_spawn, .stale);
+    defer trace.deinit(allocator);
+    try testing.expectEqual(@as(i64, 0), trace.session.spawned_worker_count);
+    for (trace.graph_edges.items) |edge| {
+        try testing.expect(!std.mem.eql(u8, edge.call_id orelse "", "toolu_spawn_w"));
+    }
+}
+
+const image_result_source = prompt_line ++
+    \\{"type":"assistant","uuid":"q2","parentUuid":"q1","sessionId":"s","cwd":"/w","timestamp":"2026-11-01T00:00:01Z","message":{"id":"m1","role":"assistant","model":"x","stop_reason":"tool_use","content":[{"type":"tool_use","id":"c1","name":"Read","input":{}}]}}
+    \\{"type":"user","uuid":"q3","parentUuid":"q2","sessionId":"s","cwd":"/w","timestamp":"2026-11-01T00:00:02Z","message":{"role":"user","content":[{"type":"image","source":{}},{"type":"tool_result","tool_use_id":"c1","content":[{"type":"image","source":{}},{"type":"text","text":"caption"}]}]}}
+    \\
+;
+
+fn resolvePointer(root: std.json.Value, pointer: []const u8) ?std.json.Value {
+    var value = root;
+    var tokens = std.mem.tokenizeScalar(u8, pointer, '/');
+    while (tokens.next()) |token| {
+        value = switch (value) {
+            .object => |object| object.get(token) orelse return null,
+            .array => |array| array.items[
+                std.fmt.parseInt(usize, token, 10) catch return null
+            ],
+            else => return null,
+        };
+    }
+    return value;
+}
+
+test "tools: Claude output-part pointers resolve in the published payload" {
+    var trace = try support.parse(allocator, "image.jsonl", image_result_source, .stale);
+    defer trace.deinit(allocator);
+    const parts_json = trace.tools.items[0].output_parts_json.?;
+    const parts = try std.json.parseFromSlice(std.json.Value, allocator, parts_json, .{});
+    defer parts.deinit();
+    const part = parts.value.array.items[0].object;
+    const pointer = part.get("payload_pointer").?.string;
+    var payload_json: ?[]const u8 = null;
+    for (trace.occurrences.items) |occurrence| {
+        if (occurrence.line_number == 3) payload_json = occurrence.payload_json;
+    }
+    const payload = try std.json.parseFromSlice(std.json.Value, allocator, payload_json.?, .{});
+    defer payload.deinit();
+    const resolved = resolvePointer(payload.value, pointer) orelse
+        return error.TestPointerUnresolved;
+    try testing.expectEqualStrings("caption", resolved.string);
+}

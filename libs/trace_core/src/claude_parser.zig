@@ -373,12 +373,15 @@ pub const Extractor = struct {
         }
         const content = valueArray(message.get("content") orelse return) orelse return;
         var results: std.ArrayList(ResultBlock) = .empty;
-        for (content.items, 0..) |item, index| {
+        var published: usize = 0;
+        for (content.items) |item| {
             const block = valueObject(item) orelse continue;
+            if (!isPublishedBlock(block)) continue;
+            defer published += 1;
             if (!eql(stringField(block, "type"), "tool_result")) continue;
             result.tool_result = true;
             const call_id = stringField(block, "tool_use_id") orelse continue;
-            try results.append(self.arena, try self.resultBlock(root, block, call_id, index));
+            try results.append(self.arena, try self.resultBlock(root, block, call_id, published));
         }
         if (results.items.len == 1) try self.spawnResult(&results.items[0], root);
         result.results = results.items;
@@ -403,13 +406,21 @@ pub const Extractor = struct {
                 first_text = value;
                 try parts.append(self.arena, try self.pointer(index, null, value));
             },
-            .array => |items| for (items.items, 0..) |item, part_index| {
-                const part = valueObject(item) orelse continue;
-                if (!eql(stringField(part, "type"), "text")) continue;
-                const value = stringField(part, "text") orelse continue;
-                if (first_text == null) first_text = value else try text.append(self.arena, '\n');
-                try text.appendSlice(self.arena, value);
-                try parts.append(self.arena, try self.pointer(index, part_index, value));
+            .array => |items| {
+                var published: usize = 0;
+                for (items.items) |item| {
+                    const part = valueObject(item) orelse continue;
+                    if (!eql(stringField(part, "type"), "text")) continue;
+                    defer published += 1;
+                    const value = stringField(part, "text") orelse continue;
+                    if (first_text == null) {
+                        first_text = value;
+                    } else {
+                        try text.append(self.arena, '\n');
+                    }
+                    try text.appendSlice(self.arena, value);
+                    try parts.append(self.arena, try self.pointer(index, published, value));
+                }
             },
             else => {},
         };
@@ -658,15 +669,20 @@ fn projectUsage(arena: std.mem.Allocator, raw_usage: std.json.ObjectMap) !std.js
     return public_usage;
 }
 
+fn isPublishedBlock(block: std.json.ObjectMap) bool {
+    const block_type = stringField(block, "type") orelse return false;
+    return oneOf(block_type, &.{ "text", "tool_use", "tool_result" });
+}
+
 fn projectBlock(arena: std.mem.Allocator, block: std.json.ObjectMap) !?std.json.ObjectMap {
-    const block_type = stringField(block, "type") orelse return null;
+    if (!isPublishedBlock(block)) return null;
+    const block_type = stringField(block, "type").?;
     if (std.mem.eql(u8, block_type, "text")) {
         return try projectFields(arena, block, &.{ "type", "text" });
     }
     if (std.mem.eql(u8, block_type, "tool_use")) {
         return try projectFields(arena, block, &.{ "type", "id", "name", "input" });
     }
-    if (!std.mem.eql(u8, block_type, "tool_result")) return null;
     var result = try projectFields(arena, block, &.{ "type", "tool_use_id", "is_error" });
     if (block.get("content")) |content| switch (content) {
         .string => try result.put(arena, "content", content),
@@ -1355,16 +1371,17 @@ pub const ClaudeParser = struct {
 
     fn collectSpawns(self: *ClaudeParser, graph: *const turns_mod.Graph) ![]Spawn {
         var spawns: std.ArrayList(Spawn) = .empty;
-        var by_call: std.StringHashMapUnmanaged(usize) = .empty;
+        var by_call: std.StringHashMapUnmanaged(?usize) = .empty;
         for (self.records.items, 0..) |record, index| {
             if (!graph.modeled[index]) continue;
             if (record.isModelResponse()) {
                 for (record.blocks) |block| {
                     if (block.kind != .tool_use) continue;
                     const call_id = block.call_id orelse continue;
-                    if (!oneOf(block.name orelse "", &.{ "Agent", "Task" })) continue;
                     const entry = try by_call.getOrPut(self.arena(), call_id);
                     if (entry.found_existing) continue;
+                    entry.value_ptr.* = null;
+                    if (!oneOf(block.name orelse "", &.{ "Agent", "Task" })) continue;
                     entry.value_ptr.* = spawns.items.len;
                     try spawns.append(self.arena(), .{
                         .declaration = @intCast(index),
@@ -1373,7 +1390,8 @@ pub const ClaudeParser = struct {
                 }
             }
             for (record.results) |result| {
-                const position = by_call.get(result.call_id) orelse continue;
+                const declared = by_call.get(result.call_id) orelse continue;
+                const position = declared orelse continue;
                 if (spawns.items[position].result == null) spawns.items[position].result = result;
             }
         }
