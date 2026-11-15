@@ -68,6 +68,8 @@ fn indexUuids(
     graph: *Graph,
 ) !std.StringHashMapUnmanaged(u32) {
     var uuids: std.StringHashMapUnmanaged(u32) = .empty;
+    var seen: std.StringHashMapUnmanaged(void) = .empty;
+    defer seen.deinit(arena);
     var duplicates: std.ArrayList(usize) = .empty;
     var missing: std.ArrayList(usize) = .empty;
     for (records, 0..) |record, index| {
@@ -76,13 +78,11 @@ fn indexUuids(
             try missing.append(arena, record.line);
             continue;
         };
+        const occurrence = try seen.getOrPut(arena, uuid);
+        if (occurrence.found_existing) try duplicates.append(arena, record.line);
         if (!graph.modeled[index]) continue;
         const entry = try uuids.getOrPut(arena, uuid);
-        if (entry.found_existing) {
-            try duplicates.append(arena, record.line);
-        } else {
-            entry.value_ptr.* = @intCast(index);
-        }
+        if (!entry.found_existing) entry.value_ptr.* = @intCast(index);
     }
     graph.duplicate_uuid_lines = duplicates.items;
     graph.missing_uuid_lines = missing.items;
@@ -395,7 +395,7 @@ fn decide(
         const reason = try std.fmt.allocPrint(arena, "claude_{s}", .{stop});
         return .{ .status = .complete, .reason = reason, .record = last, .by_response = true };
     }
-    const legacy_text_end = response.hasText() and
+    const legacy_text_end = response.hasText() and !declaresCall(records, evidence.message_lines) and
         (response.stop == .absent or response.stop == .null_value);
     if (!legacy_text_end) return null;
     return .{
@@ -415,7 +415,7 @@ fn isApiError(record: Record) bool {
 }
 
 fn isTurnLimit(record: Record) bool {
-    return record.kind == .attachment and parser.eql(record.subtype, "max_turns_reached");
+    return record.kind == .attachment and parser.eql(record.attachment_type, "max_turns_reached");
 }
 
 fn lastAfter(
@@ -490,7 +490,7 @@ fn answerFor(
     if (decision.ending_call) |call_id| {
         for (owned) |position| {
             const record = records[position];
-            if (record.kind != .attachment or !parser.eql(record.subtype, "structured_output")) {
+            if (record.kind != .attachment or !parser.eql(record.attachment_type, "structured_output")) {
                 continue;
             }
             if (!parser.eql(record.call_ref, call_id)) continue;
@@ -527,32 +527,37 @@ pub fn assemble(
     lines: []const u32,
 ) !?[]const u8 {
     var entries: std.ArrayList(Keyed) = .empty;
-    var all_keyed = true;
+    var keyed: std.ArrayList(Keyed) = .empty;
     for (lines) |position| {
         const record = records[position];
         if (record.block_index) |key| {
             if (record.blocks.len != 1) return null;
-            try entries.append(arena, .{ .key = key, .block = record.blocks[0] });
+            const entry = Keyed{ .key = key, .block = record.blocks[0] };
+            try entries.append(arena, entry);
+            try keyed.append(arena, entry);
         } else {
-            all_keyed = false;
             for (record.blocks) |block| try entries.append(arena, .{ .key = null, .block = block });
         }
     }
-    if (all_keyed) {
-        std.mem.sort(Keyed, entries.items, {}, lessKey);
-        if (conflicting(entries.items)) return null;
-    }
+    std.mem.sort(Keyed, keyed.items, {}, lessKey);
+    if (conflicting(keyed.items)) return null;
+    const ordered = if (keyed.items.len == entries.items.len) keyed.items else entries.items;
     var text: std.ArrayList(u8) = .empty;
     var found = false;
-    var previous_key: ?i64 = null;
-    for (entries.items, 0..) |entry, position| {
-        if (all_keyed and position > 0 and entry.key == previous_key) continue;
-        previous_key = entry.key;
+    for (ordered, 0..) |entry, position| {
+        if (entry.key != null and repeatsEarlierKey(ordered[0..position], entry.key.?)) continue;
         if (entry.block.kind != .text) continue;
         try text.appendSlice(arena, entry.block.text);
         found = true;
     }
     return if (found) text.items else null;
+}
+
+fn repeatsEarlierKey(earlier_entries: []const Keyed, key: i64) bool {
+    for (earlier_entries) |entry| {
+        if (entry.key == key) return true;
+    }
+    return false;
 }
 
 fn lessKey(_: void, left: Keyed, right: Keyed) bool {
@@ -563,10 +568,7 @@ fn conflicting(entries: []const Keyed) bool {
     for (entries[0..entries.len -| 1], 0..) |entry, position| {
         const next = entries[position + 1];
         if (entry.key != next.key) continue;
-        if (entry.block.kind != next.block.kind) return true;
-        if (!std.mem.eql(u8, entry.block.text, next.block.text)) return true;
-        if (!std.meta.eql(entry.block.call_id != null, next.block.call_id != null)) return true;
-        if (entry.block.call_id) |id| if (!std.mem.eql(u8, id, next.block.call_id.?)) return true;
+        if (!std.mem.eql(u8, &entry.block.identity, &next.block.identity)) return true;
     }
     return false;
 }

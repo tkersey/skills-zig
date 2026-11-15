@@ -141,7 +141,11 @@ pub const Kind = enum {
         if (std.mem.eql(u8, text, "custom-title")) return .custom_title;
         if (std.mem.eql(u8, text, "ai-title")) return .ai_title;
         if (std.mem.eql(u8, text, "continued-in")) return .continued_in;
-        return std.meta.stringToEnum(Kind, text) orelse .other;
+        const wire_kinds = [_]Kind{ .user, .assistant, .system, .attachment, .summary };
+        for (wire_kinds) |kind| {
+            if (std.mem.eql(u8, text, @tagName(kind))) return kind;
+        }
+        return .other;
     }
 
     pub fn isConversation(self: Kind) bool {
@@ -208,6 +212,7 @@ pub const BlockKind = enum { text, tool_use, other };
 
 pub const Block = struct {
     kind: BlockKind,
+    identity: [32]u8 = @splat(0),
     text: []const u8 = "",
     call_id: ?[]const u8 = null,
     name: ?[]const u8 = null,
@@ -222,6 +227,9 @@ pub const OutputPart = struct {
     pointer: []const u8,
     text: []const u8,
 };
+
+const NoProcessResult = struct {};
+const no_process_results: []const NoProcessResult = &.{};
 
 pub const ResultBlock = struct {
     call_id: []const u8,
@@ -271,6 +279,7 @@ pub const Record = struct {
     duration_ms: ?i64 = null,
     preserved: ?[]const []const u8 = null,
     call_ref: ?[]const u8 = null,
+    attachment_type: ?[]const u8 = null,
     results: []const ResultBlock = &.{},
     request_id: Text = .absent,
     title: ?[]const u8 = null,
@@ -472,19 +481,22 @@ pub const Extractor = struct {
         const content = valueArray(message.get("content") orelse return &.{}) orelse return &.{};
         var result: std.ArrayList(Block) = .empty;
         for (content.items) |item| {
+            const identity = try blockIdentity(item);
             const block = valueObject(item) orelse {
-                try result.append(self.arena, .{ .kind = .other });
+                try result.append(self.arena, .{ .kind = .other, .identity = identity });
                 continue;
             };
             const block_type = stringField(block, "type") orelse "";
             if (std.mem.eql(u8, block_type, "text")) {
                 const text = stringField(block, "text") orelse "";
                 const owned = try self.arena.dupe(u8, text);
-                try result.append(self.arena, .{ .kind = .text, .text = owned });
+                try result.append(self.arena, .{ .kind = .text, .text = owned, .identity = identity });
             } else if (std.mem.eql(u8, block_type, "tool_use")) {
-                try result.append(self.arena, try self.toolUse(block));
+                var tool = try self.toolUse(block);
+                tool.identity = identity;
+                try result.append(self.arena, tool);
             } else {
-                try result.append(self.arena, .{ .kind = .other });
+                try result.append(self.arena, .{ .kind = .other, .identity = identity });
             }
         }
         return result.items;
@@ -521,8 +533,8 @@ pub const Extractor = struct {
 
     fn attachment(self: Extractor, result: *Record, root: std.json.ObjectMap) !void {
         const detail = objectField(root, "attachment") orelse return;
-        result.subtype = try self.dup(stringField(detail, "type"));
-        if (eql(result.subtype, "structured_output")) {
+        result.attachment_type = try self.dup(stringField(detail, "type"));
+        if (eql(result.attachment_type, "structured_output")) {
             result.call_ref = try self.dup(stringField(detail, "toolUseID"));
         }
     }
@@ -605,31 +617,86 @@ fn projectConversation(
     projected: *std.json.ObjectMap,
 ) !void {
     if (objectField(root, "attachment")) |detail| {
-        var attachment: std.json.ObjectMap = .empty;
-        if (detail.get("type")) |value| try attachment.put(arena, "type", value);
-        if (detail.get("toolUseID")) |value| try attachment.put(arena, "toolUseID", value);
+        const attachment = try projectFields(arena, detail, &.{ "type", "toolUseID" });
         try projected.put(arena, "attachment", .{ .object = attachment });
     }
     const message = objectField(root, "message") orelse return;
-    var public_message: std.json.ObjectMap = .empty;
-    for ([_][]const u8{ "role", "model", "id", "stop_reason", "usage" }) |field| {
-        if (message.get(field)) |value| try public_message.put(arena, field, value);
+    var public_message = try projectFields(arena, message, &.{ "role", "model", "id", "stop_reason" });
+    if (objectField(message, "usage")) |raw_usage| {
+        try public_message.put(arena, "usage", .{ .object = try projectUsage(arena, raw_usage) });
     }
     if (message.get("content")) |content| switch (content) {
+        .string => try public_message.put(arena, "content", content),
         .array => |items| {
             var public_items = std.json.Array.init(arena);
             for (items.items) |item| {
-                if (valueObject(item)) |block| {
-                    const block_type = stringField(block, "type") orelse "";
-                    if (oneOf(block_type, &.{ "thinking", "redacted_thinking" })) continue;
-                }
-                try public_items.append(item);
+                const block = valueObject(item) orelse continue;
+                const public_block = try projectBlock(arena, block) orelse continue;
+                try public_items.append(.{ .object = public_block });
             }
             try public_message.put(arena, "content", .{ .array = public_items });
         },
-        else => try public_message.put(arena, "content", content),
+        else => {},
     };
     try projected.put(arena, "message", .{ .object = public_message });
+}
+
+const usage_counter_fields = [_][]const u8{
+    "input_tokens", "cache_read_input_tokens", "cache_creation_input_tokens", "output_tokens",
+};
+
+fn projectUsage(arena: std.mem.Allocator, raw_usage: std.json.ObjectMap) !std.json.ObjectMap {
+    var public_usage = try projectFields(arena, raw_usage, &(usage_counter_fields ++ .{"service_tier"}));
+    if (objectField(raw_usage, "output_tokens_details")) |details| {
+        const public_details = try projectFields(arena, details, &.{"thinking_tokens"});
+        try public_usage.put(arena, "output_tokens_details", .{ .object = public_details });
+    }
+    const iterations = valueArray(raw_usage.get("iterations") orelse return public_usage) orelse
+        return public_usage;
+    var public_iterations = std.json.Array.init(arena);
+    for (iterations.items) |item| {
+        const entry = valueObject(item) orelse continue;
+        const fields = usage_counter_fields ++ .{"type"};
+        try public_iterations.append(.{ .object = try projectFields(arena, entry, &fields) });
+    }
+    try public_usage.put(arena, "iterations", .{ .array = public_iterations });
+    return public_usage;
+}
+
+fn projectBlock(arena: std.mem.Allocator, block: std.json.ObjectMap) !?std.json.ObjectMap {
+    const block_type = stringField(block, "type") orelse return null;
+    if (std.mem.eql(u8, block_type, "text")) return try projectFields(arena, block, &.{ "type", "text" });
+    if (std.mem.eql(u8, block_type, "tool_use")) {
+        return try projectFields(arena, block, &.{ "type", "id", "name", "input" });
+    }
+    if (!std.mem.eql(u8, block_type, "tool_result")) return null;
+    var result = try projectFields(arena, block, &.{ "type", "tool_use_id", "is_error" });
+    if (block.get("content")) |content| switch (content) {
+        .string => try result.put(arena, "content", content),
+        .array => |parts| {
+            var public_parts = std.json.Array.init(arena);
+            for (parts.items) |part| {
+                const object = valueObject(part) orelse continue;
+                if (!eql(stringField(object, "type"), "text")) continue;
+                try public_parts.append(.{ .object = try projectFields(arena, object, &.{ "type", "text" }) });
+            }
+            try result.put(arena, "content", .{ .array = public_parts });
+        },
+        else => {},
+    };
+    return result;
+}
+
+fn projectFields(
+    arena: std.mem.Allocator,
+    source: std.json.ObjectMap,
+    fields: []const []const u8,
+) !std.json.ObjectMap {
+    var projected: std.json.ObjectMap = .empty;
+    for (fields) |field| {
+        if (source.get(field)) |value| try projected.put(arena, field, value);
+    }
+    return projected;
 }
 
 pub fn eql(value: ?[]const u8, expected: []const u8) bool {
@@ -1269,19 +1336,42 @@ pub const ClaudeParser = struct {
         return result.spawned_agent;
     }
 
+    const AdmittedSpawn = struct {
+        spawn: Spawn,
+        result: ResultBlock,
+        worker: []const u8,
+    };
+
+    fn admittedSpawns(
+        self: *ClaudeParser,
+        graph: *const turns_mod.Graph,
+        accounting: tokens_mod.Accounting,
+    ) ![]AdmittedSpawn {
+        var admitted: std.ArrayList(AdmittedSpawn) = .empty;
+        const root = self.trace.session.root_session_id;
+        for (try self.collectSpawns(graph)) |spawn| {
+            const agent = spawnedChild(spawn) orelse continue;
+            if (!accounting.here_records[spawn.declaration] or root == null) {
+                self.trace.claude_limitations.unlocated_spawn_count += 1;
+                continue;
+            }
+            const worker = try std.fmt.allocPrint(self.arena(), "{s}/agent-{s}", .{ root.?, agent });
+            try admitted.append(self.arena(), .{
+                .spawn = spawn,
+                .result = spawn.result.?,
+                .worker = worker,
+            });
+        }
+        self.trace.session.spawned_worker_count = @intCast(admitted.items.len);
+        return admitted.items;
+    }
+
     fn countSpawnEdges(
         self: *ClaudeParser,
         graph: *const turns_mod.Graph,
         accounting: tokens_mod.Accounting,
     ) !void {
-        for (try self.collectSpawns(graph)) |spawn| {
-            if (spawnedChild(spawn) == null) continue;
-            if (accounting.here_records[spawn.declaration]) {
-                self.trace.session.spawned_worker_count += 1;
-            } else {
-                self.trace.claude_limitations.unlocated_spawn_count += 1;
-            }
-        }
+        _ = try self.admittedSpawns(graph, accounting);
     }
 
     fn emitEdges(
@@ -1299,27 +1389,19 @@ pub const ClaudeParser = struct {
                 .call_id = call_id,
             });
         }
-        for (try self.collectSpawns(graph)) |spawn| {
-            const agent = spawnedChild(spawn) orelse continue;
-            if (!accounting.here_records[spawn.declaration]) {
-                self.trace.claude_limitations.unlocated_spawn_count += 1;
-                continue;
-            }
-            const root = session.root_session_id orelse continue;
-            const worker = try std.fmt.allocPrint(self.arena(), "{s}/agent-{s}", .{ root, agent });
-            const result = spawn.result.?;
+        for (try self.admittedSpawns(graph, accounting)) |admitted| {
+            const spawn = admitted.spawn;
             try self.appendEdge(.{
                 .parent_session_id = session.session_id,
-                .worker_session_id = worker,
+                .worker_session_id = admitted.worker,
                 .parent_path = session.path,
                 .call_id = spawn.block.call_id,
                 .agent_role = spawn.block.agent_role,
                 .agent_nickname = spawn.block.agent_nickname,
-                .model = result.resolved_model orelse spawn.block.model,
+                .model = admitted.result.resolved_model orelse spawn.block.model,
                 .spawned_at = self.records.items[spawn.declaration].timestamp,
-                .worker_status = result.worker_status,
+                .worker_status = admitted.result.worker_status,
             });
-            session.spawned_worker_count += 1;
             if (graph.owner[spawn.declaration]) |turn| {
                 self.trace.turns.items[turn].spawned_worker_count += 1;
             }
@@ -1463,7 +1545,7 @@ pub const ClaudeParser = struct {
                 .timestamp = record.timestamp,
                 .payload_pointer = part.pointer,
                 .text = part.text,
-                .process_results = [_]u8{},
+                .process_results = no_process_results,
             }, .{});
             errdefer self.allocator.free(json);
             try tool.output_parts.append(self.allocator, json);
@@ -1670,4 +1752,14 @@ pub fn isPrefixSeed(root: std.json.ObjectMap) bool {
     const kind = Kind.fromType(stringField(root, "type"));
     return kind.isConversation() and stringField(root, "sessionId") != null and
         stringField(root, "cwd") != null and stringField(root, "timestamp") != null;
+}
+
+fn blockIdentity(item: std.json.Value) ![32]u8 {
+    var buffer: [256]u8 = undefined;
+    var hashing = std.Io.Writer.Hashing(std.crypto.hash.sha2.Sha256).init(&buffer);
+    try std.json.Stringify.value(item, .{}, &hashing.writer);
+    try hashing.writer.flush();
+    var digest: [32]u8 = undefined;
+    hashing.hasher.final(&digest);
+    return digest;
 }
