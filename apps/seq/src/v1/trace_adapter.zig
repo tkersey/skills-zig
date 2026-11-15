@@ -103,7 +103,7 @@ pub fn discoverSessionIdentity(
         .parent_session_id = null,
         .lineage_conflict = summary.session.lineage_conflict,
         .subagent_history_start_ordinal = summary.session.subagent_history_start_ordinal,
-        .bytes_read = prefix.bytes.len,
+        .bytes_read = prefix.bytes.len +| sidecarBytes(summary.claude_sidecar),
         .source = summary.source,
         .sidecar_mtime_ns = sidecarMtime(summary.claude_sidecar),
         .file_size = std.math.cast(usize, stat.size) orelse
@@ -386,6 +386,10 @@ fn parseSelectedRelations(
         return error.ObservationInputByteBoundExceeded;
     }
     corpus_hasher.addSidecar(trace.claude_sidecar);
+    metrics.bytes_read +|= sidecarBytes(trace.claude_sidecar);
+    if (metrics.bytes_read > options.max_input_bytes) {
+        return error.ObservationInputByteBoundExceeded;
+    }
     return .{
         .trace = trace,
         .metrics = metrics,
@@ -777,6 +781,10 @@ fn parseSelectedReader(
         return error.ObservationInputByteBoundExceeded;
     }
     corpus_hasher.addSidecar(trace.claude_sidecar);
+    metrics.bytes_read +|= sidecarBytes(trace.claude_sidecar);
+    if (metrics.bytes_read > options.max_input_bytes) {
+        return error.ObservationInputByteBoundExceeded;
+    }
     return ParsedTrace{
         .trace = trace,
         .metrics = metrics,
@@ -2765,3 +2773,8 @@ pub fn sidecarMtime(sidecar: ?trace_core.claude_parser.Sidecar) ?i128 {
     return if (evidence.present) evidence.mtime_ns else null;
 }
 pub const ClaudeLimitations = trace_core.claude_parser.Limitations;
+
+fn sidecarBytes(sidecar: ?trace_core.claude_parser.Sidecar) usize {
+    const evidence = sidecar orelse return 0;
+    return evidence.bytes;
+}

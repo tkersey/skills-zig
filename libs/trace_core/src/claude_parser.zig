@@ -687,6 +687,7 @@ pub const Sidecar = struct {
     present: bool,
     digest: [71]u8,
     mtime_ns: i128,
+    bytes: usize = 0,
 };
 
 pub const Limitations = struct {
@@ -1074,6 +1075,7 @@ pub const ClaudeParser = struct {
             .present = true,
             .digest = digestOf(bytes),
             .mtime_ns = mtime_ns,
+            .bytes = bytes.len,
         };
         return parseSidecar(self.arena(), bytes);
     }
