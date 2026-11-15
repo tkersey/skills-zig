@@ -12,8 +12,13 @@ pub const prefix_lines_max: usize = 256;
 pub const prefix_bytes_max: usize = 4 * 1024 * 1024;
 
 pub fn withinPrefix(line: usize, end_offset: usize) bool {
-    return line <= prefix_lines_max and (line == 1 or end_offset <= prefix_bytes_max);
+    return line == 1 or seedsPrefix(line, end_offset);
 }
+
+pub fn seedsPrefix(line: usize, end_offset: usize) bool {
+    return line <= prefix_lines_max and end_offset <= prefix_bytes_max;
+}
+
 pub const sidecar_bytes_max: usize = 64 * 1024;
 pub const request_record_version_min = Version{ .major = 2, .minor = 1, .patch = 319 };
 pub const adapter_id = "claude-code-transcript-jsonl/v1";
@@ -84,7 +89,8 @@ fn isCodexSignature(root: std.json.ObjectMap) bool {
         };
         return oneOf(entry_type, &codex_types) and objectField(root, "payload") != null;
     }
-    if (root.get("payload")) |payload| return payload == .object;
+    if (stringField(root, "record_type")) |record_type| return eql(record_type, "state");
+    if (root.get("payload") != null) return false;
     if (root.get("id") != null and root.get("timestamp") != null) return true;
     if (root.get("call_id") != null) {
         return (root.get("arguments") != null and root.get("name") != null) or
@@ -861,7 +867,7 @@ const Prefix = struct {
 
     fn observe(self: *Prefix, record: Record, index: usize) void {
         if (self.done) return;
-        if (!withinPrefix(record.line, record.end_offset)) {
+        if (!seedsPrefix(record.line, record.end_offset)) {
             self.done = true;
             return;
         }
@@ -876,7 +882,7 @@ const Prefix = struct {
     }
 
     fn noteTimestamp(self: *Prefix, timestamp: []const u8) void {
-        const millis = timestampMillis(timestamp);
+        const millis = core.iso_time.parseIsoTimestampMillis(timestamp);
         if (self.earliest == null) {
             self.earliest = timestamp;
             self.earliest_ms = millis;
@@ -1131,7 +1137,6 @@ pub const ClaudeParser = struct {
         } else {
             try replaceNullable(self.allocator, &session.control_parent_session_id, root);
         }
-        if (self.options.discovery_prefix) return;
         const parent_root = root orelse return;
         if (!try self.parentAdmitted(parent_root, facts, layout)) {
             session.lineage_conflict = true;
@@ -1184,10 +1189,16 @@ pub const ClaudeParser = struct {
         else
             directory_handle.openFile(io, sidecar_path, .{});
         discovery.sidecar = .absent;
-        const file = opened catch return;
+        const file = opened catch |err| switch (err) {
+            error.FileNotFound, error.NotDir => return,
+            else => {
+                discovery.sidecar = .unreadable;
+                return;
+            },
+        };
         defer file.close(io);
         discovery.sidecar = .unreadable;
-        const stat = try file.stat(io);
+        const stat = file.stat(io) catch return;
         discovery.sidecar_mtime_ns = stat.mtime.nanoseconds;
         if (stat.size > sidecar_bytes_max) return;
         var reader = file.reader(io, &.{});
@@ -1246,7 +1257,7 @@ pub const ClaudeParser = struct {
         var ai_title: ?[]const u8 = null;
         for (self.records.items) |record| {
             if (record.timestamp) |timestamp| {
-                const millis = timestampMillis(timestamp);
+                const millis = core.iso_time.parseIsoTimestampMillis(timestamp);
                 const later = millis != null and (latest_ms == null or millis.? >= latest_ms.?);
                 if (session.end_time == null or later) {
                     try replaceOpt(self.allocator, &session.end_time, timestamp);
@@ -1585,9 +1596,11 @@ pub const ClaudeParser = struct {
         if (self.trace.omitted_tool_call_ids.contains(result.call_id)) return;
         const position = self.findTool(result.call_id) orelse blk: {
             var tool = try self.newTool(result.call_id, turn);
-            errdefer tool.deinit(self.allocator);
+            var owned = true;
+            errdefer if (owned) tool.deinit(self.allocator);
             tool.lifecycle_status = .inferred;
             try self.trace.tools.append(self.allocator, tool);
+            owned = false;
             try core.retainNewestTools(self.allocator, self.trace, self.options.max_tools);
             break :blk self.findTool(result.call_id) orelse return;
         };
@@ -1721,60 +1734,6 @@ fn digestOf(bytes: []const u8) [71]u8 {
     return encoded;
 }
 
-pub fn timestampMillis(text: []const u8) ?i64 {
-    if (text.len < 20 or text[4] != '-' or text[7] != '-' or text[10] != 'T') return null;
-    if (text[13] != ':' or text[16] != ':') return null;
-    const year = std.fmt.parseInt(i32, text[0..4], 10) catch return null;
-    const month = std.fmt.parseInt(u8, text[5..7], 10) catch return null;
-    const day = std.fmt.parseInt(u8, text[8..10], 10) catch return null;
-    const hour = std.fmt.parseInt(i64, text[11..13], 10) catch return null;
-    const minute = std.fmt.parseInt(i64, text[14..16], 10) catch return null;
-    const second = std.fmt.parseInt(i64, text[17..19], 10) catch return null;
-    if (month < 1 or month > 12 or day < 1 or day > 31) return null;
-    if (hour > 23 or minute > 59 or second > 60) return null;
-    var position: usize = 19;
-    var millis: i64 = 0;
-    if (text[position] == '.') {
-        position += 1;
-        var digits: usize = 0;
-        while (position < text.len and std.ascii.isDigit(text[position])) : (position += 1) {
-            if (digits < 3) millis = millis * 10 + (text[position] - '0');
-            digits += 1;
-        }
-        if (digits == 0) return null;
-        while (digits < 3) : (digits += 1) millis *= 10;
-    }
-    const offset = zoneOffsetSeconds(text[position..]) orelse return null;
-    const days = daysFromCivil(year, month, day);
-    const seconds = days * 86_400 + hour * 3600 + minute * 60 + second - offset;
-    return seconds * 1000 + millis;
-}
-
-fn zoneOffsetSeconds(zone: []const u8) ?i64 {
-    if (zone.len == 1 and zone[0] == 'Z') return 0;
-    if (zone.len != 6 or zone[3] != ':') return null;
-    const sign: i64 = switch (zone[0]) {
-        '+' => 1,
-        '-' => -1,
-        else => return null,
-    };
-    const hours = std.fmt.parseInt(i64, zone[1..3], 10) catch return null;
-    const minutes = std.fmt.parseInt(i64, zone[4..6], 10) catch return null;
-    if (hours > 23 or minutes > 59) return null;
-    return sign * (hours * 3600 + minutes * 60);
-}
-
-fn daysFromCivil(year_in: i32, month: u8, day: u8) i64 {
-    const year: i64 = if (month <= 2) year_in - 1 else year_in;
-    const era = @divFloor(year, 400);
-    const year_of_era = year - era * 400;
-    const shifted_month: i64 = if (month > 2) month - 3 else month + 9;
-    const day_of_year = @divFloor(153 * shifted_month + 2, 5) + day - 1;
-    const day_of_era = year_of_era * 365 + @divFloor(year_of_era, 4) -
-        @divFloor(year_of_era, 100) + day_of_year;
-    return era * 146_097 + day_of_era - 719_468;
-}
-
 pub fn dupOpt(allocator: std.mem.Allocator, value: ?[]const u8) !?[]u8 {
     return if (value) |text| try allocator.dupe(u8, text) else null;
 }
@@ -1796,15 +1755,6 @@ pub fn replaceNullable(allocator: std.mem.Allocator, slot: *?[]u8, value: ?[]con
         freeOpt(allocator, slot.*);
         slot.* = null;
     }
-}
-
-test "timestamps convert to epoch milliseconds" {
-    try std.testing.expectEqual(@as(?i64, 0), timestampMillis("1970-01-01T00:00:00Z"));
-    try std.testing.expectEqual(
-        @as(?i64, 1_794_678_204_397),
-        timestampMillis("2026-11-14T17:43:24.397Z"),
-    );
-    try std.testing.expectEqual(@as(?i64, null), timestampMillis("2026-11-14"));
 }
 
 test "reported exit codes require the complete leading line" {

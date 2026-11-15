@@ -2,6 +2,7 @@ const std = @import("std");
 const jsonl_stream = @import("jsonl_core");
 pub const SessionInput = @import("session_input.zig").SessionInput;
 pub const claude_parser = @import("claude_parser.zig");
+pub const iso_time = @import("iso_time.zig");
 const stringField = claude_parser.stringField;
 const objectField = claude_parser.objectField;
 const boolField = claude_parser.boolField;
@@ -70,15 +71,36 @@ pub const TraceParseOptions = struct {
     sidecar_dir: ?std.Io.Dir = null,
     discovery_prefix: bool = false,
     claude_discovery: ?*const claude_parser.Discovery = null,
-    admission: ?Admission = null,
+    admission: ?*const Admission = null,
 };
 
 pub const Admission = struct {
-    context: *anyopaque,
-    admitsFn: *const fn (context: *anyopaque, path: []const u8) anyerror!bool,
+    paths: std.StringHashMapUnmanaged(void) = .empty,
 
-    pub fn admits(self: Admission, path: []const u8) !bool {
-        return self.admitsFn(self.context, path);
+    pub fn initAlloc(allocator: std.mem.Allocator, paths: []const []const u8) !Admission {
+        var admission = Admission{};
+        errdefer admission.deinit(allocator);
+        const capacity = std.math.cast(u32, paths.len) orelse return error.OutOfMemory;
+        try admission.paths.ensureTotalCapacity(allocator, capacity);
+        for (paths) |path| {
+            const key = try std.fs.path.resolveAlloc(allocator, &.{path});
+            const entry = admission.paths.getOrPutAssumeCapacity(key);
+            if (entry.found_existing) allocator.free(key);
+        }
+        return admission;
+    }
+
+    pub fn deinit(self: *Admission, allocator: std.mem.Allocator) void {
+        var keys = self.paths.keyIterator();
+        while (keys.next()) |key| allocator.free(key.*);
+        self.paths.deinit(allocator);
+    }
+
+    pub fn admits(self: *const Admission, path: []const u8) !bool {
+        var buffer: [2 * std.fs.max_path_bytes]u8 = undefined;
+        var scratch = std.heap.FixedBufferAllocator.init(&buffer);
+        const key = try std.fs.path.resolveAlloc(scratch.allocator(), &.{path});
+        return self.paths.contains(key);
     }
 };
 
@@ -946,6 +968,7 @@ pub fn readDiscoveryPrefixAlloc(
         offset +|= record.bytes.len + 1;
         if (!claude_parser.withinPrefix(record.number, offset)) break;
         parse_end = offset;
+        lines.max_line_bytes = @max(claude_parser.prefix_bytes_max -| offset, 1);
         const line = std.mem.trim(u8, record.bytes, " \t\r\n");
         if (line.len == 0) continue;
         const root = (scratch.parse(line) catch |err| switch (err) {

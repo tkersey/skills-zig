@@ -646,14 +646,14 @@ fn runRelation(
         require_single,
     );
     defer freePaths(allocator, &paths);
-    var admitted = try Admission.initAlloc(io, dir, allocator, paths.items, null, .{});
-    defer admitted.deinit();
+    var admitted = try trace_core.Admission.initAlloc(allocator, paths.items);
+    defer admitted.deinit(allocator);
 
     try writer.writeByte('[');
     var first = true;
     var remaining = options.limit;
     const selection = relationRowSelection(options, relation, &remaining);
-    const trace_options = traceOptions(relation, admitted.interface());
+    const trace_options = traceOptions(relation, &admitted);
     for (paths.items) |path| {
         if (selection.remaining != null and remaining == 0) break;
         if (opencode_adapter.recognizes(path)) {
@@ -723,14 +723,14 @@ fn runSessionDetail(
     if (opencode_adapter.recognizes(paths.items[0])) {
         return error.OpenCodeSessionDetailUnavailable;
     }
-    var admitted = try Admission.initAlloc(io, dir, allocator, paths.items, null, .{});
-    defer admitted.deinit();
+    var admitted = try trace_core.Admission.initAlloc(allocator, paths.items);
+    defer admitted.deinit(allocator);
     var trace = trace_core.parseSessionTrace(
         io,
         dir,
         allocator,
         paths.items[0],
-        .{ .admission = admitted.interface() },
+        .{ .admission = &admitted },
     ) catch |err| return sourceFailure(options, paths.items[0], err);
     defer trace.deinit(allocator);
     try trace_adapter.writeTraceDetailJson(writer, &trace);
@@ -756,8 +756,8 @@ fn runSessionGraph(
     if (options.format != .dot) return error.UnsupportedNativeFormat;
     var paths = try resolveTargetPaths(allocator, io, dir, options, false);
     defer freePaths(allocator, &paths);
-    var admitted = try Admission.initAlloc(io, dir, allocator, paths.items, null, .{});
-    defer admitted.deinit();
+    var admitted = try trace_core.Admission.initAlloc(allocator, paths.items);
+    defer admitted.deinit(allocator);
     var arena_state = std.heap.ArenaAllocator.init(allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
@@ -771,7 +771,7 @@ fn runSessionGraph(
             dir,
             allocator,
             path,
-            traceOptions(.session_edges, admitted.interface()),
+            traceOptions(.session_edges, &admitted),
         ) catch |err| return sourceFailure(options, path, err);
         defer trace.deinit(allocator);
         try rejectTraceWarnings(&trace, options);
@@ -888,8 +888,8 @@ fn runFindSession(
     if (options.format != .json) return error.UnsupportedNativeFormat;
     var paths = try resolveTargetPaths(allocator, io, dir, options, false);
     defer freePaths(allocator, &paths);
-    var admitted = try Admission.initAlloc(io, dir, allocator, paths.items, null, .{});
-    defer admitted.deinit();
+    var admitted = try trace_core.Admission.initAlloc(allocator, paths.items);
+    defer admitted.deinit(allocator);
 
     try writer.writeByte('[');
     var first = true;
@@ -920,7 +920,7 @@ fn runFindSession(
             dir,
             allocator,
             path,
-            traceOptions(.messages, admitted.interface()),
+            traceOptions(.messages, &admitted),
         ) catch |err| return sourceFailure(options, path, err);
         defer trace.deinit(allocator);
         try rejectTraceWarnings(&trace, options);
@@ -1110,8 +1110,8 @@ fn runQueryObject(
         false,
     );
     defer freePaths(allocator, &paths);
-    var admitted = try Admission.initAlloc(io, dir, allocator, paths.items, null, .{});
-    defer admitted.deinit();
+    var admitted = try trace_core.Admission.initAlloc(allocator, paths.items);
+    defer admitted.deinit(allocator);
     for (paths.items) |path| {
         const feed_result = try feedQueryPath(
             io,
@@ -1121,7 +1121,7 @@ fn runQueryObject(
             query_options,
             &compilation,
             &runner,
-            admitted.interface(),
+            &admitted,
         );
         if (feed_result == .stop) break;
     }
@@ -1142,7 +1142,7 @@ fn feedQueryPath(
     options: Options,
     compilation: *const QueryCompilation,
     runner: *execution.Runner,
-    admission: trace_core.Admission,
+    admission: *const trace_core.Admission,
 ) !execution.Feed {
     if (opencode_adapter.recognizes(path)) {
         return feedOpenCodeQueryPath(
@@ -2018,6 +2018,7 @@ const RootFacts = struct {
     source: Source,
     live_codex_root: bool,
     live_claude_root: bool,
+    claude_candidates: bool,
 };
 
 pub fn resolveTargetPaths(
@@ -2043,11 +2044,13 @@ pub fn resolveTargetPaths(
     const source = effectiveSource(options, current);
     const root = try resolveSourceRootAlloc(allocator, options, source, io, dir);
     defer allocator.free(root);
+    const live_codex_root = source == .codex and
+        try isLiveNativeSessionRoot(allocator, options, root, io, dir);
     const facts = RootFacts{
         .source = source,
-        .live_codex_root = source == .codex and
-            try isLiveNativeSessionRoot(allocator, options, root, io, dir),
+        .live_codex_root = live_codex_root,
         .live_claude_root = source == .claude_code and options.root == null,
+        .claude_candidates = source == .claude_code or (options.root != null and !live_codex_root),
     };
     var paths = try collectTargetJsonlPaths(allocator, io, dir, root, options);
     errdefer freePaths(allocator, &paths);
@@ -2133,6 +2136,7 @@ fn claudePathPassesWindow(
     options: Options,
     facts: RootFacts,
 ) !bool {
+    if (!facts.claude_candidates) return true;
     if (isCanonicalRolloutBasename(std.fs.path.basename(path))) return true;
     if (opencode_adapter.recognizes(path)) return true;
     const since_rejects = facts.live_claude_root and
@@ -2726,7 +2730,7 @@ fn containsIgnoreCase(
 
 fn traceOptions(
     relation: physical.Relation,
-    admission: ?trace_core.Admission,
+    admission: ?*const trace_core.Admission,
 ) trace_core.TraceParseOptions {
     return trace_adapter.relationParseOptions(&.{relation}, .{ .admission = admission });
 }
@@ -3731,77 +3735,6 @@ test "default Codex discovery includes archives while explicit roots retain thei
     try std.testing.expect(std.mem.endsWith(u8, selected.items[0], "sessions/live.jsonl"));
 }
 
-pub const Admission = struct {
-    io: std.Io,
-    dir: std.Io.Dir,
-    allocator: std.mem.Allocator,
-    candidates: std.StringHashMapUnmanaged([]const u8) = .empty,
-    selection: ?trace_adapter.SessionSelection = null,
-    options: trace_adapter.Options = .{},
-    verdicts: std.StringHashMapUnmanaged(bool) = .empty,
-    reads: DiscoveryReads = .{},
-
-    pub fn initAlloc(
-        io: std.Io,
-        dir: std.Io.Dir,
-        allocator: std.mem.Allocator,
-        paths: []const []const u8,
-        selection: ?trace_adapter.SessionSelection,
-        options: trace_adapter.Options,
-    ) !Admission {
-        var admission = Admission{
-            .io = io,
-            .dir = dir,
-            .allocator = allocator,
-            .selection = selection,
-            .options = options,
-        };
-        errdefer admission.deinit();
-        const capacity = std.math.cast(u32, paths.len) orelse return error.OutOfMemory;
-        try admission.candidates.ensureTotalCapacity(allocator, capacity);
-        for (paths) |path| {
-            const key = try std.fs.path.resolveAlloc(allocator, &.{path});
-            const entry = admission.candidates.getOrPutAssumeCapacity(key);
-            if (entry.found_existing) allocator.free(key) else entry.value_ptr.* = path;
-        }
-        return admission;
-    }
-
-    pub fn deinit(self: *Admission) void {
-        var keys = self.candidates.keyIterator();
-        while (keys.next()) |key| self.allocator.free(key.*);
-        self.candidates.deinit(self.allocator);
-        self.verdicts.deinit(self.allocator);
-    }
-
-    pub fn interface(self: *Admission) trace_core.Admission {
-        return .{ .context = self, .admitsFn = admits };
-    }
-
-    fn admits(context: *anyopaque, path: []const u8) anyerror!bool {
-        const self: *Admission = @ptrCast(@alignCast(context));
-        var buffer: [2 * std.fs.max_path_bytes]u8 = undefined;
-        var scratch = std.heap.FixedBufferAllocator.init(&buffer);
-        const key = try std.fs.path.resolveAlloc(scratch.allocator(), &.{path});
-        const entry = self.candidates.getEntry(key) orelse return false;
-        const selection = self.selection orelse return true;
-        const cached = try self.verdicts.getOrPut(self.allocator, entry.key_ptr.*);
-        if (cached.found_existing) return cached.value_ptr.*;
-        errdefer _ = self.verdicts.remove(entry.key_ptr.*);
-        const verdict = try trace_adapter.selectionVerdict(
-            self.io,
-            self.dir,
-            self.allocator,
-            entry.value_ptr.*,
-            self.options,
-            selection,
-        );
-        if (verdict.file_opened) try self.reads.charge(verdict.bytes_read);
-        cached.value_ptr.* = verdict.passes;
-        return verdict.passes;
-    }
-};
-
 pub const DiscoveryReads = struct {
     bytes: usize = 0,
     opened: usize = 0,
@@ -4001,7 +3934,10 @@ test "family admission reports an undecodable flat sibling instead of dropping i
     const allocator = std.testing.allocator;
     const main_path = "proj/" ++ regression_root ++ ".jsonl";
     try tmp.dir.createDirPath(std.testing.io, "proj");
-    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = main_path, .data = regression_transcript });
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = main_path,
+        .data = regression_transcript,
+    });
     try tmp.dir.writeFile(std.testing.io, .{
         .sub_path = "proj/agent-broken.jsonl.zst",
         .data = "not a zstd frame",

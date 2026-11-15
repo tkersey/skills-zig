@@ -378,19 +378,11 @@ fn parseAdmitted(
     dir: std.Io.Dir,
     path: []const u8,
     admitted: []const []const u8,
-    selection: ?trace_adapter.SessionSelection,
 ) !Trace {
-    var admission = try native.Admission.initAlloc(
-        testing.io,
-        dir,
-        allocator,
-        admitted,
-        selection,
-        .{},
-    );
-    defer admission.deinit();
+    var admission = try trace_core.Admission.initAlloc(allocator, admitted);
+    defer admission.deinit(allocator);
     var options = support.options();
-    options.admission = admission.interface();
+    options.admission = &admission;
     return trace_core.parseSessionTrace(testing.io, dir, allocator, path, options);
 }
 
@@ -401,19 +393,14 @@ test "parent admission: a worker's parent is present only when its transcript is
     try support.writeTree(tmp.dir, &files);
     const worker = files[1].path;
     const dotted_root = "./proj/" ++ worker_root ++ ".jsonl";
-    var family = try parseAdmitted(tmp.dir, worker, &.{ dotted_root, worker }, null);
+    var family = try parseAdmitted(tmp.dir, worker, &.{ dotted_root, worker });
     defer family.deinit(allocator);
     try testing.expect(!family.session.lineage_conflict);
     try testing.expect(!family.claude_limitations.worker_parent_missing);
-    var alone = try parseAdmitted(tmp.dir, worker, &.{worker}, null);
+    var alone = try parseAdmitted(tmp.dir, worker, &.{worker});
     defer alone.deinit(allocator);
     try testing.expect(alone.session.lineage_conflict);
     try testing.expect(alone.claude_limitations.worker_parent_missing);
-    const elsewhere = trace_adapter.SessionSelection{ .repo = "/elsewhere" };
-    var filtered = try parseAdmitted(tmp.dir, worker, &.{ files[0].path, worker }, elsewhere);
-    defer filtered.deinit(allocator);
-    try testing.expect(filtered.session.lineage_conflict);
-    try testing.expect(filtered.claude_limitations.worker_parent_missing);
     var bare = try parseIn(tmp.dir, worker);
     defer bare.deinit(allocator);
     try testing.expect(bare.claude_limitations.worker_parent_missing);
@@ -468,4 +455,78 @@ test "discovery prefix: a read failure after the first line is reported, not tru
         error.ReadFailed,
         trace_core.readDiscoveryPrefixAlloc(allocator, &reader, 1024),
     );
+}
+
+test "discovery judges a worker's parent against the admitted set" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const files = workerTree();
+    try support.writeTree(tmp.dir, &files);
+    const worker = files[1].path;
+    const Case = struct { admitted: []const []const u8, conflict: bool };
+    const cases = [_]Case{
+        .{ .admitted = &.{ files[0].path, worker }, .conflict = false },
+        .{ .admitted = &.{worker}, .conflict = true },
+    };
+    for (cases) |case| {
+        var admission = try trace_core.Admission.initAlloc(allocator, case.admitted);
+        defer admission.deinit(allocator);
+        var identity = try trace_adapter.discoverSessionIdentity(
+            testing.io,
+            tmp.dir,
+            allocator,
+            worker,
+            .{ .admission = &admission },
+            null,
+        );
+        defer identity.deinit(allocator);
+        try testing.expectEqual(case.conflict, identity.lineage_conflict);
+    }
+}
+
+test "an untyped payload record casts no Codex vote" {
+    const bytes = "{\"payload\":{\"secret\":\"SENTINEL\"}}\n";
+    try testing.expectError(
+        error.UnclassifiedSessionFormat,
+        trace_core.parseSessionTraceBytes(testing.io, allocator, "/u.jsonl", bytes, 0, .{}),
+    );
+}
+
+fn paddedClaudeLine(pad_bytes: usize) ![]u8 {
+    var bytes: std.ArrayList(u8) = .empty;
+    errdefer bytes.deinit(allocator);
+    try bytes.appendSlice(allocator, claude_line[0 .. claude_line.len - 1]);
+    try bytes.appendSlice(allocator, ",\"pad\":\"");
+    try bytes.appendNTimes(allocator, 'x', pad_bytes);
+    try bytes.appendSlice(allocator, "\"}\n");
+    return bytes.toOwnedSlice(allocator);
+}
+
+test "prefix bound: a first line past the byte bound classifies but does not seed" {
+    const bound = trace_core.claude_parser.prefix_bytes_max;
+    const small = try paddedClaudeLine(0);
+    defer allocator.free(small);
+    var seeded = try support.parse(allocator, "small.jsonl", small, .stale);
+    defer seeded.deinit(allocator);
+    try testing.expect(seeded.session.cwd != null);
+    const large = try paddedClaudeLine(bound);
+    defer allocator.free(large);
+    var unseeded = try support.parse(allocator, "large.jsonl", large, .stale);
+    defer unseeded.deinit(allocator);
+    try testing.expectEqual(trace_core.TraceSource.claude, unseeded.source);
+    try testing.expectEqual(@as(?[]u8, null), unseeded.session.cwd);
+}
+
+test "discovery prefix: a later line is read only up to the remaining byte budget" {
+    const bound = trace_core.claude_parser.prefix_bytes_max;
+    var bytes: std.ArrayList(u8) = .empty;
+    defer bytes.deinit(allocator);
+    try bytes.appendSlice(allocator, neutral_line);
+    try bytes.appendNTimes(allocator, ' ', 2 * bound);
+    try bytes.appendSlice(allocator, claude_line);
+    var reader = std.Io.Reader.fixed(bytes.items);
+    var prefix = try trace_core.readDiscoveryPrefixAlloc(allocator, &reader, 4 * bound);
+    defer prefix.deinit(allocator);
+    try testing.expectEqual(neutral_line.len, prefix.parse_len);
+    try testing.expect(prefix.bytes.len <= bound + 2 * 64 * 1024);
 }

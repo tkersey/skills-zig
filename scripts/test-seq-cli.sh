@@ -259,6 +259,76 @@ if claude_undeclared=$("$binary" observe --definition "$message_definition" --pr
 fi
 jq -e '.code == "ObservationSelectorNotDeclared"' <<<"$claude_undeclared" >/dev/null
 
+claude_definitions=$claude_fixtures/observations
+claude_family="$cache_dir/claude-outside"
+claude_root_id=d0000000-0000-4000-8000-000000000001
+claude_worker_id=$claude_root_id/agent-a1b2c3d4e5f600001
+mkdir -p "$claude_family" "$cache_dir/home" "$cache_dir/pi"
+cp -R "$claude_fixtures/worker/proj" "$claude_family/proj"
+claude_root_path="$claude_family/proj/$claude_root_id.jsonl"
+claude_isolated() {
+  HOME="$cache_dir/home" CODEX_HOME="$cache_dir/codex" CLAUDE_CONFIG_DIR="$claude_config" \
+    PI_CODING_AGENT_DIR="$cache_dir/pi" PI_CODING_AGENT_SESSION_DIR="$cache_dir/pi" \
+    "$binary" "$@"
+}
+claude_lineage=$(claude_isolated observe --definition "$claude_definitions/family-lineage.json" \
+  --projection rows --path "$claude_root_path" --format json)
+jq -e --arg root "$claude_root_id" --arg worker "$claude_worker_id" '
+  .corpus.files == 2 and .corpus.sessions == 2 and
+  (.data.rows | map(.session_id) | sort) == [$root, $worker] and
+  .stats.discovery_files_opened > 0 and .limitations == []' <<<"$claude_lineage" >/dev/null
+claude_reachable=$(claude_isolated observe --definition "$pi_graph_definition" \
+  --projection rows --path "$claude_root_path" --format json)
+jq -e --arg root "$claude_root_id" '.corpus.files == 2 and .corpus.sessions == 2 and
+  (.data.rows | map(.session_id)) == [$root]' <<<"$claude_reachable" >/dev/null
+claude_root_bytes=$(wc -c <"$claude_root_path")
+claude_joined=$(claude_isolated observe --definition "$claude_definitions/session-self-join.json" \
+  --projection rows --path "$claude_root_path" --format json)
+jq -e --arg root "$claude_root_id" --argjson bytes "$claude_root_bytes" '
+  .corpus.files == 1 and .corpus.sessions == 1 and .data.rows == [{"session_id": $root}] and
+  .stats.files_opened == 1 and .stats.discovery_files_opened == 0 and
+  .stats.discovery_bytes_read == 0 and .stats.corpus_bytes_read == $bytes' \
+  <<<"$claude_joined" >/dev/null
+
+claude_window=$claude_fixtures/time-window/projects
+claude_late_id=e0000000-0000-4000-8000-000000000002
+claude_present=$(claude_isolated observe --definition "$claude_definitions/session-self-join.json" \
+  --projection rows --root "$claude_window" --session-id "$claude_late_id" --format json)
+jq -e --arg id "$claude_late_id" '.data.rows == [{"session_id": $id}]' \
+  <<<"$claude_present" >/dev/null
+if claude_pruned=$(claude_isolated observe \
+  --definition "$claude_definitions/session-self-join.json" --projection rows \
+  --root "$claude_window" --session-id "$claude_late_id" --until 2026-11-01T00:00:00Z \
+  --format json); then
+  exit 1
+fi
+jq -e '.code == "SessionNotFound"' <<<"$claude_pruned" >/dev/null
+claude_native_late=$(claude_isolated turns --root "$claude_window" \
+  --session-id "$claude_late_id" --until 2026-11-01T00:00:00Z --format json)
+test "$claude_native_late" = '[]'
+if claude_native_absent=$(claude_isolated turns --root "$claude_window" \
+  --session-id e0000000-0000-4000-8000-0000000000ff --until 2026-11-01T00:00:00Z \
+  --format json); then
+  exit 1
+fi
+jq -e '.code == "SessionNotFound"' <<<"$claude_native_absent" >/dev/null
+
+claude_excluded=$(claude_isolated observe --definition "$claude_definitions/session-exclusion.json" \
+  --projection rows --root "$claude_family" --param "exclude_session_id=$claude_root_id" \
+  --format json)
+jq -e --arg worker "$claude_worker_id" '
+  .data.rows == [{"session_id": $worker, "lineage_conflict": false}] and
+  (.limitations | all(startswith("claude_worker_parent_missing") | not))' \
+  <<<"$claude_excluded" >/dev/null
+claude_worker_only=$(claude_isolated observe \
+  --definition "$claude_definitions/session-exclusion.json" --projection rows \
+  --root "$claude_family" --session-id "$claude_worker_id" --param exclude_session_id=none \
+  --format json)
+jq -e --arg worker "$claude_worker_id" '
+  .data.rows == [{"session_id": $worker, "lineage_conflict": false}] and
+  (.limitations | all(startswith("claude_worker_parent_missing") | not))' \
+  <<<"$claude_worker_only" >/dev/null
+
 external_output=$("$binary" observe \
   --definition "$external_definition" \
   --projection rows \

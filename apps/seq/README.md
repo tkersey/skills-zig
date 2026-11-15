@@ -475,7 +475,9 @@ seq tail --once --current --source claude-code --format json
 ```
 
 Detection uses the first positive record signature in a bounded prefix (256
-lines or 4 MiB). Unknown record types are neutral. A later signature for another
+lines or 4 MiB; the first line always classifies). Identity, `cwd` and start time
+come only from lines inside both bounds, so a first line larger than 4 MiB
+classifies the file but seeds nothing. Unknown record types are neutral. A later signature for another
 source fails with `UnsupportedSessionFormat`; non-empty input with no known
 signature fails with `UnclassifiedSessionFormat` before any row is emitted.
 Empty files keep their rows and cast no adapter vote.
@@ -486,10 +488,14 @@ adjacent `agent-<id>.meta.json` sidecar, and their root from the directory (or,
 for legacy flat `agent-<id>.jsonl` files, from the recorded `sessionId`). A
 worker whose sidecar is missing or unreadable, whose recorded identity
 contradicts its path, or whose parent transcript is not admitted sets
-`lineage_conflict`. Admission is the observation's own file selection: the
-command's target paths, a physically selected observation's paths after its
-session, repo and time selectors, or a graph corpus after its repo selector. A
-worker read through an explicit one-file path therefore reports a missing parent. Spawner-side `session_edges` come only from `Agent`/`Task`
+`lineage_conflict`. A parent is admitted when its transcript is among the paths
+the command or observation resolved: the native target paths, a physically
+selected observation's paths, a graph corpus or session family, or a streaming
+plan's discovered paths. Path resolution applies the file-admission policy (time
+pruning with the session ID cleared); row selectors such as `--session-id`,
+`--repo`, an exact time filter or the search exclusion narrow the selection and
+never make a parent missing. A worker read through an explicit one-file path
+therefore reports a missing parent. Spawner-side `session_edges` come only from `Agent`/`Task`
 calls in responses that this transcript's request records prove it made.
 `session_edges` keeps each file's assertion separately. A spawner's claim and a worker's
 sidecar live in different files, so a per-file `lineage_conflict` cannot see their
@@ -500,10 +506,10 @@ marks every edge of a worker whose assertions disagree on its parent with
 same parent under different calls, such as a resumed worker, agree. The `seq/request-usage`
 definition treats such a worker as a lineage conflict for worker-scoped totals.
 Sidecar contents are discovery facts: they are read once, bound into the corpus
-digest, and reused by the body read. Parent admission is decided by the body read,
-which also writes it into the corpus digest. A streaming lineage plan's discovered
-`sessions` rows take `lineage_conflict` from that body read for every session it
-reads.
+digest, and reused by the body read, which also writes parent admission into the
+corpus digest. A streaming lineage plan's discovered `sessions` rows judge the
+parent at discovery and take `lineage_conflict` from the body read for every
+session it reads.
 `--session-id` accepts a session UUID or a worker ID.
 
 Turns open at an input that got a reply (a model response, an API error or an

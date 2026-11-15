@@ -3,6 +3,7 @@ const definition_core = @import("definition_core");
 const trace_core = @import("trace_core");
 pub const SessionInput = trace_core.SessionInput;
 pub const SessionRecord = trace_core.SessionRecord;
+pub const Admission = trace_core.Admission;
 const definition = @import("definition.zig");
 const execution = @import("execution.zig");
 const physical = @import("physical.zig");
@@ -20,7 +21,7 @@ pub const Options = struct {
     discovery_prefix_limit: usize = max_discovery_prefix_bytes,
     sidecar_dir: ?std.Io.Dir = null,
     claude_discovery: ?*const trace_core.claude_parser.Discovery = null,
-    admission: ?trace_core.Admission = null,
+    admission: ?*const trace_core.Admission = null,
 };
 
 pub const SessionSelection = struct {
@@ -314,69 +315,6 @@ fn parseAdmittedFile(
         selection,
         parser,
     ) catch |err| return input.sourceError(err);
-}
-
-pub const SelectionVerdict = struct {
-    passes: bool,
-    bytes_read: usize = 0,
-    file_opened: bool = false,
-};
-
-pub fn selectionVerdict(
-    io: std.Io,
-    dir: std.Io.Dir,
-    allocator: std.mem.Allocator,
-    path: []const u8,
-    options: Options,
-    selection: SessionSelection,
-) !SelectionVerdict {
-    if (!canonicalPathPassesSessionSelection(path, selection)) return .{ .passes = false };
-    if (!requiresSummaryPreselection(selection)) return .{ .passes = true };
-    var scoped = options;
-    scoped.admission = null;
-    if (scoped.sidecar_dir == null) scoped.sidecar_dir = dir;
-    const file = try openTraceFile(io, dir, path);
-    defer file.close(io);
-    const stat = try file.stat(io);
-    var raw = file.reader(io, &.{});
-    var input = try SessionInput.init(
-        allocator,
-        path,
-        &raw.interface,
-        options.discovery_prefix_limit,
-    );
-    defer input.deinit(allocator);
-    const source = input.reader();
-    return preselectVerdict(io, allocator, path, stat, source, scoped, selection) catch |err|
-        return input.sourceError(err);
-}
-
-fn preselectVerdict(
-    io: std.Io,
-    allocator: std.mem.Allocator,
-    path: []const u8,
-    stat: std.Io.File.Stat,
-    source: *std.Io.Reader,
-    options: Options,
-    selection: SessionSelection,
-) !SelectionVerdict {
-    var prefix = try readDiscoveryPrefixAlloc(allocator, source, options);
-    defer prefix.deinit(allocator);
-    var preselection = try preselectSession(
-        io,
-        allocator,
-        path,
-        stat.mtime.nanoseconds,
-        options,
-        selection,
-        prefix,
-    );
-    defer preselection.deinit(allocator);
-    return .{
-        .passes = preselection.passes,
-        .bytes_read = preselection.bytes_read +| preselection.discovery_bytes,
-        .file_opened = true,
-    };
 }
 
 fn admitSelectedInput(
@@ -995,6 +933,7 @@ fn parseDiscoveryLine(
             .ongoing_threshold_secs = options.ongoing_threshold_secs,
             .as_of_ns = options.as_of_ns,
             .sidecar_dir = options.sidecar_dir,
+            .admission = options.admission,
             .discovery_prefix = true,
         },
     );

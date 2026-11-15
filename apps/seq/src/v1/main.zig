@@ -1046,7 +1046,7 @@ const GraphObservationContext = struct {
     args: *const ObserveArgs,
     plans: *const seq.compiled_plan.PlanSet,
     bindings: *const definition_core.parameters.Bindings,
-    admission: ?*seq.native.Admission = null,
+    admission: ?*const seq.trace_adapter.Admission = null,
 
     fn init(
         io: std.Io,
@@ -1073,7 +1073,7 @@ const GraphObservationContext = struct {
         max_input_bytes: usize,
     ) seq.trace_adapter.Options {
         var options = self.args.traceOptions(max_input_bytes);
-        if (self.admission) |admission| options.admission = admission.interface();
+        options.admission = self.admission;
         return options;
     }
 
@@ -1465,19 +1465,10 @@ fn executeMaterializedGraphObservation(
     try recordFamilyDiscovery(&metrics, family);
     var digest_set = CorpusSetHasher{};
     const selection: GraphSelection = if (physical_selection) .physical else .corpus;
-    const sessions_only = rows.relations.items.len == 1 and rows.relations.items[0] == .sessions;
-    var admission = try seq.native.Admission.initAlloc(
-        io,
-        dir,
-        allocator,
-        paths.items,
-        graphSessionSelection(args.selectors, selection, sessions_only),
-        args.freshnessOptions(),
-    );
-    defer admission.deinit();
+    var admission = try seq.trace_adapter.Admission.initAlloc(allocator, paths.items);
+    defer admission.deinit(allocator);
     graph.admission = &admission;
     try readMaterializedGraphPaths(&graph, &rows, paths.items, &metrics, &digest_set, selection);
-    try recordFamilyDiscovery(&metrics, admission.reads);
     if (physical_selection and args.selectors.session_id != null) {
         if (metrics.sessions == 0) return error.SessionNotFound;
         if (metrics.sessions != 1) return error.AmbiguousSessionTarget;
@@ -1619,28 +1610,16 @@ const DiscoveredSessions = struct {
     indices: std.StringHashMap(usize),
     identity_bytes: usize = 0,
 
-    fn admission(
-        self: *const DiscoveredSessions,
-        io: std.Io,
-        dir: std.Io.Dir,
-        allocator: std.mem.Allocator,
-        paths: []const []const u8,
-    ) !seq.native.Admission {
-        var admitted: std.ArrayList([]const u8) = .empty;
-        defer admitted.deinit(allocator);
-        for (self.items[0..self.initialized_count]) |item| {
-            if (item.identity.repo_matches) try admitted.append(allocator, paths[item.path_index]);
-        }
-        return seq.native.Admission.initAlloc(io, dir, allocator, admitted.items, null, .{});
-    }
-
     fn init(
         io: std.Io,
         dir: std.Io.Dir,
         allocator: std.mem.Allocator,
         paths: []const []const u8,
         args: *const ObserveArgs,
+        admission: *const seq.trace_adapter.Admission,
     ) !DiscoveredSessions {
+        var options = args.freshnessOptions();
+        options.admission = admission;
         var result: DiscoveredSessions = .{
             .items = try allocator.alloc(DiscoveredSession, paths.len),
             .indices = .init(allocator),
@@ -1654,7 +1633,7 @@ const DiscoveredSessions = struct {
                     dir,
                     allocator,
                     path,
-                    args.freshnessOptions(),
+                    options,
                     args.selectors.repo,
                 ),
             };
@@ -2126,11 +2105,11 @@ fn executeStreamingGraphObservation(
     var family = seq.native.DiscoveryReads{};
     var paths = try resolveGraphPaths(allocator, io, dir, args, false, &family);
     defer seq.native.freePaths(allocator, &paths);
-    var discovered = try DiscoveredSessions.init(io, dir, allocator, paths.items, args);
-    defer discovered.deinit(allocator);
-    var admission = try discovered.admission(io, dir, allocator, paths.items);
-    defer admission.deinit();
+    var admission = try seq.trace_adapter.Admission.initAlloc(allocator, paths.items);
+    defer admission.deinit(allocator);
     graph.admission = &admission;
+    var discovered = try DiscoveredSessions.init(io, dir, allocator, paths.items, args, &admission);
+    defer discovered.deinit(allocator);
     var session_seed = [_]seq.relation_graph.ScanInput{
         try buildSessionSeed(&graph, schedule, &discovered, paths.items),
     };
@@ -2418,15 +2397,8 @@ fn executePhysicalObservation(
     var metrics = PhysicalMetrics{};
     try recordFamilyDiscovery(&metrics, resolution_reads);
     var digest_set = CorpusSetHasher{};
-    var admission = try seq.native.Admission.initAlloc(
-        io,
-        dir,
-        allocator,
-        paths.items,
-        physicalSessionSelection(args, program, relation),
-        args.freshnessOptions(),
-    );
-    defer admission.deinit();
+    var admission = try seq.trace_adapter.Admission.initAlloc(allocator, paths.items);
+    defer admission.deinit(allocator);
     for (paths.items) |path| {
         const feed = try feedPhysicalFile(
             io,
@@ -2444,7 +2416,6 @@ fn executePhysicalObservation(
         );
         if (feed == .stop and args.selectors.session_id == null) break;
     }
-    try recordFamilyDiscovery(&metrics, admission.reads);
     if (args.selectors.session_id != null) {
         if (metrics.sessions == 0) return error.SessionNotFound;
         if (metrics.sessions != 1) return error.AmbiguousSessionTarget;
@@ -2511,7 +2482,7 @@ fn feedPhysicalFile(
     runner: *seq.execution.Runner,
     digest_set: *CorpusSetHasher,
     metrics: *PhysicalMetrics,
-    admission: *seq.native.Admission,
+    admission: *const seq.trace_adapter.Admission,
 ) !seq.execution.Feed {
     if (seq.opencode_adapter.recognizes(path)) {
         return feedOpenCodeFile(
@@ -2648,10 +2619,10 @@ fn feedTraceFile(
     runner: *seq.execution.Runner,
     digest_set: *CorpusSetHasher,
     metrics: *PhysicalMetrics,
-    admission: *seq.native.Admission,
+    admission: *const seq.trace_adapter.Admission,
 ) !seq.execution.Feed {
     var options = args.traceOptions(bounds.max_input_bytes -| metrics.corpus_bytes);
-    options.admission = admission.interface();
+    options.admission = admission;
     const selected = try seq.trace_adapter.parseFileSelected(
         io,
         dir,
@@ -4263,7 +4234,8 @@ fn resolvePhysicalPaths(
 }
 
 test "streaming seed rows take lineage conflicts and token coverage from the body parse" {
-    var values = [_]seq.execution.Value{ .null, .{ .boolean = false }, .null, .{ .boolean = false } };
+    const unset = seq.execution.Value{ .boolean = false };
+    var values = [_]seq.execution.Value{ .null, unset, .null, unset };
     var seed = seq.relation_graph.ScanInput{
         .stage_index = 0,
         .table = .{ .values = &values, .width = 2 },

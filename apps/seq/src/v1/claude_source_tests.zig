@@ -32,17 +32,10 @@ fn parseInFamily(dir: std.Io.Dir, files: []const support.TreeFile, path: []const
     var paths: [8][]const u8 = undefined;
     std.debug.assert(files.len <= paths.len);
     for (files, 0..) |file, index| paths[index] = file.path;
-    var admission = try native.Admission.initAlloc(
-        testing.io,
-        dir,
-        allocator,
-        paths[0..files.len],
-        null,
-        .{},
-    );
-    defer admission.deinit();
+    var admission = try trace_core.Admission.initAlloc(allocator, paths[0..files.len]);
+    defer admission.deinit(allocator);
     var options = support.options();
-    options.admission = admission.interface();
+    options.admission = &admission;
     return trace_core.parseSessionTrace(testing.io, dir, allocator, path, options);
 }
 
@@ -1253,12 +1246,15 @@ test "worker discovery identity comes from the path and the sidecar" {
         base ++ "agent-aaaa0000000000001.jsonl",
     });
     try support.writeTree(tmp.dir, &files);
+    const admitted = [_][]const u8{ files[0].path, files[2].path };
+    var admission = try trace_core.Admission.initAlloc(allocator, &admitted);
+    defer admission.deinit(allocator);
     var identity = try trace_adapter.discoverSessionIdentity(
         testing.io,
         tmp.dir,
         allocator,
         files[0].path,
-        .{},
+        .{ .admission = &admission },
         null,
     );
     defer identity.deinit(allocator);
