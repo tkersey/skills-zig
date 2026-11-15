@@ -375,7 +375,7 @@ test "metadata-first: known metadata classifies and the prefix sets start time" 
     try testing.expectEqualStrings("file-history-snapshot", occurrenceAt(&trace, 3).entry_type);
     for ([_][]const u8{ "summary", "queue-operation", "file-history-snapshot" }) |kind| {
         const single = try std.mem.concat(allocator, u8, &.{
-            firstLineOfType(@embedFile(fixture_root ++ "metadata-first.jsonl"), kind),
+            try firstLineOfType(@embedFile(fixture_root ++ "metadata-first.jsonl"), kind),
             "\n",
         });
         defer allocator.free(single);
@@ -386,11 +386,11 @@ test "metadata-first: known metadata classifies and the prefix sets start time" 
     }
 }
 
-fn firstLineOfType(bytes: []const u8, kind: []const u8) []const u8 {
+fn firstLineOfType(bytes: []const u8, kind: []const u8) ![]const u8 {
     var lines = std.mem.splitScalar(u8, bytes, '\n');
     while (lines.next()) |line| {
         var buffer: [64]u8 = undefined;
-        const marker = std.fmt.bufPrint(&buffer, "\"type\":\"{s}\"", .{kind}) catch unreachable;
+        const marker = try std.fmt.bufPrint(&buffer, "\"type\":\"{s}\"", .{kind});
         if (std.mem.indexOf(u8, line, marker) != null) return line;
     }
     @panic("missing line");
@@ -1198,7 +1198,7 @@ test "default roots: Claude root follows CLAUDE_CONFIG_DIR and is never inferred
 
 test "discovery prefix: a seed beyond 256 lines leaves prefix-only fields unset" {
     const source = @embedFile(fixture_root ++ "metadata-first.jsonl");
-    const queue = firstLineOfType(source, "queue-operation");
+    const queue = try firstLineOfType(source, "queue-operation");
     var bytes: std.ArrayList(u8) = .empty;
     defer bytes.deinit(allocator);
     for (0..300) |_| {
