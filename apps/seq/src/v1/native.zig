@@ -1274,6 +1274,9 @@ fn queryTargetOptions(
     if (options.session_id != null and options.current) {
         return error.ConflictingSessionSelectors;
     }
+    if (options.source != null and (options.root != null or options.path != null)) {
+        return error.ConflictingSourceSelectors;
+    }
     return options;
 }
 

@@ -269,8 +269,8 @@ with saturating arithmetic and one sentinel byte for overrun detection. This
 bounds streams that produce little or no decoded output. Native file parsing
 has a 64 GiB decoded limit; observation definitions supply their own limits.
 Corrupt, truncated, or unsupported compressed input cannot produce successful
-empty sessions. Recognized Claude Code transcripts fail with
-`UnsupportedSessionFormat`; sharing a skill installation does not add a reader.
+empty sessions. A Claude Code record inside a Codex rollout, or a Codex record
+inside a Claude Code transcript, fails with `UnsupportedSessionFormat`.
 
 `sessions.parent_session_id` follows history ownership: `forked_from_id`, with
 legacy fallback to the control parent. `control_parent_session_id` records the
