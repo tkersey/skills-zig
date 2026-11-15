@@ -734,6 +734,11 @@ fn runSessionDetail(
     try writer.writeByte('\n');
 }
 
+const GraphEdgeView = struct {
+    parent: []const u8,
+    worker: []const u8,
+};
+
 fn runSessionGraph(
     allocator: std.mem.Allocator,
     writer: *std.Io.Writer,
@@ -742,26 +747,19 @@ fn runSessionGraph(
     options: Options,
 ) !void {
     if (options.format == .json) {
-        return runRelation(
-            allocator,
-            writer,
-            io,
-            dir,
-            .session_edges,
-            options,
-            false,
-        );
+        return runRelation(allocator, writer, io, dir, .session_edges, options, false);
     }
     if (options.format != .dot) return error.UnsupportedNativeFormat;
     var paths = try resolveTargetPaths(allocator, io, dir, options, false);
     defer freePaths(allocator, &paths);
-    var body: std.Io.Writer.Allocating = .init(allocator);
-    defer body.deinit();
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var edges: std.ArrayList(GraphEdgeView) = .empty;
     var claude_corpus = false;
     var other_corpus = false;
-    var remaining = options.limit;
     for (paths.items) |path| {
-        if (remaining == 0) break;
+        if (edges.items.len == options.limit) break;
         if (opencode_adapter.recognizes(path)) continue;
         var trace = trace_core.parseSessionTrace(
             io,
@@ -778,21 +776,35 @@ fn runSessionGraph(
             .none => {},
         }
         for (trace.graph_edges.items) |edge| {
-            if (remaining == 0) break;
+            if (edges.items.len == options.limit) break;
             const parent = edge.parent_session_id orelse continue;
             const worker = edge.worker_session_id orelse edge.agent_path orelse continue;
-            try body.writer.writeAll("  ");
-            try definition_core.canonical_json.writeCanonicalString(&body.writer, parent);
-            try body.writer.writeAll(" -> ");
-            try definition_core.canonical_json.writeCanonicalString(&body.writer, worker);
-            try body.writer.writeAll(";\n");
-            remaining -= 1;
+            try edges.append(arena, .{
+                .parent = try arena.dupe(u8, parent),
+                .worker = try arena.dupe(u8, worker),
+            });
         }
     }
-    const graph_name = if (claude_corpus and !other_corpus) "claude_sessions" else "codex_sessions";
+    const claude_graph = claude_corpus and !other_corpus;
+    const graph_name = if (claude_graph) "claude_sessions" else "codex_sessions";
     try writer.print("digraph {s} {{\n", .{graph_name});
-    try writer.writeAll(body.written());
+    for (edges.items) |edge| {
+        try writer.writeAll("  ");
+        try definition_core.canonical_json.writeCanonicalString(writer, edge.parent);
+        try writer.writeAll(" -> ");
+        try definition_core.canonical_json.writeCanonicalString(writer, edge.worker);
+        const contradicted = claude_graph and parentContradicted(edges.items, edge);
+        try writer.writeAll(if (contradicted) " [contradiction=true];\n" else ";\n");
+    }
     try writer.writeAll("}\n");
+}
+
+fn parentContradicted(edges: []const GraphEdgeView, edge: GraphEdgeView) bool {
+    for (edges) |other| {
+        if (!std.mem.eql(u8, other.worker, edge.worker)) continue;
+        if (!std.mem.eql(u8, other.parent, edge.parent)) return true;
+    }
+    return false;
 }
 
 fn runTail(

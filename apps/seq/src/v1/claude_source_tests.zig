@@ -1316,3 +1316,51 @@ test "current Claude session in a worker family resolves the root transcript" {
     defer native.freePaths(allocator, &paths);
     try testing.expectEqualStrings(r8 ++ ".jsonl", std.fs.path.basename(paths.items[0]));
 }
+
+const contradicting_agent = "a9c0ffee000000001";
+
+const contradicting_worker =
+    "{\"type\":\"user\",\"uuid\":\"cw-1\",\"parentUuid\":null,\"sessionId\":\"" ++ root_w ++
+    "\",\"agentId\":\"" ++ contradicting_agent ++ "\",\"isSidechain\":true," ++
+    "\"cwd\":\"/work\",\"timestamp\":\"2026-11-10T10:00:00.000Z\",\"version\":\"2.1.325\"," ++
+    "\"message\":{\"role\":\"user\",\"content\":\"hello\"}}\n";
+
+test "session graph: contradictory parents for one worker are reported, not chosen" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var files = comptime embedTree("worker/", &.{
+        "proj/" ++ root_w ++ ".jsonl",
+        "proj/" ++ root_w ++ "/subagents/agent-" ++ agent_w ++ ".jsonl",
+        "proj/" ++ root_w ++ "/subagents/agent-" ++ agent_w ++ ".meta.json",
+    });
+    files[2].bytes = "{\"toolUseId\":\"toolu_spawn_w\",\"parentAgentId\":\"" ++
+        contradicting_agent ++ "\"}";
+    try support.writeTree(tmp.dir, &files);
+    try support.writeTree(tmp.dir, &.{.{
+        .path = "proj/" ++ root_w ++ "/subagents/agent-" ++ contradicting_agent ++ ".jsonl",
+        .bytes = contradicting_worker,
+    }});
+    var environment = std.process.Environ.Map.init(allocator);
+    defer environment.deinit();
+    var output: std.Io.Writer.Allocating = .init(allocator);
+    defer output.deinit();
+    const root = try tmp.dir.realPathFileAlloc(testing.io, "proj", allocator);
+    defer allocator.free(root);
+    _ = try native.run(
+        allocator,
+        &environment,
+        .session_graph,
+        &.{ "--root", root, "--format", "dot" },
+        &output.writer,
+        testing.io,
+        tmp.dir,
+        null,
+    );
+    const text = output.written();
+    try testing.expect(std.mem.startsWith(u8, text, "digraph claude_sessions {\n"));
+    const spawner = "\"" ++ root_w ++ "\" -> \"" ++ worker_w ++ "\" [contradiction=true];";
+    const child = "\"" ++ root_w ++ "/agent-" ++ contradicting_agent ++ "\" -> \"" ++
+        worker_w ++ "\" [contradiction=true];";
+    try testing.expect(std.mem.indexOf(u8, text, spawner) != null);
+    try testing.expect(std.mem.indexOf(u8, text, child) != null);
+}
