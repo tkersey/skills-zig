@@ -2129,13 +2129,15 @@ fn claudePathPassesWindow(
 ) !bool {
     if (isCanonicalRolloutBasename(std.fs.path.basename(path))) return true;
     if (opencode_adapter.recognizes(path)) return true;
-    const since_rejects = facts.live_claude_root and modifiedBefore(io, dir, path, options.since_ms);
+    const since_rejects = facts.live_claude_root and
+        modifiedBefore(io, dir, path, options.since_ms);
     const upper: ?i64 = if (options.until_ms) |until|
         std.math.add(i64, until, claude_window_margin_ms) catch null
     else
         null;
     if (!since_rejects and upper == null) return true;
-    const discovered = try discoverClaudeIdentity(allocator, io, dir, path, options.discovery_reads);
+    const reads = options.discovery_reads;
+    const discovered = try discoverClaudeIdentity(allocator, io, dir, path, reads);
     var identity = discovered orelse return !since_rejects;
     defer identity.deinit(allocator);
     const start = identity.start_time orelse return true;
@@ -2172,7 +2174,8 @@ fn discoverClaudeIdentity(
     reads: ?*DiscoveryReads,
 ) !?trace_adapter.SessionIdentity {
     if (!isClaudeLayoutPath(path)) return null;
-    var identity = trace_adapter.discoverSessionIdentity(io, dir, allocator, path, .{}, null) catch |err|
+    const discovery = trace_adapter.discoverSessionIdentity(io, dir, allocator, path, .{}, null);
+    var identity = discovery catch |err|
         switch (err) {
             error.OutOfMemory => return err,
             else => return null,
@@ -2327,7 +2330,8 @@ fn claudeIdentityMatches(
     wanted: []const u8,
     reads: ?*DiscoveryReads,
 ) !bool {
-    var identity = (try discoverClaudeIdentity(allocator, io, dir, path, reads)) orelse return false;
+    const discovered = try discoverClaudeIdentity(allocator, io, dir, path, reads);
+    var identity = discovered orelse return false;
     defer identity.deinit(allocator);
     const actual = identity.session_id orelse return false;
     return std.mem.eql(u8, actual, wanted);
@@ -2347,67 +2351,65 @@ fn retainSessionId(
     var write_index: usize = 0;
     var failure: ?anyerror = null;
     for (paths.items) |path| {
-        if (opencode_adapter.recognizes(path)) {
-            var session_id_buffer: [64]u8 = undefined;
-            const session_id = opencode_adapter.sessionId(
-                &session_id_buffer,
-                path,
-            ) catch |err| {
-                if (failure == null) failure = sourceFailure(options, path, err);
-                allocator.free(path);
-                continue;
-            };
-            if (std.mem.eql(u8, session_id, wanted)) {
-                paths.items[write_index] = path;
-                write_index += 1;
-            } else {
-                allocator.free(path);
-            }
-            continue;
-        }
-        if (live_native_root and
-            isCanonicalRolloutBasename(std.fs.path.basename(path)) and
-            !rolloutBasenameMatchesSessionId(path, wanted))
-        {
-            allocator.free(path);
-            continue;
-        }
-        if (try discoverClaudeIdentity(allocator, io, dir, path, reads)) |found| {
-            var identity = found;
-            defer identity.deinit(allocator);
-            const matches = identity.session_id != null and
-                std.mem.eql(u8, identity.session_id.?, wanted);
-            if (matches) {
-                paths.items[write_index] = path;
-                write_index += 1;
-            } else {
-                allocator.free(path);
-            }
-            continue;
-        }
-        var trace = trace_core.parseSessionSummaryTrace(
+        const verdict = try sessionPathVerdict(
             io,
             dir,
             allocator,
             path,
-            traceOptions(.sessions),
-        ) catch |err| {
-            if (failure == null) failure = sourceFailure(options, path, err);
-            allocator.free(path);
-            continue;
-        };
-        defer trace.deinit(allocator);
-        if (trace.session.session_id != null and
-            std.mem.eql(u8, trace.session.session_id.?, wanted))
-        {
-            paths.items[write_index] = path;
-            write_index += 1;
-        } else {
-            allocator.free(path);
+            wanted,
+            live_native_root,
+            options,
+        );
+        switch (verdict) {
+            .keep => {
+                paths.items[write_index] = path;
+                write_index += 1;
+            },
+            .drop => allocator.free(path),
+            .failed => |err| {
+                if (failure == null) failure = err;
+                allocator.free(path);
+            },
         }
     }
     paths.items.len = write_index;
     if (failure) |err| return err;
+}
+
+const PathVerdict = union(enum) { keep, drop, failed: anyerror };
+
+fn sessionPathVerdict(
+    io: std.Io,
+    dir: std.Io.Dir,
+    allocator: std.mem.Allocator,
+    path: []const u8,
+    wanted: []const u8,
+    live_native_root: bool,
+    options: Options,
+) !PathVerdict {
+    if (opencode_adapter.recognizes(path)) {
+        var session_id_buffer: [64]u8 = undefined;
+        const session_id = opencode_adapter.sessionId(&session_id_buffer, path) catch |err|
+            return .{ .failed = sourceFailure(options, path, err) };
+        return if (std.mem.eql(u8, session_id, wanted)) .keep else .drop;
+    }
+    if (live_native_root and
+        isCanonicalRolloutBasename(std.fs.path.basename(path)) and
+        !rolloutBasenameMatchesSessionId(path, wanted)) return .drop;
+    const reads = options.discovery_reads;
+    if (try discoverClaudeIdentity(allocator, io, dir, path, reads)) |found| {
+        var identity = found;
+        defer identity.deinit(allocator);
+        const actual = identity.session_id orelse return .drop;
+        return if (std.mem.eql(u8, actual, wanted)) .keep else .drop;
+    }
+    const summary_options = traceOptions(.sessions);
+    const parsed = trace_core.parseSessionSummaryTrace(io, dir, allocator, path, summary_options);
+    var trace = parsed catch |err|
+        return .{ .failed = sourceFailure(options, path, err) };
+    defer trace.deinit(allocator);
+    const actual = trace.session.session_id orelse return .drop;
+    return if (std.mem.eql(u8, actual, wanted)) .keep else .drop;
 }
 
 fn isCanonicalRolloutBasename(basename: []const u8) bool {

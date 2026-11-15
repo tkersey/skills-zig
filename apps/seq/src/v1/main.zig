@@ -2326,16 +2326,7 @@ fn executePhysicalObservation(
     }
     try validateSelectedSelectors(&context.definition_plan, args.selectors);
     var resolution_reads = seq.native.DiscoveryReads{};
-    var discovery_selectors = args.selectors;
-    discovery_selectors.session_id = null;
-    discovery_selectors.discovery_reads = &resolution_reads;
-    var paths = try seq.native.resolveTargetPaths(
-        allocator,
-        io,
-        dir,
-        discovery_selectors,
-        false,
-    );
+    var paths = try resolvePhysicalPaths(allocator, io, dir, args, &resolution_reads);
     defer seq.native.freePaths(allocator, &paths);
     var runner = try seq.execution.Runner.initOwnedAllocBounded(
         allocator,
@@ -4144,4 +4135,17 @@ fn resolveObservationRootAlloc(
 
 fn observesCodexDefaultRoot(args: *const ObserveArgs) bool {
     return args.selectors.root == null and (args.selectors.source orelse .codex) == .codex;
+}
+
+fn resolvePhysicalPaths(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    dir: std.Io.Dir,
+    args: *const ObserveArgs,
+    reads: *seq.native.DiscoveryReads,
+) !std.ArrayList([]u8) {
+    var selectors = args.selectors;
+    selectors.session_id = null;
+    selectors.discovery_reads = reads;
+    return seq.native.resolveTargetPaths(allocator, io, dir, selectors, false);
 }

@@ -395,7 +395,8 @@ fn decide(
         const reason = try std.fmt.allocPrint(arena, "claude_{s}", .{stop});
         return .{ .status = .complete, .reason = reason, .record = last, .by_response = true };
     }
-    const legacy_text_end = response.hasText() and !declaresCall(records, evidence.message_lines) and
+    const declares = declaresCall(records, evidence.message_lines);
+    const legacy_text_end = response.hasText() and !declares and
         (response.stop == .absent or response.stop == .null_value);
     if (!legacy_text_end) return null;
     return .{
@@ -490,7 +491,8 @@ fn answerFor(
     if (decision.ending_call) |call_id| {
         for (owned) |position| {
             const record = records[position];
-            if (record.kind != .attachment or !parser.eql(record.attachment_type, "structured_output")) {
+            const structured = parser.eql(record.attachment_type, "structured_output");
+            if (record.kind != .attachment or !structured) {
                 continue;
             }
             if (!parser.eql(record.call_ref, call_id)) continue;

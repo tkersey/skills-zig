@@ -490,7 +490,11 @@ pub const Extractor = struct {
             if (std.mem.eql(u8, block_type, "text")) {
                 const text = stringField(block, "text") orelse "";
                 const owned = try self.arena.dupe(u8, text);
-                try result.append(self.arena, .{ .kind = .text, .text = owned, .identity = identity });
+                try result.append(self.arena, .{
+                    .kind = .text,
+                    .text = owned,
+                    .identity = identity,
+                });
             } else if (std.mem.eql(u8, block_type, "tool_use")) {
                 var tool = try self.toolUse(block);
                 tool.identity = identity;
@@ -621,7 +625,8 @@ fn projectConversation(
         try projected.put(arena, "attachment", .{ .object = attachment });
     }
     const message = objectField(root, "message") orelse return;
-    var public_message = try projectFields(arena, message, &.{ "role", "model", "id", "stop_reason" });
+    const message_fields = [_][]const u8{ "role", "model", "id", "stop_reason" };
+    var public_message = try projectFields(arena, message, &message_fields);
     if (objectField(message, "usage")) |raw_usage| {
         try public_message.put(arena, "usage", .{ .object = try projectUsage(arena, raw_usage) });
     }
@@ -646,7 +651,8 @@ const usage_counter_fields = [_][]const u8{
 };
 
 fn projectUsage(arena: std.mem.Allocator, raw_usage: std.json.ObjectMap) !std.json.ObjectMap {
-    var public_usage = try projectFields(arena, raw_usage, &(usage_counter_fields ++ .{"service_tier"}));
+    const fields = usage_counter_fields ++ .{"service_tier"};
+    var public_usage = try projectFields(arena, raw_usage, &fields);
     if (objectField(raw_usage, "output_tokens_details")) |details| {
         const public_details = try projectFields(arena, details, &.{"thinking_tokens"});
         try public_usage.put(arena, "output_tokens_details", .{ .object = public_details });
@@ -656,8 +662,9 @@ fn projectUsage(arena: std.mem.Allocator, raw_usage: std.json.ObjectMap) !std.js
     var public_iterations = std.json.Array.init(arena);
     for (iterations.items) |item| {
         const entry = valueObject(item) orelse continue;
-        const fields = usage_counter_fields ++ .{"type"};
-        try public_iterations.append(.{ .object = try projectFields(arena, entry, &fields) });
+        const entry_fields = usage_counter_fields ++ .{"type"};
+        const public_entry = try projectFields(arena, entry, &entry_fields);
+        try public_iterations.append(.{ .object = public_entry });
     }
     try public_usage.put(arena, "iterations", .{ .array = public_iterations });
     return public_usage;
@@ -665,7 +672,9 @@ fn projectUsage(arena: std.mem.Allocator, raw_usage: std.json.ObjectMap) !std.js
 
 fn projectBlock(arena: std.mem.Allocator, block: std.json.ObjectMap) !?std.json.ObjectMap {
     const block_type = stringField(block, "type") orelse return null;
-    if (std.mem.eql(u8, block_type, "text")) return try projectFields(arena, block, &.{ "type", "text" });
+    if (std.mem.eql(u8, block_type, "text")) {
+        return try projectFields(arena, block, &.{ "type", "text" });
+    }
     if (std.mem.eql(u8, block_type, "tool_use")) {
         return try projectFields(arena, block, &.{ "type", "id", "name", "input" });
     }
@@ -678,7 +687,8 @@ fn projectBlock(arena: std.mem.Allocator, block: std.json.ObjectMap) !?std.json.
             for (parts.items) |part| {
                 const object = valueObject(part) orelse continue;
                 if (!eql(stringField(object, "type"), "text")) continue;
-                try public_parts.append(.{ .object = try projectFields(arena, object, &.{ "type", "text" }) });
+                const text_part = try projectFields(arena, object, &.{ "type", "text" });
+                try public_parts.append(.{ .object = text_part });
             }
             try result.put(arena, "content", .{ .array = public_parts });
         },
@@ -784,7 +794,8 @@ pub const Discovery = struct {
     }
 };
 
-const empty_digest: [71]u8 = "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855".*;
+const empty_digest: [71]u8 = ("sha256:" ++
+    "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855").*;
 
 pub const Limitations = struct {
     inline_sidechain_records: usize = 0,
@@ -1069,14 +1080,21 @@ pub const ClaudeParser = struct {
         }
     }
 
-    fn applyDiscovery(self: *ClaudeParser, io: std.Io, identity: *Identity, layout: PathIdentity) !void {
+    fn applyDiscovery(
+        self: *ClaudeParser,
+        io: std.Io,
+        identity: *Identity,
+        layout: PathIdentity,
+    ) !void {
         const session = &self.trace.session;
         const discovery = if (self.options.claude_discovery) |given|
             try given.clone(self.allocator)
         else
             try self.readDiscovery(io, identity.root, layout);
         self.trace.claude_discovery = discovery;
-        if (self.options.claude_discovery == null) self.trace.claude_discovery_bytes = discovery.sidecar_bytes;
+        if (self.options.claude_discovery == null) {
+            self.trace.claude_discovery_bytes = discovery.sidecar_bytes;
+        }
         const facts = self.trace.claude_discovery.?;
         const root = identity.root;
         if (layout.current_layout) {
@@ -1088,7 +1106,10 @@ pub const ClaudeParser = struct {
             identity.sidecar_call = facts.tool_use;
             if (root) |value| {
                 if (facts.parent_agent) |parent| {
-                    const id = try std.fmt.allocPrint(self.allocator, "{s}/agent-{s}", .{ value, parent });
+                    const id = try std.fmt.allocPrint(self.allocator, "{s}/agent-{s}", .{
+                        value,
+                        parent,
+                    });
                     freeOpt(self.allocator, session.control_parent_session_id);
                     session.control_parent_session_id = id;
                 } else {
@@ -1131,7 +1152,12 @@ pub const ClaudeParser = struct {
         return discovery;
     }
 
-    fn transcriptExists(self: *ClaudeParser, io: std.Io, directory: []const u8, stem: []const u8) !bool {
+    fn transcriptExists(
+        self: *ClaudeParser,
+        io: std.Io,
+        directory: []const u8,
+        stem: []const u8,
+    ) !bool {
         for ([_][]const u8{ ".jsonl", ".jsonl.zst" }) |extension| {
             const name = try std.mem.concat(self.arena(), u8, &.{ stem, extension });
             const path = try std.fs.path.join(self.arena(), &.{ directory, name });
@@ -1145,7 +1171,12 @@ pub const ClaudeParser = struct {
         return false;
     }
 
-    fn readSidecar(self: *ClaudeParser, io: std.Io, agent: []const u8, discovery: *Discovery) !void {
+    fn readSidecar(
+        self: *ClaudeParser,
+        io: std.Io,
+        agent: []const u8,
+        discovery: *Discovery,
+    ) !void {
         const directory = std.fs.path.dirname(self.trace.session.path) orelse ".";
         const name = try std.fmt.allocPrint(self.arena(), "agent-{s}.meta.json", .{agent});
         const sidecar_path = try std.fs.path.join(self.arena(), &.{ directory, name });
@@ -1162,7 +1193,8 @@ pub const ClaudeParser = struct {
         discovery.sidecar_mtime_ns = stat.mtime.nanoseconds;
         if (stat.size > sidecar_bytes_max) return;
         var reader = file.reader(io, &.{});
-        const remaining = reader.interface.allocRemaining(self.arena(), .limited(sidecar_bytes_max));
+        const limit: std.Io.Limit = .limited(sidecar_bytes_max);
+        const remaining = reader.interface.allocRemaining(self.arena(), limit);
         const bytes = remaining catch |err| switch (err) {
             error.OutOfMemory => return err,
             else => return,
@@ -1388,7 +1420,10 @@ pub const ClaudeParser = struct {
                 self.trace.claude_limitations.unlocated_spawn_count += 1;
                 continue;
             }
-            const worker = try std.fmt.allocPrint(self.arena(), "{s}/agent-{s}", .{ root.?, agent });
+            const worker = try std.fmt.allocPrint(self.arena(), "{s}/agent-{s}", .{
+                root.?,
+                agent,
+            });
             try admitted.append(self.arena(), .{
                 .spawn = spawn,
                 .result = spawn.result.?,

@@ -1996,7 +1996,10 @@ const CorpusHasher = struct {
         const facts = discovery orelse return;
         self.hasher.update("\x00claude-discovery\x00");
         const state: u8 = if (facts.sidecar) |value| @as(u8, @backingInt(value)) + 1 else 0;
-        const parent: u8 = if (facts.parent_present) |present| @as(u8, @intFromBool(present)) + 1 else 0;
+        const parent: u8 = if (facts.parent_present) |present|
+            @as(u8, @intFromBool(present)) + 1
+        else
+            0;
         self.hasher.update(&.{ state, parent });
         self.hasher.update(&facts.sidecar_digest);
     }

@@ -12,11 +12,10 @@ const twin_worker = "agent-a7f0000000000001";
 
 fn twinFiles() [5]support.TreeFile {
     const base = "fixtures/claude/twin/";
+    const root = "claude/proj/" ++ twin_root ++ ".jsonl";
     const worker = "claude/proj/" ++ twin_root ++ "/subagents/" ++ twin_worker;
     return .{
-        .{ .path = "claude/proj/" ++ twin_root ++ ".jsonl", .bytes = @embedFile(
-            base ++ "claude/proj/" ++ twin_root ++ ".jsonl",
-        ) },
+        .{ .path = root, .bytes = @embedFile(base ++ root) },
         .{ .path = worker ++ ".jsonl", .bytes = @embedFile(base ++ worker ++ ".jsonl") },
         .{ .path = worker ++ ".meta.json", .bytes = @embedFile(base ++ worker ++ ".meta.json") },
         .{ .path = "codex/root.jsonl", .bytes = @embedFile(base ++ "codex/root.jsonl") },
@@ -29,8 +28,19 @@ fn parseIn(dir: std.Io.Dir, path: []const u8) !Trace {
 }
 
 fn expectOptional(expected: ?[]const u8, actual: ?[]const u8) !void {
-    if (expected == null or actual == null) return testing.expect(expected == null and actual == null);
+    if (expected == null or actual == null) {
+        return testing.expect(expected == null and actual == null);
+    }
     try testing.expectEqualStrings(expected.?, actual.?);
+}
+
+fn visibleRows(
+    trace: *const Trace,
+    rows: *std.ArrayList(*const trace_core.TraceOccurrence),
+) !void {
+    for (trace.occurrences.items) |*row| {
+        if (row.message_visible) try rows.append(allocator, row);
+    }
 }
 
 fn expectSameMessages(left: *const Trace, right: *const Trace) !void {
@@ -38,8 +48,8 @@ fn expectSameMessages(left: *const Trace, right: *const Trace) !void {
     defer left_rows.deinit(allocator);
     var right_rows: std.ArrayList(*const trace_core.TraceOccurrence) = .empty;
     defer right_rows.deinit(allocator);
-    for (left.occurrences.items) |*row| if (row.message_visible) try left_rows.append(allocator, row);
-    for (right.occurrences.items) |*row| if (row.message_visible) try right_rows.append(allocator, row);
+    try visibleRows(left, &left_rows);
+    try visibleRows(right, &right_rows);
     try testing.expectEqual(left_rows.items.len, right_rows.items.len);
     for (left_rows.items, right_rows.items) |a, b| {
         try expectOptional(a.role, b.role);
@@ -77,7 +87,8 @@ test "twins: Claude and Codex give the same conversation, answers, tools and par
     defer claude_root.deinit(allocator);
     var codex_root = try parseIn(tmp.dir, files[3].path);
     defer codex_root.deinit(allocator);
-    try testing.expectEqualStrings("There are two files: a and b.", claude_root.turns.items[0].final_answer.?);
+    const answer = claude_root.turns.items[0].final_answer.?;
+    try testing.expectEqualStrings("There are two files: a and b.", answer);
     try expectSameMessages(&claude_root, &codex_root);
     try expectSameTurns(&claude_root, &codex_root);
     try expectSameTools(&claude_root, &codex_root);
@@ -91,49 +102,41 @@ test "twins: Claude and Codex give the same conversation, answers, tools and par
     try expectOptional(codex_worker.session.control_parent_session_id, twin_root);
 }
 
+const neutral_prefix =
+    \\{"type":"vendor-note","note":"x"}
+    \\{"type":"session_meta","payload":{"id":"late"}}
+    \\{"type":"event_msg","payload":{"type":"task_started","turn_id":"t"}}
+    \\
+;
+
+fn discover(dir: std.Io.Dir, path: []const u8) !trace_adapter.SessionIdentity {
+    return trace_adapter.discoverSessionIdentity(testing.io, dir, allocator, path, .{}, null);
+}
+
 test "discovery: a neutral first record before Codex records classifies as the body does" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
     try support.writeTree(tmp.dir, &.{
-        .{ .path = "neutral.jsonl", .bytes = "{\"type\":\"vendor-note\",\"note\":\"x\"}\n" ++
-            "{\"type\":\"session_meta\",\"payload\":{\"id\":\"late\"}}\n" ++
-            "{\"type\":\"event_msg\",\"payload\":{\"type\":\"task_started\",\"turn_id\":\"t\"}}\n" },
-        .{ .path = "opencode/prompt-history.jsonl", .bytes = "{\"input\":\"hello\",\"parts\":[]}\n" },
+        .{ .path = "neutral.jsonl", .bytes = neutral_prefix },
+        .{ .path = "opencode/prompt-history.jsonl", .bytes = "{\"input\":\"hello\"}\n" },
     });
-    var neutral = try trace_adapter.discoverSessionIdentity(testing.io, tmp.dir, allocator, "neutral.jsonl", .{}, null);
+    var neutral = try discover(tmp.dir, "neutral.jsonl");
     defer neutral.deinit(allocator);
     try testing.expectEqual(trace_core.TraceSource.codex, neutral.source);
     var body = try parseIn(tmp.dir, "neutral.jsonl");
     defer body.deinit(allocator);
     try testing.expectEqual(trace_core.TraceSource.codex, body.source);
-    var opencode = try trace_adapter.discoverSessionIdentity(
-        testing.io,
-        tmp.dir,
-        allocator,
-        "opencode/prompt-history.jsonl",
-        .{},
-        null,
-    );
+    var opencode = try discover(tmp.dir, "opencode/prompt-history.jsonl");
     defer opencode.deinit(allocator);
     try testing.expectEqual(trace_core.TraceSource.none, opencode.source);
 }
 
 const allow_list_source =
-    "{\"type\":\"user\",\"uuid\":\"p1\",\"parentUuid\":null,\"sessionId\":\"s\",\"cwd\":\"/w\"," ++
-    "\"timestamp\":\"2026-11-01T00:00:00Z\",\"turnOrigin\":\"human\",\"secretTop\":\"SECRET-TOP\"," ++
-    "\"message\":{\"role\":\"user\",\"content\":[{\"type\":\"image\",\"source\":\"SECRET-IMAGE\"}," ++
-    "{\"type\":\"text\",\"text\":\"hi\",\"extra\":\"SECRET-EXTRA\"}]}}\n" ++
-    "{\"type\":\"assistant\",\"uuid\":\"p2\",\"parentUuid\":\"p1\",\"sessionId\":\"s\",\"cwd\":\"/w\"," ++
-    "\"timestamp\":\"2026-11-01T00:00:01Z\",\"message\":{\"id\":\"m\",\"role\":\"assistant\"," ++
-    "\"model\":\"x\",\"stop_reason\":\"end_turn\",\"secret\":\"SECRET-MESSAGE\",\"usage\":{" ++
-    "\"input_tokens\":1,\"cache_read_input_tokens\":0,\"cache_creation_input_tokens\":0," ++
-    "\"output_tokens\":1,\"server_tool_use\":{\"note\":\"SECRET-USAGE\"}},\"content\":[" ++
-    "{\"type\":\"thinking\",\"thinking\":\"SECRET-THINKING\"}," ++
-    "{\"type\":\"server_tool_use\",\"id\":\"x\",\"input\":\"SECRET-SERVER\"}," ++
-    "{\"type\":\"text\",\"text\":\"ok\"}]}}\n" ++
-    "{\"type\":\"attachment\",\"uuid\":\"p3\",\"parentUuid\":\"p2\",\"sessionId\":\"s\"," ++
-    "\"cwd\":\"/w\",\"timestamp\":\"2026-11-01T00:00:02Z\",\"attachment\":{\"type\":\"hook\"," ++
-    "\"data\":\"SECRET-ATTACHMENT\"}}\n";
+    \\{"type":"user","uuid":"p1","parentUuid":null,"sessionId":"s","cwd":"/w","timestamp":"2026-11-01T00:00:00Z","turnOrigin":"human","secretTop":"SECRET-TOP","message":{"role":"user","content":[{"type":"image","source":"SECRET-IMAGE"},{"type":"text","text":"hi","extra":"SECRET-EXTRA"}]}}
+    \\{"type":"assistant","uuid":"p2","parentUuid":"p1","sessionId":"s","cwd":"/w","timestamp":"2026-11-01T00:00:01Z","message":{"id":"m","role":"assistant","model":"x","stop_reason":"end_turn","secret":"SECRET-MESSAGE","usage":{"input_tokens":1,"cache_read_input_tokens":0,"cache_creation_input_tokens":0,"output_tokens":1,"server_tool_use":{"note":"SECRET-USAGE"}},"content":[{"type":"thinking","thinking":"SECRET-THINKING"},{"type":"server_tool_use","id":"x","input":"SECRET-SERVER"},{"type":"text","text":"ok"}]}}
+    \\{"type":"attachment","uuid":"p3","parentUuid":"p2","sessionId":"s","cwd":"/w","timestamp":"2026-11-01T00:00:02Z","attachment":{"type":"hook","data":"SECRET-ATTACHMENT"}}
+    \\
+;
 
 test "payloads: only modeled fields, blocks and usage counters are exposed" {
     var trace = try support.parse(allocator, "allow.jsonl", allow_list_source, .stale);
@@ -146,82 +149,86 @@ test "payloads: only modeled fields, blocks and usage counters are exposed" {
     try testing.expect(trace.occurrences.items[2].event_type == null);
 }
 
-inline fn line(comptime fields: []const u8) []const u8 {
-    return "{" ++ fields ++ "}\n";
-}
+const prompt_line =
+    \\{"type":"user","uuid":"q1","parentUuid":null,"sessionId":"s","cwd":"/w","timestamp":"2026-11-01T00:00:00Z","turnOrigin":"human","message":{"role":"user","content":"go"}}
+    \\
+;
 
-const prompt_line = line("\"type\":\"user\",\"uuid\":\"q1\",\"parentUuid\":null,\"sessionId\":\"s\"," ++
-    "\"cwd\":\"/w\",\"timestamp\":\"2026-11-01T00:00:00Z\",\"turnOrigin\":\"human\"," ++
-    "\"message\":{\"role\":\"user\",\"content\":\"go\"}");
+const tool_source = prompt_line ++
+    \\{"type":"assistant","uuid":"q2","parentUuid":"q1","sessionId":"s","cwd":"/w","timestamp":"2026-11-01T00:00:01Z","message":{"id":"m1","role":"assistant","model":"x","stop_reason":"tool_use","content":[{"type":"tool_use","id":"c1","name":"Bash","input":{"command":"ls"}}]}}
+    \\{"type":"user","uuid":"q3","parentUuid":"q2","sessionId":"s","cwd":"/w","timestamp":"2026-11-01T00:00:02Z","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"c1","content":"a"}]}}
+    \\
+;
 
 test "tools: Claude output parts report process_results as an array" {
-    const source = prompt_line ++ line("\"type\":\"assistant\",\"uuid\":\"q2\",\"parentUuid\":\"q1\"," ++
-        "\"sessionId\":\"s\",\"cwd\":\"/w\",\"timestamp\":\"2026-11-01T00:00:01Z\"," ++
-        "\"message\":{\"id\":\"m1\",\"role\":\"assistant\",\"model\":\"x\",\"stop_reason\":\"tool_use\"," ++
-        "\"content\":[{\"type\":\"tool_use\",\"id\":\"c1\",\"name\":\"Bash\",\"input\":{\"command\":\"ls\"}}]}") ++
-        line("\"type\":\"user\",\"uuid\":\"q3\",\"parentUuid\":\"q2\",\"sessionId\":\"s\",\"cwd\":\"/w\"," ++
-            "\"timestamp\":\"2026-11-01T00:00:02Z\",\"message\":{\"role\":\"user\",\"content\":[" ++
-            "{\"type\":\"tool_result\",\"tool_use_id\":\"c1\",\"content\":\"a\"}]}");
-    var trace = try support.parse(allocator, "tools.jsonl", source, .stale);
+    var trace = try support.parse(allocator, "tools.jsonl", tool_source, .stale);
     defer trace.deinit(allocator);
     const parts = trace.tools.items[0].output_parts_json.?;
     try testing.expect(std.mem.indexOf(u8, parts, "\"process_results\":[]") != null);
 }
 
+const sidechain_duplicate = prompt_line ++
+    \\{"type":"user","uuid":"q1","parentUuid":null,"sessionId":"s","cwd":"/w","timestamp":"2026-11-01T00:00:01Z","isSidechain":true,"message":{"role":"user","content":"side"}}
+    \\
+;
+
 test "warnings: a uuid reused by an inline sidechain record is diagnosed" {
-    const source = prompt_line ++ line("\"type\":\"user\",\"uuid\":\"q1\",\"parentUuid\":null," ++
-        "\"sessionId\":\"s\",\"cwd\":\"/w\",\"timestamp\":\"2026-11-01T00:00:01Z\",\"isSidechain\":true," ++
-        "\"message\":{\"role\":\"user\",\"content\":\"side\"}");
-    var trace = try support.parse(allocator, "dup.jsonl", source, .stale);
+    var trace = try support.parse(allocator, "dup.jsonl", sidechain_duplicate, .stale);
     defer trace.deinit(allocator);
     try testing.expectEqual(@as(usize, 1), trace.warnings.items.len);
 }
 
+const pending_text = prompt_line ++
+    \\{"type":"assistant","uuid":"q2","parentUuid":"q1","sessionId":"s","cwd":"/w","timestamp":"2026-11-01T00:00:01Z","message":{"id":"m1","role":"assistant","model":"x","stop_reason":null,"content":[{"type":"text","text":"running"},{"type":"tool_use","id":"c1","name":"Bash","input":{"command":"ls"}}]}}
+    \\
+;
+
 test "turns: legacy text that also declares a pending call stays unfinished" {
-    const source = prompt_line ++ line("\"type\":\"assistant\",\"uuid\":\"q2\",\"parentUuid\":\"q1\"," ++
-        "\"sessionId\":\"s\",\"cwd\":\"/w\",\"timestamp\":\"2026-11-01T00:00:01Z\"," ++
-        "\"message\":{\"id\":\"m1\",\"role\":\"assistant\",\"model\":\"x\",\"stop_reason\":null," ++
-        "\"content\":[{\"type\":\"text\",\"text\":\"running\"},{\"type\":\"tool_use\",\"id\":\"c1\"," ++
-        "\"name\":\"Bash\",\"input\":{\"command\":\"ls\"}}]}");
-    var trace = try support.parse(allocator, "pending.jsonl", source, .stale);
+    var trace = try support.parse(allocator, "pending.jsonl", pending_text, .stale);
     defer trace.deinit(allocator);
     try testing.expectEqual(trace_core.TurnStatus.aborted, trace.turns.items[0].status);
     try testing.expectEqualStrings("stale_ongoing_file", trace.turns.items[0].status_reason.?);
 }
 
-inline fn indexedLine(comptime uuid: []const u8, comptime parent: []const u8, comptime index: []const u8, comptime block: []const u8) []const u8 {
-    return line("\"type\":\"assistant\",\"uuid\":\"" ++ uuid ++ "\",\"parentUuid\":\"" ++ parent ++
-        "\",\"sessionId\":\"s\",\"cwd\":\"/w\",\"timestamp\":\"2026-11-01T00:00:01Z\"" ++ index ++
-        ",\"message\":{\"id\":\"m1\",\"role\":\"assistant\",\"model\":\"x\",\"stop_reason\":\"end_turn\"," ++
-        "\"content\":[" ++ block ++ "]}");
-}
+const keyed_conflict = prompt_line ++
+    \\{"type":"assistant","uuid":"q2","parentUuid":"q1","sessionId":"s","cwd":"/w","timestamp":"2026-11-01T00:00:01Z","apiBlockIndex":0,"message":{"id":"m1","role":"assistant","model":"x","stop_reason":"end_turn","content":[{"type":"thinking","thinking":"alpha"}]}}
+    \\{"type":"assistant","uuid":"q3","parentUuid":"q2","sessionId":"s","cwd":"/w","timestamp":"2026-11-01T00:00:01Z","apiBlockIndex":0,"message":{"id":"m1","role":"assistant","model":"x","stop_reason":"end_turn","content":[{"type":"thinking","thinking":"beta"}]}}
+    \\{"type":"assistant","uuid":"q4","parentUuid":"q3","sessionId":"s","cwd":"/w","timestamp":"2026-11-01T00:00:01Z","apiBlockIndex":1,"message":{"id":"m1","role":"assistant","model":"x","stop_reason":"end_turn","content":[{"type":"text","text":"answer"}]}}
+    \\
+;
+
+const mixed_conflict = prompt_line ++
+    \\{"type":"assistant","uuid":"q2","parentUuid":"q1","sessionId":"s","cwd":"/w","timestamp":"2026-11-01T00:00:01Z","apiBlockIndex":0,"message":{"id":"m1","role":"assistant","model":"x","stop_reason":"end_turn","content":[{"type":"thinking","thinking":"alpha"}]}}
+    \\{"type":"assistant","uuid":"q3","parentUuid":"q2","sessionId":"s","cwd":"/w","timestamp":"2026-11-01T00:00:01Z","apiBlockIndex":0,"message":{"id":"m1","role":"assistant","model":"x","stop_reason":"end_turn","content":[{"type":"thinking","thinking":"beta"}]}}
+    \\{"type":"assistant","uuid":"q4","parentUuid":"q3","sessionId":"s","cwd":"/w","timestamp":"2026-11-01T00:00:01Z","message":{"id":"m1","role":"assistant","model":"x","stop_reason":"end_turn","content":[{"type":"text","text":"answer"}]}}
+    \\
+;
+
+const agreeing_keys = prompt_line ++
+    \\{"type":"assistant","uuid":"q2","parentUuid":"q1","sessionId":"s","cwd":"/w","timestamp":"2026-11-01T00:00:01Z","apiBlockIndex":0,"message":{"id":"m1","role":"assistant","model":"x","stop_reason":"end_turn","content":[{"type":"text","text":"answer"}]}}
+    \\{"type":"assistant","uuid":"q3","parentUuid":"q2","sessionId":"s","cwd":"/w","timestamp":"2026-11-01T00:00:01Z","apiBlockIndex":0,"message":{"id":"m1","role":"assistant","model":"x","stop_reason":"end_turn","content":[{"type":"text","text":"answer"}]}}
+    \\
+;
 
 test "answers: one block index with different content voids the answer, keyed or mixed" {
-    const thinking_a = "{\"type\":\"thinking\",\"thinking\":\"alpha\"}";
-    const thinking_b = "{\"type\":\"thinking\",\"thinking\":\"beta\"}";
-    const text = "{\"type\":\"text\",\"text\":\"answer\"}";
-    const keyed = prompt_line ++ indexedLine("q2", "q1", ",\"apiBlockIndex\":0", thinking_a) ++
-        indexedLine("q3", "q2", ",\"apiBlockIndex\":0", thinking_b) ++
-        indexedLine("q4", "q3", ",\"apiBlockIndex\":1", text);
-    const mixed = prompt_line ++ indexedLine("q2", "q1", ",\"apiBlockIndex\":0", thinking_a) ++
-        indexedLine("q3", "q2", ",\"apiBlockIndex\":0", thinking_b) ++ indexedLine("q4", "q3", "", text);
-    const agreeing = prompt_line ++ indexedLine("q2", "q1", ",\"apiBlockIndex\":0", text) ++
-        indexedLine("q3", "q2", ",\"apiBlockIndex\":0", text);
-    for ([_][]const u8{ keyed, mixed }) |source| {
+    for ([_][]const u8{ keyed_conflict, mixed_conflict }) |source| {
         var trace = try support.parse(allocator, "conflict.jsonl", source, .stale);
         defer trace.deinit(allocator);
         try testing.expect(trace.turns.items[0].final_answer == null);
     }
-    var trace = try support.parse(allocator, "agree.jsonl", agreeing, .stale);
+    var trace = try support.parse(allocator, "agree.jsonl", agreeing_keys, .stale);
     defer trace.deinit(allocator);
     try testing.expectEqualStrings("answer", trace.turns.items[0].final_answer.?);
 }
 
+const underscore_kinds = prompt_line ++
+    \\{"type":"api_request","id":"r","sessionId":"s","timestamp":"2026-11-01T00:00:01Z"}
+    \\{"type":"custom_title","customTitle":"wrong","sessionId":"s"}
+    \\
+;
+
 test "record kinds: underscore spellings stay unknown and private" {
-    const source = prompt_line ++ line("\"type\":\"api_request\",\"id\":\"r\",\"sessionId\":\"s\"," ++
-        "\"timestamp\":\"2026-11-01T00:00:01Z\"") ++ line("\"type\":\"custom_title\"," ++
-        "\"customTitle\":\"wrong\",\"sessionId\":\"s\"");
-    var trace = try support.parse(allocator, "kinds.jsonl", source, .stale);
+    var trace = try support.parse(allocator, "kinds.jsonl", underscore_kinds, .stale);
     defer trace.deinit(allocator);
     try testing.expectEqual(@as(usize, 0), trace.token_events.items.len);
     try testing.expect(trace.session.thread_name == null);
@@ -233,16 +240,17 @@ const worker_base = "fixtures/claude/worker/proj/";
 const worker_name = worker_root ++ "/subagents/agent-a1b2c3d4e5f600001";
 
 fn workerTree() [3]support.TreeFile {
+    const root = worker_root ++ ".jsonl";
     return .{
-        .{ .path = "proj/" ++ worker_root ++ ".jsonl", .bytes = @embedFile(
-            worker_base ++ worker_root ++ ".jsonl",
-        ) },
-        .{ .path = "proj/" ++ worker_name ++ ".jsonl", .bytes = @embedFile(
-            worker_base ++ worker_name ++ ".jsonl",
-        ) },
-        .{ .path = "proj/" ++ worker_name ++ ".meta.json", .bytes = @embedFile(
-            worker_base ++ worker_name ++ ".meta.json",
-        ) },
+        .{ .path = "proj/" ++ root, .bytes = @embedFile(worker_base ++ root) },
+        .{
+            .path = "proj/" ++ worker_name ++ ".jsonl",
+            .bytes = @embedFile(worker_base ++ worker_name ++ ".jsonl"),
+        },
+        .{
+            .path = "proj/" ++ worker_name ++ ".meta.json",
+            .bytes = @embedFile(worker_base ++ worker_name ++ ".meta.json"),
+        },
     };
 }
 
@@ -256,14 +264,15 @@ test "discovery facts: a body parse reuses supplied facts instead of rereading t
     supplied.parent_agent = &parent;
     var options = support.options();
     options.claude_discovery = &supplied;
-    var trace = try trace_core.parseSessionTrace(testing.io, tmp.dir, allocator, files[1].path, options);
+    const path = files[1].path;
+    var trace = try trace_core.parseSessionTrace(testing.io, tmp.dir, allocator, path, options);
     defer trace.deinit(allocator);
     try testing.expectEqualStrings(
         worker_root ++ "/agent-zz00000000000001",
         trace.session.control_parent_session_id.?,
     );
     try testing.expectEqual(@as(usize, 0), trace.claude_discovery_bytes);
-    var fresh = try parseIn(tmp.dir, files[1].path);
+    var fresh = try parseIn(tmp.dir, path);
     defer fresh.deinit(allocator);
     try testing.expectEqualStrings(worker_root, fresh.session.control_parent_session_id.?);
     try testing.expect(fresh.claude_discovery_bytes > 0);
@@ -276,10 +285,17 @@ test "spawn edges: summary and full parses count the same admitted spawns" {
     try support.writeTree(tmp.dir, &files);
     var full = try parseIn(tmp.dir, files[0].path);
     defer full.deinit(allocator);
-    var summary = try trace_core.parseSessionSummaryTrace(testing.io, tmp.dir, allocator, files[0].path, support.options());
+    var summary = try trace_core.parseSessionSummaryTrace(
+        testing.io,
+        tmp.dir,
+        allocator,
+        files[0].path,
+        support.options(),
+    );
     defer summary.deinit(allocator);
-    try testing.expectEqual(full.session.spawned_worker_count, summary.session.spawned_worker_count);
-    try testing.expectEqual(@as(i64, 1), summary.session.spawned_worker_count);
+    const counted = summary.session.spawned_worker_count;
+    try testing.expectEqual(full.session.spawned_worker_count, counted);
+    try testing.expectEqual(@as(i64, 1), counted);
 }
 
 fn renderGraph(dir: std.Io.Dir, root: []const u8) ![]u8 {
@@ -287,7 +303,17 @@ fn renderGraph(dir: std.Io.Dir, root: []const u8) ![]u8 {
     defer environment.deinit();
     var output: std.Io.Writer.Allocating = .init(allocator);
     defer output.deinit();
-    _ = try native.run(allocator, &environment, .session_graph, &.{ "--root", root, "--format", "dot" }, &output.writer, testing.io, dir, null);
+    const argv = [_][]const u8{ "--root", root, "--format", "dot" };
+    _ = try native.run(
+        allocator,
+        &environment,
+        .session_graph,
+        &argv,
+        &output.writer,
+        testing.io,
+        dir,
+        null,
+    );
     return allocator.dupe(u8, output.written());
 }
 
@@ -300,7 +326,8 @@ test "session graph: agreeing spawner and sidecar assertions render one edge" {
     defer allocator.free(root);
     const text = try renderGraph(tmp.dir, root);
     defer allocator.free(text);
-    const edge = "\"" ++ worker_root ++ "\" -> \"" ++ worker_root ++ "/agent-a1b2c3d4e5f600001\";\n";
+    const worker = worker_root ++ "/agent-a1b2c3d4e5f600001";
+    const edge = "\"" ++ worker_root ++ "\" -> \"" ++ worker ++ "\";\n";
     try testing.expectEqual(@as(usize, 1), std.mem.count(u8, text, edge));
     try testing.expect(std.mem.indexOf(u8, text, "contradiction") == null);
 }
@@ -312,13 +339,18 @@ fn setModified(dir: std.Io.Dir, path: []const u8, seconds: i64) !void {
     try file.setTimestamps(testing.io, .{ .modify_timestamp = .{ .new = stamp } });
 }
 
+const untimed_transcript =
+    \\{"type":"summary","summary":"s","leafUuid":"x"}
+    \\
+;
+
 test "time pruning: since never prunes a Claude file without a prefix timestamp" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
     const untimed = "projects/p/e0000000-0000-4000-8000-000000000001.jsonl";
     const timed = "projects/p/e0000000-0000-4000-8000-000000000002.jsonl";
     try support.writeTree(tmp.dir, &.{
-        .{ .path = untimed, .bytes = "{\"type\":\"summary\",\"summary\":\"s\",\"leafUuid\":\"x\"}\n" },
+        .{ .path = untimed, .bytes = untimed_transcript },
         .{ .path = timed, .bytes = prompt_line },
     });
     try setModified(tmp.dir, untimed, 1_600_000_000);
