@@ -1874,6 +1874,22 @@ const StreamingGraphState = struct {
         self.paths = paths;
     }
 
+    fn countUnreadSeeds(self: *StreamingGraphState) !void {
+        var parsed: usize = 0;
+        for (self.discovered) |item| {
+            while (parsed < self.corpus_entries.items.len and
+                self.corpus_entries.items[parsed].path_index < item.path_index) parsed += 1;
+            const read = parsed < self.corpus_entries.items.len and
+                self.corpus_entries.items[parsed].path_index == item.path_index;
+            if (read or !item.identity.repo_matches) continue;
+            const facts = item.identity.claude_limitations;
+            try self.metrics.claude.add(.{
+                .worker_parent_unread = facts.worker_parent_unread,
+                .worker_parent_missing = facts.worker_parent_missing,
+            });
+        }
+    }
+
     fn bindSourceMetadata(self: *StreamingGraphState) void {
         var admitted: usize = 0;
         for (self.discovered) |item| {
@@ -1992,6 +2008,7 @@ const StreamingGraphState = struct {
     ) !ObservationExecution {
         const graph = self.graph;
         std.mem.sort(CorpusEntry, self.corpus_entries.items, {}, corpusEntryLessThan);
+        try self.countUnreadSeeds();
         for (self.corpus_entries.items) |entry| self.digest_set.add(entry.path, &entry.digest);
         self.bindSourceMetadata();
         const owned = try reducer.finish();

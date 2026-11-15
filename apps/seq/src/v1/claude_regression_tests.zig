@@ -349,11 +349,14 @@ test "time pruning: since never prunes a Claude file without a prefix timestamp"
     defer tmp.cleanup();
     const untimed = "projects/p/e0000000-0000-4000-8000-000000000001.jsonl";
     const timed = "projects/p/e0000000-0000-4000-8000-000000000002.jsonl";
+    const empty = "projects/p/e0000000-0000-4000-8000-000000000003.jsonl";
     try support.writeTree(tmp.dir, &.{
         .{ .path = untimed, .bytes = untimed_transcript },
         .{ .path = timed, .bytes = prompt_line },
+        .{ .path = empty, .bytes = "" },
     });
     try setModified(tmp.dir, untimed, 1_600_000_000);
+    try setModified(tmp.dir, empty, 1_600_000_000);
     try setModified(tmp.dir, timed, 1_600_000_000);
     const config = try tmp.dir.realPathFileAlloc(testing.io, ".", allocator);
     defer allocator.free(config);
@@ -368,9 +371,10 @@ test "time pruning: since never prunes a Claude file without a prefix timestamp"
         .discovery_reads = &reads,
     }, false);
     defer native.freePaths(allocator, &paths);
-    try testing.expectEqual(@as(usize, 1), paths.items.len);
+    try testing.expectEqual(@as(usize, 2), paths.items.len);
     try testing.expect(std.mem.endsWith(u8, paths.items[0], untimed));
-    try testing.expectEqual(@as(usize, 2), reads.opened);
+    try testing.expect(std.mem.endsWith(u8, paths.items[1], empty));
+    try testing.expectEqual(@as(usize, 3), reads.opened);
     try testing.expect(reads.bytes > 0);
 }
 
@@ -529,4 +533,82 @@ test "discovery prefix: a later line is read only up to the remaining byte budge
     defer prefix.deinit(allocator);
     try testing.expectEqual(neutral_line.len, prefix.parse_len);
     try testing.expect(prefix.bytes.len <= bound + 2 * 64 * 1024);
+}
+
+fn parseBytes(path: []const u8, bytes: []const u8) !Trace {
+    return trace_core.parseSessionTraceBytes(testing.io, allocator, path, bytes, 0, .{});
+}
+
+test "Codex classification follows the shapes the Codex reader models" {
+    const bytes =
+        \\{"payload":{"type":"session_meta","id":"s1","cwd":"/r"}}
+        \\{"type":"turn_context","model":"m","cwd":"/r"}
+        \\
+    ;
+    var trace = try parseBytes("/m.jsonl", bytes);
+    defer trace.deinit(allocator);
+    try testing.expectEqual(trace_core.TraceSource.codex, trace.source);
+    try testing.expectEqualStrings("s1", trace.session.session_id.?);
+}
+
+test "summary and full reads vote Codex alike after an undetermined prefix" {
+    var bytes: std.ArrayList(u8) = .empty;
+    defer bytes.deinit(allocator);
+    for (0..trace_core.claude_parser.prefix_lines_max) |_| {
+        try bytes.appendSlice(allocator, "{\"type\":\"mystery-note\"}\n");
+    }
+    try bytes.appendSlice(
+        allocator,
+        "{\"type\":\"response_item\",\"payload\":{\"type\":\"message\",\"role\":\"user\"," ++
+            "\"content\":[]}}\n",
+    );
+    var full = try parseBytes("/f.jsonl", bytes.items);
+    defer full.deinit(allocator);
+    var reader = std.Io.Reader.fixed(bytes.items);
+    var summary = try trace_core.parseSessionSummaryTraceReader(
+        testing.io,
+        allocator,
+        "/f.jsonl",
+        &reader,
+        0,
+        .{},
+    );
+    defer summary.deinit(allocator);
+    try testing.expectEqual(full.source, summary.source);
+}
+
+test "a worker metadata record that contradicts the discovery identity is a conflict" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var files = workerTree();
+    const contradiction = "{\"type\":\"queue-operation\",\"operation\":\"enqueue\"," ++
+        "\"sessionId\":\"e0000000-0000-4000-8000-0000000000ee\"," ++
+        "\"timestamp\":\"2026-11-14T00:00:00Z\"}\n";
+    const worker_bytes = @embedFile(worker_base ++ worker_name ++ ".jsonl");
+    files[1].bytes = worker_bytes ++ contradiction;
+    try support.writeTree(tmp.dir, &files);
+    var trace = try parseAdmitted(tmp.dir, files[1].path, &.{ files[0].path, files[1].path });
+    defer trace.deinit(allocator);
+    try testing.expect(trace.session.lineage_conflict);
+    try testing.expect(trace.warnings.items.len > 0);
+}
+
+test "a native exact worker target admits the corpus it was resolved from" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const files = workerTree();
+    try support.writeTree(tmp.dir, &files);
+    const root = try tmp.dir.realPathFileAlloc(testing.io, "proj", allocator);
+    defer allocator.free(root);
+    var admitted: trace_core.Admission = .{};
+    defer admitted.deinit(allocator);
+    var paths = try native.resolveAdmittedTargets(allocator, testing.io, tmp.dir, .{
+        .root = root,
+        .session_id = worker_root ++ "/agent-a1b2c3d4e5f600001",
+    }, true, &admitted);
+    defer native.freePaths(allocator, &paths);
+    try testing.expect(std.mem.endsWith(u8, paths.items[0], files[1].path["proj/".len..]));
+    const parent = try std.fs.path.join(allocator, &.{ root, worker_root ++ ".jsonl" });
+    defer allocator.free(parent);
+    try testing.expect(try admitted.admits(parent));
 }

@@ -34,10 +34,6 @@ const session_metadata_types = [_][]const u8{
     "cost-state",      "worktree-state",   "relocated",
 };
 
-const codex_types = [_][]const u8{
-    "session_meta", "turn_context", "compacted", "event_msg", "response_item",
-};
-
 const re_query_prefixes = [_][]const u8{
     "Output token limit hit",
     "Your response was cut off because it exceeded the output token limit",
@@ -49,7 +45,7 @@ const visible_origins = [_][]const u8{ "human", "sdk", "peer" };
 pub fn signature(root: std.json.ObjectMap, line_number: usize) Signature {
     if (line_number == 1 and isPiHeader(root)) return .pi;
     if (isClaudeSignature(root)) return .claude;
-    if (isCodexSignature(root)) return .codex;
+    if (core.isCodexModeledRecord(root)) return .codex;
     return .neutral;
 }
 
@@ -79,25 +75,6 @@ pub fn isClaudeSignature(root: std.json.ObjectMap) bool {
     if (stringField(root, field) == null) return false;
     if (std.mem.eql(u8, entry_type, "api-request") and root.get("id") == null) return false;
     return std.mem.eql(u8, field, "sessionId") or stringField(root, "sessionId") != null;
-}
-
-fn isCodexSignature(root: std.json.ObjectMap) bool {
-    if (root.get("type")) |value| {
-        const entry_type = switch (value) {
-            .string => |text| text,
-            else => return false,
-        };
-        return oneOf(entry_type, &codex_types) and objectField(root, "payload") != null;
-    }
-    if (stringField(root, "record_type")) |record_type| return eql(record_type, "state");
-    if (root.get("payload") != null) return false;
-    if (root.get("id") != null and root.get("timestamp") != null) return true;
-    if (root.get("call_id") != null) {
-        return (root.get("arguments") != null and root.get("name") != null) or
-            root.get("output") != null;
-    }
-    if (root.get("role") != null and root.get("content") != null) return true;
-    return root.get("encrypted_content") != null;
 }
 
 pub const Version = struct {
@@ -1082,7 +1059,6 @@ pub const ClaudeParser = struct {
 
     fn checkWorkerRecords(self: *ClaudeParser, identity: *Identity) !void {
         for (self.records.items) |record| {
-            if (!record.kind.isConversation()) continue;
             const root_mismatch = if (record.session_id) |value|
                 identity.root == null or !std.mem.eql(u8, value, identity.root.?)
             else
@@ -1658,7 +1634,7 @@ pub const ClaudeParser = struct {
     ) !void {
         for (accounting.rows) |row| {
             const record = self.records.items[row.record];
-            const occurrence = record.occurrence orelse continue;
+            const occurrence = record.occurrence orelse return error.TokenEventOccurrenceMissing;
             var event = core.TokenEventRecord{ .occurrence_index = occurrence, .turn_index = null };
             errdefer event.deinit(self.allocator);
             if (row.kind != .unanswered) {

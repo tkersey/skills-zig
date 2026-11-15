@@ -328,6 +328,15 @@ jq -e --arg worker "$claude_worker_id" '
   .data.rows == [{"session_id": $worker, "lineage_conflict": false}] and
   (.limitations | all(startswith("claude_worker_parent_missing") | not))' \
   <<<"$claude_worker_only" >/dev/null
+claude_orphan_root="$cache_dir/claude-orphan"
+claude_orphan_id=d0000000-0000-4000-8000-000000000005
+cp -R "$claude_fixtures/worker-missing-parent" "$claude_orphan_root"
+jq '.selectors += ["session-id"]' "$claude_definitions/family-lineage.json" \
+  >"$cache_dir/family-lineage-selected.json"
+claude_orphan=$(claude_isolated observe --definition "$cache_dir/family-lineage-selected.json" \
+  --projection rows --root "$claude_orphan_root" --session-id "$claude_orphan_id" --format json)
+jq -e '.corpus.files == 1 and (.limitations | index("claude_worker_parent_missing: 1") != null)' \
+  <<<"$claude_orphan" >/dev/null
 
 external_output=$("$binary" observe \
   --definition "$external_definition" \

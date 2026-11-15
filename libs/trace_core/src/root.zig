@@ -968,7 +968,8 @@ pub fn readDiscoveryPrefixAlloc(
         offset +|= record.bytes.len + 1;
         if (!claude_parser.withinPrefix(record.number, offset)) break;
         parse_end = offset;
-        lines.max_line_bytes = @max(claude_parser.prefix_bytes_max -| offset, 1);
+        const budget = claude_parser.prefix_bytes_max -| offset;
+        lines.max_line_bytes = @max(@min(max_line_bytes, budget), 1);
         const line = std.mem.trim(u8, record.bytes, " \t\r\n");
         if (line.len == 0) continue;
         const root = (scratch.parse(line) catch |err| switch (err) {
@@ -1191,7 +1192,7 @@ fn parseSessionLines(
         line_end_offset +|= record.bytes.len + 1;
         const line = std.mem.trim(u8, record.bytes, " \t\r\n");
         if (line.len == 0) continue;
-        if (state.decided == .codex and
+        if (state.decided == .codex and state.codex_vote and
             try parser.skipsLine(scratch.arena.allocator(), line, &facts.workers))
         {
             continue;
@@ -1252,6 +1253,57 @@ const SessionFacts = struct {
         try self.workers.apply(allocator, trace, record, turn_index);
     }
 };
+
+pub fn isCodexModeledRecord(root: std.json.ObjectMap) bool {
+    if (stringField(root, "record_type")) |record_type| {
+        return std.mem.eql(u8, record_type, "state");
+    }
+    if (root.get("type")) |value| {
+        const entry_type = switch (value) {
+            .string => |text| text,
+            else => return false,
+        };
+        return isCodexModeledTyped(root, entry_type);
+    }
+    if (root.get("payload")) |value| {
+        const payload = switch (value) {
+            .object => |object| object,
+            else => return false,
+        };
+        return std.mem.eql(u8, stringField(payload, "type") orelse "", "session_meta");
+    }
+    if (root.get("id") != null and root.get("timestamp") != null) return true;
+    if (root.get("call_id") != null) {
+        return (root.get("arguments") != null and root.get("name") != null) or
+            root.get("output") != null;
+    }
+    if (root.get("role") != null and root.get("content") != null) return true;
+    return root.get("encrypted_content") != null;
+}
+
+fn isCodexModeledTyped(root: std.json.ObjectMap, entry_type: []const u8) bool {
+    const Kind = enum {
+        session_meta,
+        turn_context,
+        compacted,
+        event_msg,
+        response_item,
+        function_call,
+        custom_tool_call,
+        function_call_output,
+        custom_tool_call_output,
+    };
+    const kind = std.meta.stringToEnum(Kind, entry_type) orelse return false;
+    return switch (kind) {
+        .turn_context, .compacted => true,
+        .session_meta, .event_msg, .response_item => objectField(root, "payload") != null,
+        .function_call,
+        .custom_tool_call,
+        .function_call_output,
+        .custom_tool_call_output,
+        => stringField(root, "call_id") != null,
+    };
+}
 
 fn sessionMetaObject(record: ParsedRecord) ?std.json.ObjectMap {
     if (record.root_type) |entry_type| {

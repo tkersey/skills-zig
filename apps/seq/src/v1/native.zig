@@ -638,16 +638,17 @@ fn runRelation(
     require_single: bool,
 ) !void {
     if (options.format != .json) return error.UnsupportedNativeFormat;
-    var paths = try resolveTargetPaths(
+    var admitted: trace_core.Admission = .{};
+    defer admitted.deinit(allocator);
+    var paths = try resolveAdmittedTargets(
         allocator,
         io,
         dir,
         options,
         require_single,
+        &admitted,
     );
     defer freePaths(allocator, &paths);
-    var admitted = try trace_core.Admission.initAlloc(allocator, paths.items);
-    defer admitted.deinit(allocator);
 
     try writer.writeByte('[');
     var first = true;
@@ -718,13 +719,13 @@ fn runSessionDetail(
     options: Options,
 ) !void {
     if (options.format != .json) return error.UnsupportedNativeFormat;
-    var paths = try resolveTargetPaths(allocator, io, dir, options, true);
+    var admitted: trace_core.Admission = .{};
+    defer admitted.deinit(allocator);
+    var paths = try resolveAdmittedTargets(allocator, io, dir, options, true, &admitted);
     defer freePaths(allocator, &paths);
     if (opencode_adapter.recognizes(paths.items[0])) {
         return error.OpenCodeSessionDetailUnavailable;
     }
-    var admitted = try trace_core.Admission.initAlloc(allocator, paths.items);
-    defer admitted.deinit(allocator);
     var trace = trace_core.parseSessionTrace(
         io,
         dir,
@@ -754,10 +755,10 @@ fn runSessionGraph(
         return runRelation(allocator, writer, io, dir, .session_edges, options, false);
     }
     if (options.format != .dot) return error.UnsupportedNativeFormat;
-    var paths = try resolveTargetPaths(allocator, io, dir, options, false);
-    defer freePaths(allocator, &paths);
-    var admitted = try trace_core.Admission.initAlloc(allocator, paths.items);
+    var admitted: trace_core.Admission = .{};
     defer admitted.deinit(allocator);
+    var paths = try resolveAdmittedTargets(allocator, io, dir, options, false, &admitted);
+    defer freePaths(allocator, &paths);
     var arena_state = std.heap.ArenaAllocator.init(allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
@@ -886,10 +887,10 @@ fn runFindSession(
         return error.MissingFindSessionSelector;
     }
     if (options.format != .json) return error.UnsupportedNativeFormat;
-    var paths = try resolveTargetPaths(allocator, io, dir, options, false);
-    defer freePaths(allocator, &paths);
-    var admitted = try trace_core.Admission.initAlloc(allocator, paths.items);
+    var admitted: trace_core.Admission = .{};
     defer admitted.deinit(allocator);
+    var paths = try resolveAdmittedTargets(allocator, io, dir, options, false, &admitted);
+    defer freePaths(allocator, &paths);
 
     try writer.writeByte('[');
     var first = true;
@@ -1102,16 +1103,17 @@ fn runQueryObject(
         query_output_bytes_max,
     );
     defer runner.deinit();
-    var paths = try resolveTargetPaths(
+    var admitted: trace_core.Admission = .{};
+    defer admitted.deinit(allocator);
+    var paths = try resolveAdmittedTargets(
         allocator,
         io,
         dir,
         query_options,
         false,
+        &admitted,
     );
     defer freePaths(allocator, &paths);
-    var admitted = try trace_core.Admission.initAlloc(allocator, paths.items);
-    defer admitted.deinit(allocator);
     for (paths.items) |path| {
         const feed_result = try feedQueryPath(
             io,
@@ -2028,6 +2030,28 @@ pub fn resolveTargetPaths(
     options: Options,
     require_single: bool,
 ) !std.ArrayList([]u8) {
+    return resolveTargets(allocator, io, dir, options, require_single, null);
+}
+
+pub fn resolveAdmittedTargets(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    dir: std.Io.Dir,
+    options: Options,
+    require_single: bool,
+    admitted: *trace_core.Admission,
+) !std.ArrayList([]u8) {
+    return resolveTargets(allocator, io, dir, options, require_single, admitted);
+}
+
+fn resolveTargets(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    dir: std.Io.Dir,
+    options: Options,
+    require_single: bool,
+    admitted: ?*trace_core.Admission,
+) !std.ArrayList([]u8) {
     const current = if (options.current)
         try CurrentSession.fromEnvironment(options.environment, options.source)
     else
@@ -2039,6 +2063,7 @@ pub fn resolveTargetPaths(
             allocator,
             try absolutePathAlloc(allocator, options.environment, path, io, dir),
         );
+        if (admitted) |set| set.* = try trace_core.Admission.initAlloc(allocator, paths.items);
         return paths;
     }
     const source = effectiveSource(options, current);
@@ -2064,6 +2089,7 @@ pub fn resolveTargetPaths(
     if (exact_session_id == null) {
         try retainCanonicalRolloutWindow(allocator, io, dir, &paths, options, facts, archive);
     }
+    if (admitted) |set| set.* = try trace_core.Admission.initAlloc(allocator, paths.items);
     if (exact_session_id) |wanted| {
         try retainSessionId(io, dir, allocator, &paths, wanted, facts.live_codex_root, options);
     }
@@ -2148,7 +2174,7 @@ fn claudePathPassesWindow(
     if (!since_rejects and upper == null) return true;
     const reads = options.discovery_reads;
     const discovered = try discoverClaudeIdentity(allocator, io, dir, path, reads);
-    var identity = discovered orelse return !since_rejects;
+    var identity = discovered orelse return true;
     defer identity.deinit(allocator);
     const start = identity.start_time orelse return true;
     if (since_rejects) return false;
@@ -2418,19 +2444,13 @@ fn sessionPathVerdict(
     if (live_native_root and
         isCanonicalRolloutBasename(std.fs.path.basename(path)) and
         !rolloutBasenameMatchesSessionId(path, wanted)) return .drop;
-    if (probe) |known| switch (known) {
-        .match => return .keep,
-        .other_claude => return .drop,
-        .not_claude => return summaryPathVerdict(io, dir, allocator, path, wanted, options),
-    };
     const reads = options.discovery_reads;
-    if (try discoverClaudeIdentity(allocator, io, dir, path, reads)) |found| {
-        var identity = found;
-        defer identity.deinit(allocator);
-        const actual = identity.session_id orelse return .drop;
-        return if (std.mem.eql(u8, actual, wanted)) .keep else .drop;
-    }
-    return summaryPathVerdict(io, dir, allocator, path, wanted, options);
+    const known = probe orelse try claudeIdentityProbe(allocator, io, dir, path, wanted, reads);
+    return switch (known) {
+        .match => .keep,
+        .other_claude => .drop,
+        .not_claude => summaryPathVerdict(io, dir, allocator, path, wanted, options),
+    };
 }
 
 fn summaryPathVerdict(
