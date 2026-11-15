@@ -189,10 +189,26 @@ jq -se 'length == 1 and (.[0] | .schema == "seq-command-error/v1" and
 mkdir -p "$work/claude"
 printf '%s\n' '{"type":"user","uuid":"u","sessionId":"claude","message":{"role":"user","content":"hello"}}' \
   >"$work/claude/transcript.jsonl"
-if unsupported=$("$binary" sessions --root "$work/claude" --format json); then
+admitted=$("$binary" sessions --root "$work/claude" --format json)
+jq -e 'length == 1 and .[0].session_id == "claude" and .[0].originator == "claude-code" and
+  .[0].turn_count == 0 and .[0].status_reason == "no_turns"' <<<"$admitted" >/dev/null
+mkdir -p "$work/contradiction"
+{
+  printf '%s\n' '{"type":"session_meta","payload":{"id":"codex"}}'
+  printf '%s\n' '{"type":"user","uuid":"u","sessionId":"claude"}'
+} >"$work/contradiction/late-claude.jsonl"
+if contradiction=$("$binary" sessions --root "$work/contradiction" --format json); then
   exit 1
 fi
-jq -e '.code == "UnsupportedSessionFormat"' <<<"$unsupported" >/dev/null
+jq -e '.code == "UnsupportedSessionFormat"' <<<"$contradiction" >/dev/null
+mkdir -p "$work/unclassified"
+printf '%s\n' '{"type":"vendor-record","sessionId":"sentinel-value"}' \
+  >"$work/unclassified/unknown.jsonl"
+if unclassified=$("$binary" sessions --root "$work/unclassified" --format json); then
+  exit 1
+fi
+jq -e '.code == "UnclassifiedSessionFormat" and (tostring | contains("sentinel-value") | not)' \
+  <<<"$unclassified" >/dev/null
 
 mkdir -p "$work/failed-selection"
 printf '%s\n' 'not zstd' >"$work/failed-selection/a-invalid.jsonl.zst"
@@ -214,11 +230,18 @@ if failed_graph=$("$binary" session-graph --root "$work/failed-selection" --form
 fi
 jq -e '.code == "InvalidCompressedSession" and .message == "InvalidCompressedSession" and
   (.path | endswith("a-invalid.jsonl.zst"))' <<<"$failed_graph" >/dev/null
-if unsupported=$("$binary" observe --definition "$message_definition" \
-  --path "$work/claude/transcript.jsonl" --param needle=hello --projection rows --format json); then
+claude_observation=$("$binary" observe --definition "$message_definition" \
+  --path "$work/claude/transcript.jsonl" --param needle=hello --projection rows --format json)
+jq -e '.corpus.adapter == "claude-code-transcript-jsonl/v1" and .corpus.files == 1' \
+  <<<"$claude_observation" >/dev/null
+mkdir -p "$work/mixed-adapters"
+cp "$work/claude/transcript.jsonl" "$work/mixed-adapters/b-claude.jsonl"
+cp "$rollout" "$work/mixed-adapters/a-codex.jsonl"
+if mixed=$("$binary" observe --definition "$work/message.json" \
+  --root "$work/mixed-adapters" --param needle=hello --projection rows --format json); then
   exit 1
 fi
-jq -e '.code == "UnsupportedSessionFormat"' <<<"$unsupported" >/dev/null
+jq -e '.code == "MixedPhysicalSourceAdapters"' <<<"$mixed" >/dev/null
 
 mkdir -p "$work/linear-root"
 cp "$rollout" "$work/linear-root/inside.jsonl"

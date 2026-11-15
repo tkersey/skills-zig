@@ -2,6 +2,7 @@
 set -euo pipefail
 
 binary=$1
+unset CLAUDE_CODE_SESSION_ID CODEX_THREAD_ID PI_SESSION_ID PI_SESSION_FILE
 bash scripts/test-seq-observation-contract.sh "$binary"
 message_definition=apps/seq/src/v1/fixtures/message-observation.json
 external_definition=apps/seq/src/v1/fixtures/external-observation.json
