@@ -1225,11 +1225,12 @@ fn resolveGraphPaths(
     dir: std.Io.Dir,
     args: *const ObserveArgs,
     physical_selection: bool,
-    discovery: *seq.native.FamilyDiscovery,
+    discovery: *seq.native.DiscoveryReads,
 ) !std.ArrayList([]u8) {
     if (physical_selection) {
         var selectors = args.selectors;
         selectors.session_id = null;
+        selectors.discovery_reads = discovery;
         return seq.native.resolveTargetPaths(allocator, io, dir, selectors, false);
     }
     var paths = try seq.native.resolveTargetPaths(
@@ -1425,7 +1426,7 @@ fn executeMaterializedGraphObservation(
         &context.native_plan,
         args.projection,
     );
-    var family = seq.native.FamilyDiscovery{};
+    var family = seq.native.DiscoveryReads{};
     var paths = try resolveGraphPaths(allocator, io, dir, args, physical_selection, &family);
     defer seq.native.freePaths(allocator, &paths);
     try rows.reserve(&graph, paths.items.len);
@@ -2043,7 +2044,7 @@ fn executeStreamingGraphObservation(
         .plans = context,
         .bindings = bindings,
     };
-    var family = seq.native.FamilyDiscovery{};
+    var family = seq.native.DiscoveryReads{};
     var paths = try resolveGraphPaths(allocator, io, dir, args, false, &family);
     defer seq.native.freePaths(allocator, &paths);
     var discovered = try DiscoveredSessions.init(io, dir, allocator, paths.items, args);
@@ -2322,8 +2323,10 @@ fn executePhysicalObservation(
         return error.ExternalInputNotAcceptedForPhysicalObservation;
     }
     try validateSelectedSelectors(&context.definition_plan, args.selectors);
+    var resolution_reads = seq.native.DiscoveryReads{};
     var discovery_selectors = args.selectors;
     discovery_selectors.session_id = null;
+    discovery_selectors.discovery_reads = &resolution_reads;
     var paths = try seq.native.resolveTargetPaths(
         allocator,
         io,
@@ -2340,6 +2343,7 @@ fn executePhysicalObservation(
     );
     errdefer runner.deinit();
     var metrics = PhysicalMetrics{};
+    try recordFamilyDiscovery(&metrics, resolution_reads);
     var digest_set = CorpusSetHasher{};
     for (paths.items) |path| {
         const feed = try feedPhysicalFile(
@@ -2589,7 +2593,7 @@ fn recordTraceRead(metrics: *PhysicalMetrics, selected: seq.trace_adapter.Select
     try recordDiscoveryBytes(metrics, selected.discovery_bytes_read);
 }
 
-fn recordFamilyDiscovery(metrics: *PhysicalMetrics, family: seq.native.FamilyDiscovery) !void {
+fn recordFamilyDiscovery(metrics: *PhysicalMetrics, family: seq.native.DiscoveryReads) !void {
     try recordDiscoveryBytes(metrics, family.bytes);
     metrics.opened = std.math.add(usize, metrics.opened, family.opened) catch
         return error.ObservationMetricOverflow;
@@ -3013,6 +3017,7 @@ fn parseObserveArgs(
 
 fn hasPhysicalSelector(options: seq.native.Options) bool {
     return options.root != null or
+        options.source != null or
         options.path != null or
         options.session_id != null or
         options.repo != null or
@@ -3029,7 +3034,7 @@ fn validateSelectedSelectors(
         active: bool,
         selector: seq.definition.Selector,
     }{
-        .{ .active = options.root != null, .selector = .root },
+        .{ .active = options.root != null or options.source != null, .selector = .root },
         .{ .active = options.session_id != null, .selector = .session_id },
         .{ .active = options.path != null, .selector = .path },
         .{ .active = options.repo != null, .selector = .repo },
@@ -4067,7 +4072,7 @@ fn testGraphPaths(
     args: *const ObserveArgs,
     physical_selection: bool,
 ) !std.ArrayList([]u8) {
-    var family = seq.native.FamilyDiscovery{};
+    var family = seq.native.DiscoveryReads{};
     return resolveGraphPaths(allocator, io, dir, args, physical_selection, &family);
 }
 

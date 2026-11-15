@@ -909,6 +909,7 @@ fn parseDiscoveryLine(
             .ongoing_threshold_secs = options.ongoing_threshold_secs,
             .as_of_ns = options.as_of_ns,
             .sidecar_dir = options.sidecar_dir,
+            .discovery_prefix = true,
         },
     );
 }

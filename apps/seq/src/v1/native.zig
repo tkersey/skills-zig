@@ -140,6 +140,7 @@ pub const Source = enum {
 pub const Options = struct {
     root: ?[]const u8 = null,
     source: ?Source = null,
+    discovery_reads: ?*DiscoveryReads = null,
     path: ?[]const u8 = null,
     session_id: ?[]const u8 = null,
     prompt: ?[]const u8 = null,
@@ -2045,8 +2046,9 @@ fn retainCanonicalRolloutWindow(
     archive: ?[]const u8,
 ) !void {
     if (options.since_ms == null and options.until_ms == null) return;
-    var write_index: usize = 0;
-    for (paths.items) |path| {
+    const keep = try allocator.alloc(bool, paths.items.len);
+    defer allocator.free(keep);
+    for (paths.items, keep) |path, *kept| {
         const modified_ms: ?i64 = if (facts.live_codex_root and
             options.since_ms != null)
             modifiedMillis(io, dir, path)
@@ -2054,9 +2056,12 @@ fn retainCanonicalRolloutWindow(
             null;
         const archived = archive != null and
             std.mem.eql(u8, std.fs.path.dirname(path) orelse "", archive.?);
-        const passes = canonicalRolloutPathPassesWindow(path, options, modified_ms, archived) and
+        kept.* = canonicalRolloutPathPassesWindow(path, options, modified_ms, archived) and
             try claudePathPassesWindow(allocator, io, dir, path, options, facts);
-        if (passes) {
+    }
+    var write_index: usize = 0;
+    for (paths.items, keep) |path, kept| {
+        if (kept) {
             paths.items[write_index] = path;
             write_index += 1;
         } else {
@@ -2078,33 +2083,59 @@ fn claudePathPassesWindow(
 ) !bool {
     if (isCanonicalRolloutBasename(std.fs.path.basename(path))) return true;
     if (opencode_adapter.recognizes(path)) return true;
-    if (facts.live_claude_root) {
-        if (options.since_ms) |since| {
-            const lower = std.math.sub(i64, since, claude_window_margin_ms) catch return true;
-            if (modifiedMillis(io, dir, path)) |modified| {
-                if (modified < lower) return false;
-            }
-        }
-    }
-    const until = options.until_ms orelse return true;
-    const upper = std.math.add(i64, until, claude_window_margin_ms) catch return true;
-    var identity = trace_adapter.discoverSessionIdentity(
-        io,
-        dir,
-        allocator,
-        path,
-        .{},
-        null,
-    ) catch |err|
+    const since_rejects = facts.live_claude_root and modifiedBefore(io, dir, path, options.since_ms);
+    const upper: ?i64 = if (options.until_ms) |until|
+        std.math.add(i64, until, claude_window_margin_ms) catch null
+    else
+        null;
+    if (!since_rejects and upper == null) return true;
+    const discovered = try discoverClaudeIdentity(allocator, io, dir, path, options.discovery_reads);
+    var identity = discovered orelse return !since_rejects;
+    defer identity.deinit(allocator);
+    const start = identity.start_time orelse return true;
+    if (since_rejects) return false;
+    const limit = upper orelse return true;
+    const start_ms = seq_time.parseIsoTimestampMillis(start) orelse return true;
+    return start_ms <= limit;
+}
+
+fn modifiedBefore(io: std.Io, dir: std.Io.Dir, path: []const u8, since_ms: ?i64) bool {
+    const since = since_ms orelse return false;
+    const lower = std.math.sub(i64, since, claude_window_margin_ms) catch return false;
+    const modified = modifiedMillis(io, dir, path) orelse return false;
+    return modified < lower;
+}
+
+pub fn isClaudeLayoutPath(path: []const u8) bool {
+    const name = std.fs.path.basename(path);
+    const stem = if (std.mem.endsWith(u8, name, ".jsonl.zst"))
+        name[0 .. name.len - ".jsonl.zst".len]
+    else if (std.mem.endsWith(u8, name, ".jsonl"))
+        name[0 .. name.len - ".jsonl".len]
+    else
+        return false;
+    if (trace_core.claude_parser.isUuid(stem)) return true;
+    return std.mem.startsWith(u8, stem, "agent-") and stem.len > "agent-".len;
+}
+
+fn discoverClaudeIdentity(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    dir: std.Io.Dir,
+    path: []const u8,
+    reads: ?*DiscoveryReads,
+) !?trace_adapter.SessionIdentity {
+    if (!isClaudeLayoutPath(path)) return null;
+    var identity = trace_adapter.discoverSessionIdentity(io, dir, allocator, path, .{}, null) catch |err|
         switch (err) {
             error.OutOfMemory => return err,
-            else => return true,
+            else => return null,
         };
-    defer identity.deinit(allocator);
-    if (identity.source != .claude) return true;
-    const start = identity.start_time orelse return true;
-    const start_ms = seq_time.parseIsoTimestampMillis(start) orelse return true;
-    return start_ms <= upper;
+    errdefer identity.deinit(allocator);
+    if (reads) |sink| try sink.charge(identity.bytes_read);
+    if (identity.source == .claude) return identity;
+    identity.deinit(allocator);
+    return null;
 }
 
 fn modifiedMillis(io: std.Io, dir: std.Io.Dir, path: []const u8) ?i64 {
@@ -2223,27 +2254,13 @@ fn retainNamedClaudeSession(
     allocator: std.mem.Allocator,
     paths: *std.ArrayList([]u8),
     wanted: []const u8,
+    reads: ?*DiscoveryReads,
 ) !bool {
     const stem = claudeTranscriptStem(wanted) orelse return false;
     var confirmed: ?usize = null;
     for (paths.items, 0..) |path, index| {
         if (!basenameStemEquals(path, stem)) continue;
-        var identity = trace_adapter.discoverSessionIdentity(
-            io,
-            dir,
-            allocator,
-            path,
-            .{},
-            null,
-        ) catch |err|
-            switch (err) {
-                error.OutOfMemory => return err,
-                else => continue,
-            };
-        defer identity.deinit(allocator);
-        if (identity.source != .claude) continue;
-        const actual = identity.session_id orelse continue;
-        if (!std.mem.eql(u8, actual, wanted)) continue;
+        if (!try claudeIdentityMatches(allocator, io, dir, path, wanted, reads)) continue;
         if (confirmed != null) return false;
         confirmed = index;
     }
@@ -2256,6 +2273,20 @@ fn retainNamedClaudeSession(
     return true;
 }
 
+fn claudeIdentityMatches(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    dir: std.Io.Dir,
+    path: []const u8,
+    wanted: []const u8,
+    reads: ?*DiscoveryReads,
+) !bool {
+    var identity = (try discoverClaudeIdentity(allocator, io, dir, path, reads)) orelse return false;
+    defer identity.deinit(allocator);
+    const actual = identity.session_id orelse return false;
+    return std.mem.eql(u8, actual, wanted);
+}
+
 fn retainSessionId(
     io: std.Io,
     dir: std.Io.Dir,
@@ -2265,7 +2296,8 @@ fn retainSessionId(
     live_native_root: bool,
     options: Options,
 ) !void {
-    if (try retainNamedClaudeSession(io, dir, allocator, paths, wanted)) return;
+    const reads = options.discovery_reads;
+    if (try retainNamedClaudeSession(io, dir, allocator, paths, wanted, reads)) return;
     var write_index: usize = 0;
     var failure: ?anyerror = null;
     for (paths.items) |path| {
@@ -2292,6 +2324,19 @@ fn retainSessionId(
             !rolloutBasenameMatchesSessionId(path, wanted))
         {
             allocator.free(path);
+            continue;
+        }
+        if (try discoverClaudeIdentity(allocator, io, dir, path, reads)) |found| {
+            var identity = found;
+            defer identity.deinit(allocator);
+            const matches = identity.session_id != null and
+                std.mem.eql(u8, identity.session_id.?, wanted);
+            if (matches) {
+                paths.items[write_index] = path;
+                write_index += 1;
+            } else {
+                allocator.free(path);
+            }
             continue;
         }
         var trace = trace_core.parseSessionSummaryTrace(
@@ -3601,11 +3646,11 @@ test "default Codex discovery includes archives while explicit roots retain thei
     try std.testing.expect(std.mem.endsWith(u8, selected.items[0], "sessions/live.jsonl"));
 }
 
-pub const FamilyDiscovery = struct {
+pub const DiscoveryReads = struct {
     bytes: usize = 0,
     opened: usize = 0,
 
-    fn charge(self: *FamilyDiscovery, bytes: usize) !void {
+    fn charge(self: *DiscoveryReads, bytes: usize) !void {
         self.bytes = std.math.add(usize, self.bytes, bytes) catch
             return error.ObservationMetricOverflow;
         self.opened += 1;
@@ -3634,23 +3679,11 @@ pub fn claudeFamilyPathsAlloc(
     io: std.Io,
     dir: std.Io.Dir,
     selected: []const u8,
-    discovery: *FamilyDiscovery,
+    discovery: *DiscoveryReads,
 ) !?std.ArrayList([]u8) {
-    var identity = trace_adapter.discoverSessionIdentity(
-        io,
-        dir,
-        allocator,
-        selected,
-        .{},
-        null,
-    ) catch |err|
-        switch (err) {
-            error.OutOfMemory => return err,
-            else => return null,
-        };
+    const discovered = try discoverClaudeIdentity(allocator, io, dir, selected, discovery);
+    var identity = discovered orelse return null;
     defer identity.deinit(allocator);
-    try discovery.charge(identity.bytes_read);
-    if (identity.source != .claude) return null;
     const root = identity.root_session_id orelse return null;
     const layout = claudeFamilyLayout(selected, root) orelse return null;
     var paths: std.ArrayList([]u8) = .empty;
@@ -3700,7 +3733,7 @@ fn appendClaudeWorkers(
     directory: []const u8,
     recorded_root: ?[]const u8,
     paths: *std.ArrayList([]u8),
-    discovery: *FamilyDiscovery,
+    discovery: *DiscoveryReads,
 ) !void {
     var handle = dir.openDir(io, directory, .{ .iterate = true }) catch return;
     defer handle.close(io);
@@ -3730,23 +3763,11 @@ fn flatWorkerBelongs(
     dir: std.Io.Dir,
     path: []const u8,
     root: []const u8,
-    discovery: *FamilyDiscovery,
+    discovery: *DiscoveryReads,
 ) !bool {
-    var identity = trace_adapter.discoverSessionIdentity(
-        io,
-        dir,
-        allocator,
-        path,
-        .{},
-        null,
-    ) catch |err|
-        switch (err) {
-            error.OutOfMemory => return err,
-            else => return false,
-        };
+    const discovered = try discoverClaudeIdentity(allocator, io, dir, path, discovery);
+    var identity = discovered orelse return false;
     defer identity.deinit(allocator);
-    try discovery.charge(identity.bytes_read);
-    if (identity.source != .claude) return false;
     const actual = identity.root_session_id orelse return false;
     return std.mem.eql(u8, actual, root);
 }

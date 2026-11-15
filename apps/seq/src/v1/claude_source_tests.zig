@@ -968,7 +968,7 @@ fn expectFamily(
     expected: []const []const u8,
     min_opened: usize,
 ) !void {
-    var discovery = native.FamilyDiscovery{};
+    var discovery = native.DiscoveryReads{};
     var family = (try native.claudeFamilyPathsAlloc(
         allocator,
         testing.io,
@@ -1001,7 +1001,7 @@ test "accounting-scopes: a Claude path admits its session family" {
     const legacy_family = [_][]const u8{ scope_files[5].path, scope_files[6].path };
     try expectFamily(tmp.dir, scope_files[5].path, &legacy_family, 3);
     try expectFamily(tmp.dir, scope_files[6].path, &legacy_family, 3);
-    var discovery = native.FamilyDiscovery{};
+    var discovery = native.DiscoveryReads{};
     const codex = try native.claudeFamilyPathsAlloc(
         allocator,
         testing.io,

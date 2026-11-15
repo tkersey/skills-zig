@@ -60,6 +60,7 @@ pub const TraceParseOptions = struct {
     /// large payloads for rows that cannot reach that result.
     max_tools: ?usize = null,
     sidecar_dir: ?std.Io.Dir = null,
+    discovery_prefix: bool = false,
 };
 
 pub const StreamMetrics = struct {
@@ -911,8 +912,8 @@ pub fn readDiscoveryPrefixAlloc(
     var scratch = ParseScratch.init(allocator);
     defer scratch.deinit();
     var offset: usize = 0;
-    var first_end: usize = 0;
-    var claude_end: ?usize = null;
+    var parse_end: usize = 0;
+    var claude_seen = false;
     var lines_left = claude_parser.prefix_lines_max + 1;
     while (lines_left > 0) : (lines_left -= 1) {
         defer scratch.reset();
@@ -922,9 +923,9 @@ pub fn readDiscoveryPrefixAlloc(
         };
         const record = next orelse break;
         offset +|= record.bytes.len + 1;
-        if (record.number == 1) first_end = offset;
         if (record.number > claude_parser.prefix_lines_max) break;
         if (offset > claude_parser.prefix_bytes_max and record.number > 1) break;
+        parse_end = offset;
         const line = std.mem.trim(u8, record.bytes, " \t\r\n");
         if (line.len == 0) continue;
         const root = (scratch.parse(line) catch |err| switch (err) {
@@ -932,30 +933,13 @@ pub fn readDiscoveryPrefixAlloc(
             else => null,
         }) orelse continue;
         const line_signature = claude_parser.signature(root, record.number);
-        if (claude_end == null and (line_signature == .codex or line_signature == .pi)) break;
-        if (line_signature == .claude or claude_end != null) claude_end = offset;
-        if (claude_end != null and claude_parser.isPrefixSeed(root)) break;
+        if (!claude_seen and (line_signature == .codex or line_signature == .pi)) break;
+        if (line_signature == .claude) claude_seen = true;
+        if (claude_seen and claude_parser.isPrefixSeed(root)) break;
     }
     const bytes = try consumed.toOwnedSlice(allocator);
-    const parse_len = @min(claude_end orelse first_end, bytes.len);
+    const parse_len = @min(parse_end, bytes.len);
     return .{ .bytes = bytes, .parse_len = parse_len };
-}
-
-pub fn readFirstLinePrefixAlloc(
-    allocator: std.mem.Allocator,
-    reader: *std.Io.Reader,
-    max_line_bytes: usize,
-) ![]u8 {
-    var consumed: std.ArrayList(u8) = .empty;
-    errdefer consumed.deinit(allocator);
-    var collector = ConsumedBytes{ .allocator = allocator, .bytes = &consumed };
-    var lines = try jsonl_stream.Stream.init(allocator, reader, .{
-        .max_line_bytes = max_line_bytes,
-        .chunk_observer = collector.observer(),
-    });
-    defer lines.deinit();
-    _ = try lines.next();
-    return consumed.toOwnedSlice(allocator);
 }
 
 const ConsumedBytes = struct {
@@ -1009,6 +993,7 @@ pub fn parseSessionTraceReaderWithVisitorMetrics(
         &parser,
         &pi_parser,
         &claude,
+        options.discovery_prefix,
     );
     switch (trace.source) {
         .pi => try pi_parser.finish(io, source_mtime_ns),
@@ -1026,8 +1011,8 @@ const PendingLine = struct {
 
 const SourceState = struct {
     decided: ?TraceSource = null,
+    prefix_only: bool = false,
     pending: std.ArrayList(PendingLine) = .empty,
-    pending_bytes: usize = 0,
     saw_record: bool = false,
     codex_vote: bool = false,
 
@@ -1036,8 +1021,7 @@ const SourceState = struct {
         self.pending.deinit(allocator);
     }
 
-    fn buffers(self: *const SourceState, line_bytes: usize, end_offset: usize, number: usize) bool {
-        _ = line_bytes;
+    fn buffers(self: *const SourceState, end_offset: usize, number: usize) bool {
         return number <= claude_parser.prefix_lines_max and
             end_offset <= claude_parser.prefix_bytes_max and
             self.pending.items.len < claude_parser.prefix_lines_max;
@@ -1057,7 +1041,6 @@ const SourceState = struct {
             .number = number,
             .end_offset = end_offset,
         });
-        self.pending_bytes += line.len;
     }
 
     fn decide(self: *SourceState, line_signature: claude_parser.Signature) void {
@@ -1084,7 +1067,7 @@ const SourceState = struct {
         const decided = self.decided orelse return .none;
         if (decided != .codex) return decided;
         if (self.codex_vote) return .codex;
-        if (self.saw_record) return error.UnclassifiedSessionFormat;
+        if (self.saw_record and !self.prefix_only) return error.UnclassifiedSessionFormat;
         return .none;
     }
 };
@@ -1147,10 +1130,11 @@ fn parseSessionLines(
     parser: anytype,
     pi_parser: *PiParser,
     claude: *claude_parser.ClaudeParser,
+    prefix_only: bool,
 ) !TraceSource {
     var facts: SessionFacts = .{};
     defer facts.deinit(allocator);
-    var state = SourceState{};
+    var state = SourceState{ .prefix_only = prefix_only };
     defer state.deinit(allocator);
     const sinks = LineSinks{
         .allocator = allocator,
@@ -1186,7 +1170,7 @@ fn parseSessionLines(
         const line_signature = claude_parser.signature(root, record.number);
         const end_offset = line_end_offset;
         if (state.decided == null) {
-            if (line_signature == .neutral and state.buffers(line.len, end_offset, record.number)) {
+            if (line_signature == .neutral and state.buffers(end_offset, record.number)) {
                 try state.buffer(allocator, line, record.number, end_offset);
                 continue;
             }
@@ -2447,6 +2431,7 @@ pub fn parseSessionSummaryTraceReaderWithVisitorMetrics(
         &parser,
         &pi_parser,
         &claude,
+        options.discovery_prefix,
     );
     switch (trace.source) {
         .pi => try pi_parser.finish(io, source_mtime_ns),
