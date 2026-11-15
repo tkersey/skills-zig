@@ -762,6 +762,7 @@ fn runSessionGraph(
     var remaining = options.limit;
     for (paths.items) |path| {
         if (remaining == 0) break;
+        if (opencode_adapter.recognizes(path)) continue;
         var trace = trace_core.parseSessionTrace(
             io,
             dir,
