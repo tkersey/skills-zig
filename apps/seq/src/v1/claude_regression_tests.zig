@@ -671,3 +671,34 @@ test "tools: Claude output-part pointers resolve in the published payload" {
         return error.TestPointerUnresolved;
     try testing.expectEqualStrings("caption", resolved.string);
 }
+
+const result_first_source = prompt_line ++
+    \\{"type":"user","uuid":"q2","parentUuid":"q1","sessionId":"s","cwd":"/w","timestamp":"2026-11-01T00:00:01Z","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"c1","content":"a"}]}}
+    \\{"type":"assistant","uuid":"q3","parentUuid":"q2","sessionId":"s","cwd":"/w","timestamp":"2026-11-01T00:00:02Z","message":{"id":"m1","role":"assistant","model":"x","stop_reason":"end_turn","content":[{"type":"tool_use","id":"c1","name":"Bash","input":{"command":"ls"}}]}}
+    \\
+;
+
+test "tools: a result before its declaration keeps one invocation per call ID" {
+    var trace = try support.parse(allocator, "first.jsonl", result_first_source, .stale);
+    defer trace.deinit(allocator);
+    try testing.expectEqual(@as(usize, 1), trace.tools.items.len);
+    try testing.expect(trace.tools.items[0].lifecycle_status != .unresolved);
+}
+
+test "time pruning: a failed Claude probe is charged to discovery reads" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const broken = "projects/p/e0000000-0000-4000-8000-000000000009.jsonl.zst";
+    try support.writeTree(tmp.dir, &.{.{ .path = broken, .bytes = "not a zstd frame" }});
+    const projects = try tmp.dir.realPathFileAlloc(testing.io, "projects", allocator);
+    defer allocator.free(projects);
+    var reads = native.DiscoveryReads{};
+    var paths = try native.resolveTargetPaths(allocator, testing.io, tmp.dir, .{
+        .root = projects,
+        .until_ms = 1_790_000_000_000,
+        .discovery_reads = &reads,
+    }, false);
+    defer native.freePaths(allocator, &paths);
+    try testing.expectEqual(@as(usize, 1), paths.items.len);
+    try testing.expectEqual(@as(usize, 1), reads.opened);
+}

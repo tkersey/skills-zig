@@ -813,6 +813,7 @@ pub const PathIdentity = struct {
     agent: ?[]const u8 = null,
     current_layout: bool = false,
     layout_root: ?[]const u8 = null,
+    base: []const u8 = ".",
 
     pub fn layoutNamed(self: PathIdentity) bool {
         return self.transcript and (isUuid(self.stem) or self.agent != null);
@@ -820,7 +821,7 @@ pub const PathIdentity = struct {
 
     pub fn read(path: []const u8) PathIdentity {
         const name = std.fs.path.basename(path);
-        var identity = PathIdentity{ .stem = name };
+        var identity = PathIdentity{ .stem = name, .base = std.fs.path.dirname(path) orelse "." };
         for ([_][]const u8{ ".jsonl.zst", ".jsonl" }) |extension| {
             if (!std.mem.endsWith(u8, name, extension)) continue;
             identity.stem = name[0 .. name.len - extension.len];
@@ -835,6 +836,7 @@ pub const PathIdentity = struct {
         const session_directory = std.fs.path.dirname(directory) orelse return identity;
         identity.current_layout = true;
         identity.layout_root = std.fs.path.basename(session_directory);
+        identity.base = std.fs.path.dirname(session_directory) orelse ".";
         return identity;
     }
 };
@@ -1143,13 +1145,11 @@ pub const ClaudeParser = struct {
         layout: PathIdentity,
     ) !bool {
         const admission = self.options.admission orelse return false;
-        var directory = std.fs.path.dirname(self.trace.session.path) orelse ".";
+        var directory = layout.base;
         var stem = root;
         if (facts.parent_agent) |parent| {
             stem = try std.fmt.allocPrint(self.arena(), "agent-{s}", .{parent});
-        } else if (layout.current_layout) {
-            const session_directory = std.fs.path.dirname(directory) orelse ".";
-            directory = std.fs.path.dirname(session_directory) orelse ".";
+            directory = std.fs.path.dirname(self.trace.session.path) orelse ".";
         }
         for ([_][]const u8{ ".jsonl", ".jsonl.zst" }) |extension| {
             const name = try std.mem.concat(self.arena(), u8, &.{ stem, extension });
@@ -1369,20 +1369,53 @@ pub const ClaudeParser = struct {
         result: ?ResultBlock = null,
     };
 
-    fn collectSpawns(self: *ClaudeParser, graph: *const turns_mod.Graph) ![]Spawn {
-        var spawns: std.ArrayList(Spawn) = .empty;
-        var by_call: std.StringHashMapUnmanaged(?usize) = .empty;
+    const Invocations = std.StringHashMapUnmanaged(Invocation);
+
+    const Invocation = struct {
+        record: usize,
+        block: ?usize,
+
+        fn declaredBy(self: Invocation, record: usize, block: usize) bool {
+            return self.record == record and self.block == block;
+        }
+    };
+
+    fn invocations(self: *ClaudeParser, graph: *const turns_mod.Graph) !Invocations {
+        var first: Invocations = .empty;
         for (self.records.items, 0..) |record, index| {
             if (!graph.modeled[index]) continue;
             if (record.isModelResponse()) {
-                for (record.blocks) |block| {
+                for (record.blocks, 0..) |block, block_index| {
                     if (block.kind != .tool_use) continue;
                     const call_id = block.call_id orelse continue;
-                    const entry = try by_call.getOrPut(self.arena(), call_id);
-                    if (entry.found_existing) continue;
-                    entry.value_ptr.* = null;
+                    const entry = try first.getOrPut(self.arena(), call_id);
+                    if (!entry.found_existing) entry.value_ptr.* = .{
+                        .record = index,
+                        .block = block_index,
+                    };
+                }
+            }
+            for (record.results) |result| {
+                const entry = try first.getOrPut(self.arena(), result.call_id);
+                if (!entry.found_existing) entry.value_ptr.* = .{ .record = index, .block = null };
+            }
+        }
+        return first;
+    }
+
+    fn collectSpawns(self: *ClaudeParser, graph: *const turns_mod.Graph) ![]Spawn {
+        const first = try self.invocations(graph);
+        var spawns: std.ArrayList(Spawn) = .empty;
+        var by_call: std.StringHashMapUnmanaged(usize) = .empty;
+        for (self.records.items, 0..) |record, index| {
+            if (!graph.modeled[index]) continue;
+            if (record.isModelResponse()) {
+                for (record.blocks, 0..) |block, block_index| {
+                    if (block.kind != .tool_use) continue;
+                    const call_id = block.call_id orelse continue;
+                    if (!first.get(call_id).?.declaredBy(index, block_index)) continue;
                     if (!oneOf(block.name orelse "", &.{ "Agent", "Task" })) continue;
-                    entry.value_ptr.* = spawns.items.len;
+                    try by_call.put(self.arena(), call_id, spawns.items.len);
                     try spawns.append(self.arena(), .{
                         .declaration = @intCast(index),
                         .block = block,
@@ -1390,8 +1423,7 @@ pub const ClaudeParser = struct {
                 }
             }
             for (record.results) |result| {
-                const declared = by_call.get(result.call_id) orelse continue;
-                const position = declared orelse continue;
+                const position = by_call.get(result.call_id) orelse continue;
                 if (spawns.items[position].result == null) spawns.items[position].result = result;
             }
         }
@@ -1507,17 +1539,16 @@ pub const ClaudeParser = struct {
         accounting: tokens_mod.Accounting,
         identity: Identity,
     ) !void {
-        var declared: std.StringHashMapUnmanaged(void) = .empty;
+        const first = try self.invocations(graph);
         var finalized: std.StringHashMapUnmanaged(void) = .empty;
         for (self.records.items, 0..) |record, index| {
             if (!graph.modeled[index]) continue;
             const turn = graph.owner[index];
             if (record.isModelResponse()) {
-                for (record.blocks) |block| {
+                for (record.blocks, 0..) |block, block_index| {
                     if (block.kind != .tool_use) continue;
                     const call_id = block.call_id orelse continue;
-                    const entry = try declared.getOrPut(self.arena(), call_id);
-                    if (entry.found_existing) continue;
+                    if (!first.get(call_id).?.declaredBy(index, block_index)) continue;
                     try self.declareTool(record, block, call_id, turn);
                 }
             }

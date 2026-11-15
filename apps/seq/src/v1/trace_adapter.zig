@@ -22,6 +22,7 @@ pub const Options = struct {
     sidecar_dir: ?std.Io.Dir = null,
     claude_discovery: ?*const trace_core.claude_parser.Discovery = null,
     admission: ?*const trace_core.Admission = null,
+    discovery_failure_bytes: ?*?usize = null,
 };
 
 pub const SessionSelection = struct {
@@ -81,8 +82,11 @@ pub fn discoverSessionIdentity(
 ) !SessionIdentity {
     const file = try openTraceFile(io, dir, path);
     defer file.close(io);
-    const stat = try file.stat(io);
     var raw = file.reader(io, &.{});
+    errdefer if (options.discovery_failure_bytes) |sink| {
+        sink.* = std.math.cast(usize, raw.logicalPos()) orelse std.math.maxInt(usize);
+    };
+    const stat = try file.stat(io);
     var input = try SessionInput.init(
         allocator,
         path,
@@ -860,17 +864,7 @@ fn canonicalSessionFilenameSuffix(session_id: []const u8) ?[42]u8 {
     return suffix;
 }
 
-fn canonicalSessionId(session_id: []const u8) bool {
-    if (session_id.len != 36) return false;
-    for (session_id, 0..) |byte, index| {
-        if (index == 8 or index == 13 or index == 18 or index == 23) {
-            if (byte != '-') return false;
-        } else if (!std.ascii.isHex(byte)) {
-            return false;
-        }
-    }
-    return true;
-}
+const canonicalSessionId = trace_core.claude_parser.isUuid;
 
 test "canonical rollout paths preselect exact and excluded sessions" {
     const wanted = "019f9cf9-37b3-7692-9bd6-f479dc16e385";

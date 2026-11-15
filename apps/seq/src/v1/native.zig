@@ -741,7 +741,6 @@ fn runSessionDetail(
 const GraphEdgeView = struct {
     parent: []const u8,
     worker: []const u8,
-    call: ?[]const u8,
 };
 
 fn runSessionGraph(
@@ -783,7 +782,6 @@ fn runSessionGraph(
             try edges.append(arena, .{
                 .parent = try arena.dupe(u8, parent),
                 .worker = try arena.dupe(u8, worker),
-                .call = if (edge.call_id) |call| try arena.dupe(u8, call) else null,
             });
         }
     }
@@ -839,9 +837,7 @@ fn writeReconciledEdges(
     var count: usize = 0;
     for (edges) |edge| {
         if (count == limit) break;
-        const key = try std.fmt.allocPrint(arena, "{s}\x00{s}\x00{s}", .{
-            edge.parent, edge.worker, edge.call orelse "",
-        });
+        const key = try std.fmt.allocPrint(arena, "{s}\x00{s}", .{ edge.parent, edge.worker });
         const seen = try written.getOrPut(arena, key);
         if (seen.found_existing) continue;
         try writeGraphEdge(writer, edge, workers.get(edge.worker).?.contradicted);
@@ -2215,7 +2211,14 @@ fn probeClaudeIdentity(
     reads: ?*DiscoveryReads,
 ) !?trace_adapter.SessionIdentity {
     if (!isClaudeLayoutPath(path)) return null;
-    var identity = try trace_adapter.discoverSessionIdentity(io, dir, allocator, path, .{}, null);
+    var failure_bytes: ?usize = null;
+    const options = trace_adapter.Options{ .discovery_failure_bytes = &failure_bytes };
+    const discovered =
+        trace_adapter.discoverSessionIdentity(io, dir, allocator, path, options, null);
+    var identity = discovered catch |err| {
+        if (failure_bytes) |bytes| if (reads) |sink| try sink.charge(bytes);
+        return err;
+    };
     errdefer identity.deinit(allocator);
     if (reads) |sink| try sink.charge(identity.bytes_read);
     if (identity.source == .claude) return identity;
@@ -3771,14 +3774,8 @@ const FamilyLayout = struct {
     root: []const u8,
 };
 
-fn claudeFamilyLayout(path: []const u8, root: []const u8) ?FamilyLayout {
-    const directory = std.fs.path.dirname(path) orelse return null;
-    if (!trace_core.claude_parser.PathIdentity.read(path).current_layout) {
-        return .{ .base = directory, .root = root };
-    }
-    const session_directory = std.fs.path.dirname(directory) orelse return null;
-    const base = std.fs.path.dirname(session_directory) orelse return null;
-    return .{ .base = base, .root = root };
+fn claudeFamilyLayout(path: []const u8, root: []const u8) FamilyLayout {
+    return .{ .base = trace_core.claude_parser.PathIdentity.read(path).base, .root = root };
 }
 
 pub fn claudeFamilyPathsAlloc(
@@ -3792,7 +3789,7 @@ pub fn claudeFamilyPathsAlloc(
     var identity = discovered orelse return null;
     defer identity.deinit(allocator);
     const root = identity.root_session_id orelse return null;
-    const layout = claudeFamilyLayout(selected, root) orelse return null;
+    const layout = claudeFamilyLayout(selected, root);
     var paths: std.ArrayList([]u8) = .empty;
     errdefer freePaths(allocator, &paths);
     try appendClaudeMain(allocator, io, dir, layout, &paths);
@@ -3899,15 +3896,16 @@ test "session graph reconciliation marks contradictions only for disagreeing par
     var output: std.Io.Writer.Allocating = .init(std.testing.allocator);
     defer output.deinit();
     const resumed = [_]GraphEdgeView{
-        .{ .parent = "root", .worker = "root/agent-w", .call = "call-a" },
-        .{ .parent = "root", .worker = "root/agent-w", .call = "call-b" },
+        .{ .parent = "root", .worker = "root/agent-w" },
+        .{ .parent = "root", .worker = "root/agent-w" },
     };
     try writeReconciledEdges(arena_state.allocator(), &output.writer, &resumed, 10);
     try std.testing.expect(std.mem.indexOf(u8, output.written(), "contradiction") == null);
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, output.written(), " -> "));
     output.clearRetainingCapacity();
     const disagreeing = [_]GraphEdgeView{
-        .{ .parent = "root", .worker = "root/agent-w", .call = "call-a" },
-        .{ .parent = "root/agent-x", .worker = "root/agent-w", .call = "call-a" },
+        .{ .parent = "root", .worker = "root/agent-w" },
+        .{ .parent = "root/agent-x", .worker = "root/agent-w" },
     };
     try writeReconciledEdges(arena_state.allocator(), &output.writer, &disagreeing, 10);
     const marked = std.mem.count(u8, output.written(), "contradiction=true");
