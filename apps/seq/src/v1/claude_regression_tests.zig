@@ -772,3 +772,16 @@ test "family admission refuses a recorded root that is not a UUID" {
     defer if (family) |*paths| native.freePaths(allocator, paths);
     try testing.expect(family == null);
 }
+
+const unplaced_spawn_source = prompt_line ++
+    \\{"type":"assistant","uuid":"q2","parentUuid":"q1","sessionId":"s","cwd":"/w","timestamp":"2026-11-01T00:00:01Z","message":{"id":"m1","role":"assistant","model":"x","stop_reason":"tool_use","content":[{"type":"tool_use","id":"t1","name":"Task","input":{"prompt":"p"}}]}}
+    \\{"type":"user","uuid":"q3","parentUuid":"q2","sessionId":"s","cwd":"/w","timestamp":"2026-11-01T00:00:02Z","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"t1","content":"done"}]}}
+    \\
+;
+
+test "spawns: a spawn call in a response that is not here is counted whatever its result" {
+    var trace = try support.parse(allocator, "unplaced.jsonl", unplaced_spawn_source, .stale);
+    defer trace.deinit(allocator);
+    try testing.expectEqual(@as(usize, 1), trace.claude_limitations.unlocated_spawn_count);
+    try testing.expectEqual(@as(usize, 0), trace.graph_edges.items.len);
+}

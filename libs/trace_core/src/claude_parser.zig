@@ -1446,8 +1446,12 @@ pub const ClaudeParser = struct {
         var admitted: std.ArrayList(AdmittedSpawn) = .empty;
         const root = self.trace.session.root_session_id;
         for (try self.collectSpawns(graph)) |spawn| {
+            if (!accounting.here_records[spawn.declaration]) {
+                self.trace.claude_limitations.unlocated_spawn_count += 1;
+                continue;
+            }
             const agent = spawnedChild(spawn) orelse continue;
-            if (!accounting.here_records[spawn.declaration] or root == null) {
+            if (root == null) {
                 self.trace.claude_limitations.unlocated_spawn_count += 1;
                 continue;
             }
