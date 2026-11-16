@@ -514,10 +514,10 @@ Sidecar contents are discovery facts: they are read once, bound into the corpus
 digest, and reused by the body read, which also writes parent admission into the
 corpus digest. A streaming lineage plan's discovered `sessions` rows judge the
 parent at discovery and take `lineage_conflict` from the body read for every
-session it reads. If a body read changes `lineage_conflict` in a way that changes
-the lineage graph the plan already streamed from, the observation fails with
-`ObservationLineageChangedAfterDiscovery` instead of returning rows from a stale
-closure.
+session it reads. If a body read changes a seed's `lineage_conflict` after the plan
+has streamed from its discovery value, the observation is rerun as a materialized
+graph so the result matches that plan; the receipt charges the reads of both
+attempts.
 `--session-id` accepts a session UUID or a worker ID.
 
 Turns open at an input that got a reply (a model response, an API error or an
@@ -548,7 +548,8 @@ when the representative line records a stop reason, otherwise `provisional`
 uncached + cache read + cache write; reasoning tokens are inside output.
 Session and turn token fields are physical sums that include copied history;
 they are not a session's own consumption. Use the `seq/request-usage`
-definition for authored and observed request totals; `seq/token-usage` returns
+definition (shipped with the Seq skill's standard definitions, not in this
+repository) for authored and observed request totals; `seq/token-usage` returns
 no valid total over Claude Code rows.
 
 An explicit Claude transcript path outside the default corpus admits its

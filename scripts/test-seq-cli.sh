@@ -349,12 +349,12 @@ jq '.selectors += ["session-id"] | .requires.operators += ["filter"] |
       "where": [{"field": "lineage_conflict", "op": "eq", "value": false}]},
     (.pipeline[1] | .inputs = ["clean", "clean", "clean"])]' \
   "$claude_definitions/family-lineage.json" >"$cache_dir/lineage-filter.json"
-if claude_stale=$(claude_isolated observe --definition "$cache_dir/lineage-filter.json" \
+claude_restaged=$(claude_isolated observe --definition "$cache_dir/lineage-filter.json" \
   --projection rows --root "$claude_conflict_root" \
-  --session-id d0000000-0000-4000-8000-000000000006 --format json); then
-  exit 1
-fi
-jq -e '.code == "ObservationLineageChangedAfterDiscovery"' <<<"$claude_stale" >/dev/null
+  --session-id d0000000-0000-4000-8000-000000000006 --format json)
+jq -e '(.data.rows | map(.session_id)) == ["d0000000-0000-4000-8000-000000000006"] and
+  .stats.discovery_files_opened > 0 and .stats.discovery_bytes_read > 0 and
+  .corpus.parser_warning_count > 0' <<<"$claude_restaged" >/dev/null
 
 external_output=$("$binary" observe \
   --definition "$external_definition" \
