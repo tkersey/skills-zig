@@ -203,7 +203,10 @@ grep -Fq '"code":"PiCumulativeTokenEventsUnavailable"' <<<"$pi_usage_error"
 claude_fixtures=apps/seq/src/v1/fixtures/claude
 "$binary" capabilities --format json |
   jq -e '.source_adapters | any(.[]; . == "claude-code-transcript-jsonl/v1")' >/dev/null
-claude_turns=$("$binary" turns --path "$claude_fixtures/turn-outcomes.jsonl" --format json)
+claude_outcomes="$cache_dir/turn-outcomes.jsonl"
+cp "$claude_fixtures/turn-outcomes.jsonl" "$claude_outcomes"
+touch -t 202001010000 "$claude_outcomes"
+claude_turns=$("$binary" turns --path "$claude_outcomes" --format json)
 jq -e 'map(.status_reason) == ["claude_end_turn", "claude_tool_ended_turn",
   "claude_interrupted", "claude_text_end", "claude_superseded", "stale_ongoing_file"]' \
   <<<"$claude_turns" >/dev/null
