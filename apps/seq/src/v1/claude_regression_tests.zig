@@ -707,3 +707,21 @@ test "time pruning: a failed Claude probe is charged to discovery reads" {
     try testing.expectEqual(@as(usize, 1), paths.items.len);
     try testing.expectEqual(@as(usize, 1), reads.opened);
 }
+
+test "sidecar: a sidecar of exactly 64 KiB is read" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var files = workerTree();
+    const sidecar = @embedFile(worker_base ++ worker_name ++ ".meta.json");
+    const trimmed = std.mem.trimEnd(u8, sidecar, " \t\r\n");
+    const padded = try allocator.alloc(u8, trace_core.claude_parser.sidecar_bytes_max);
+    defer allocator.free(padded);
+    @memset(padded, ' ');
+    @memcpy(padded[0..trimmed.len], trimmed);
+    files[2].bytes = padded;
+    try support.writeTree(tmp.dir, &files);
+    var trace = try parseAdmitted(tmp.dir, files[1].path, &.{ files[0].path, files[1].path });
+    defer trace.deinit(allocator);
+    try testing.expect(!trace.claude_limitations.worker_parent_unread);
+    try testing.expect(!trace.session.lineage_conflict);
+}

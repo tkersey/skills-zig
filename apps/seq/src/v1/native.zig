@@ -742,6 +742,7 @@ const GraphEdgeView = struct {
     parent: []const u8,
     worker: []const u8,
     call: ?[]const u8,
+    claude: bool = true,
 };
 
 fn runSessionGraph(
@@ -784,19 +785,14 @@ fn runSessionGraph(
                 .parent = try arena.dupe(u8, parent),
                 .worker = try arena.dupe(u8, worker),
                 .call = if (edge.call_id) |call| try arena.dupe(u8, call) else null,
+                .claude = trace.source == .claude,
             });
         }
     }
     const claude_graph = corpus.claude and !corpus.other;
     const graph_name = if (claude_graph) "claude_sessions" else "codex_sessions";
     try writer.print("digraph {s} {{\n", .{graph_name});
-    if (claude_graph) {
-        try writeReconciledEdges(arena, writer, edges.items, options.limit);
-    } else {
-        for (edges.items[0..@min(edges.items.len, options.limit)]) |edge| {
-            try writeGraphEdge(writer, edge, false);
-        }
-    }
+    try writeReconciledEdges(arena, writer, edges.items, options.limit);
     try writer.writeAll("}\n");
 }
 
@@ -826,6 +822,7 @@ fn writeReconciledEdges(
 ) !void {
     var workers: std.StringHashMapUnmanaged(WorkerAssertion) = .empty;
     for (edges) |edge| {
+        if (!edge.claude) continue;
         const entry = try workers.getOrPut(arena, edge.worker);
         if (!entry.found_existing) {
             entry.value_ptr.* = .{ .parent = edge.parent };
@@ -839,6 +836,11 @@ fn writeReconciledEdges(
     var count: usize = 0;
     for (edges) |edge| {
         if (count == limit) break;
+        if (!edge.claude) {
+            try writeGraphEdge(writer, edge, false);
+            count += 1;
+            continue;
+        }
         const key = try std.fmt.allocPrint(arena, "{s}\x00{s}\x00{c}{s}", .{
             edge.parent,
             edge.worker,
@@ -3918,6 +3920,25 @@ test "session graph reconciliation marks contradictions only for disagreeing par
     try writeReconciledEdges(arena_state.allocator(), &output.writer, &disagreeing, 10);
     const marked = std.mem.count(u8, output.written(), "contradiction=true");
     try std.testing.expectEqual(@as(usize, 2), marked);
+}
+
+test "session graph reconciles Claude edges in a mixed corpus and leaves others as read" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    var output: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer output.deinit();
+    const mixed = [_]GraphEdgeView{
+        .{ .parent = "codex-root", .worker = "codex-w", .call = "c", .claude = false },
+        .{ .parent = "root", .worker = "root/agent-w", .call = "call-a" },
+        .{ .parent = "codex-root", .worker = "codex-w", .call = "c", .claude = false },
+        .{ .parent = "root", .worker = "root/agent-w", .call = "call-a" },
+        .{ .parent = "root/agent-x", .worker = "root/agent-w", .call = "call-a" },
+    };
+    try writeReconciledEdges(arena_state.allocator(), &output.writer, &mixed, 10);
+    const text = output.written();
+    try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, text, "\"codex-w\";"));
+    try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, text, "contradiction=true"));
+    try std.testing.expectEqual(@as(usize, 4), std.mem.count(u8, text, " -> "));
 }
 
 const regression_root = "d0000000-0000-4000-8000-000000000001";
