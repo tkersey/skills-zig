@@ -1058,6 +1058,7 @@ const SourceState = struct {
     prefix_only: bool = false,
     pending: std.ArrayList(PendingLine) = .empty,
     saw_record: bool = false,
+    saw_line: bool = false,
     codex_vote: bool = false,
 
     fn deinit(self: *SourceState, allocator: std.mem.Allocator) void {
@@ -1102,7 +1103,7 @@ const SourceState = struct {
     }
 
     fn source(self: *const SourceState) !TraceSource {
-        const decided = self.decided orelse return .none;
+        const decided = self.decided orelse return if (self.saw_line) .codex else .none;
         if (decided != .codex) return decided;
         if (self.codex_vote) return .codex;
         if (self.saw_record and !self.prefix_only) return error.UnclassifiedSessionFormat;
@@ -1197,6 +1198,7 @@ fn parseSessionLines(
         {
             continue;
         }
+        state.saw_line = true;
         const root = scratch.parse(line) catch |err| switch (err) {
             error.OutOfMemory => return err,
             else => {

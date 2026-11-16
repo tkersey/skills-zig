@@ -725,3 +725,14 @@ test "sidecar: a sidecar of exactly 64 KiB is read" {
     try testing.expect(!trace.claude_limitations.worker_parent_unread);
     try testing.expect(!trace.session.lineage_conflict);
 }
+
+test "classification: a file of only malformed or non-object lines stays Codex as in 1.4.0" {
+    for ([_][]const u8{ "{not json\n", "[1,2]\n5\n", "{not json\n[1]\n" }) |bytes| {
+        var trace = try parseBytes("/malformed.jsonl", bytes);
+        defer trace.deinit(allocator);
+        try testing.expectEqual(trace_core.TraceSource.codex, trace.source);
+    }
+    var empty = try parseBytes("/empty.jsonl", "\n  \n");
+    defer empty.deinit(allocator);
+    try testing.expectEqual(trace_core.TraceSource.none, empty.source);
+}
