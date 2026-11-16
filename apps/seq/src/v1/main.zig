@@ -1127,7 +1127,7 @@ const GraphObservationContext = struct {
                 .source_row_count = result.source_rows,
                 .materialized_row_count = result.materialized_rows,
             },
-            .corpus_adapter = metrics.adapter orelse source_adapter_version,
+            .corpus_adapter = metrics.reportedAdapter() orelse source_adapter_version,
             .corpus_digest = digest,
             .corpus_files = metrics.files,
             .corpus_sessions = metrics.sessions,
@@ -1348,7 +1348,7 @@ fn readMaterializedGraphPaths(
         defer if (selected.parsed) |*parsed| parsed.deinit(graph.allocator);
         try recordTraceRead(metrics, selected);
         const parsed = if (selected.parsed) |*value| value else continue;
-        try metrics.admitAdapter(seq.trace_adapter.adapterId(&parsed.trace));
+        try metrics.admitTrace(&parsed.trace);
         try recordCorpusBytes(metrics, parsed.metrics.bytes_read, input_bound);
         if (selection == .physical and !(if (sessions_only)
             seq.native.sessionPasses(parsed.trace.session, selectors)
@@ -1953,7 +1953,7 @@ const StreamingGraphState = struct {
                 .width = reducer.width,
             });
         };
-        try self.metrics.admitAdapter(seq.trace_adapter.adapterId(&parsed.trace));
+        try self.metrics.admitTrace(&parsed.trace);
         try countTraceSession(&self.metrics, parsed);
         try self.patchSeed(task, &parsed.trace.session);
         try self.corpus_entries.append(self.graph.allocator, .{
@@ -2448,7 +2448,7 @@ fn physicalExecution(
     return .{
         .result = try runner.finish(),
         .runner = runner.*,
-        .corpus_adapter = metrics.adapter orelse source_adapter_version,
+        .corpus_adapter = metrics.reportedAdapter() orelse source_adapter_version,
         .corpus_digest = digest_set.digest(),
         .corpus_files = metrics.files,
         .corpus_sessions = metrics.sessions,
@@ -2473,7 +2473,18 @@ const PhysicalMetrics = struct {
     source_metadata: SourceMetadataHasher = .{},
     warnings: usize = 0,
     adapter: ?[]const u8 = null,
+    weak_adapter: ?[]const u8 = null,
     claude: ClaudeLimitationCounts = .{},
+
+    fn admitTrace(self: *PhysicalMetrics, trace: *const seq.trace_adapter.Trace) !void {
+        const vote = seq.trace_adapter.adapterId(trace);
+        if (!trace.source_unparsed) return self.admitAdapter(vote);
+        if (self.weak_adapter == null) self.weak_adapter = vote;
+    }
+
+    fn reportedAdapter(self: PhysicalMetrics) ?[]const u8 {
+        return self.adapter orelse self.weak_adapter;
+    }
 
     fn admitAdapter(self: *PhysicalMetrics, vote: ?[]const u8) !void {
         const adapter = vote orelse return;
@@ -2652,7 +2663,7 @@ fn feedTraceFile(
     try recordTraceRead(metrics, selected);
     var parsed = selected.parsed orelse return .continue_scanning;
     defer parsed.deinit(allocator);
-    try metrics.admitAdapter(seq.trace_adapter.adapterId(&parsed.trace));
+    try metrics.admitTrace(&parsed.trace);
     try recordCorpusBytes(metrics, parsed.metrics.bytes_read, bounds.max_input_bytes);
     if (relation == .sessions) {
         if (!seq.native.sessionPasses(

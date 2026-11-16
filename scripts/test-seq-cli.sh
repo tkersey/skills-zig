@@ -354,6 +354,16 @@ claude_restaged=$(claude_isolated observe --definition "$cache_dir/lineage-filte
   --session-id d0000000-0000-4000-8000-000000000006 --format json)
 jq -e '(.data.rows | map(.session_id)) == ["d0000000-0000-4000-8000-000000000006"] and
   .corpus.parser_warning_count > 0' <<<"$claude_restaged" >/dev/null
+claude_truncated_root="$cache_dir/claude-truncated"
+mkdir -p "$claude_truncated_root/proj"
+cp "$claude_fixtures/worker/proj/$claude_root_id.jsonl" "$claude_truncated_root/proj/"
+printf '{"type":"user","uuid":"u1","sessi' \
+  >"$claude_truncated_root/proj/e0000000-0000-4000-8000-000000000002.jsonl"
+claude_truncated=$(claude_isolated observe \
+  --definition "$claude_definitions/session-exclusion.json" --projection rows \
+  --root "$claude_truncated_root" --param exclude_session_id=none --format json)
+jq -e '.corpus.adapter == "claude-code-transcript-jsonl/v1" and
+  .corpus.parser_warning_count == 1' <<<"$claude_truncated" >/dev/null
 
 external_output=$("$binary" observe \
   --definition "$external_definition" \

@@ -4,6 +4,7 @@ const trace_core = @import("trace_core");
 pub const SessionInput = trace_core.SessionInput;
 pub const SessionRecord = trace_core.SessionRecord;
 pub const Admission = trace_core.Admission;
+pub const Trace = trace_core.CanonicalSessionTrace;
 const definition = @import("definition.zig");
 const execution = @import("execution.zig");
 const physical = @import("physical.zig");
@@ -352,7 +353,9 @@ fn admitSelectedInput(
         return skippedSelection(true, preselection.bytes_read);
     }
     var body_options = options;
-    if (preselection.discovery) |*facts| body_options.claude_discovery = facts;
+    if (body_options.claude_discovery == null) {
+        if (preselection.discovery) |*facts| body_options.claude_discovery = facts;
+    }
     if (!SessionInput.isCompressed(path) and stat.size > options.max_input_bytes) {
         return error.ObservationInputByteBoundExceeded;
     }
@@ -930,6 +933,7 @@ fn parseDiscoveryLine(
             .as_of_ns = options.as_of_ns,
             .sidecar_dir = options.sidecar_dir,
             .admission = options.admission,
+            .claude_discovery = options.claude_discovery,
             .discovery_prefix = true,
         },
     );

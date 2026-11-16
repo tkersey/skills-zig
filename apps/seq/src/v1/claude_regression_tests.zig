@@ -786,12 +786,48 @@ test "spawns: a spawn call in a response that is not here is counted whatever it
     try testing.expectEqual(@as(usize, 0), trace.graph_edges.items.len);
 }
 
-test "classification: a Claude-named file of only unparsed lines casts no vote" {
+test "classification: an unparsed-only file keeps its Codex reading as a fallback source" {
     const path = "/p/e0000000-0000-4000-8000-000000000001.jsonl";
     var truncated = try parseBytes(path, "{\"type\":\"user\",\"uuid\":\"u1\",\"sessi\n");
     defer truncated.deinit(allocator);
-    try testing.expectEqual(trace_core.TraceSource.none, truncated.source);
-    var worker = try parseBytes("/p/agent-a1.jsonl", "{not json\n");
-    defer worker.deinit(allocator);
-    try testing.expectEqual(trace_core.TraceSource.none, worker.source);
+    try testing.expectEqual(trace_core.TraceSource.codex, truncated.source);
+    try testing.expect(truncated.source_unparsed);
+    var parsed = try parseBytes(path, prompt_line);
+    defer parsed.deinit(allocator);
+    try testing.expect(!parsed.source_unparsed);
+}
+
+test "selected body reads reuse discovered sidecar facts instead of reading the sidecar again" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const files = workerTree();
+    try support.writeTree(tmp.dir, &files);
+    const worker = files[1].path;
+    var admission = try trace_core.Admission.initAlloc(allocator, &.{ files[0].path, worker });
+    defer admission.deinit(allocator);
+    const options = trace_adapter.Options{ .admission = &admission };
+    var identity = try trace_adapter.discoverSessionIdentity(
+        testing.io,
+        tmp.dir,
+        allocator,
+        worker,
+        options,
+        null,
+    );
+    defer identity.deinit(allocator);
+    try tmp.dir.deleteFile(testing.io, files[2].path);
+    var supplied = options;
+    supplied.claude_discovery = &identity.claude_discovery.?;
+    var selected = try trace_adapter.parseRelationsFileSelected(
+        testing.io,
+        tmp.dir,
+        allocator,
+        &.{.sessions},
+        worker,
+        supplied,
+        .{ .repo = "/" },
+    );
+    defer if (selected.parsed) |*parsed| parsed.deinit(allocator);
+    const parsed = selected.parsed orelse return error.TestExpectedParse;
+    try testing.expect(!parsed.trace.claude_limitations.worker_parent_unread);
 }

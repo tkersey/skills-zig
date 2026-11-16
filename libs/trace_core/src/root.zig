@@ -514,6 +514,7 @@ pub const CanonicalSessionTrace = struct {
     token_events: std.ArrayList(TokenEventRecord) = .empty,
     warnings: std.ArrayList([]u8) = .empty,
     source: TraceSource = .none,
+    source_unparsed: bool = false,
     claude_limitations: claude_parser.Limitations = .{},
     claude_discovery: ?claude_parser.Discovery = null,
     claude_discovery_bytes: usize = 0,
@@ -1059,15 +1060,7 @@ const SourceState = struct {
     pending: std.ArrayList(PendingLine) = .empty,
     saw_record: bool = false,
     saw_line: bool = false,
-    claude_named: bool = false,
     codex_vote: bool = false,
-
-    fn init(prefix_only: bool, path: []const u8) SourceState {
-        return .{
-            .prefix_only = prefix_only,
-            .claude_named = claude_parser.PathIdentity.read(path).layoutNamed(),
-        };
-    }
 
     fn deinit(self: *SourceState, allocator: std.mem.Allocator) void {
         for (self.pending.items) |pending| allocator.free(pending.bytes);
@@ -1111,8 +1104,7 @@ const SourceState = struct {
     }
 
     fn source(self: *const SourceState) !TraceSource {
-        const unparsed_codex = self.saw_line and !self.claude_named;
-        const decided = self.decided orelse return if (unparsed_codex) .codex else .none;
+        const decided = self.decided orelse return if (self.saw_line) .codex else .none;
         if (decided != .codex) return decided;
         if (self.codex_vote) return .codex;
         if (self.saw_record and !self.prefix_only) return error.UnclassifiedSessionFormat;
@@ -1182,7 +1174,7 @@ fn parseSessionLines(
 ) !TraceSource {
     var facts: SessionFacts = .{};
     defer facts.deinit(allocator);
-    var state = SourceState.init(prefix_only, trace.session.path);
+    var state = SourceState{ .prefix_only = prefix_only };
     defer state.deinit(allocator);
     const sinks = LineSinks{
         .allocator = allocator,
@@ -1235,6 +1227,7 @@ fn parseSessionLines(
         try sinks.replay(parser, &state);
     }
     metrics.* = .{ .bytes_read = lines.bytes_read, .lines_seen = lines.line_number };
+    trace.source_unparsed = state.decided == null and state.saw_line;
     return state.source();
 }
 
