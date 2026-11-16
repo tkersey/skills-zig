@@ -1399,7 +1399,6 @@ fn executeGraphObservation(
         &context.native_plan,
         args.projection,
     )) |schedule| {
-        var spent = PhysicalMetrics{};
         return executeStreamingGraphObservation(
             io,
             dir,
@@ -1408,13 +1407,7 @@ fn executeGraphObservation(
             context,
             bindings,
             schedule,
-            &spent,
-        ) catch |err| switch (err) {
-            error.ObservationLineageChangedAfterDiscovery => {
-                return executeMaterializedGraph(io, dir, allocator, args, context, bindings, spent);
-            },
-            else => return err,
-        };
+        );
     }
     if (try seq.relation_graph.boundedNativePrefix(
         &context.definition_plan,
@@ -1433,17 +1426,16 @@ fn executeGraphObservation(
     {
         return error.ObservationStreamingLineageShapeUnsupported;
     }
-    return executeMaterializedGraph(io, dir, allocator, args, context, bindings, .{});
+    return executeMaterializedGraphObservation(io, dir, allocator, args, context, bindings);
 }
 
-fn executeMaterializedGraph(
+fn executeMaterializedGraphObservation(
     io: std.Io,
     dir: std.Io.Dir,
     allocator: std.mem.Allocator,
     args: *const ObserveArgs,
     context: *const seq.compiled_plan.PlanSet,
     bindings: *const definition_core.parameters.Bindings,
-    spent: PhysicalMetrics,
 ) !ObservationExecution {
     const scan_stages = try seq.relation_graph.requiredScanStages(
         allocator,
@@ -1470,7 +1462,6 @@ fn executeMaterializedGraph(
     defer seq.native.freePaths(allocator, &paths);
     try rows.reserve(&graph, paths.items.len);
     var metrics = PhysicalMetrics{};
-    try metrics.addSpentReads(spent);
     try recordFamilyDiscovery(&metrics, family);
     var digest_set = CorpusSetHasher{};
     const selection: GraphSelection = if (physical_selection) .physical else .corpus;
@@ -1834,7 +1825,6 @@ const StreamingGraphState = struct {
     materialized_rows: usize,
     session_seed: ?*seq.relation_graph.ScanInput = null,
     seed_columns: SeedColumns = .{},
-    lineage_changed: bool = false,
 
     corpus_entries: std.ArrayList(CorpusEntry) = .empty,
     discovered: []const DiscoveredSession = &.{},
@@ -1864,16 +1854,7 @@ const StreamingGraphState = struct {
             else
                 .{ .integer = session.token_usage_observation_count };
         }
-        if (columns.lineage) |column| {
-            const seeded = values[column];
-            const conflict = session.lineage_conflict;
-            if (seeded != .boolean or seeded.boolean != conflict) self.lineage_changed = true;
-            values[column] = .{ .boolean = conflict };
-        }
-    }
-
-    fn checkLineageGraph(self: *const StreamingGraphState) !void {
-        if (self.lineage_changed) return error.ObservationLineageChangedAfterDiscovery;
+        if (columns.lineage) |column| values[column] = .{ .boolean = session.lineage_conflict };
     }
 
     fn deinit(self: *StreamingGraphState) void {
@@ -2028,7 +2009,6 @@ const StreamingGraphState = struct {
         const graph = self.graph;
         std.mem.sort(CorpusEntry, self.corpus_entries.items, {}, corpusEntryLessThan);
         try self.countUnreadSeeds();
-        try self.checkLineageGraph();
         for (self.corpus_entries.items) |entry| self.digest_set.add(entry.path, &entry.digest);
         self.bindSourceMetadata();
         const owned = try reducer.finish();
@@ -2133,7 +2113,6 @@ fn executeStreamingGraphObservation(
     context: *const seq.compiled_plan.PlanSet,
     bindings: *const definition_core.parameters.Bindings,
     schedule: seq.relation_graph.StreamingLineagePlan,
-    spent: *PhysicalMetrics,
 ) !ObservationExecution {
     const arena = try allocator.create(std.heap.ArenaAllocator);
     errdefer allocator.destroy(arena);
@@ -2174,7 +2153,6 @@ fn executeStreamingGraphObservation(
         .session_seed = &session_seed[0],
         .seed_columns = .init(context, session_seed[0].stage_index),
     };
-    errdefer spent.* = state.metrics;
     if (args.selectors.session_id) |wanted| try requireDiscoveredSession(&discovered, wanted);
     try state.recordDiscovery(&discovered, paths.items);
     defer state.deinit();
@@ -2496,17 +2474,6 @@ const PhysicalMetrics = struct {
     warnings: usize = 0,
     adapter: ?[]const u8 = null,
     claude: ClaudeLimitationCounts = .{},
-
-    fn addSpentReads(self: *PhysicalMetrics, spent: PhysicalMetrics) !void {
-        const add = std.math.add;
-        const overflow = error.ObservationMetricOverflow;
-        self.opened = add(usize, self.opened, spent.opened) catch return overflow;
-        self.bytes_read = add(usize, self.bytes_read, spent.bytes_read) catch return overflow;
-        self.discovery_opened = add(usize, self.discovery_opened, spent.discovery_opened) catch
-            return overflow;
-        self.discovery_bytes = add(usize, self.discovery_bytes, spent.discovery_bytes) catch
-            return overflow;
-    }
 
     fn admitAdapter(self: *PhysicalMetrics, vote: ?[]const u8) !void {
         const adapter = vote orelse return;

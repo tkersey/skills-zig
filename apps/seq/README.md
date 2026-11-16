@@ -514,10 +514,9 @@ Sidecar contents are discovery facts: they are read once, bound into the corpus
 digest, and reused by the body read, which also writes parent admission into the
 corpus digest. A streaming lineage plan's discovered `sessions` rows judge the
 parent at discovery and take `lineage_conflict` from the body read for every
-session it reads. If a body read changes a seed's `lineage_conflict` after the plan
-has streamed from its discovery value, the observation is rerun as a materialized
-graph so the result matches that plan; the receipt charges the reads of both
-attempts.
+session it reads. Its lineage closure is selected from those discovery facts:
+later lines never change selection, so a worker identity contradiction found by
+the body read is a warning and appears on the row without moving the closure.
 `--session-id` accepts a session UUID or a worker ID.
 
 Turns open at an input that got a reply (a model response, an API error or an

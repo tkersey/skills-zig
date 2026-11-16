@@ -353,7 +353,6 @@ claude_restaged=$(claude_isolated observe --definition "$cache_dir/lineage-filte
   --projection rows --root "$claude_conflict_root" \
   --session-id d0000000-0000-4000-8000-000000000006 --format json)
 jq -e '(.data.rows | map(.session_id)) == ["d0000000-0000-4000-8000-000000000006"] and
-  .stats.discovery_files_opened > 0 and .stats.discovery_bytes_read > 0 and
   .corpus.parser_warning_count > 0' <<<"$claude_restaged" >/dev/null
 
 external_output=$("$binary" observe \
