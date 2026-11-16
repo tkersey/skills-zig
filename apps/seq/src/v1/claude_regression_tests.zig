@@ -785,3 +785,13 @@ test "spawns: a spawn call in a response that is not here is counted whatever it
     try testing.expectEqual(@as(usize, 1), trace.claude_limitations.unlocated_spawn_count);
     try testing.expectEqual(@as(usize, 0), trace.graph_edges.items.len);
 }
+
+test "classification: a Claude-named file of only unparsed lines casts no vote" {
+    const path = "/p/e0000000-0000-4000-8000-000000000001.jsonl";
+    var truncated = try parseBytes(path, "{\"type\":\"user\",\"uuid\":\"u1\",\"sessi\n");
+    defer truncated.deinit(allocator);
+    try testing.expectEqual(trace_core.TraceSource.none, truncated.source);
+    var worker = try parseBytes("/p/agent-a1.jsonl", "{not json\n");
+    defer worker.deinit(allocator);
+    try testing.expectEqual(trace_core.TraceSource.none, worker.source);
+}
