@@ -741,6 +741,7 @@ fn runSessionDetail(
 const GraphEdgeView = struct {
     parent: []const u8,
     worker: []const u8,
+    call: ?[]const u8,
 };
 
 fn runSessionGraph(
@@ -782,6 +783,7 @@ fn runSessionGraph(
             try edges.append(arena, .{
                 .parent = try arena.dupe(u8, parent),
                 .worker = try arena.dupe(u8, worker),
+                .call = if (edge.call_id) |call| try arena.dupe(u8, call) else null,
             });
         }
     }
@@ -837,7 +839,12 @@ fn writeReconciledEdges(
     var count: usize = 0;
     for (edges) |edge| {
         if (count == limit) break;
-        const key = try std.fmt.allocPrint(arena, "{s}\x00{s}", .{ edge.parent, edge.worker });
+        const key = try std.fmt.allocPrint(arena, "{s}\x00{s}\x00{c}{s}", .{
+            edge.parent,
+            edge.worker,
+            @as(u8, if (edge.call == null) '0' else '1'),
+            edge.call orelse "",
+        });
         const seen = try written.getOrPut(arena, key);
         if (seen.found_existing) continue;
         try writeGraphEdge(writer, edge, workers.get(edge.worker).?.contradicted);
@@ -3896,16 +3903,17 @@ test "session graph reconciliation marks contradictions only for disagreeing par
     var output: std.Io.Writer.Allocating = .init(std.testing.allocator);
     defer output.deinit();
     const resumed = [_]GraphEdgeView{
-        .{ .parent = "root", .worker = "root/agent-w" },
-        .{ .parent = "root", .worker = "root/agent-w" },
+        .{ .parent = "root", .worker = "root/agent-w", .call = "call-a" },
+        .{ .parent = "root", .worker = "root/agent-w", .call = "call-b" },
+        .{ .parent = "root", .worker = "root/agent-w", .call = "call-a" },
     };
     try writeReconciledEdges(arena_state.allocator(), &output.writer, &resumed, 10);
     try std.testing.expect(std.mem.indexOf(u8, output.written(), "contradiction") == null);
-    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, output.written(), " -> "));
+    try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, output.written(), " -> "));
     output.clearRetainingCapacity();
     const disagreeing = [_]GraphEdgeView{
-        .{ .parent = "root", .worker = "root/agent-w" },
-        .{ .parent = "root/agent-x", .worker = "root/agent-w" },
+        .{ .parent = "root", .worker = "root/agent-w", .call = "call-a" },
+        .{ .parent = "root/agent-x", .worker = "root/agent-w", .call = "call-a" },
     };
     try writeReconciledEdges(arena_state.allocator(), &output.writer, &disagreeing, 10);
     const marked = std.mem.count(u8, output.written(), "contradiction=true");

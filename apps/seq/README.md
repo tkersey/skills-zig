@@ -502,8 +502,9 @@ calls in responses that this transcript's request records prove it made.
 `session_edges` keeps each file's assertion separately. A spawner's claim and a worker's
 sidecar live in different files, so a per-file `lineage_conflict` cannot see their
 disagreement; consumers that read both reconcile them. `seq session-graph --format
-dot` names a Claude corpus `claude_sessions`, prints agreeing assertions once, and
-marks every edge of a worker whose assertions disagree on its parent with
+dot` names a Claude corpus `claude_sessions`, reconciles assertions by parent, worker
+and call (printing each distinct triple once, so a resumed worker shows one edge per
+call), and marks every edge of a worker whose assertions disagree on its parent with
 `[contradiction=true]`; it never chooses between them. Assertions that name the
 same parent under different calls, such as a resumed worker, agree. The `seq/request-usage`
 definition treats such a worker as a lineage conflict for worker-scoped totals.

@@ -899,6 +899,7 @@ pub const ClaudeParser = struct {
     arena_state: std.heap.ArenaAllocator,
     records: std.ArrayList(Record) = .empty,
     prefix: Prefix = .{},
+    declared: ?Declarations = null,
 
     pub fn init(
         allocator: std.mem.Allocator,
@@ -1369,59 +1370,54 @@ pub const ClaudeParser = struct {
         result: ?ResultBlock = null,
     };
 
-    const Invocations = std.StringHashMapUnmanaged(Invocation);
+    const Declarations = std.StringHashMapUnmanaged(Declaration);
 
-    const Invocation = struct {
+    const Declaration = struct {
         record: usize,
-        block: ?usize,
+        block: usize,
 
-        fn declaredBy(self: Invocation, record: usize, block: usize) bool {
+        fn is(self: Declaration, record: usize, block: usize) bool {
             return self.record == record and self.block == block;
         }
     };
 
-    fn invocations(self: *ClaudeParser, graph: *const turns_mod.Graph) !Invocations {
-        var first: Invocations = .empty;
+    fn declarations(self: *ClaudeParser, graph: *const turns_mod.Graph) !*const Declarations {
+        if (self.declared) |*known| return known;
+        var first: Declarations = .empty;
         for (self.records.items, 0..) |record, index| {
-            if (!graph.modeled[index]) continue;
-            if (record.isModelResponse()) {
-                for (record.blocks, 0..) |block, block_index| {
-                    if (block.kind != .tool_use) continue;
-                    const call_id = block.call_id orelse continue;
-                    const entry = try first.getOrPut(self.arena(), call_id);
-                    if (!entry.found_existing) entry.value_ptr.* = .{
-                        .record = index,
-                        .block = block_index,
-                    };
-                }
-            }
-            for (record.results) |result| {
-                const entry = try first.getOrPut(self.arena(), result.call_id);
-                if (!entry.found_existing) entry.value_ptr.* = .{ .record = index, .block = null };
+            if (!graph.modeled[index] or !record.isModelResponse()) continue;
+            for (record.blocks, 0..) |block, block_index| {
+                if (block.kind != .tool_use) continue;
+                const call_id = block.call_id orelse continue;
+                const entry = try first.getOrPut(self.arena(), call_id);
+                if (!entry.found_existing) entry.value_ptr.* = .{
+                    .record = index,
+                    .block = block_index,
+                };
             }
         }
-        return first;
+        self.declared = first;
+        return &self.declared.?;
     }
 
     fn collectSpawns(self: *ClaudeParser, graph: *const turns_mod.Graph) ![]Spawn {
-        const first = try self.invocations(graph);
+        const first = try self.declarations(graph);
         var spawns: std.ArrayList(Spawn) = .empty;
         var by_call: std.StringHashMapUnmanaged(usize) = .empty;
         for (self.records.items, 0..) |record, index| {
-            if (!graph.modeled[index]) continue;
-            if (record.isModelResponse()) {
-                for (record.blocks, 0..) |block, block_index| {
-                    if (block.kind != .tool_use) continue;
-                    const call_id = block.call_id orelse continue;
-                    if (!first.get(call_id).?.declaredBy(index, block_index)) continue;
-                    if (!oneOf(block.name orelse "", &.{ "Agent", "Task" })) continue;
-                    try by_call.put(self.arena(), call_id, spawns.items.len);
-                    try spawns.append(self.arena(), .{
-                        .declaration = @intCast(index),
-                        .block = block,
-                    });
-                }
+            if (!graph.modeled[index] or !record.isModelResponse()) continue;
+            for (record.blocks, 0..) |block, block_index| {
+                if (block.kind != .tool_use) continue;
+                const call_id = block.call_id orelse continue;
+                if (!first.get(call_id).?.is(index, block_index)) continue;
+                if (!oneOf(block.name orelse "", &.{ "Agent", "Task" })) continue;
+                try by_call.put(self.arena(), call_id, spawns.items.len);
+                const spawn = Spawn{ .declaration = @intCast(index), .block = block };
+                try spawns.append(self.arena(), spawn);
             }
+        }
+        for (self.records.items, 0..) |record, index| {
+            if (!graph.modeled[index]) continue;
             for (record.results) |result| {
                 const position = by_call.get(result.call_id) orelse continue;
                 if (spawns.items[position].result == null) spawns.items[position].result = result;
@@ -1533,14 +1529,20 @@ pub const ClaudeParser = struct {
         try self.trace.graph_edges.append(self.allocator, edge);
     }
 
+    const EarlyResult = struct {
+        record: usize,
+        result: ResultBlock,
+    };
+
     fn emitTools(
         self: *ClaudeParser,
         graph: *const turns_mod.Graph,
         accounting: tokens_mod.Accounting,
         identity: Identity,
     ) !void {
-        const first = try self.invocations(graph);
+        const first = try self.declarations(graph);
         var finalized: std.StringHashMapUnmanaged(void) = .empty;
+        var early: std.StringHashMapUnmanaged(EarlyResult) = .empty;
         for (self.records.items, 0..) |record, index| {
             if (!graph.modeled[index]) continue;
             const turn = graph.owner[index];
@@ -1548,13 +1550,21 @@ pub const ClaudeParser = struct {
                 for (record.blocks, 0..) |block, block_index| {
                     if (block.kind != .tool_use) continue;
                     const call_id = block.call_id orelse continue;
-                    if (!first.get(call_id).?.declaredBy(index, block_index)) continue;
+                    if (!first.get(call_id).?.is(index, block_index)) continue;
                     try self.declareTool(record, block, call_id, turn);
+                    const waiting = early.get(call_id) orelse continue;
+                    try self.finalizeTool(self.records.items[waiting.record], waiting.result, turn);
                 }
             }
             for (record.results) |result| {
                 const entry = try finalized.getOrPut(self.arena(), result.call_id);
                 if (entry.found_existing) continue;
+                const declaration = first.get(result.call_id);
+                if (declaration != null and declaration.?.record > index) {
+                    const waiting = EarlyResult{ .record = index, .result = result };
+                    try early.put(self.arena(), result.call_id, waiting);
+                    continue;
+                }
                 try self.finalizeTool(record, result, turn);
             }
         }

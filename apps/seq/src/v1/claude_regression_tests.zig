@@ -682,7 +682,12 @@ test "tools: a result before its declaration keeps one invocation per call ID" {
     var trace = try support.parse(allocator, "first.jsonl", result_first_source, .stale);
     defer trace.deinit(allocator);
     try testing.expectEqual(@as(usize, 1), trace.tools.items.len);
-    try testing.expect(trace.tools.items[0].lifecycle_status != .unresolved);
+    const tool = trace.tools.items[0];
+    try testing.expectEqual(trace_core.ToolLifecycleStatus.completed, tool.lifecycle_status);
+    try testing.expectEqualStrings("Bash", tool.tool_name.?);
+    try testing.expectEqualStrings("ls", tool.command_text.?);
+    try testing.expectEqualStrings("a", tool.output_text.?);
+    try testing.expectEqual(@as(i64, 1), support.turnByIndex(&trace, 1).tool_count);
 }
 
 test "time pruning: a failed Claude probe is charged to discovery reads" {
