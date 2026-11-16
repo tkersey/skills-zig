@@ -3798,6 +3798,7 @@ pub fn claudeFamilyPathsAlloc(
     var identity = discovered orelse return null;
     defer identity.deinit(allocator);
     const root = identity.root_session_id orelse return null;
+    if (!trace_core.claude_parser.isUuid(root)) return null;
     const layout = claudeFamilyLayout(selected, root);
     var paths: std.ArrayList([]u8) = .empty;
     errdefer freePaths(allocator, &paths);

@@ -1294,10 +1294,14 @@ fn isCodexModeledTyped(root: std.json.ObjectMap, entry_type: []const u8) bool {
         custom_tool_call,
         function_call_output,
         custom_tool_call_output,
+        message,
+        reasoning,
     };
     const kind = std.meta.stringToEnum(Kind, entry_type) orelse return false;
     return switch (kind) {
         .turn_context, .compacted => true,
+        .message => root.get("role") != null and root.get("content") != null,
+        .reasoning => root.get("summary") != null or root.get("encrypted_content") != null,
         .session_meta, .event_msg, .response_item => objectField(root, "payload") != null,
         .function_call,
         .custom_tool_call,

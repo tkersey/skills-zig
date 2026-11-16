@@ -340,6 +340,21 @@ claude_orphan=$(claude_isolated observe --definition "$cache_dir/family-lineage-
   --projection rows --root "$claude_orphan_root" --session-id "$claude_orphan_id" --format json)
 jq -e '.corpus.files == 1 and (.limitations | index("claude_worker_parent_missing: 1") != null)' \
   <<<"$claude_orphan" >/dev/null
+claude_conflict_root="$cache_dir/claude-identity-conflict"
+cp -R "$claude_fixtures/worker-identity-conflict" "$claude_conflict_root"
+jq '.selectors += ["session-id"] | .requires.operators += ["filter"] |
+  .relations[0].fields += ["lineage_conflict"] |
+  .pipeline = [.pipeline[0],
+    {"op": "filter", "input": "session_rows", "as": "clean",
+      "where": [{"field": "lineage_conflict", "op": "eq", "value": false}]},
+    (.pipeline[1] | .inputs = ["clean", "clean", "clean"])]' \
+  "$claude_definitions/family-lineage.json" >"$cache_dir/lineage-filter.json"
+if claude_stale=$(claude_isolated observe --definition "$cache_dir/lineage-filter.json" \
+  --projection rows --root "$claude_conflict_root" \
+  --session-id d0000000-0000-4000-8000-000000000006 --format json); then
+  exit 1
+fi
+jq -e '.code == "ObservationLineageChangedAfterDiscovery"' <<<"$claude_stale" >/dev/null
 
 external_output=$("$binary" observe \
   --definition "$external_definition" \

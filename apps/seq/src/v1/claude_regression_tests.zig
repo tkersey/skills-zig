@@ -736,3 +736,39 @@ test "classification: a file of only malformed or non-object lines stays Codex a
     defer empty.deinit(allocator);
     try testing.expectEqual(trace_core.TraceSource.none, empty.source);
 }
+
+test "classification: legacy root-typed message and reasoning records vote Codex" {
+    const sources = [_][]const u8{
+        "{\"type\":\"message\",\"role\":\"user\"," ++
+            "\"content\":[{\"type\":\"input_text\",\"text\":\"hi\"}]}\n",
+        "{\"type\":\"reasoning\",\"summary\":[],\"encrypted_content\":\"x\"}\n",
+    };
+    for (sources) |bytes| {
+        var trace = try parseBytes("/typed.jsonl", bytes);
+        defer trace.deinit(allocator);
+        try testing.expectEqual(trace_core.TraceSource.codex, trace.source);
+    }
+}
+
+test "family admission refuses a recorded root that is not a UUID" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const escaping =
+        \\{"type":"user","uuid":"u1","parentUuid":null,"sessionId":"../other/e0000000-0000-4000-8000-000000000001","cwd":"/w","timestamp":"2026-11-01T00:00:00Z","message":{"role":"user","content":"go"}}
+        \\
+    ;
+    try support.writeTree(tmp.dir, &.{
+        .{ .path = "proj/agent-x.jsonl", .bytes = escaping },
+        .{ .path = "other/e0000000-0000-4000-8000-000000000001.jsonl", .bytes = prompt_line },
+    });
+    var reads = native.DiscoveryReads{};
+    var family = try native.claudeFamilyPathsAlloc(
+        allocator,
+        testing.io,
+        tmp.dir,
+        "proj/agent-x.jsonl",
+        &reads,
+    );
+    defer if (family) |*paths| native.freePaths(allocator, paths);
+    try testing.expect(family == null);
+}

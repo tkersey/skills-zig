@@ -1825,6 +1825,8 @@ const StreamingGraphState = struct {
     materialized_rows: usize,
     session_seed: ?*seq.relation_graph.ScanInput = null,
     seed_columns: SeedColumns = .{},
+    lineage_graph: ?seq.relation_graph.Table = null,
+    lineage_changed: bool = false,
 
     corpus_entries: std.ArrayList(CorpusEntry) = .empty,
     discovered: []const DiscoveredSession = &.{},
@@ -1854,7 +1856,26 @@ const StreamingGraphState = struct {
             else
                 .{ .integer = session.token_usage_observation_count };
         }
-        if (columns.lineage) |column| values[column] = .{ .boolean = session.lineage_conflict };
+        if (columns.lineage) |column| {
+            const seeded = values[column];
+            const conflict = session.lineage_conflict;
+            if (seeded != .boolean or seeded.boolean != conflict) self.lineage_changed = true;
+            values[column] = .{ .boolean = conflict };
+        }
+    }
+
+    fn checkLineageGraph(
+        self: *StreamingGraphState,
+        session_seed: *const seq.relation_graph.ScanInput,
+    ) !void {
+        if (!self.lineage_changed) return;
+        const initial = self.lineage_graph orelse return;
+        const allocator = self.graph.table_allocator;
+        var seed = [_]seq.relation_graph.ScanInput{try copyGraphScan(allocator, session_seed.*)};
+        defer freeGraphScans(allocator, &seed);
+        const rechecked = try self.graph.executeTarget(self.schedule.graph_stage, &seed);
+        defer allocator.free(rechecked.table.values);
+        if (!initial.same(rechecked.table)) return error.ObservationLineageChangedAfterDiscovery;
     }
 
     fn deinit(self: *StreamingGraphState) void {
@@ -2009,6 +2030,7 @@ const StreamingGraphState = struct {
         const graph = self.graph;
         std.mem.sort(CorpusEntry, self.corpus_entries.items, {}, corpusEntryLessThan);
         try self.countUnreadSeeds();
+        try self.checkLineageGraph(session_seed);
         for (self.corpus_entries.items) |entry| self.digest_set.add(entry.path, &entry.digest);
         self.bindSourceMetadata();
         const owned = try reducer.finish();
@@ -2152,6 +2174,7 @@ fn executeStreamingGraphObservation(
         .materialized_rows = lineage_graph.materialized_rows,
         .session_seed = &session_seed[0],
         .seed_columns = .init(context, session_seed[0].stage_index),
+        .lineage_graph = lineage_graph.table,
     };
     if (args.selectors.session_id) |wanted| try requireDiscoveredSession(&discovered, wanted);
     try state.recordDiscovery(&discovered, paths.items);

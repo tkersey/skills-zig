@@ -23,6 +23,14 @@ pub const Table = struct {
     values: []execution.Value,
     width: usize,
 
+    pub fn same(self: Table, other: Table) bool {
+        if (self.width != other.width or self.values.len != other.values.len) return false;
+        for (self.values, other.values) |left, right| {
+            if (!value_module.equal(left, right, false)) return false;
+        }
+        return true;
+    }
+
     pub fn rowCount(self: Table) !usize {
         if (self.width == 0 or self.values.len % self.width != 0) {
             return error.InvalidObservationRows;

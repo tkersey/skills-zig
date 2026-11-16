@@ -505,14 +505,19 @@ disagreement; consumers that read both reconcile them. `seq session-graph --form
 dot` names a Claude corpus `claude_sessions`, reconciles assertions by parent, worker
 and call (printing each distinct triple once, so a resumed worker shows one edge per
 call), and marks every edge of a worker whose assertions disagree on its parent with
-`[contradiction=true]`; it never chooses between them. Assertions that name the
+`[contradiction=true]`; it never chooses between them. Because reconciliation needs every
+assertion, `--limit` bounds the printed edges of a corpus that holds Claude
+transcripts, not the files read. Assertions that name the
 same parent under different calls, such as a resumed worker, agree. The `seq/request-usage`
 definition treats such a worker as a lineage conflict for worker-scoped totals.
 Sidecar contents are discovery facts: they are read once, bound into the corpus
 digest, and reused by the body read, which also writes parent admission into the
 corpus digest. A streaming lineage plan's discovered `sessions` rows judge the
 parent at discovery and take `lineage_conflict` from the body read for every
-session it reads.
+session it reads. If a body read changes `lineage_conflict` in a way that changes
+the lineage graph the plan already streamed from, the observation fails with
+`ObservationLineageChangedAfterDiscovery` instead of returning rows from a stale
+closure.
 `--session-id` accepts a session UUID or a worker ID.
 
 Turns open at an input that got a reply (a model response, an API error or an
