@@ -9,6 +9,7 @@ pub const max_file_bytes = 256 * 1024;
 pub const max_total_bytes = 1024 * 1024;
 pub const max_json_bytes = 8 * 1024 * 1024;
 pub const request_timeout_ms = 30_000;
+pub const max_error_document_bytes = 1024;
 
 pub const help =
     \\ledger gist create --input <request.json> [--format json]
@@ -45,7 +46,7 @@ pub const Diagnostics = struct {
 
     fn remember(self: *Diagnostics, id: []const u8) void {
         if (!validId(id)) return;
-        std.mem.copyForwards(u8, self.id[0..id.len], id);
+        @memcpy(self.id[0..id.len], id);
         self.id_len = @intCast(id.len);
     }
 };
@@ -230,10 +231,10 @@ pub fn runCommand(
     defer document.deinit();
     var diagnostics: Diagnostics = .{};
     run(io, dir, allocator, environment, args, &document.writer, &diagnostics) catch |err| {
-        var failure: Writer.Allocating = .init(allocator);
-        defer failure.deinit();
-        try writeError(&failure.writer, err, &diagnostics);
-        try output.writeAll(failure.written());
+        var buffer: [max_error_document_bytes]u8 = undefined;
+        var failure: Writer = .fixed(&buffer);
+        try writeError(&failure, err, &diagnostics);
+        try output.writeAll(failure.buffered());
         return 2;
     };
     try output.writeAll(document.written());
@@ -278,6 +279,10 @@ fn execute(
 ) !void {
     const options = try parseArgs(args);
     if (options == .help) return output.writeAll(help);
+    if (options == .read) {
+        diagnostics.remember(options.read.id);
+        if (options.read.revision) |sha| diagnostics.revision = sha[0..40].*;
+    }
     const token = try tokenFromEnvironment(environment);
     var document = switch (options) {
         .help => unreachable,
@@ -468,7 +473,6 @@ fn read(
     token: ?[]const u8,
     diagnostics: ?*Diagnostics,
 ) !Document {
-    if (diagnostics) |known| known.remember(ref.id);
     var revision: [40]u8 = undefined;
     if (ref.revision) |sha| {
         if (!validRevision(sha)) return error.InvalidGistRevision;
@@ -1075,6 +1079,68 @@ test "gist read failures report the requested id and resolved revision" {
     try std.testing.expect(!diagnostics.attempted_create);
     try std.testing.expectEqualStrings(test_id, diagnostics.gistId().?);
     try std.testing.expectEqualStrings(test_revision, &diagnostics.revision.?);
+}
+
+test "gist read failures before any request keep the admitted id and revision" {
+    const allocator = std.testing.allocator;
+    var environment: std.process.Environ.Map = .init(allocator);
+    defer environment.deinit();
+    try environment.put("GH_TOKEN", "bad token");
+    var mock: Mock = .{ .replies = &.{} };
+    var output: Writer.Allocating = .init(allocator);
+    defer output.deinit();
+    var diagnostics: Diagnostics = .{};
+    try std.testing.expectError(error.InvalidGistToken, execute(
+        std.testing.io,
+        Io.Dir.cwd(),
+        allocator,
+        &environment,
+        &.{ "read", "--gist", test_id, "--revision", test_revision },
+        mock.transport(),
+        &output.writer,
+        &diagnostics,
+    ));
+    try std.testing.expectEqual(@as(usize, 0), mock.calls);
+    try std.testing.expectEqualStrings(test_id, diagnostics.gistId().?);
+    try std.testing.expectEqualStrings(test_revision, &diagnostics.revision.?);
+}
+
+test "gist errors stay structured when allocation fails" {
+    var environment: std.process.Environ.Map = .init(std.testing.allocator);
+    defer environment.deinit();
+    var failing: std.testing.FailingAllocator = .init(std.testing.allocator, .{ .fail_index = 0 });
+    var output: Writer.Allocating = .init(std.testing.allocator);
+    defer output.deinit();
+    try std.testing.expectEqual(@as(u8, 2), try runCommand(
+        std.testing.io,
+        Io.Dir.cwd(),
+        failing.allocator(),
+        &environment,
+        &.{ "read", "--gist", test_id },
+        &output.writer,
+    ));
+    var parsed = try std.json.parseFromSlice(
+        std.json.Value,
+        std.testing.allocator,
+        output.written(),
+        .{},
+    );
+    defer parsed.deinit();
+    const object = parsed.value.object;
+    try std.testing.expectEqualStrings("ledger-gist-error/v1", object.get("schema").?.string);
+    try std.testing.expectEqualStrings("OutOfMemory", object.get("error").?.string);
+    try std.testing.expectEqualStrings(test_id, object.get("gist_id").?.string);
+}
+
+test "gist error documents fit their fixed bound at maximum identifier size" {
+    var diagnostics: Diagnostics = .{ .attempted_create = true };
+    const longest_id: [64]u8 = @splat('a');
+    diagnostics.remember(&longest_id);
+    diagnostics.revision = test_revision.*;
+    var buffer: [max_error_document_bytes]u8 = undefined;
+    var output: Writer = .fixed(&buffer);
+    try writeError(&output, error.GistCreatedButUnverified, &diagnostics);
+    try std.testing.expect(output.buffered().len < max_error_document_bytes / 2);
 }
 
 const HttpFixture = struct {
