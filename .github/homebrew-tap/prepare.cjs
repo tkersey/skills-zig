@@ -21,29 +21,7 @@ function releaseTagFromVersion(app, version, requestedTag) {
   return tag;
 }
 
-function releaseTagFromRun(app, run, artifacts) {
-  assert.ok(['ledger', 'seq'].includes(app), 'Unsupported tap product');
-  assert.equal(run.status, 'completed');
-  assert.equal(run.conclusion, 'success');
-  assert.equal(run.repository.full_name, repository);
-  assert.equal(run.head_repository.full_name, repository);
-  assert.equal(run.path, `.github/workflows/release-${app}.yml`);
-  assert.equal(artifacts.length, platforms.length);
-  let tag;
-  for (const platform of platforms) {
-    const matches = artifacts.filter(artifact => artifact.name.endsWith(`-${platform}.tar.gz`));
-    assert.equal(matches.length, 1, `Expected one qualified archive: ${platform}`);
-    assert.equal(matches[0].expired, false);
-    const candidate = matches[0].name.slice(0, -`-${platform}.tar.gz`.length);
-    assert.ok(candidate.startsWith(`${app}-v`));
-    versionParts(candidate.slice(`${app}-v`.length));
-    if (tag) assert.equal(candidate, tag, 'Qualified archives disagree on release tag');
-    tag = candidate;
-  }
-  return tag;
-}
-
-function prepareFormula(app, formula, release, archives, qualifiedArchives = null) {
+function prepareFormula(app, formula, release, archives) {
   assert.ok(['ledger', 'seq'].includes(app), 'Unsupported tap product');
   assert.equal(release.draft, false);
   assert.equal(release.prerelease, false);
@@ -70,10 +48,6 @@ function prepareFormula(app, formula, release, archives, qualifiedArchives = nul
     assert.match(asset.digest, /^sha256:[0-9a-f]{64}$/);
     const archive = archives[platform];
     assert.ok(Buffer.isBuffer(archive) && archive.length > 0, `Missing archive: ${name}`);
-    if (qualifiedArchives) {
-      assert.ok(Buffer.isBuffer(qualifiedArchives[platform]), `Missing qualified archive: ${name}`);
-      assert.ok(archive.equals(qualifiedArchives[platform]), `Published archive differs from successful run: ${name}`);
-    }
     const digest = createHash('sha256').update(archive).digest('hex');
     assert.equal(`sha256:${digest}`, asset.digest, `Checksum mismatch: ${name}`);
     const url = `    url "https://github.com/${repository}/releases/download/${app}-v#{version}/${app}-v#{version}-${platform}.tar.gz"`;
@@ -93,29 +67,17 @@ function main() {
   const gh = (...args) => execFileSync('gh', args, { encoding: 'utf8' });
   let tag = process.env.RELEASE_TAG;
   const commit = process.env.RELEASE_COMMIT;
-  const runId = process.env.RELEASE_RUN_ID;
-  if (runId) {
-    assert.match(runId, /^[1-9][0-9]*$/);
-    assert.ok(!tag && !commit, 'Select either a successful run or an explicit release');
-    const run = JSON.parse(gh('api', `repos/${repository}/actions/runs/${runId}`));
-    const pages = JSON.parse(gh('api', '--paginate', '--slurp',
-      `repos/${repository}/actions/runs/${runId}/artifacts?per_page=100`));
-    const artifacts = pages.flatMap(page => page.artifacts);
-    assert.ok(pages.length > 0);
-    assert.ok(pages.every(page => page.total_count === artifacts.length), 'Incomplete artifact inventory');
-    tag = releaseTagFromRun(app, run, artifacts);
-  }
   if (commit) {
     assert.match(commit, /^[0-9a-f]{40}$/);
     const content = JSON.parse(gh('api', `repos/${repository}/contents/apps/${app}/VERSION?ref=${commit}`));
     tag = releaseTagFromVersion(app, Buffer.from(content.content, 'base64').toString('utf8'), tag);
   }
-  assert.ok(tag, 'RELEASE_TAG, RELEASE_COMMIT or RELEASE_RUN_ID is required');
+  assert.ok(tag, 'RELEASE_TAG or RELEASE_COMMIT is required');
   assert.ok(tag.startsWith(`${app}-v`));
   versionParts(tag.slice(`${app}-v`.length));
   if (commit) {
     const target = JSON.parse(gh('api', `repos/${repository}/commits/${tag}`));
-    assert.equal(target.sha, commit, 'Release tag no longer matches the successful release run');
+    assert.equal(target.sha, commit, 'Release tag does not resolve to the release commit');
   }
   const release = JSON.parse(gh('api', `repos/${repository}/releases/tags/${tag}`));
   assert.equal(release.tag_name, tag);
@@ -125,18 +87,9 @@ function main() {
     gh('release', 'download', tag, '--repo', repository, '--dir', directory, ...patterns);
     const archives = Object.fromEntries(platforms.map(platform =>
       [platform, readFileSync(join(directory, `${tag}-${platform}.tar.gz`))]));
-    let qualifiedArchives = null;
-    if (runId) {
-      qualifiedArchives = Object.fromEntries(platforms.map(platform => {
-        const name = `${tag}-${platform}.tar.gz`;
-        const destination = join(directory, 'qualified', platform);
-        gh('run', 'download', runId, '--repo', repository, '--name', name, '--dir', destination);
-        return [platform, readFileSync(join(destination, name))];
-      }));
-    }
     const path = process.argv[3];
     assert.ok(path, 'Formula path is required');
-    const result = prepareFormula(app, readFileSync(path, 'utf8'), release, archives, qualifiedArchives);
+    const result = prepareFormula(app, readFileSync(path, 'utf8'), release, archives);
     if (result.changed) writeFileSync(path, result.formula);
     if (process.env.GITHUB_OUTPUT) {
       appendFileSync(process.env.GITHUB_OUTPUT, `version=${result.version}\nchanged=${result.changed}\n`);
@@ -147,5 +100,5 @@ function main() {
   }
 }
 
-module.exports = { prepareFormula, releaseTagFromRun, releaseTagFromVersion };
+module.exports = { prepareFormula, releaseTagFromVersion };
 if (require.main === module) main();

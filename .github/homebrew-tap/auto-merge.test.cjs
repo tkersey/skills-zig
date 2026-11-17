@@ -2,12 +2,13 @@ const assert = require('node:assert/strict');
 const { test } = require('node:test');
 const { validateAutoMerge, checksReady } = require('./auto-merge.cjs');
 
-function fixture() {
+function fixture(app = 'ledger') {
   return {
+    app,
     pr: { state: 'open', draft: false,
       base: { ref: 'main', repo: { full_name: 'tkersey/homebrew-tap' } },
-      head: { ref: 'automation/ledger-1.8.1', sha: 'a'.repeat(40), repo: { full_name: 'tkersey/homebrew-tap' } } },
-    files: [{ filename: 'Formula/ledger.rb', status: 'modified' }],
+      head: { ref: `automation/${app}-1.8.1`, sha: 'a'.repeat(40), repo: { full_name: 'tkersey/homebrew-tap' } } },
+    files: [{ filename: `Formula/${app}.rb`, status: 'modified' }],
     content: 'verified formula', expectedContent: 'verified formula', head: 'a'.repeat(40), version: '1.8.1',
     rules: [
       { type: 'pull_request', parameters: { required_review_thread_resolution: true } },
@@ -21,7 +22,17 @@ function fixture() {
 }
 
 test('admits only the exact verified formula PR under both platform requirements', () => {
-  assert.doesNotThrow(() => validateAutoMerge(fixture()));
+  for (const app of ['ledger', 'seq']) assert.doesNotThrow(() => validateAutoMerge(fixture(app)));
+});
+
+test('a product cannot merge another product\'s formula or branch', () => {
+  for (const change of [
+    f => { f.app = 'seq'; },
+    f => { f.app = 'lift'; },
+    f => { f.files[0].filename = 'Formula/seq.rb'; f.pr.head.ref = 'automation/seq-1.8.1'; },
+  ]) {
+    const f = fixture(); change(f); assert.throws(() => validateAutoMerge(f));
+  }
 });
 
 test('head drift, unrelated changes, forks and different formula bytes fail closed', () => {
@@ -74,10 +85,11 @@ test('CLI merges only the revalidated head and requires terminal merged readback
   const { tmpdir } = require('node:os');
   const { join, resolve } = require('node:path');
   const { spawnSync } = require('node:child_process');
-  for (const scenario of ['success', 'head-drift', 'unmerged', 'no-checks', 'no-required-checks']) {
+  for (const [app, scenario] of [['ledger', 'success'], ['seq', 'success'], ['ledger', 'head-drift'],
+    ['seq', 'unmerged'], ['ledger', 'no-checks'], ['seq', 'no-required-checks'], ['lift', 'unsupported']]) {
     const dir = mkdtempSync(join(tmpdir(), 'tap-merge-test-'));
     try {
-      writeFileSync(join(dir, 'fixture.json'), JSON.stringify(fixture()));
+      writeFileSync(join(dir, 'fixture.json'), JSON.stringify(fixture(app)));
       writeFileSync(join(dir, 'formula.rb'), 'verified formula');
       writeFileSync(join(dir, 'gh'), `#!/usr/bin/env node
 const fs = require('node:fs');
@@ -115,10 +127,10 @@ else if (a.at(-1) === 'state,headRefOid,mergedAt,mergeCommit') {
       const child = spawnSync(process.execPath, [resolve(__dirname, 'auto-merge.cjs'), join(dir, 'formula.rb')], {
         encoding: 'utf8', timeout: 15000,
         env: { ...process.env, PATH: dir + ':' + process.env.PATH, FIXTURE: join(dir, 'fixture.json'),
-          SCENARIO: scenario, TAP_PR: '81', TAP_HEAD: 'a'.repeat(40), TAP_VERSION: '1.8.1' },
+          SCENARIO: scenario, TAP_APP: app, TAP_PR: '81', TAP_HEAD: 'a'.repeat(40), TAP_VERSION: '1.8.1' },
       });
-      assert.equal(child.status, ['head-drift', 'unmerged'].includes(scenario) ? 1 : 0, child.stderr);
-      assert.equal(existsSync(join(dir, 'fixture.json.merged')), scenario !== 'head-drift');
+      assert.equal(child.status, ['head-drift', 'unmerged', 'unsupported'].includes(scenario) ? 1 : 0, child.stderr);
+      assert.equal(existsSync(join(dir, 'fixture.json.merged')), !['head-drift', 'unsupported'].includes(scenario));
     } finally { rmSync(dir, { recursive: true, force: true }); }
   }
 });

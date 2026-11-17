@@ -90,9 +90,11 @@ The initial Homebrew formula is a separate tap handoff after the first release.
 Homebrew formula updates are intentionally handled in a separate tap repository.
 This repo does not support installing its CLIs into user-global paths from source builds.
 Build artifacts are only allowed under repo-local `zig-out/bin`; shipped installs must flow through a tagged release plus the tap formula update.
-The `Release ledger` publish job explicitly dispatches `Update Ledger tap` on
-`main` after both platform archives have been published. The handoff carries the
-exact release tag and commit; dispatch failure fails the publishing job instead
+The `Release ledger` and `Release seq` publish jobs explicitly dispatch
+`Update Ledger tap` and `Update Seq tap` on `main` after both platform archives
+have been published. GitHub does not emit `workflow_run` events for runs started
+with `GITHUB_TOKEN`, so an Auto Release dispatch cannot hand off by completion
+event. The handoff carries the exact release tag and commit; dispatch failure fails the publishing job instead
 of leaving an unobserved completion-event handoff. The tap workflow verifies the
 tag against the commit's VERSION and tag target, downloads both archives, and
 checks their SHA256 digests against GitHub's release metadata. It changes only
@@ -112,14 +114,11 @@ required checks. Manual retries use the same verification and merge path.
 Repo settings are configured through GitHub. The workflow verifies the effective
 status-check and review-thread requirements before merging.
 
-The `Update Seq tap` workflow runs after a successful `Release seq` workflow.
-It identifies the release tag from the run's two platform archive artifacts,
-then verifies that both published archives match those artifacts byte for byte
-and match GitHub's SHA256 digests. This supports tagless Seq dispatches whose
-explicit build commit differs from the workflow's `main` commit. It opens or
-updates a version-specific PR changing only `Formula/seq.rb`'s version and
-platform checksums, with the same downgrade protection and tap CI requirements.
-Both workflows use `.github/homebrew-tap/prepare.cjs`.
+`Update Seq tap` performs the same verification, PR, and exact-head merge for
+`Formula/seq.rb`. `Release seq` passes its qualified `RELEASE_COMMIT`, which
+for a tagless Auto Release dispatch may differ from the workflow's `main` commit.
+Both workflows use `.github/homebrew-tap/prepare.cjs` and
+`.github/homebrew-tap/auto-merge.cjs`.
 
 One-time setup: add the Actions secret `HOMEBREW_TAP_TOKEN` to this repository.
 Use a fine-grained personal access token scoped only to
