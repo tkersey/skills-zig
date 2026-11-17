@@ -107,7 +107,7 @@ repository/branch, sole changed file, and formula bytes against the verified
 release. An active tap ruleset without bypass actors must require both
 `test-bot (macos-latest)` and `test-bot (ubuntu-latest)` from GitHub Actions
 (app ID 15368) and resolved review conversations. Active change requests or review
-requests block the merge. The job waits up to eight minutes for both checks on the
+requests block the merge. The job waits up to thirty minutes for both checks on the
 verified head, revalidates, then uses an exact-head merge guard. It does not arm
 GitHub auto-merge for unverified successor commits. GitHub also enforces the
 required checks. Manual retries use the same verification and merge path.

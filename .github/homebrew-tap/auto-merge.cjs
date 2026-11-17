@@ -74,7 +74,8 @@ async function main() {
     });
   }
   validate();
-  const deadline = Date.now() + 8 * 60 * 1000;
+  // macOS test-bot runners can queue for several minutes before a ~5 minute formula test.
+  const deadline = Date.now() + 30 * 60 * 1000;
   while (true) {
     assert.equal(api(`pulls/${number}`).head.sha, head, 'Tap PR head changed while waiting');
     const observed = spawnSync('gh', ['pr', 'checks', number, '--repo', repository,
