@@ -89,6 +89,7 @@ jobs:
         if: steps.pr.outputs.pull-request-number != ''
         env:
           GH_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          TAP_APP: ledger
           TAP_PR: ${{ steps.pr.outputs.pull-request-number }}
           TAP_HEAD: ${{ steps.pr.outputs.pull-request-head-sha }}
           TAP_VERSION: ${{ steps.formula.outputs.version }}

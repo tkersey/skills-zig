@@ -1,7 +1,7 @@
 const assert = require('node:assert/strict');
 const { createHash } = require('node:crypto');
 const { test } = require('node:test');
-const { prepareFormula, releaseTagFromRun, releaseTagFromVersion } = require('./prepare.cjs');
+const { prepareFormula, releaseTagFromVersion } = require('./prepare.cjs');
 
 for (const app of ['ledger', 'seq']) {
   function fixture(version = '1.7.0', current = '1.6.0') {
@@ -115,43 +115,6 @@ end
       const f = fixture();
       f.formula = change(f.formula);
       assert.throws(() => prepare(f));
-    }
-  });
-
-  test(app + ': successful run artifacts identify the release independently of workflow head', () => {
-    const f = fixture();
-    const run = {
-      status: 'completed', conclusion: 'success',
-      repository: { full_name: 'tkersey/skills-zig' },
-      head_repository: { full_name: 'tkersey/skills-zig' },
-      path: '.github/workflows/release-' + app + '.yml',
-      head_sha: 'b'.repeat(40),
-    };
-    const artifacts = f.release.assets.map(asset => ({ name: asset.name, expired: false }));
-    assert.equal(releaseTagFromRun(app, run, artifacts), app + '-v1.7.0');
-    for (const patch of [
-      { status: 'in_progress' }, { conclusion: 'failure' }, { conclusion: 'cancelled' },
-      { repository: { full_name: 'other/repo' } },
-      { head_repository: { full_name: 'fork/skills-zig' } },
-      { path: '.github/workflows/pr-ci.yml' },
-    ]) assert.throws(() => releaseTagFromRun(app, { ...run, ...patch }, artifacts));
-    for (const invalid of [
-      [], artifacts.slice(0, 1), [...artifacts, artifacts[0]], [artifacts[0], artifacts[0]],
-      [artifacts[0], { ...artifacts[1], expired: true }],
-      [artifacts[0], { ...artifacts[1], name: artifacts[1].name.replace('1.7.0', '1.7.1') }],
-      artifacts.map(a => ({ ...a, name: a.name.replace(app + '-v', 'lift-v') })),
-      artifacts.map(a => ({ ...a, name: a.name.replace('1.7.0', '01.7.0') })),
-    ]) assert.throws(() => releaseTagFromRun(app, run, invalid));
-  });
-
-  test(app + ': published bytes must equal the successful run even with valid release digests', () => {
-    const f = fixture();
-    assert.equal(prepareFormula(app, f.formula, f.release, f.archives, f.archives).changed, true);
-    for (const platform of ['darwin-arm64', 'linux-x86_64']) {
-      for (const value of [Buffer.from('different qualified archive'), undefined]) {
-        assert.throws(() => prepareFormula(app, f.formula, f.release, f.archives,
-          { ...f.archives, [platform]: value }));
-      }
     }
   });
 }

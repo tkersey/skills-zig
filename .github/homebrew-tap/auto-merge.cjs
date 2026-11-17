@@ -5,8 +5,10 @@ const { setTimeout } = require('node:timers/promises');
 
 const repository = 'tkersey/homebrew-tap';
 const contexts = ['test-bot (macos-latest)', 'test-bot (ubuntu-latest)'];
+const apps = ['ledger', 'seq'];
 
-function validateAutoMerge({ pr, files, content, expectedContent, head, version, rules, repo, review }) {
+function validateAutoMerge({ app, pr, files, content, expectedContent, head, version, rules, repo, review }) {
+  assert.ok(apps.includes(app), 'Unsupported tap product');
   assert.match(head, /^[0-9a-f]{40}$/);
   assert.match(version, /^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$/);
   assert.equal(pr.state, 'open');
@@ -14,10 +16,10 @@ function validateAutoMerge({ pr, files, content, expectedContent, head, version,
   assert.equal(pr.base.repo.full_name, repository);
   assert.equal(pr.base.ref, 'main');
   assert.equal(pr.head.repo.full_name, repository);
-  assert.equal(pr.head.ref, `automation/ledger-${version}`);
+  assert.equal(pr.head.ref, `automation/${app}-${version}`);
   assert.equal(pr.head.sha, head, 'Tap PR head changed');
   assert.equal(files.length, 1, 'Only the verified formula may change');
-  assert.equal(files[0].filename, 'Formula/ledger.rb');
+  assert.equal(files[0].filename, `Formula/${app}.rb`);
   assert.equal(files[0].status, 'modified');
   assert.equal(content, expectedContent, 'PR formula differs from verified release formula');
   assert.equal(repo.allow_squash_merge, true);
@@ -46,6 +48,8 @@ function checksReady(checks) {
 }
 
 async function main() {
+  const app = process.env.TAP_APP;
+  assert.ok(apps.includes(app), 'TAP_APP must name a tap product');
   const number = process.env.TAP_PR;
   const head = process.env.TAP_HEAD;
   const version = process.env.TAP_VERSION;
@@ -56,8 +60,9 @@ async function main() {
   const api = path => JSON.parse(gh('api', `repos/${repository}/${path}`));
   const pages = path => JSON.parse(gh('api', '--paginate', '--slurp', `repos/${repository}/${path}`));
   function validate() {
-    const content = api(`contents/Formula/ledger.rb?ref=${head}`);
+    const content = api(`contents/Formula/${app}.rb?ref=${head}`);
     validateAutoMerge({
+      app,
       pr: api(`pulls/${number}`),
       files: pages(`pulls/${number}/files?per_page=100`).flat(),
       head, version, expectedContent,
@@ -91,7 +96,7 @@ async function main() {
   assert.equal(result.headRefOid, head);
   assert.equal(result.state, 'MERGED');
   assert.ok(result.mergedAt && result.mergeCommit?.oid, 'Merged-state proof missing');
-  console.log(`Ledger ${version}: PR #${number} merged at ${result.mergeCommit.oid}`);
+  console.log(`${app} ${version}: PR #${number} merged at ${result.mergeCommit.oid}`);
 }
 
 module.exports = { validateAutoMerge, checksReady };

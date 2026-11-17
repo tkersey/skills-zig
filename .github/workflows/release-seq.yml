@@ -109,6 +109,9 @@ jobs:
   publish:
     needs: release
     runs-on: ubuntu-latest
+    permissions:
+      actions: write
+      contents: write
     env:
       GH_TOKEN: ${{ github.token }}
     steps:
@@ -168,3 +171,7 @@ jobs:
           else
             gh release create "${RELEASE_TAG}" "${assets[@]}" --repo "$GITHUB_REPOSITORY" --verify-tag --title "${RELEASE_TAG}"
           fi
+      - name: Dispatch verified Seq tap update
+        run: |
+          gh workflow run seq-tap.yml --repo "$GITHUB_REPOSITORY" --ref main \
+            -f "tag_name=${RELEASE_TAG}" -f "commit_sha=${RELEASE_COMMIT}"
