@@ -365,6 +365,8 @@ pub const TraceOccurrence = struct {
     private: bool = false,
     format: TraceFormat = .unknown,
     message_id: ?[]u8 = null,
+    native_id: ?[]u8 = null,
+    native_parent_id: ?[]u8 = null,
 
     pub fn init(
         allocator: std.mem.Allocator,
@@ -402,6 +404,8 @@ pub const TraceOccurrence = struct {
         freeOpt(allocator, self.raw_json);
         freeOpt(allocator, self.text);
         freeOpt(allocator, self.message_id);
+        freeOpt(allocator, self.native_id);
+        freeOpt(allocator, self.native_parent_id);
     }
 
     pub fn sourceEventId(self: *const TraceOccurrence) []const u8 {

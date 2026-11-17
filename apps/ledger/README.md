@@ -29,6 +29,62 @@ zig build test-ledger-segmented -Doptimize=fast
 
 The binary is written to `zig-out/bin/ledger`.
 
+## Gist transport (Ledger 1.9)
+
+`github-gist/v1` in `ledger capabilities` identifies native transport support.
+Create a secret gist from explicitly selected text files:
+
+```json
+{
+  "description": "Selected project context",
+  "files": {
+    "context.md": {"content": "# Context\nThe prepared, reviewed context goes here.\n"}
+  }
+}
+```
+
+```bash
+ledger gist create --input request.json --format json
+ledger gist read --gist <id-or-url> --revision <40-hex-sha> --format json
+```
+
+These commands exchange supplied files independently of local custody. They do
+not require or initialize a Ledger store, catalog, owner definition, or migration.
+Ledger transports the supplied bytes; the calling skill selects their contents,
+interprets their format, and assesses whether they may be shared.
+
+Creation requires a token from `LEDGER_GITHUB_TOKEN`, then `GH_TOKEN`, then
+`GITHUB_TOKEN`; an empty variable counts as unset, and reading can be anonymous.
+Keep tokens out of request files.
+Ledger uses the GitHub API directly, without another transport executable.
+Creation always sends `public:false` and rejects other request fields. Secret
+gists are unlisted: anyone with the URL can read them.
+
+A `ledger-gist/v1` result carries `gist_id`, `revision`, `url`, `revision_url`,
+`public`, `description`, and a `files` map with complete text. A successful create
+has read its immutable revision back and compared visibility, description, file
+names, and every file's bytes with the request. Keep the revision with the URL.
+A read without `--revision` resolves the current revision once from the gist's
+commit list, then fetches it by SHA; it never relies on the version-dependent
+`history` field. Reading does not run commands, install files, or restore native
+sessions.
+
+The transport admits at most 16 files, 256 KiB per file, 1 MiB of decoded text,
+and 8 MiB of JSON. It rejects unsafe filenames, invalid UTF-8, truncated responses,
+and file-size disagreements. It does not follow redirects or remote `raw_url`
+values. A command makes at most three requests: create posts once, resolves the
+new revision, and reads it back; read resolves the revision unless pinned, then
+fetches it. Each request has a 30-second deadline, although blocking host name
+resolution (as on macOS) can outlast it. Failure emits one structured
+`ledger-gist-error/v1` result without partial file contents or server response bodies.
+
+Publication may have happened even when verification fails. An ambiguous POST
+returns `GistCreateOutcomeUnknown`; a known creation whose contents could not be
+verified returns `GistCreatedButUnverified` in the `error` field. Errors retain
+`attempted_create`, any safely known `gist_id` and `revision`, and
+`authority_granted:false`. No create request is retried automatically. Inspect
+the known gist or the account before deciding to retry.
+
 ## Canonical owner access and retained custody (Ledger 1.8)
 
 Use the owner definition and migration declaration when selecting a history:

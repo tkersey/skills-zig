@@ -140,6 +140,8 @@ const source_event_fields = [_]Field{
     .{ .name = "role", .kind = .string },
     .{ .name = "text", .kind = .string },
     .{ .name = "private", .kind = .boolean, .nullable = false },
+    .{ .name = "native_id", .kind = .string },
+    .{ .name = "native_parent_id", .kind = .string },
 };
 
 const turn_fields = [_]Field{

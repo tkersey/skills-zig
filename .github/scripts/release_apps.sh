@@ -114,7 +114,7 @@ case "$mode" in
         scripts/test-seq-cli.sh|scripts/test-seq-observation-contract.sh)
           mark_app seq
           ;;
-        scripts/test-ledger-cli.sh)
+        scripts/test-ledger-cli.sh|scripts/test-ledger-gist.sh)
           mark_app ledger
           ;;
         tools/durable_store_perf.zig)

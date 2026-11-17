@@ -648,6 +648,7 @@ fn fillSourceEvent(
             11 => .{ .string = "user" },
             12 => optionalString(input),
             13 => .{ .boolean = false },
+            14, 15 => .null,
             else => return error.InvalidOpenCodePhysicalFieldIndex,
         };
     }

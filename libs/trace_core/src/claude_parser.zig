@@ -973,6 +973,8 @@ pub const ClaudeParser = struct {
         occurrence.format = .claude_code_jsonl;
         occurrence.message_visible = false;
         occurrence.timestamp = try dupOpt(self.allocator, record.timestamp);
+        occurrence.native_id = try dupOpt(self.allocator, stringField(root, "uuid"));
+        occurrence.native_parent_id = try dupOpt(self.allocator, stringField(root, "parentUuid"));
         if (self.options.include_occurrence_payloads and modeled) {
             occurrence.payload_json = try payloadJsonAlloc(self.allocator, root);
         }

@@ -397,6 +397,7 @@ assert_ci_affected "$all_apps" write_cas_runtime
 assert_ci_affected seq write_seq_smoke
 assert_ci_affected seq write_seq_observation_contract
 assert_ci_affected ledger write_ledger_smoke
+assert_ci_affected ledger write_path scripts/test-ledger-gist.sh
 assert_affected "" write_ci_helper
 assert_ci_affected seq,lift,ledger,memory-note,siwc write_ci_helper
 assert_affected "" write_path .github/workflows/pr-ci.yml
