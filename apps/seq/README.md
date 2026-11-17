@@ -482,6 +482,12 @@ source fails with `UnsupportedSessionFormat`; non-empty input with no known
 signature fails with `UnclassifiedSessionFormat` before any row is emitted.
 Empty files keep their rows and cast no adapter vote.
 
+`source_events` carries nullable `native_id` and `native_parent_id` (Seq 1.6):
+each Claude record's `uuid` and physical `parentUuid`, for modeled and private
+records alike. A compaction's `logicalParentUuid` is not substituted. Other
+sources leave both fields null. Persisted branches stay in file order; these
+fields expose the recorded ancestry without reconstructing the active context.
+
 A main transcript's `session_id` is its filename stem. Worker transcripts are
 sessions named `<root-session>/agent-<id>`; their direct parent comes from the
 adjacent `agent-<id>.meta.json` sidecar, and their root from the directory (or,

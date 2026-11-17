@@ -149,6 +149,21 @@ test "payloads: only modeled fields, blocks and usage counters are exposed" {
     try testing.expect(trace.occurrences.items[2].event_type == null);
 }
 
+test "source events: native uuid and parentUuid are retained, modeled or not" {
+    var trace = try support.parse(allocator, "allow.jsonl", allow_list_source, .stale);
+    defer trace.deinit(allocator);
+    const expected = [_]struct { id: []const u8, parent: ?[]const u8 }{
+        .{ .id = "p1", .parent = null },
+        .{ .id = "p2", .parent = "p1" },
+        .{ .id = "p3", .parent = "p2" },
+    };
+    try testing.expectEqual(expected.len, trace.occurrences.items.len);
+    for (expected, trace.occurrences.items) |want, occurrence| {
+        try testing.expectEqualStrings(want.id, occurrence.native_id.?);
+        try expectOptional(want.parent, occurrence.native_parent_id);
+    }
+}
+
 const prompt_line =
     \\{"type":"user","uuid":"q1","parentUuid":null,"sessionId":"s","cwd":"/w","timestamp":"2026-11-01T00:00:00Z","turnOrigin":"human","message":{"role":"user","content":"go"}}
     \\

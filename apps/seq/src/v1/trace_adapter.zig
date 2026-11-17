@@ -2046,6 +2046,8 @@ fn fillSourceEvent(
             11 => optionalString(occurrence.role),
             12 => optionalString(occurrence.text),
             13 => .{ .boolean = occurrence.private },
+            14 => optionalString(occurrence.native_id),
+            15 => optionalString(occurrence.native_parent_id),
             else => return error.InvalidTracePhysicalFieldIndex,
         };
     }

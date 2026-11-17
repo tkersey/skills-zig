@@ -9,7 +9,7 @@ if [[ ! -x "$bin_path" ]]; then
   exit 1
 fi
 
-expected=$'context\ndefinition check\ndefinition describe\nvalidate\nmaterialize\ntransact\nproject\ndoctor\nmigrate-segmented\nprepare\nmaintain\nrecovery inspect\nrecovery reclaim\ncapabilities\nversion'
+expected=$'context\ndefinition check\ndefinition describe\nvalidate\nmaterialize\ntransact\nproject\ndoctor\nmigrate-segmented\nprepare\nmaintain\nrecovery inspect\nrecovery reclaim\ngist create\ngist read\ncapabilities\nversion'
 help_output=$("$bin_path" --help)
 actual=$(
   awk '
@@ -19,7 +19,7 @@ actual=$(
       line = substr($0, 3)
       sub(/^ledger /, "", line)
       count = split(line, words, /[[:space:]]+/)
-      if ((words[1] == "definition" || words[1] == "recovery") && count >= 2) {
+      if ((words[1] == "definition" || words[1] == "recovery" || words[1] == "gist") && count >= 2) {
         print words[1] " " words[2]
       } else {
         print words[1]
@@ -45,6 +45,7 @@ jq -e --arg version "$version" \
     (.operators | type == "array" and length > 0) and
     (.codecs | type == "array" and length > 0) and
     (.storage_adapters | type == "array" and length > 0) and
+    (.transports | index("github-gist/v1")) != null and
     .features.bounded_checkpoint_replay_v1 == true and
     .features.full_history_doctor_v1 == true and
     .features.segmented_event_log_v1 == true and
@@ -56,7 +57,9 @@ jq -e --arg version "$version" \
     .features.historical_custody_migration_v2 == true and
     .cache_format != null and
     (.result_schemas | type == "array" and length > 0) and
-    (.result_schemas | index("ledger-storage-root-error/v1")) != null
+    (.result_schemas | index("ledger-storage-root-error/v1")) != null and
+    (.result_schemas | index("ledger-gist/v1")) != null and
+    (.result_schemas | index("ledger-gist-error/v1")) != null
   ' \
   <<<"$capabilities" >/dev/null
 
