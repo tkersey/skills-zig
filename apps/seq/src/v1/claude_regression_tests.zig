@@ -845,3 +845,14 @@ test "parent admission: a parent ID too long for a path is not admitted, not an 
     try testing.expect(trace.claude_limitations.worker_parent_missing);
     try testing.expect(trace.session.lineage_conflict);
 }
+
+test "parent admission: a parent agent ID with path segments is not admitted" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var files = workerTree();
+    files[2].bytes = "{\"parentAgentId\":\"x/../../../" ++ worker_root ++ "\",\"toolUseId\":\"t\"}";
+    try support.writeTree(tmp.dir, &files);
+    var trace = try parseAdmitted(tmp.dir, files[1].path, &.{ files[0].path, files[1].path });
+    defer trace.deinit(allocator);
+    try testing.expect(trace.claude_limitations.worker_parent_missing);
+}

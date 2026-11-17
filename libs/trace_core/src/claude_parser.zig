@@ -841,6 +841,11 @@ pub const PathIdentity = struct {
     }
 };
 
+fn isPathComponent(text: []const u8) bool {
+    if (text.len == 0 or eql(text, ".") or eql(text, "..")) return false;
+    return std.mem.indexOfAny(u8, text, "/\\") == null;
+}
+
 pub fn isUuid(text: []const u8) bool {
     if (text.len != 36) return false;
     for (text, 0..) |byte, index| {
@@ -1146,9 +1151,11 @@ pub const ClaudeParser = struct {
         layout: PathIdentity,
     ) !bool {
         const admission = self.options.admission orelse return false;
+        if (!isUuid(root)) return false;
         var directory = layout.base;
         var stem = root;
         if (facts.parent_agent) |parent| {
+            if (!isPathComponent(parent)) return false;
             stem = try std.fmt.allocPrint(self.arena(), "agent-{s}", .{parent});
             directory = std.fs.path.dirname(self.trace.session.path) orelse ".";
         }

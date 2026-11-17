@@ -2477,28 +2477,27 @@ const PhysicalMetrics = struct {
     claude: ClaudeLimitationCounts = .{},
 
     fn admitTrace(self: *PhysicalMetrics, trace: *const seq.trace_adapter.Trace) !void {
-        const vote = seq.trace_adapter.adapterId(trace);
-        if (trace.source_unparsed) self.weak_adapter = vote else try self.admitAdapter(vote);
-        const fallback = self.weak_adapter orelse return;
-        const current = self.adapter orelse return;
-        if (std.mem.eql(u8, current, fallback)) return;
-        if (std.mem.eql(u8, current, seq.trace_adapter.claude_adapter_id)) return;
-        return error.MixedPhysicalSourceAdapters;
+        const vote = seq.trace_adapter.adapterId(trace) orelse return;
+        return self.admitVote(vote, trace.source_unparsed);
     }
 
     fn reportedAdapter(self: PhysicalMetrics) ?[]const u8 {
         return self.adapter orelse self.weak_adapter;
     }
 
-    fn admitAdapter(self: *PhysicalMetrics, vote: ?[]const u8) !void {
-        const adapter = vote orelse return;
-        if (self.adapter) |current| {
-            if (!std.mem.eql(u8, current, adapter)) {
-                return error.MixedPhysicalSourceAdapters;
-            }
+    fn admitVote(self: *PhysicalMetrics, vote: []const u8, fallback: bool) !void {
+        if (fallback) {
+            self.weak_adapter = vote;
+        } else if (self.adapter) |current| {
+            if (!std.mem.eql(u8, current, vote)) return error.MixedPhysicalSourceAdapters;
         } else {
-            self.adapter = adapter;
+            self.adapter = vote;
         }
+        const weak = self.weak_adapter orelse return;
+        const strong = self.adapter orelse return;
+        if (std.mem.eql(u8, strong, weak)) return;
+        if (std.mem.eql(u8, strong, seq.trace_adapter.claude_adapter_id)) return;
+        return error.MixedPhysicalSourceAdapters;
     }
 };
 
@@ -2580,7 +2579,7 @@ fn feedOpenCodeFile(
         path,
         remaining_bytes,
     );
-    try metrics.admitAdapter(seq.opencode_adapter.adapter_id);
+    try metrics.admitVote(seq.opencode_adapter.adapter_id, false);
     metrics.opened += 1;
     try recordCorpusBytes(metrics, observed.bytes_read, bounds.max_input_bytes);
     metrics.warnings = try std.math.add(
@@ -4263,6 +4262,28 @@ fn resolvePhysicalPaths(
     selectors.session_id = null;
     selectors.discovery_reads = reads;
     return seq.native.resolveTargetPaths(allocator, io, dir, selectors, false);
+}
+
+test "adapter votes: a fallback Codex vote yields only to Claude, in either order" {
+    const codex = "codex-rollout-jsonl/v1";
+    const others = [_][]const u8{ seq.opencode_adapter.adapter_id, "pi-session-jsonl/v1" };
+    for (others) |other| {
+        var first = PhysicalMetrics{};
+        try first.admitVote(codex, true);
+        const mixed = error.MixedPhysicalSourceAdapters;
+        try std.testing.expectError(mixed, first.admitVote(other, false));
+        var second = PhysicalMetrics{};
+        try second.admitVote(other, false);
+        try std.testing.expectError(mixed, second.admitVote(codex, true));
+    }
+    var claude = PhysicalMetrics{};
+    try claude.admitVote(codex, true);
+    try claude.admitVote(seq.trace_adapter.claude_adapter_id, false);
+    const claude_id = seq.trace_adapter.claude_adapter_id;
+    try std.testing.expectEqualStrings(claude_id, claude.reportedAdapter().?);
+    var alone = PhysicalMetrics{};
+    try alone.admitVote(codex, true);
+    try std.testing.expectEqualStrings(codex, alone.reportedAdapter().?);
 }
 
 test "streaming seed rows take lineage conflicts and token coverage from the body parse" {
