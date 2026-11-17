@@ -54,7 +54,8 @@ Ledger transports the supplied bytes; the calling skill selects their contents,
 interprets their format, and assesses whether they may be shared.
 
 Creation requires a token from `LEDGER_GITHUB_TOKEN`, then `GH_TOKEN`, then
-`GITHUB_TOKEN`; reading can be anonymous. Keep tokens out of request files.
+`GITHUB_TOKEN`; an empty variable counts as unset, and reading can be anonymous.
+Keep tokens out of request files.
 Ledger uses the GitHub API directly, without another transport executable.
 Creation always sends `public:false` and rejects other request fields. Secret
 gists are unlisted: anyone with the URL can read them.
@@ -63,13 +64,18 @@ A `ledger-gist/v1` result carries `gist_id`, `revision`, `url`, `revision_url`,
 `public`, `description`, and a `files` map with complete text. A successful create
 has read its immutable revision back and compared visibility, description, file
 names, and every file's bytes with the request. Keep the revision with the URL.
-A read without `--revision` resolves the current revision once, then fetches it
-by SHA. Reading does not run commands, install files, or restore native sessions.
+A read without `--revision` resolves the current revision once from the gist's
+commit list, then fetches it by SHA; it never relies on the version-dependent
+`history` field. Reading does not run commands, install files, or restore native
+sessions.
 
 The transport admits at most 16 files, 256 KiB per file, 1 MiB of decoded text,
 and 8 MiB of JSON. It rejects unsafe filenames, invalid UTF-8, truncated responses,
 and file-size disagreements. It does not follow redirects or remote `raw_url`
-values. Requests have a 30-second deadline; failure emits one structured
+values. A command makes at most three requests: create posts once, resolves the
+new revision, and reads it back; read resolves the revision unless pinned, then
+fetches it. Each request has a 30-second deadline, although blocking host name
+resolution (as on macOS) can outlast it. Failure emits one structured
 `ledger-gist-error/v1` result without partial file contents or server response bodies.
 
 Publication may have happened even when verification fails. An ambiguous POST

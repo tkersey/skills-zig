@@ -27,7 +27,7 @@ pub fn main(init: std.process.Init) !void {
             argv[2..],
             &output.interface,
         ) catch |err| {
-            const write_err = output.err orelse err;
+            const write_err = output.err orelse return err;
             if (cli.isClosedPipe(write_err)) return;
             return write_err;
         };

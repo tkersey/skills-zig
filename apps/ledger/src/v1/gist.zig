@@ -16,7 +16,7 @@ pub const help =
     \\
     \\Create accepts {"description":"...","files":{"handoff.md":{"content":"..."}}}.
     \\Only those fields are accepted. Creation always sets public=false and
-    \\verifies every file at the returned revision before reporting success.
+    \\verifies every file at its new revision before reporting success.
     \\Secret gists are unlisted: anyone with the URL can read their contents.
     \\
     \\Read returns complete text at one immutable revision. Without --revision,
@@ -24,7 +24,8 @@ pub const help =
     \\Limits: 16 files, 256 KiB per file, 1 MiB total text, 8 MiB JSON.
     \\Truncated or unsupported contents fail; remote URLs are never followed.
     \\
-    \\Authentication: LEDGER_GITHUB_TOKEN, then GH_TOKEN, then GITHUB_TOKEN.
+    \\Authentication: LEDGER_GITHUB_TOKEN, then GH_TOKEN, then GITHUB_TOKEN;
+    \\empty variables are ignored.
     \\Creation requires a token with permission to create gists. Reading can
     \\be anonymous. Requests use the GitHub API directly.
     \\A failed create can have published a gist. Never retry an uncertain
@@ -206,10 +207,13 @@ pub fn parseCreate(allocator: Allocator, bytes: []const u8) !std.json.Parsed(Cre
 }
 
 fn tokenFromEnvironment(environment: *const std.process.Environ.Map) !?[]const u8 {
-    const token = environment.get("LEDGER_GITHUB_TOKEN") orelse
-        environment.get("GH_TOKEN") orelse environment.get("GITHUB_TOKEN") orelse return null;
-    try validateToken(token);
-    return token;
+    for ([_][]const u8{ "LEDGER_GITHUB_TOKEN", "GH_TOKEN", "GITHUB_TOKEN" }) |name| {
+        const token = environment.get(name) orelse continue;
+        if (token.len == 0) continue;
+        try validateToken(token);
+        return token;
+    }
+    return null;
 }
 
 fn validateToken(token: []const u8) !void {
@@ -267,10 +271,10 @@ pub fn run(
     var http: Http = .{};
     var document = switch (options) {
         .help => unreachable,
-        .read => |ref| try read(allocator, io, http.transport(), ref, token),
+        .read => |ref| try read(allocator, io, http.transport(), ref, token, null),
         .create => |path| created: {
             if (token == null) return error.GistTokenRequired;
-            const bytes = try dir.readFileAlloc(io, path, allocator, .limited(max_json_bytes));
+            const bytes = try readRequest(io, dir, allocator, path);
             defer allocator.free(bytes);
             var input = try parseCreate(allocator, bytes);
             defer input.deinit();
@@ -288,8 +292,13 @@ pub fn run(
     try document.write(allocator, output);
 }
 
+fn readRequest(io: Io, dir: Io.Dir, allocator: Allocator, path: []const u8) ![]u8 {
+    return dir.readFileAlloc(io, path, allocator, .limited(max_json_bytes + 1)) catch |err|
+        return if (err == error.StreamTooLong) error.GistJsonLimitExceeded else err;
+}
+
 const ApiRequest = struct {
-    operation: union(enum) { create: []const u8, read: Ref },
+    operation: union(enum) { create: []const u8, latest: []const u8, read: Ref },
     token: ?[]const u8,
 
     fn validate(self: ApiRequest) !void {
@@ -299,10 +308,11 @@ const ApiRequest = struct {
                 if (self.token == null) return error.GistTokenRequired;
                 if (bytes.len > max_json_bytes) return error.GistJsonLimitExceeded;
             },
+            .latest => |id| if (!validId(id)) return error.InvalidGistId,
             .read => |ref| {
                 if (!validId(ref.id)) return error.InvalidGistId;
-                if (ref.revision) |sha| if (!validRevision(sha))
-                    return error.InvalidGistRevision;
+                const sha = ref.revision orelse return error.InvalidGistRevision;
+                if (!validRevision(sha)) return error.InvalidGistRevision;
             },
         }
     }
@@ -327,12 +337,6 @@ const Transport = struct {
         try value.validate();
         return self.request_fn(self.context, allocator, io, value);
     }
-};
-
-const Metadata = struct {
-    id: []const u8,
-    public: bool,
-    history: []const struct { version: []const u8 } = &.{},
 };
 
 const RemoteFile = struct {
@@ -452,27 +456,51 @@ fn read(
     transport: Transport,
     ref: Ref,
     token: ?[]const u8,
+    diagnostics: ?*Diagnostics,
 ) !Document {
-    var selected = ref;
     var revision: [40]u8 = undefined;
-    if (selected.revision == null) {
-        var latest = try get(allocator, io, transport, ref, token);
-        defer latest.deinit();
-        var metadata = try parseMetadata(allocator, latest.body);
-        defer metadata.deinit();
-        if (!std.mem.eql(u8, metadata.value.id, ref.id)) return error.GistIdentityMismatch;
-        const sha = try currentRevision(metadata.value);
+    if (ref.revision) |sha| {
+        if (!validRevision(sha)) return error.InvalidGistRevision;
         revision = sha[0..40].*;
-        selected.revision = &revision;
-    }
-    var response = try get(allocator, io, transport, selected, token);
+    } else revision = try latestRevision(allocator, io, transport, ref.id, token);
+    if (diagnostics) |known| known.revision = revision;
+    const pinned: Ref = .{ .id = ref.id, .revision = &revision };
+    var response = try fetch(allocator, io, transport, .{ .read = pinned }, token);
     defer response.deinit();
-    return Document.parse(allocator, response.body, selected);
+    return Document.parse(allocator, response.body, pinned);
 }
 
-fn get(allocator: Allocator, io: Io, transport: Transport, ref: Ref, token: ?[]const u8) !Response {
+fn latestRevision(
+    allocator: Allocator,
+    io: Io,
+    transport: Transport,
+    id: []const u8,
+    token: ?[]const u8,
+) ![40]u8 {
+    var response = try fetch(allocator, io, transport, .{ .latest = id }, token);
+    defer response.deinit();
+    if (response.body.len > max_json_bytes) return error.GistJsonLimitExceeded;
+    const commits = try std.json.parseFromSlice(
+        []const struct { version: []const u8 },
+        allocator,
+        response.body,
+        .{ .ignore_unknown_fields = true, .duplicate_field_behavior = .@"error" },
+    );
+    defer commits.deinit();
+    if (commits.value.len == 0 or !validRevision(commits.value[0].version))
+        return error.InvalidGistRevision;
+    return commits.value[0].version[0..40].*;
+}
+
+fn fetch(
+    allocator: Allocator,
+    io: Io,
+    transport: Transport,
+    operation: @FieldType(ApiRequest, "operation"),
+    token: ?[]const u8,
+) !Response {
     var response = try transport.request(allocator, io, .{
-        .operation = .{ .read = ref },
+        .operation = operation,
         .token = token,
     });
     errdefer response.deinit();
@@ -509,52 +537,25 @@ fn create(
         if (response.status >= 400 and response.status < 500) return statusError(response.status);
         return error.GistCreateOutcomeUnknown;
     }
-    rememberCreatedId(allocator, response.body, diagnostics);
-    var metadata = parseMetadata(allocator, response.body) catch
+    rememberCreatedId(allocator, response.body, diagnostics) catch
         return error.GistCreatedButUnverified;
-    defer metadata.deinit();
-    diagnostics.remember(metadata.value.id, null);
-    const revision = currentRevision(metadata.value) catch return error.GistCreatedButUnverified;
-    diagnostics.remember(metadata.value.id, revision);
-    if (metadata.value.public) return error.GistCreatedButUnverified;
-    const ref: Ref = .{ .id = metadata.value.id, .revision = revision };
-    var initial = Document.parse(allocator, response.body, ref) catch
-        return error.GistCreatedButUnverified;
-    defer initial.deinit();
-    initial.matches(input) catch return error.GistCreatedButUnverified;
-    var confirmed = read(allocator, io, transport, ref, token) catch
+    const ref: Ref = .{ .id = diagnostics.gistId().? };
+    var confirmed = read(allocator, io, transport, ref, token, diagnostics) catch
         return error.GistCreatedButUnverified;
     errdefer confirmed.deinit();
     confirmed.matches(input) catch return error.GistCreatedButUnverified;
     return confirmed;
 }
 
-fn rememberCreatedId(allocator: Allocator, bytes: []const u8, diagnostics: *Diagnostics) void {
-    if (bytes.len > max_json_bytes) return;
-    const parsed = std.json.parseFromSlice(struct { id: []const u8 }, allocator, bytes, .{
-        .ignore_unknown_fields = true,
-        .duplicate_field_behavior = .@"error",
-    }) catch return;
-    defer parsed.deinit();
-    diagnostics.remember(parsed.value.id, null);
-}
-
-fn parseMetadata(allocator: Allocator, bytes: []const u8) !std.json.Parsed(Metadata) {
+fn rememberCreatedId(allocator: Allocator, bytes: []const u8, diagnostics: *Diagnostics) !void {
     if (bytes.len > max_json_bytes) return error.GistJsonLimitExceeded;
-    const parsed = try std.json.parseFromSlice(Metadata, allocator, bytes, .{
-        .allocate = .alloc_always,
+    const parsed = try std.json.parseFromSlice(struct { id: []const u8 }, allocator, bytes, .{
         .ignore_unknown_fields = true,
         .duplicate_field_behavior = .@"error",
     });
-    errdefer parsed.deinit();
+    defer parsed.deinit();
     if (!validId(parsed.value.id)) return error.InvalidGistId;
-    return parsed;
-}
-
-fn currentRevision(metadata: Metadata) ![]const u8 {
-    if (metadata.history.len == 0 or !validRevision(metadata.history[0].version))
-        return error.InvalidGistRevision;
-    return metadata.history[0].version;
+    diagnostics.remember(parsed.value.id, null);
 }
 
 fn statusError(status: u16) anyerror {
@@ -572,14 +573,16 @@ fn apiUrl(allocator: Allocator, request: ApiRequest) ![]u8 {
     try request.validate();
     return switch (request.operation) {
         .create => allocator.dupe(u8, "https://api.github.com/gists"),
-        .read => |ref| if (ref.revision) |revision|
-            std.fmt.allocPrint(
-                allocator,
-                "https://api.github.com/gists/{s}/{s}",
-                .{ ref.id, revision },
-            )
-        else
-            std.fmt.allocPrint(allocator, "https://api.github.com/gists/{s}", .{ref.id}),
+        .latest => |id| std.fmt.allocPrint(
+            allocator,
+            "https://api.github.com/gists/{s}/commits?per_page=1",
+            .{id},
+        ),
+        .read => |ref| std.fmt.allocPrint(
+            allocator,
+            "https://api.github.com/gists/{s}/{s}",
+            .{ ref.id, ref.revision.? },
+        ),
     };
 }
 
@@ -656,7 +659,7 @@ const Job = struct {
         };
         const payload: ?[]const u8 = switch (self.request.operation) {
             .create => |bytes| bytes,
-            .read => null,
+            .latest, .read => null,
         };
         var request = try client.request(if (payload == null) .GET else .POST, self.uri, .{
             .redirect_behavior = .unhandled,
@@ -708,6 +711,8 @@ const Job = struct {
 
 const test_id = "0123456789abcdef0123456789abcdef";
 const test_revision = "0123456789abcdef0123456789abcdef01234567";
+const test_commits = "[{\"version\":\"" ++ test_revision ++
+    "\",\"url\":\"https://untrusted.invalid\"}]";
 const test_input =
     \\{"description":"handoff","files":{"handoff.md":{"content":"Goal\nEvidence\n"}}}
 ;
@@ -718,7 +723,6 @@ fn testResponse(allocator: Allocator, content: []const u8, public: bool, truncat
         .public = public,
         .description = "handoff",
         .truncated = truncated,
-        .history = .{.{ .version = test_revision }},
         .files = .{ .@"handoff.md" = .{
             .filename = "handoff.md",
             .size = content.len,
@@ -826,6 +830,41 @@ test "gist credentials retain explicit precedence and cannot inject headers" {
     try std.testing.expectError(error.InvalidGistToken, tokenFromEnvironment(&environment));
 }
 
+test "gist credentials treat empty variables as unset so reads stay anonymous" {
+    var environment: std.process.Environ.Map = .init(std.testing.allocator);
+    defer environment.deinit();
+    for ([_][]const u8{ "LEDGER_GITHUB_TOKEN", "GH_TOKEN", "GITHUB_TOKEN" }) |name| {
+        try environment.put(name, "");
+    }
+    try std.testing.expectEqual(null, try tokenFromEnvironment(&environment));
+    try environment.put("GITHUB_TOKEN", "synthetic-third");
+    try std.testing.expectEqualStrings(
+        "synthetic-third",
+        (try tokenFromEnvironment(&environment)).?,
+    );
+}
+
+test "gist request files admit exactly the JSON bound and name the excess" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const exact = try allocator.alloc(u8, max_json_bytes);
+    defer allocator.free(exact);
+    @memset(exact, ' ');
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "exact.json", .data = exact });
+    const bytes = try readRequest(std.testing.io, tmp.dir, allocator, "exact.json");
+    defer allocator.free(bytes);
+    try std.testing.expectEqual(max_json_bytes, bytes.len);
+    const excess = try allocator.alloc(u8, max_json_bytes + 1);
+    defer allocator.free(excess);
+    @memset(excess, ' ');
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "excess.json", .data = excess });
+    try std.testing.expectError(
+        error.GistJsonLimitExceeded,
+        readRequest(std.testing.io, tmp.dir, allocator, "excess.json"),
+    );
+}
+
 const MockReply = struct {
     operation: enum { create, latest, revision },
     status: u16 = 200,
@@ -858,16 +897,14 @@ const Mock = struct {
                 defer parsed.deinit();
                 try std.testing.expectEqual(false, parsed.value.object.get("public").?.bool);
             },
-            .latest, .revision => {
+            .latest => {
+                try std.testing.expect(value.operation == .latest);
+                try std.testing.expectEqualStrings(test_id, value.operation.latest);
+            },
+            .revision => {
                 try std.testing.expect(value.operation == .read);
                 try std.testing.expectEqualStrings(test_id, value.operation.read.id);
-                if (reply.operation == .revision)
-                    try std.testing.expectEqualStrings(
-                        test_revision,
-                        value.operation.read.revision.?,
-                    )
-                else
-                    try std.testing.expect(value.operation.read.revision == null);
+                try std.testing.expectEqualStrings(test_revision, value.operation.read.revision.?);
             },
         }
         if (reply.fail) return error.ConnectionLost;
@@ -887,6 +924,7 @@ test "gist create verifies secret content with an immutable read before success"
     defer input.deinit();
     var mock: Mock = .{ .replies = &.{
         .{ .operation = .create, .status = 201, .body = body },
+        .{ .operation = .latest, .body = test_commits },
         .{ .operation = .revision, .body = body },
     } };
     var diagnostics: Diagnostics = .{};
@@ -899,7 +937,7 @@ test "gist create verifies secret content with an immutable read before success"
         &diagnostics,
     );
     defer document.deinit();
-    try std.testing.expectEqual(@as(usize, 2), mock.calls);
+    try std.testing.expectEqual(@as(usize, 3), mock.calls);
     try std.testing.expectEqualStrings(test_id, diagnostics.gistId().?);
     try std.testing.expectEqualStrings(test_revision, &diagnostics.revision.?);
     var output: Writer.Allocating = .init(allocator);
@@ -928,10 +966,12 @@ test "gist read resolves latest once then ignores untrusted raw URLs" {
     const body = try testResponse(allocator, "Goal\nEvidence\n", false, false);
     defer allocator.free(body);
     var mock: Mock = .{ .replies = &.{
-        .{ .operation = .latest, .body = body },
+        .{ .operation = .latest, .body = test_commits },
         .{ .operation = .revision, .body = body },
     } };
-    var document = try read(allocator, std.testing.io, mock.transport(), .{ .id = test_id }, null);
+    var document = try read(allocator, std.testing.io, mock.transport(), .{
+        .id = test_id,
+    }, null, null);
     defer document.deinit();
     try std.testing.expectEqual(@as(usize, 2), mock.calls);
     try std.testing.expectEqualStrings(test_revision, &document.revision);
@@ -965,6 +1005,7 @@ test "gist creation uncertainty and failed verification preserve recovery withou
     for ([_][]const u8{ changed, public, truncated }) |body| {
         var mock: Mock = .{ .replies = &.{
             .{ .operation = .create, .status = 201, .body = initial },
+            .{ .operation = .latest, .body = test_commits },
             .{ .operation = .revision, .body = body },
         } };
         var diagnostics: Diagnostics = .{};
@@ -976,7 +1017,7 @@ test "gist creation uncertainty and failed verification preserve recovery withou
             "synthetic-token",
             &diagnostics,
         ));
-        try std.testing.expectEqual(@as(usize, 2), mock.calls);
+        try std.testing.expectEqual(@as(usize, 3), mock.calls);
         try std.testing.expectEqualStrings(test_id, diagnostics.gistId().?);
         try std.testing.expectEqualStrings(test_revision, &diagnostics.revision.?);
     }
@@ -992,6 +1033,7 @@ test "gist read rejects truncation instead of presenting an incomplete document"
         std.testing.io,
         mock.transport(),
         .{ .id = test_id, .revision = test_revision },
+        null,
         null,
     ));
     try std.testing.expectEqual(@as(usize, 1), mock.calls);
@@ -1045,7 +1087,7 @@ const HttpFixture = struct {
             );
             const target = switch (reply.operation) {
                 .create => "/gists",
-                .latest => "/gists/" ++ test_id,
+                .latest => "/gists/" ++ test_id ++ "/commits?per_page=1",
                 .revision => "/gists/" ++ test_id ++ "/" ++ test_revision,
             };
             try std.testing.expectEqualStrings(target, incoming.head.target);
@@ -1103,6 +1145,7 @@ test "native HTTP creates secret payload and reads exact revision without extern
     defer allocator.free(body);
     var fixture = try HttpFixture.open(&.{
         .{ .operation = .create, .status = 201, .body = body },
+        .{ .operation = .latest, .body = test_commits },
         .{ .operation = .revision, .body = body },
     });
     defer fixture.server.deinit(std.testing.io);
@@ -1121,7 +1164,7 @@ test "native HTTP creates secret payload and reads exact revision without extern
     );
     defer document.deinit();
     try worker.await(std.testing.io);
-    try std.testing.expectEqual(@as(usize, 2), fixture.calls.load(.monotonic));
+    try std.testing.expectEqual(@as(usize, 3), fixture.calls.load(.monotonic));
     try std.testing.expectEqualStrings(test_revision, &document.revision);
 }
 
@@ -1139,6 +1182,7 @@ test "native HTTP rejects redirects without following locations or waiting for r
         fixture.transport(),
         .{ .id = test_id, .revision = test_revision },
         "synthetic-token",
+        null,
     ));
     try std.testing.expectEqual(@as(usize, 1), fixture.calls.load(.monotonic));
 }
@@ -1283,7 +1327,7 @@ test "native HTTP anonymous read omits credentials and still pins a revision" {
     var document = try read(allocator, std.testing.io, fixture.transport(), .{
         .id = test_id,
         .revision = test_revision,
-    }, null);
+    }, null, null);
     defer document.deinit();
     try worker.await(std.testing.io);
     try std.testing.expectEqualStrings(test_revision, &document.revision);
@@ -1302,6 +1346,7 @@ test "native HTTP incomplete response ends at deadline without reporting content
         fixture.transport(),
         .{ .id = test_id, .revision = test_revision },
         "synthetic-token",
+        null,
     ));
     try std.testing.expectEqual(@as(usize, 1), fixture.calls.load(.monotonic));
 }

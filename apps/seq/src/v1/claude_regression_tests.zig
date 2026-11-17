@@ -164,6 +164,19 @@ test "source events: native uuid and parentUuid are retained, modeled or not" {
     }
 }
 
+const compaction_source = allow_list_source ++
+    \\{"type":"system","subtype":"compact_boundary","uuid":"c1","parentUuid":null,"logicalParentUuid":"p3","sessionId":"s","cwd":"/w","timestamp":"2026-11-01T00:00:03Z","content":"Conversation compacted","compactMetadata":{"trigger":"auto","preTokens":10}}
+    \\
+;
+
+test "source events: a compaction keeps its physical parent, not logicalParentUuid" {
+    var trace = try support.parse(allocator, "compact.jsonl", compaction_source, .stale);
+    defer trace.deinit(allocator);
+    const boundary = trace.occurrences.items[trace.occurrences.items.len - 1];
+    try testing.expectEqualStrings("c1", boundary.native_id.?);
+    try testing.expect(boundary.native_parent_id == null);
+}
+
 const prompt_line =
     \\{"type":"user","uuid":"q1","parentUuid":null,"sessionId":"s","cwd":"/w","timestamp":"2026-11-01T00:00:00Z","turnOrigin":"human","message":{"role":"user","content":"go"}}
     \\

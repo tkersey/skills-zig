@@ -40,6 +40,13 @@ jq -e '.schema == "ledger-gist-error/v1" and .error == "GistTokenRequired" and
   .authority_granted == false and (has("storage_mutated") | not)' \
   <<<"$no_token" >/dev/null
 
+if empty_tokens=$(LEDGER_GITHUB_TOKEN= GH_TOKEN= GITHUB_TOKEN= \
+  "$binary" gist create --input "$work/missing.json" --format json); then
+  exit 1
+fi
+jq -e '.schema == "ledger-gist-error/v1" and .error == "GistTokenRequired" and
+  .attempted_create == false' <<<"$empty_tokens" >/dev/null
+
 if missing_id=$("$binary" gist read --format json); then
   exit 1
 fi
