@@ -96,10 +96,10 @@ pub const Admission = struct {
         self.paths.deinit(allocator);
     }
 
-    pub fn admits(self: *const Admission, path: []const u8) !bool {
+    pub fn admits(self: *const Admission, path: []const u8) bool {
         var buffer: [2 * std.fs.max_path_bytes]u8 = undefined;
         var scratch = std.heap.FixedBufferAllocator.init(&buffer);
-        const key = try std.fs.path.resolveAlloc(scratch.allocator(), &.{path});
+        const key = std.fs.path.resolveAlloc(scratch.allocator(), &.{path}) catch return false;
         return self.paths.contains(key);
     }
 };

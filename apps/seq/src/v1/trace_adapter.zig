@@ -5,6 +5,7 @@ pub const SessionInput = trace_core.SessionInput;
 pub const SessionRecord = trace_core.SessionRecord;
 pub const Admission = trace_core.Admission;
 pub const Trace = trace_core.CanonicalSessionTrace;
+pub const claude_adapter_id = trace_core.claude_parser.adapter_id;
 const definition = @import("definition.zig");
 const execution = @import("execution.zig");
 const physical = @import("physical.zig");

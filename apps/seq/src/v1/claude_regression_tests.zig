@@ -610,7 +610,7 @@ test "a native exact worker target admits the corpus it was resolved from" {
     try testing.expect(std.mem.endsWith(u8, paths.items[0], files[1].path["proj/".len..]));
     const parent = try std.fs.path.join(allocator, &.{ root, worker_root ++ ".jsonl" });
     defer allocator.free(parent);
-    try testing.expect(try admitted.admits(parent));
+    try testing.expect(admitted.admits(parent));
 }
 
 const shadowed_spawn = blk: {
@@ -830,4 +830,18 @@ test "selected body reads reuse discovered sidecar facts instead of reading the 
     defer if (selected.parsed) |*parsed| parsed.deinit(allocator);
     const parsed = selected.parsed orelse return error.TestExpectedParse;
     try testing.expect(!parsed.trace.claude_limitations.worker_parent_unread);
+}
+
+test "parent admission: a parent ID too long for a path is not admitted, not an error" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var files = workerTree();
+    const long_id: [9000]u8 = @splat('a');
+    const long_parent = "{\"parentAgentId\":\"" ++ long_id ++ "\",\"toolUseId\":\"t\"}";
+    files[2].bytes = long_parent;
+    try support.writeTree(tmp.dir, &files);
+    var trace = try parseAdmitted(tmp.dir, files[1].path, &.{ files[0].path, files[1].path });
+    defer trace.deinit(allocator);
+    try testing.expect(trace.claude_limitations.worker_parent_missing);
+    try testing.expect(trace.session.lineage_conflict);
 }

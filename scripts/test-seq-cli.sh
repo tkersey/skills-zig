@@ -364,6 +364,18 @@ claude_truncated=$(claude_isolated observe \
   --root "$claude_truncated_root" --param exclude_session_id=none --format json)
 jq -e '.corpus.adapter == "claude-code-transcript-jsonl/v1" and
   .corpus.parser_warning_count == 1' <<<"$claude_truncated" >/dev/null
+pi_malformed_root="$cache_dir/pi-malformed"
+mkdir -p "$pi_malformed_root"
+cp "$pi_session" "$pi_malformed_root/"
+printf '{not json\n' >"$pi_malformed_root/z.jsonl"
+jq '.relations[0].fields = ["session_id"] | .pipeline[2].fields = ["session_id"] |
+  .projections.rows.fields = ["session_id"]' "$claude_definitions/session-exclusion.json" \
+  >"$cache_dir/session-ids.json"
+if pi_mixed=$(claude_isolated observe --definition "$cache_dir/session-ids.json" \
+  --projection rows --root "$pi_malformed_root" --param exclude_session_id=none --format json); then
+  exit 1
+fi
+jq -e '.code == "MixedPhysicalSourceAdapters"' <<<"$pi_mixed" >/dev/null
 
 external_output=$("$binary" observe \
   --definition "$external_definition" \

@@ -1155,7 +1155,7 @@ pub const ClaudeParser = struct {
         for ([_][]const u8{ ".jsonl", ".jsonl.zst" }) |extension| {
             const name = try std.mem.concat(self.arena(), u8, &.{ stem, extension });
             const path = try std.fs.path.join(self.arena(), &.{ directory, name });
-            if (try admission.admits(path)) return true;
+            if (admission.admits(path)) return true;
         }
         return false;
     }

@@ -2478,8 +2478,12 @@ const PhysicalMetrics = struct {
 
     fn admitTrace(self: *PhysicalMetrics, trace: *const seq.trace_adapter.Trace) !void {
         const vote = seq.trace_adapter.adapterId(trace);
-        if (!trace.source_unparsed) return self.admitAdapter(vote);
-        if (self.weak_adapter == null) self.weak_adapter = vote;
+        if (trace.source_unparsed) self.weak_adapter = vote else try self.admitAdapter(vote);
+        const fallback = self.weak_adapter orelse return;
+        const current = self.adapter orelse return;
+        if (std.mem.eql(u8, current, fallback)) return;
+        if (std.mem.eql(u8, current, seq.trace_adapter.claude_adapter_id)) return;
+        return error.MixedPhysicalSourceAdapters;
     }
 
     fn reportedAdapter(self: PhysicalMetrics) ?[]const u8 {
