@@ -856,3 +856,17 @@ test "parent admission: a parent agent ID with path segments is not admitted" {
     defer trace.deinit(allocator);
     try testing.expect(trace.claude_limitations.worker_parent_missing);
 }
+
+const sidechain_after_request = prompt_line ++
+    \\{"type":"assistant","uuid":"q2","parentUuid":"q1","sessionId":"s","cwd":"/w","timestamp":"2026-11-01T00:00:01Z","message":{"id":"m1","role":"assistant","model":"x","stop_reason":"end_turn","content":[{"type":"text","text":"done"}]}}
+    \\{"type":"api-request","id":"req_pending","sessionId":"s","timestamp":"2026-11-01T00:00:02Z"}
+    \\{"type":"user","uuid":"sc1","parentUuid":null,"sessionId":"s","cwd":"/w","timestamp":"2026-11-01T00:00:03Z","isSidechain":true,"message":{"role":"user","content":"side"}}
+    \\
+;
+
+test "re-query: an inline sidechain record does not end a pending request" {
+    var trace = try support.parse(allocator, "pending.jsonl", sidechain_after_request, .stale);
+    defer trace.deinit(allocator);
+    try testing.expectEqual(@as(usize, 1), trace.turns.items.len);
+    try testing.expect(trace.turns.items[0].status != .complete);
+}

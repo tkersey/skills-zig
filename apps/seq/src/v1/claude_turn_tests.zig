@@ -760,6 +760,10 @@ test "duplicate uuid warns only when a different record reuses it" {
     var same = try load(repeated, .stale);
     defer same.deinit(testing.allocator);
     try testing.expectEqual(@as(usize, 0), duplicateUuidWarnings(&same, warning));
+    try testing.expectEqual(@as(usize, 1), same.turns.items.len);
+    try testing.expect(same.turns.items[0].status != .ongoing);
+    const reason = same.turns.items[0].status_reason orelse "";
+    try testing.expect(!std.mem.eql(u8, reason, "stale_ongoing_file"));
     var changed = try load(repeat_prompt ++ repeat_reply ++ altered_reply ++ repeat_reply, .stale);
     defer changed.deinit(testing.allocator);
     try testing.expectEqual(@as(usize, 1), duplicateUuidWarnings(&changed, warning));

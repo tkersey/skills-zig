@@ -87,6 +87,8 @@ fn indexUuids(
             &record.content_digest,
         )) {
             try duplicates.append(arena, record.line);
+        } else if (graph.modeled[occurrence.value_ptr.*]) {
+            graph.modeled[index] = false;
         }
         if (!graph.modeled[index]) continue;
         const entry = try uuids.getOrPut(arena, uuid);

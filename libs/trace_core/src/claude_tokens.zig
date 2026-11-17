@@ -53,6 +53,7 @@ const Tables = struct {
 pub fn account(
     arena: std.mem.Allocator,
     records: []const Record,
+    modeled: []const bool,
     identity_conflict: bool,
 ) !Accounting {
     var tables = Tables{};
@@ -62,7 +63,7 @@ pub fn account(
     var last_conversation: ?u32 = null;
     for (records, 0..) |record, index| {
         const position: u32 = @intCast(index);
-        if (record.kind.isConversation()) last_conversation = position;
+        if (record.kind.isConversation() and modeled[index]) last_conversation = position;
         if (record.kind == .api_request) try noteRequest(arena, &tables, record, position);
         if (!record.isModelResponse()) continue;
         if (record.request_ref.present()) |ref| try tables.named.put(arena, ref, {});

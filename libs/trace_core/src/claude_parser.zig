@@ -997,7 +997,12 @@ pub const ClaudeParser = struct {
             try self.warn(line, "Claude conversation record without uuid");
         }
         for (graph.duplicate_uuid_lines) |line| try self.warn(line, "duplicate Claude record uuid");
-        const accounting = try tokens_mod.account(self.arena(), records, identity.conflict);
+        const accounting = try tokens_mod.account(
+            self.arena(),
+            records,
+            graph.modeled,
+            identity.conflict,
+        );
         for (accounting.rows) |row| {
             if (row.kind == .invalid_id) {
                 try self.warn(records[row.record].line, "Claude response without a message id");
