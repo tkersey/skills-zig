@@ -43,13 +43,10 @@ pub const Diagnostics = struct {
         return if (self.id_len == 0) null else self.id[0..self.id_len];
     }
 
-    fn remember(self: *Diagnostics, id: []const u8, revision: ?[]const u8) void {
+    fn remember(self: *Diagnostics, id: []const u8) void {
         if (!validId(id)) return;
-        @memcpy(self.id[0..id.len], id);
+        std.mem.copyForwards(u8, self.id[0..id.len], id);
         self.id_len = @intCast(id.len);
-        if (revision) |sha| if (validRevision(sha)) {
-            self.revision = sha[0..40].*;
-        };
     }
 };
 
@@ -265,13 +262,26 @@ pub fn run(
     output: *Writer,
     diagnostics: *Diagnostics,
 ) !void {
+    var http: Http = .{};
+    return execute(io, dir, allocator, environment, args, http.transport(), output, diagnostics);
+}
+
+fn execute(
+    io: Io,
+    dir: Io.Dir,
+    allocator: Allocator,
+    environment: *const std.process.Environ.Map,
+    args: []const []const u8,
+    transport: Transport,
+    output: *Writer,
+    diagnostics: *Diagnostics,
+) !void {
     const options = try parseArgs(args);
     if (options == .help) return output.writeAll(help);
     const token = try tokenFromEnvironment(environment);
-    var http: Http = .{};
     var document = switch (options) {
         .help => unreachable,
-        .read => |ref| try read(allocator, io, http.transport(), ref, token, null),
+        .read => |ref| try read(allocator, io, transport, ref, token, diagnostics),
         .create => |path| created: {
             if (token == null) return error.GistTokenRequired;
             const bytes = try readRequest(io, dir, allocator, path);
@@ -281,7 +291,7 @@ pub fn run(
             break :created try create(
                 allocator,
                 io,
-                http.transport(),
+                transport,
                 input.value,
                 token.?,
                 diagnostics,
@@ -458,6 +468,7 @@ fn read(
     token: ?[]const u8,
     diagnostics: ?*Diagnostics,
 ) !Document {
+    if (diagnostics) |known| known.remember(ref.id);
     var revision: [40]u8 = undefined;
     if (ref.revision) |sha| {
         if (!validRevision(sha)) return error.InvalidGistRevision;
@@ -555,7 +566,7 @@ fn rememberCreatedId(allocator: Allocator, bytes: []const u8, diagnostics: *Diag
     });
     defer parsed.deinit();
     if (!validId(parsed.value.id)) return error.InvalidGistId;
-    diagnostics.remember(parsed.value.id, null);
+    diagnostics.remember(parsed.value.id);
 }
 
 fn statusError(status: u16) anyerror {
@@ -1039,6 +1050,33 @@ test "gist read rejects truncation instead of presenting an incomplete document"
     try std.testing.expectEqual(@as(usize, 1), mock.calls);
 }
 
+test "gist read failures report the requested id and resolved revision" {
+    const allocator = std.testing.allocator;
+    var environment: std.process.Environ.Map = .init(allocator);
+    defer environment.deinit();
+    var mock: Mock = .{ .replies = &.{
+        .{ .operation = .latest, .body = test_commits },
+        .{ .operation = .revision, .status = 404 },
+    } };
+    var output: Writer.Allocating = .init(allocator);
+    defer output.deinit();
+    var diagnostics: Diagnostics = .{};
+    try std.testing.expectError(error.GistNotFound, execute(
+        std.testing.io,
+        Io.Dir.cwd(),
+        allocator,
+        &environment,
+        &.{ "read", "--gist", test_id },
+        mock.transport(),
+        &output.writer,
+        &diagnostics,
+    ));
+    try std.testing.expectEqual(@as(usize, 0), output.written().len);
+    try std.testing.expect(!diagnostics.attempted_create);
+    try std.testing.expectEqualStrings(test_id, diagnostics.gistId().?);
+    try std.testing.expectEqualStrings(test_revision, &diagnostics.revision.?);
+}
+
 const HttpFixture = struct {
     server: Io.net.Server,
     replies: []const MockReply,
@@ -1294,7 +1332,10 @@ test "gist error documents preserve creation outcomes and recovery identifiers" 
     for ([_]anyerror{ error.GistCreateOutcomeUnknown, error.GistCreatedButUnverified }) |err| {
         var diagnostics: Diagnostics = .{ .attempted_create = true };
         const acknowledged = err == error.GistCreatedButUnverified;
-        if (acknowledged) diagnostics.remember(test_id, test_revision);
+        if (acknowledged) {
+            diagnostics.remember(test_id);
+            diagnostics.revision = test_revision.*;
+        }
         var output: Writer.Allocating = .init(allocator);
         defer output.deinit();
         try writeError(&output.writer, err, &diagnostics);

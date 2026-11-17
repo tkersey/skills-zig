@@ -149,16 +149,23 @@ test "payloads: only modeled fields, blocks and usage counters are exposed" {
     try testing.expect(trace.occurrences.items[2].event_type == null);
 }
 
-test "source events: native uuid and parentUuid are retained, modeled or not" {
-    var trace = try support.parse(allocator, "allow.jsonl", allow_list_source, .stale);
+const private_record_source = allow_list_source ++
+    \\{"type":"progress","uuid":"g1","parentUuid":"p3","sessionId":"s","cwd":"/w","timestamp":"2026-11-01T00:00:03Z","data":{"type":"hook_progress"}}
+    \\
+;
+
+test "source events: native uuid and parentUuid are retained for modeled and private records" {
+    var trace = try support.parse(allocator, "private.jsonl", private_record_source, .stale);
     defer trace.deinit(allocator);
-    const expected = [_]struct { id: []const u8, parent: ?[]const u8 }{
-        .{ .id = "p1", .parent = null },
-        .{ .id = "p2", .parent = "p1" },
-        .{ .id = "p3", .parent = "p2" },
+    const expected = [_]struct { id: []const u8, parent: ?[]const u8, private: bool }{
+        .{ .id = "p1", .parent = null, .private = false },
+        .{ .id = "p2", .parent = "p1", .private = false },
+        .{ .id = "p3", .parent = "p2", .private = false },
+        .{ .id = "g1", .parent = "p3", .private = true },
     };
     try testing.expectEqual(expected.len, trace.occurrences.items.len);
     for (expected, trace.occurrences.items) |want, occurrence| {
+        try testing.expectEqual(want.private, occurrence.private);
         try testing.expectEqualStrings(want.id, occurrence.native_id.?);
         try expectOptional(want.parent, occurrence.native_parent_id);
     }
