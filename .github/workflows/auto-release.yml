@@ -12,6 +12,7 @@ on:
       - "libs/**"
       - "scripts/guards/definition-core-domain.sh"
       - "scripts/test-ledger-cli.sh"
+      - "scripts/test-ledger-gist.sh"
       - "scripts/test-seq-cli.sh"
       - "scripts/test-seq-observation-contract.sh"
       - "tools/durable_store_perf.zig"
