@@ -2,6 +2,11 @@ const core_calendar = @import("core_calendar");
 const std = @import("std");
 const builtin = @import("builtin");
 const c = @import("c_time");
+const iso_time = @import("trace_core").iso_time;
+
+pub const parseIsoTimestampMillis = iso_time.parseIsoTimestampMillis;
+pub const daysFromCivil = iso_time.daysFromCivil;
+const daysInMonth = iso_time.daysInMonth;
 
 pub const Date = struct {
     year: i32,
@@ -14,59 +19,6 @@ pub const TimeZone = union(enum) {
     local,
     fixed_offset_minutes: i32,
 };
-
-pub fn parseIsoTimestampMillis(ts: []const u8) ?i64 {
-    if (ts.len < 20) return null;
-    if (ts[4] != '-' or ts[7] != '-' or ts[10] != 'T' or
-        ts[13] != ':' or ts[16] != ':') return null;
-
-    const year = std.fmt.parseInt(i64, ts[0..4], 10) catch return null;
-    const month = std.fmt.parseInt(u8, ts[5..7], 10) catch return null;
-    const day = std.fmt.parseInt(u8, ts[8..10], 10) catch return null;
-    const hour = std.fmt.parseInt(i64, ts[11..13], 10) catch return null;
-    const minute = std.fmt.parseInt(i64, ts[14..16], 10) catch return null;
-    const second = std.fmt.parseInt(i64, ts[17..19], 10) catch return null;
-
-    if (month < 1 or month > 12) return null;
-    if (day < 1 or day > daysInMonth(@intCast(year), month)) return null;
-    if (hour < 0 or hour > 23 or minute < 0 or minute > 59 or
-        second < 0 or second > 59) return null;
-
-    var idx: usize = 19;
-    var millis: i64 = 0;
-    if (idx < ts.len and ts[idx] == '.') {
-        idx += 1;
-        var digit_count: usize = 0;
-        while (idx < ts.len and std.ascii.isDigit(ts[idx])) : (idx += 1) {
-            if (digit_count < 3) millis = millis * 10 + (ts[idx] - '0');
-            digit_count += 1;
-        }
-        if (digit_count == 0) return null;
-        while (digit_count < 3) : (digit_count += 1) millis *= 10;
-    }
-
-    var offset_seconds: i64 = 0;
-    if (idx == ts.len - 1 and ts[idx] == 'Z') {
-        idx += 1;
-    } else {
-        if (idx + 6 != ts.len) return null;
-        const sign = ts[idx];
-        if (sign != '+' and sign != '-') return null;
-        if (ts[idx + 3] != ':') return null;
-        const offset_hours = std.fmt.parseInt(i64, ts[idx + 1 .. idx + 3], 10) catch return null;
-        const offset_minutes = std.fmt.parseInt(i64, ts[idx + 4 .. idx + 6], 10) catch return null;
-        if (offset_hours < 0 or offset_hours > 23 or
-            offset_minutes < 0 or offset_minutes > 59) return null;
-        offset_seconds = offset_hours * 3600 + offset_minutes * 60;
-        if (sign == '-') offset_seconds = -offset_seconds;
-        idx += 6;
-    }
-    if (idx != ts.len) return null;
-
-    const days = daysFromCivil(year, month, day);
-    const day_seconds = hour * 3600 + minute * 60 + second - offset_seconds;
-    return (days * 86_400 + day_seconds) * 1000 + millis;
-}
 
 pub fn parseTimeZone(raw_opt: ?[]const u8) !TimeZone {
     const raw = raw_opt orelse return .utc;
@@ -138,18 +90,6 @@ pub fn daysBetweenInclusive(start: Date, end: Date) i64 {
     return end_days - start_days + 1;
 }
 
-pub fn daysFromCivil(year: i64, month: u8, day: u8) i64 {
-    var adjusted_year = year;
-    if (month <= 2) adjusted_year -= 1;
-    const era = @divFloor(if (adjusted_year >= 0) adjusted_year else adjusted_year - 399, 400);
-    const yoe = adjusted_year - era * 400;
-    const shifted_month: i64 = @as(i64, @intCast(month)) +
-        (if (month > 2) @as(i64, -3) else @as(i64, 9));
-    const doy = @divFloor(153 * shifted_month + 2, 5) + @as(i64, @intCast(day)) - 1;
-    const doe = yoe * 365 + @divFloor(yoe, 4) - @divFloor(yoe, 100) + doy;
-    return era * 146_097 + doe - 719_468;
-}
-
 fn parseOffsetMinutes(text: []const u8) ?i32 {
     if (text.len != 6) return null;
     const sign = text[0];
@@ -196,19 +136,6 @@ fn civilFromDays(days_since_unix_epoch: i64) Date {
         .year = @intCast(date.year),
         .month = @intCast(date.month),
         .day = @intCast(date.day),
-    };
-}
-
-fn isLeapYear(year: i32) bool {
-    return (@mod(year, 4) == 0 and @mod(year, 100) != 0) or (@mod(year, 400) == 0);
-}
-
-fn daysInMonth(year: i32, month: u8) u8 {
-    return switch (month) {
-        1, 3, 5, 7, 8, 10, 12 => 31,
-        4, 6, 9, 11 => 30,
-        2 => if (isLeapYear(year)) 29 else 28,
-        else => 0,
     };
 }
 

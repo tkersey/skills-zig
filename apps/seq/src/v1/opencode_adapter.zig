@@ -697,7 +697,7 @@ fn fillTurn(
             19 => try usizeInteger(toolCount(object)),
             20 => .{ .boolean = false },
             24 => .{ .integer = 0 },
-            4...6, 8, 10...18, 21...23 => .null,
+            4...6, 8, 10...18, 21...23, 25 => .null,
             else => return error.InvalidOpenCodePhysicalFieldIndex,
         };
     }

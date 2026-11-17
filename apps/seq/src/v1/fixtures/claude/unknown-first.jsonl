@@ -1,0 +1,6 @@
+{"type":"mystery-a","sessionId":"5e551000-0000-4000-8000-000000000007"}
+{"type":"mystery-b","payload":{"type":"session_meta","id":"codex-like"}}
+{"type":"mystery-c","sessionId":"5e551000-0000-4000-8000-000000000007","payload":{"type":"task_started"}}
+{"type":"mystery-d","note":"neither"}
+{"parentUuid":null,"isSidechain":false,"type":"user","uuid":"rec-k01","timestamp":"2026-11-10T15:00:00.000Z","cwd":"/work/unknown","sessionId":"5e551000-0000-4000-8000-000000000007","version":"2.1.325","gitBranch":"main","message":{"role":"user","content":"Hello after unknowns"},"userType":"external","turnOrigin":"human"}
+{"parentUuid":"rec-k01","isSidechain":false,"type":"assistant","uuid":"rec-k02","timestamp":"2026-11-10T15:00:01.000Z","cwd":"/work/unknown","sessionId":"5e551000-0000-4000-8000-000000000007","version":"2.1.325","gitBranch":"main","message":{"model":"claude-test-one","id":"msg_k1","type":"message","role":"assistant","content":[{"type":"text","text":"Hi."}],"stop_reason":"end_turn","stop_sequence":null,"usage":{"input_tokens":10,"cache_creation_input_tokens":0,"cache_read_input_tokens":0,"output_tokens":5,"service_tier":"standard"}},"apiBlockIndex":0,"requestId":"req_msg_k1","effort":"high"}

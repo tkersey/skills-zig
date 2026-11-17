@@ -13,6 +13,7 @@ pub fn build(ctx: BuildContext, shared: SharedModules) DefinitionApp {
     const seq_time = ctx.module("apps/seq/src/time_utils.zig", &.{
         .{ .name = "core_calendar", .module = shared.calendar },
         .{ .name = "c_time", .module = c_time.mod },
+        .{ .name = "trace_core", .module = shared.trace },
     });
     const seq_v1_core = ctx.module("apps/seq/src/v1/root.zig", &.{
         .{ .name = "core_selection", .module = shared.selection },

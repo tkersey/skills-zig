@@ -24,4 +24,8 @@ test {
     _ = relation_graph;
     _ = structured;
     _ = trace_adapter;
+    _ = @import("claude_turn_tests.zig");
+    _ = @import("claude_token_tests.zig");
+    _ = @import("claude_source_tests.zig");
+    _ = @import("claude_regression_tests.zig");
 }

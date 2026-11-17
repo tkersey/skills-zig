@@ -1,0 +1,39 @@
+{
+  "schema": "seq-observation-definition/v1",
+  "id": "example/claude-family-lineage",
+  "requires": {"abi": "seq-observation-abi/v1", "operators": ["scan", "join"]},
+  "parameters": {},
+  "selectors": ["path", "root"],
+  "relations": [
+    {"name": "sessions", "fields": ["session_id", "parent_session_id"]}
+  ],
+  "inputs": [],
+  "pipeline": [
+    {"op": "scan", "relation": "sessions", "as": "session_rows"},
+    {
+      "op": "join", "inputs": ["session_rows", "session_rows", "session_rows"], "as": "rows",
+      "on": {
+        "kind": "anti", "keys": [{"left": "session_id", "right": "session_id"}],
+        "lineage": {
+          "left": "session_id", "right": "session_id",
+          "node": "session_id", "parent": "parent_session_id"
+        }
+      },
+      "fields": [
+        {"source": 0, "field": "session_id", "name": "session_id",
+          "type": "string", "nullable": false}
+      ]
+    }
+  ],
+  "projections": {
+    "rows": {
+      "relation": "rows", "schema": "example/claude-family-lineage/v1",
+      "fields": ["session_id"], "renderers": ["json"]
+    }
+  },
+  "bounds": {
+    "max_rows": 100, "max_output_bytes": 65536, "max_fold_states": 4,
+    "max_input_bytes": 1048576, "max_graph_depth": 8, "max_graph_nodes": 100,
+    "max_diagnostics": 8
+  }
+}

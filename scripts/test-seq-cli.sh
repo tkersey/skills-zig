@@ -2,6 +2,7 @@
 set -euo pipefail
 
 binary=$1
+unset CLAUDE_CODE_SESSION_ID CODEX_THREAD_ID PI_SESSION_ID PI_SESSION_FILE
 bash scripts/test-seq-observation-contract.sh "$binary"
 message_definition=apps/seq/src/v1/fixtures/message-observation.json
 external_definition=apps/seq/src/v1/fixtures/external-observation.json
@@ -16,6 +17,9 @@ temp_base=$(cd "${TMPDIR:-/tmp}" && pwd -P)
 cache_dir=$(mktemp -d "$temp_base/seq-v1-smoke.XXXXXX")
 trap 'test -n "${cache_dir:-}" && rm -rf -- "$cache_dir"' EXIT
 export SEQ_CACHE_DIR="$cache_dir/cache"
+fixture_root="$cache_dir/fixture-root"
+cp -R apps/seq/src/v1/fixtures "$fixture_root"
+rm -rf -- "$fixture_root/claude"
 
 check_output=$("$binary" definition check \
   --definition "$message_definition" \
@@ -196,6 +200,183 @@ then
 fi
 grep -Fq '"code":"PiCumulativeTokenEventsUnavailable"' <<<"$pi_usage_error"
 
+claude_fixtures=apps/seq/src/v1/fixtures/claude
+"$binary" capabilities --format json |
+  jq -e '.source_adapters | any(.[]; . == "claude-code-transcript-jsonl/v1")' >/dev/null
+claude_outcomes="$cache_dir/turn-outcomes.jsonl"
+cp "$claude_fixtures/turn-outcomes.jsonl" "$claude_outcomes"
+touch -t 202001010000 "$claude_outcomes"
+claude_turns=$("$binary" turns --path "$claude_outcomes" --format json)
+jq -e 'map(.status_reason) == ["claude_end_turn", "claude_tool_ended_turn",
+  "claude_interrupted", "claude_text_end", "claude_superseded", "stale_ongoing_file"]' \
+  <<<"$claude_turns" >/dev/null
+jq -e 'map(.origin) == ["human", "sdk", "human", "human", "human", "human"]' \
+  <<<"$claude_turns" >/dev/null
+claude_tokens=$("$binary" query --path "$claude_fixtures/request-records.jsonl" \
+  --spec '{"dataset":"token_events","select":["request_key","request_record","usage_model","usage_finality","quantity_state","has_total_usage","total_tokens"],"format":"json"}')
+jq -e 'length == 2 and all(.[]; .request_record == "here" and .usage_model == "per-request" and
+  .usage_finality == "final" and .quantity_state == "usable" and .has_total_usage == false)' \
+  <<<"$claude_tokens" >/dev/null
+claude_observation=$("$binary" observe --definition "$message_definition" --projection rows \
+  --path "$claude_fixtures/turn-outcomes.jsonl" --param needle=a --format json)
+grep -Fq '"adapter":"claude-code-transcript-jsonl/v1"' <<<"$claude_observation"
+if claude_conflict=$("$binary" sessions --source claude-code --root "$claude_fixtures" \
+  --format json); then
+  exit 1
+fi
+jq -e '.code == "ConflictingSourceSelectors"' <<<"$claude_conflict" >/dev/null
+claude_config="$cache_dir/claude-config"
+claude_project="$claude_config/projects/-repo"
+claude_current_id=b1000000-0000-4000-8000-000000000001
+mkdir -p "$claude_project"
+cp "$claude_fixtures/fork-parent/$claude_current_id.jsonl" "$claude_project/"
+claude_default=$(CLAUDE_CONFIG_DIR="$claude_config" "$binary" sessions --source claude-code \
+  --format json)
+jq -e --arg id "$claude_current_id" 'length == 1 and .[0].session_id == $id' \
+  <<<"$claude_default" >/dev/null
+claude_tail=$(CLAUDE_CONFIG_DIR="$claude_config" CLAUDE_CODE_SESSION_ID="$claude_current_id" \
+  "$binary" tail --current --once --limit 1 --format json)
+grep -Fq '"format":"claude_code_jsonl"' <<<"$claude_tail"
+if claude_ambiguous=$(CLAUDE_CONFIG_DIR="$claude_config" CODEX_THREAD_ID=codex-hint \
+  CLAUDE_CODE_SESSION_ID="$claude_current_id" "$binary" tail --current --once --format json); then
+  exit 1
+fi
+jq -e '.code == "AmbiguousCurrentSessionSource"' <<<"$claude_ambiguous" >/dev/null
+claude_selected=$(CLAUDE_CONFIG_DIR="$claude_config" CODEX_THREAD_ID=codex-hint \
+  CLAUDE_CODE_SESSION_ID="$claude_current_id" "$binary" tail --current --once --source claude-code \
+  --limit 1 --format json)
+grep -Fq "\"session_id\":\"$claude_current_id\"" <<<"$claude_selected"
+if claude_missing=$(CLAUDE_CONFIG_DIR="$claude_config" CODEX_THREAD_ID=codex-hint \
+  "$binary" tail --current --once --source claude-code --format json); then
+  exit 1
+fi
+jq -e '.code == "CurrentSessionUnavailable"' <<<"$claude_missing" >/dev/null
+if claude_explain=$("$binary" explain --definition "$message_definition" --projection rows \
+  --source claude-code --format json); then
+  exit 1
+fi
+jq -e '.code == "ExplainDoesNotReadCorpus"' <<<"$claude_explain" >/dev/null
+if claude_undeclared=$("$binary" observe --definition "$message_definition" --projection rows \
+  --source claude-code --param needle=a --format json); then
+  exit 1
+fi
+jq -e '.code == "ObservationSelectorNotDeclared"' <<<"$claude_undeclared" >/dev/null
+
+claude_definitions=$claude_fixtures/observations
+claude_family="$cache_dir/claude-outside"
+claude_root_id=d0000000-0000-4000-8000-000000000001
+claude_worker_id=$claude_root_id/agent-a1b2c3d4e5f600001
+mkdir -p "$claude_family" "$cache_dir/home" "$cache_dir/pi"
+cp -R "$claude_fixtures/worker/proj" "$claude_family/proj"
+claude_root_path="$claude_family/proj/$claude_root_id.jsonl"
+claude_isolated() {
+  HOME="$cache_dir/home" CODEX_HOME="$cache_dir/codex" CLAUDE_CONFIG_DIR="$claude_config" \
+    PI_CODING_AGENT_DIR="$cache_dir/pi" PI_CODING_AGENT_SESSION_DIR="$cache_dir/pi" \
+    "$binary" "$@"
+}
+claude_lineage=$(claude_isolated observe --definition "$claude_definitions/family-lineage.json" \
+  --projection rows --path "$claude_root_path" --format json)
+jq -e --arg root "$claude_root_id" --arg worker "$claude_worker_id" '
+  .corpus.files == 2 and .corpus.sessions == 2 and
+  (.data.rows | map(.session_id) | sort) == [$root, $worker] and
+  .stats.discovery_files_opened > 0 and .limitations == []' <<<"$claude_lineage" >/dev/null
+claude_reachable=$(claude_isolated observe --definition "$pi_graph_definition" \
+  --projection rows --path "$claude_root_path" --format json)
+jq -e --arg root "$claude_root_id" '.corpus.files == 2 and .corpus.sessions == 2 and
+  (.data.rows | map(.session_id)) == [$root]' <<<"$claude_reachable" >/dev/null
+claude_root_bytes=$(wc -c <"$claude_root_path")
+claude_joined=$(claude_isolated observe --definition "$claude_definitions/session-self-join.json" \
+  --projection rows --path "$claude_root_path" --format json)
+jq -e --arg root "$claude_root_id" --argjson bytes "$claude_root_bytes" '
+  .corpus.files == 1 and .corpus.sessions == 1 and .data.rows == [{"session_id": $root}] and
+  .stats.files_opened == 1 and .stats.discovery_files_opened == 0 and
+  .stats.discovery_bytes_read == 0 and .stats.corpus_bytes_read == $bytes' \
+  <<<"$claude_joined" >/dev/null
+
+claude_window=$claude_fixtures/time-window/projects
+claude_late_id=e0000000-0000-4000-8000-000000000002
+claude_present=$(claude_isolated observe --definition "$claude_definitions/session-self-join.json" \
+  --projection rows --root "$claude_window" --session-id "$claude_late_id" --format json)
+jq -e --arg id "$claude_late_id" '.data.rows == [{"session_id": $id}]' \
+  <<<"$claude_present" >/dev/null
+if claude_pruned=$(claude_isolated observe \
+  --definition "$claude_definitions/session-self-join.json" --projection rows \
+  --root "$claude_window" --session-id "$claude_late_id" --until 2026-11-01T00:00:00Z \
+  --format json); then
+  exit 1
+fi
+jq -e '.code == "SessionNotFound"' <<<"$claude_pruned" >/dev/null
+claude_native_late=$(claude_isolated turns --root "$claude_window" \
+  --session-id "$claude_late_id" --until 2026-11-01T00:00:00Z --format json)
+test "$claude_native_late" = '[]'
+if claude_native_absent=$(claude_isolated turns --root "$claude_window" \
+  --session-id e0000000-0000-4000-8000-0000000000ff --until 2026-11-01T00:00:00Z \
+  --format json); then
+  exit 1
+fi
+jq -e '.code == "SessionNotFound"' <<<"$claude_native_absent" >/dev/null
+
+claude_excluded=$(claude_isolated observe --definition "$claude_definitions/session-exclusion.json" \
+  --projection rows --root "$claude_family" --param "exclude_session_id=$claude_root_id" \
+  --format json)
+jq -e --arg worker "$claude_worker_id" '
+  .data.rows == [{"session_id": $worker, "lineage_conflict": false}] and
+  (.limitations | all(startswith("claude_worker_parent_missing") | not))' \
+  <<<"$claude_excluded" >/dev/null
+claude_worker_only=$(claude_isolated observe \
+  --definition "$claude_definitions/session-exclusion.json" --projection rows \
+  --root "$claude_family" --session-id "$claude_worker_id" --param exclude_session_id=none \
+  --format json)
+jq -e --arg worker "$claude_worker_id" '
+  .data.rows == [{"session_id": $worker, "lineage_conflict": false}] and
+  (.limitations | all(startswith("claude_worker_parent_missing") | not))' \
+  <<<"$claude_worker_only" >/dev/null
+claude_orphan_root="$cache_dir/claude-orphan"
+claude_orphan_id=d0000000-0000-4000-8000-000000000005
+cp -R "$claude_fixtures/worker-missing-parent" "$claude_orphan_root"
+jq '.selectors += ["session-id"]' "$claude_definitions/family-lineage.json" \
+  >"$cache_dir/family-lineage-selected.json"
+claude_orphan=$(claude_isolated observe --definition "$cache_dir/family-lineage-selected.json" \
+  --projection rows --root "$claude_orphan_root" --session-id "$claude_orphan_id" --format json)
+jq -e '.corpus.files == 1 and (.limitations | index("claude_worker_parent_missing: 1") != null)' \
+  <<<"$claude_orphan" >/dev/null
+claude_conflict_root="$cache_dir/claude-identity-conflict"
+cp -R "$claude_fixtures/worker-identity-conflict" "$claude_conflict_root"
+jq '.selectors += ["session-id"] | .requires.operators += ["filter"] |
+  .relations[0].fields += ["lineage_conflict"] |
+  .pipeline = [.pipeline[0],
+    {"op": "filter", "input": "session_rows", "as": "clean",
+      "where": [{"field": "lineage_conflict", "op": "eq", "value": false}]},
+    (.pipeline[1] | .inputs = ["clean", "clean", "clean"])]' \
+  "$claude_definitions/family-lineage.json" >"$cache_dir/lineage-filter.json"
+claude_restaged=$(claude_isolated observe --definition "$cache_dir/lineage-filter.json" \
+  --projection rows --root "$claude_conflict_root" \
+  --session-id d0000000-0000-4000-8000-000000000006 --format json)
+jq -e '(.data.rows | map(.session_id)) == ["d0000000-0000-4000-8000-000000000006"] and
+  .corpus.parser_warning_count > 0' <<<"$claude_restaged" >/dev/null
+claude_truncated_root="$cache_dir/claude-truncated"
+mkdir -p "$claude_truncated_root/proj"
+cp "$claude_fixtures/worker/proj/$claude_root_id.jsonl" "$claude_truncated_root/proj/"
+printf '{"type":"user","uuid":"u1","sessi' \
+  >"$claude_truncated_root/proj/e0000000-0000-4000-8000-000000000002.jsonl"
+claude_truncated=$(claude_isolated observe \
+  --definition "$claude_definitions/session-exclusion.json" --projection rows \
+  --root "$claude_truncated_root" --param exclude_session_id=none --format json)
+jq -e '.corpus.adapter == "claude-code-transcript-jsonl/v1" and
+  .corpus.parser_warning_count == 1' <<<"$claude_truncated" >/dev/null
+pi_malformed_root="$cache_dir/pi-malformed"
+mkdir -p "$pi_malformed_root"
+cp "$pi_session" "$pi_malformed_root/"
+printf '{not json\n' >"$pi_malformed_root/z.jsonl"
+jq '.relations[0].fields = ["session_id"] | .pipeline[2].fields = ["session_id"] |
+  .projections.rows.fields = ["session_id"]' "$claude_definitions/session-exclusion.json" \
+  >"$cache_dir/session-ids.json"
+if pi_mixed=$(claude_isolated observe --definition "$cache_dir/session-ids.json" \
+  --projection rows --root "$pi_malformed_root" --param exclude_session_id=none --format json); then
+  exit 1
+fi
+jq -e '.code == "MixedPhysicalSourceAdapters"' <<<"$pi_mixed" >/dev/null
+
 external_output=$("$binary" observe \
   --definition "$external_definition" \
   --projection rows \
@@ -227,7 +408,7 @@ grep -Fq '"relation":"messages"' <<<"$explain_output"
 grep -Fq '"corpus_read":false' <<<"$explain_output"
 
 sessions_output=$("$binary" sessions \
-  --root apps/seq/src/v1/fixtures \
+  --root "$fixture_root" \
   --format json)
 grep -Fq '"session_id":"fixture-session"' <<<"$sessions_output"
 
@@ -306,7 +487,7 @@ grep -Fq '"entry_type":"session_meta"' <<<"$tail_output"
 grep -Fq '"entry_type":"event_msg"' <<<"$tail_output"
 
 find_output=$("$binary" find-session \
-  --root apps/seq/src/v1/fixtures \
+  --root "$fixture_root" \
   --session-id fixture-session \
   --format json)
 grep -Fq '"session_id":"fixture-session"' <<<"$find_output"
@@ -328,7 +509,7 @@ schema_output=$("$binary" dataset-schema \
 grep -Fq '"field":"json_pointer"' <<<"$schema_output"
 
 query_output=$("$binary" query \
-  --root apps/seq/src/v1/fixtures \
+  --root "$fixture_root" \
   --spec '{"dataset":"messages","where":[{"field":"text","op":"contains","value":"failure","case_insensitive":true}],"select":["session_id","role","text"],"limit":5,"format":"json"}')
 grep -Fq \
   '{"session_id":"fixture-session","role":"assistant","text":"Observed FAILURE evidence"}' \

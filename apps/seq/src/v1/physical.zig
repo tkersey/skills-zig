@@ -168,6 +168,7 @@ const turn_fields = [_]Field{
     .{ .name = "error", .kind = .string },
     .{ .name = "aborted_reason", .kind = .string },
     .{ .name = "spawned_worker_count", .kind = .integer, .nullable = false },
+    .{ .name = "origin", .kind = .string },
 };
 
 const message_fields = [_]Field{
@@ -286,6 +287,12 @@ const token_event_fields = [_]Field{
     .{ .name = "persisted_ordinal", .kind = .integer },
     .{ .name = "subagent_history_start_ordinal", .kind = .integer },
     .{ .name = "parent_session_id", .kind = .string },
+    .{ .name = "usage_model", .kind = .string },
+    .{ .name = "request_key", .kind = .string },
+    .{ .name = "request_record", .kind = .string },
+    .{ .name = "usage_finality", .kind = .string },
+    .{ .name = "quantity_state", .kind = .string },
+    .{ .name = "cache_creation_input_tokens", .kind = .integer },
 };
 
 const structured_document_fields = [_]Field{

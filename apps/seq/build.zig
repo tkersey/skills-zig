@@ -85,7 +85,7 @@ fn createCoreModules(
             .{ .name = "jsonl_core", .module = jsonl_core },
         },
     });
-    const seq_time = createTimeModule(b, target, optimize);
+    const seq_time = createTimeModule(b, target, optimize, trace_core);
     const core_selection = b.createModule(.{
         .root_source_file = b.path("../../libs/core/src/selection.zig"),
         .target = target,
@@ -146,6 +146,7 @@ fn createTimeModule(
     b: *std.Build,
     target: std.Build.ResolvedTarget,
     optimize: std.lang.Optimize,
+    trace_core: *std.Build.Module,
 ) *std.Build.Module {
     const calendar = b.createModule(.{
         .root_source_file = b.path("../../libs/core/src/calendar.zig"),
@@ -164,6 +165,7 @@ fn createTimeModule(
         .imports = &.{
             .{ .name = "core_calendar", .module = calendar },
             .{ .name = "c_time", .module = c_time.mod },
+            .{ .name = "trace_core", .module = trace_core },
         },
     });
 }

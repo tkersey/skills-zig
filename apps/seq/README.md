@@ -269,8 +269,8 @@ with saturating arithmetic and one sentinel byte for overrun detection. This
 bounds streams that produce little or no decoded output. Native file parsing
 has a 64 GiB decoded limit; observation definitions supply their own limits.
 Corrupt, truncated, or unsupported compressed input cannot produce successful
-empty sessions. Recognized Claude Code transcripts fail with
-`UnsupportedSessionFormat`; sharing a skill installation does not add a reader.
+empty sessions. A Claude Code record inside a Codex rollout, or a Codex record
+inside a Claude Code transcript, fails with `UnsupportedSessionFormat`.
 
 `sessions.parent_session_id` follows history ownership: `forked_from_id`, with
 legacy fallback to the control parent. `control_parent_session_id` records the
@@ -359,8 +359,9 @@ their semantic owner.
 
 ## Source boundary
 
-Seq reads Codex rollout/session sources, upstream Pi session JSONL, supported
-OpenCode execution sources, and caller-supplied immutable relations. It does
+Seq reads Codex rollout/session sources, upstream Pi session JSONL, Claude Code
+transcripts, supported OpenCode execution sources, and caller-supplied immutable
+relations. It does
 not scan memory roots, Ledger stores, artifact directories, or arbitrary durable
 stores implicitly.
 
@@ -425,9 +426,9 @@ seq sessions --root "$pi_session_root" --format json
 
 When the host supplies `PI_SESSION_FILE`, select the current session with
 `--path "$PI_SESSION_FILE"`. `seq tail --current --once` accepts `PI_SESSION_FILE`,
-or resolves `PI_SESSION_ID` under the Pi session root above. If both Codex and
-Pi current-session hints are present, it reports ambiguity; choose `--path`
-explicitly. Existing physical commands and passive definitions use the same
+or resolves `PI_SESSION_ID` under the Pi session root above. If more than one
+current-session family is present, it reports ambiguity; choose `--source` or
+`--path` explicitly. Existing physical commands and passive definitions use the same
 Pi adapter; no separate Pi command is required. This support is for upstream
 Pi, not an implicit compatibility claim for Oh My Pi.
 
@@ -458,6 +459,109 @@ counters. Requests for Pi cumulative token events fail with
 `PiCumulativeTokenEventsUnavailable`; the definition does not establish Pi
 corpus totals, deduplicate copied fork history, or measure Pi billing. Do not
 present physical Pi session/turn sums as those quantities.
+
+### Claude Code transcripts
+
+Require `claude-code-transcript-jsonl/v1` in `seq capabilities --format json`
+before reading Claude Code evidence. Select the default Claude Code root with
+`--source claude-code`, which reads `${CLAUDE_CONFIG_DIR:-$HOME/.claude}/projects`.
+`--source` conflicts with `--root` and `--path`; explicit roots and paths detect
+content instead. The default source remains `codex`.
+
+```bash
+seq sessions --source claude-code --last 1d --format json
+seq turns --source claude-code --session-id <session-uuid> --format json
+seq tail --once --current --source claude-code --format json
+```
+
+Detection uses the first positive record signature in a bounded prefix (256
+lines or 4 MiB; the first line always classifies). Identity, `cwd` and start time
+come only from lines inside both bounds, so a first line larger than 4 MiB
+classifies the file but seeds nothing. Unknown record types are neutral. A later signature for another
+source fails with `UnsupportedSessionFormat`; non-empty input with no known
+signature fails with `UnclassifiedSessionFormat` before any row is emitted.
+Empty files keep their rows and cast no adapter vote.
+
+A main transcript's `session_id` is its filename stem. Worker transcripts are
+sessions named `<root-session>/agent-<id>`; their direct parent comes from the
+adjacent `agent-<id>.meta.json` sidecar, and their root from the directory (or,
+for legacy flat `agent-<id>.jsonl` files, from the recorded `sessionId`). A
+worker whose sidecar is missing or unreadable, whose recorded identity
+contradicts its path, or whose parent transcript is not admitted sets
+`lineage_conflict`. A parent is admitted when its transcript is among the paths
+the command or observation resolved: the corpus a native command resolved before
+narrowing it to an exact session (unpruned, since an exact native target bypasses
+time pruning), a physically selected observation's paths, a graph corpus or
+session family, or a streaming plan's discovered paths. An observation's path
+resolution applies the file-admission policy (time pruning with the session ID
+cleared); row selectors such as `--session-id`,
+`--repo`, an exact time filter or the search exclusion narrow the selection and
+never make a parent missing. A worker read through an explicit one-file path
+therefore reports a missing parent. Spawner-side `session_edges` come only from `Agent`/`Task`
+calls in responses that this transcript's request records prove it made.
+`session_edges` keeps each file's assertion separately. A spawner's claim and a worker's
+sidecar live in different files, so a per-file `lineage_conflict` cannot see their
+disagreement; consumers that read both reconcile them. `seq session-graph --format
+dot` names a Claude corpus `claude_sessions`, reconciles assertions by parent, worker
+and call (printing each distinct triple once, so a resumed worker shows one edge per
+call), and marks every edge of a worker whose assertions disagree on its parent with
+`[contradiction=true]`; it never chooses between them. Because reconciliation needs every
+assertion, `--limit` bounds the printed edges of a corpus that holds Claude
+transcripts, not the files read. Assertions that name the
+same parent under different calls, such as a resumed worker, agree. The `seq/request-usage`
+definition treats such a worker as a lineage conflict for worker-scoped totals.
+Sidecar contents are discovery facts: they are read once, bound into the corpus
+digest, and reused by the body read, which also writes parent admission into the
+corpus digest. A streaming lineage plan's discovered `sessions` rows judge the
+parent at discovery and take `lineage_conflict` from the body read for every
+session it reads. Its lineage closure is selected from those discovery facts:
+later lines never change selection, so a worker identity contradiction found by
+the body read is a warning and appears on the row without moving the closure.
+`--session-id` accepts a session UUID or a worker ID.
+
+Turns open at an input that got a reply (a model response, an API error or an
+interruption marker) or that carries a recorded `turnOrigin`, which `turns.origin`
+exposes. Orphaned responses form fallback turns anchored at their chain root,
+never presented as user prompts. Outcomes follow the recorded stop reason of a
+response that calls no tool (`claude_end_turn`, `claude_max_tokens`, ...), a
+successful turn-ending tool result (`claude_tool_ended_turn`), an interruption
+(`claude_interrupted`), an API error (`claude_api_error`, status `error`) or the
+turn-limit attachment (`claude_max_turns_reached`). A pending re-query, seen as
+a request still in flight, a retry notice or a recovery prompt, leaves a turn
+unfinished. Legacy text without a stop reason ends as `claude_text_end`.
+`complete` does not establish task success. A tool-ended turn's `final_answer`
+is the call's input only where the client recorded a `structured_output`
+attachment for it; otherwise it is null. All persisted branches are read; turns
+off the active chain that never finished are `claude_inactive_branch`.
+
+`token_events` holds one per-request row for each answered API message ID
+(`usage_model = "per-request"`, `has_total_usage = false`, base and `last_*`
+counters equal), one diagnostic row per request record that no response names
+(null `request_key` and `quantity_state`), and one invalid row per response
+without a usable message ID. `request_record` states authorship evidence:
+`here`, `elsewhere` (copied in before the session's own requests), `unplaced`, or
+null for transcripts that predate request records. `usage_finality` is `final`
+when the representative line records a stop reason, otherwise `provisional`
+(a lower bound). `quantity_state` is `usable`, `missing`, `unsupported` or
+`invalid`; `cache_creation_input_tokens` is separate. Normalized input is
+uncached + cache read + cache write; reasoning tokens are inside output.
+Session and turn token fields are physical sums that include copied history;
+they are not a session's own consumption. Use the `seq/request-usage`
+definition (shipped with the Seq skill's standard definitions, not in this
+repository) for authored and observed request totals; `seq/token-usage` returns
+no valid total over Claude Code rows.
+
+An explicit Claude transcript path outside the default corpus admits its
+session family (the main transcript and its workers) for corpus graph
+discovery; native commands and physically selected observations read one file.
+Observation limitations report `claude_inline_sidechain_records`,
+`claude_unlocated_spawn_count`, `claude_worker_parent_unread` and
+`claude_worker_parent_missing` counts. Claude Code's transcript format is
+internal and versioned; out-of-line tool output files are not read.
+
+`seq tail --current` reads `CLAUDE_CODE_SESSION_ID` beside the Codex and Pi
+families. With `--source`, only that family is read; without it, more than one
+present family is `AmbiguousCurrentSessionSource`.
 
 ### Explicit durable inputs
 

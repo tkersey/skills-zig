@@ -2,6 +2,10 @@ const std = @import("std");
 const definition_core = @import("definition_core");
 const trace_core = @import("trace_core");
 pub const SessionInput = trace_core.SessionInput;
+pub const SessionRecord = trace_core.SessionRecord;
+pub const Admission = trace_core.Admission;
+pub const Trace = trace_core.CanonicalSessionTrace;
+pub const claude_adapter_id = trace_core.claude_parser.adapter_id;
 const definition = @import("definition.zig");
 const execution = @import("execution.zig");
 const physical = @import("physical.zig");
@@ -17,6 +21,10 @@ pub const Options = struct {
     structured_limits: structured.Limits = .{},
     max_input_bytes: usize = 64 * 1024 * 1024 * 1024,
     discovery_prefix_limit: usize = max_discovery_prefix_bytes,
+    sidecar_dir: ?std.Io.Dir = null,
+    claude_discovery: ?*const trace_core.claude_parser.Discovery = null,
+    admission: ?*const trace_core.Admission = null,
+    discovery_failure_bytes: ?*?usize = null,
 };
 
 pub const SessionSelection = struct {
@@ -37,15 +45,21 @@ pub const SelectedParse = struct {
 pub const SessionIdentity = struct {
     session_id: ?[]u8,
     parent_session_id: ?[]u8,
+    root_session_id: ?[]u8 = null,
+    start_time: ?[]u8 = null,
+    source: trace_core.TraceSource = .none,
+    claude_discovery: ?trace_core.claude_parser.Discovery = null,
     control_parent_session_id: ?[]u8 = null,
     forked_from_session_id: ?[]u8 = null,
     parent_relation: ?[]u8 = null,
     subagent_history_start_ordinal: ?u64 = null,
     lineage_conflict: bool = false,
+    claude_limitations: trace_core.claude_parser.Limitations = .{},
     bytes_read: usize,
     file_size: usize,
     source_mtime_ns: i128 = 0,
     repo_matches: bool = true,
+    sidecar_mtime_ns: ?i128 = null,
 
     pub fn deinit(self: *SessionIdentity, allocator: std.mem.Allocator) void {
         if (self.session_id) |value| allocator.free(value);
@@ -53,6 +67,9 @@ pub const SessionIdentity = struct {
         if (self.control_parent_session_id) |value| allocator.free(value);
         if (self.forked_from_session_id) |value| allocator.free(value);
         if (self.parent_relation) |value| allocator.free(value);
+        if (self.root_session_id) |value| allocator.free(value);
+        if (self.start_time) |value| allocator.free(value);
+        if (self.claude_discovery) |*discovery| discovery.deinit(allocator);
         self.* = undefined;
     }
 };
@@ -67,8 +84,11 @@ pub fn discoverSessionIdentity(
 ) !SessionIdentity {
     const file = try openTraceFile(io, dir, path);
     defer file.close(io);
-    const stat = try file.stat(io);
     var raw = file.reader(io, &.{});
+    errdefer if (options.discovery_failure_bytes) |sink| {
+        sink.* = std.math.cast(usize, raw.logicalPos()) orelse std.math.maxInt(usize);
+    };
+    const stat = try file.stat(io);
     var input = try SessionInput.init(
         allocator,
         path,
@@ -76,18 +96,30 @@ pub fn discoverSessionIdentity(
         options.discovery_prefix_limit,
     );
     defer input.deinit(allocator);
-    const prefix = readDiscoveryPrefixAlloc(allocator, input.reader(), options) catch |err|
+    var prefix = readDiscoveryPrefixAlloc(allocator, input.reader(), options) catch |err|
         return input.sourceError(err);
-    defer allocator.free(prefix);
+    defer prefix.deinit(allocator);
     const mtime = stat.mtime.nanoseconds;
-    var summary = try parseDiscoveryLine(io, allocator, path, prefix, mtime, options);
+    var discovery_options = options;
+    discovery_options.sidecar_dir = dir;
+    var summary = try parseDiscoveryLine(
+        io,
+        allocator,
+        path,
+        prefix.parsed(),
+        mtime,
+        discovery_options,
+    );
     defer summary.deinit(allocator);
     var identity: SessionIdentity = .{
         .session_id = null,
         .parent_session_id = null,
         .lineage_conflict = summary.session.lineage_conflict,
+        .claude_limitations = summary.claude_limitations,
         .subagent_history_start_ordinal = summary.session.subagent_history_start_ordinal,
-        .bytes_read = prefix.len,
+        .bytes_read = prefix.bytes.len +| summary.claude_discovery_bytes,
+        .source = summary.source,
+        .sidecar_mtime_ns = discoveryMtime(summary.claude_discovery),
         .file_size = std.math.cast(usize, stat.size) orelse
             return error.ObservationInputByteBoundExceeded,
         .source_mtime_ns = stat.mtime.nanoseconds,
@@ -97,9 +129,11 @@ pub fn discoverSessionIdentity(
             true,
     };
     errdefer identity.deinit(allocator);
+    if (summary.claude_discovery) |facts| identity.claude_discovery = try facts.clone(allocator);
     inline for (.{
         "session_id",             "parent_session_id", "control_parent_session_id",
-        "forked_from_session_id", "parent_relation",
+        "forked_from_session_id", "parent_relation",   "root_session_id",
+        "start_time",
     }) |field| {
         if (@field(summary.session, field)) |value| {
             @field(identity, field) = try allocator.dupe(u8, value);
@@ -127,6 +161,7 @@ pub const ParsedTrace = struct {
     metrics: trace_core.StreamMetrics,
     corpus_digest: [71]u8,
     source_mtime_ns: i128,
+    sidecar_mtime_ns: ?i128 = null,
 
     pub fn deinit(self: *ParsedTrace, allocator: std.mem.Allocator) void {
         self.trace.deinit(allocator);
@@ -134,10 +169,12 @@ pub const ParsedTrace = struct {
     }
 };
 
-pub fn adapterId(trace: *const trace_core.CanonicalSessionTrace) []const u8 {
-    return switch (trace.session.source_format) {
-        .pi_session_jsonl => "pi-session-jsonl/v1",
-        else => "codex-rollout-jsonl/v1",
+pub fn adapterId(trace: *const trace_core.CanonicalSessionTrace) ?[]const u8 {
+    return switch (trace.source) {
+        .pi => "pi-session-jsonl/v1",
+        .claude => trace_core.claude_parser.adapter_id,
+        .codex => "codex-rollout-jsonl/v1",
+        .none => null,
     };
 }
 
@@ -258,6 +295,8 @@ fn parseAdmittedFile(
     selection: ?SessionSelection,
     parser: anytype,
 ) !SelectedParse {
+    var admitted_options = options;
+    if (admitted_options.sidecar_dir == null) admitted_options.sidecar_dir = dir;
     if (selection) |selected| {
         if (!canonicalPathPassesSessionSelection(path, selected)) {
             return skippedSelection(false, 0);
@@ -280,7 +319,7 @@ fn parseAdmittedFile(
         path,
         stat,
         input.reader(),
-        options,
+        admitted_options,
         selection,
         parser,
     ) catch |err| return input.sourceError(err);
@@ -296,9 +335,9 @@ fn admitSelectedInput(
     selection: ?SessionSelection,
     parser: anytype,
 ) !SelectedParse {
-    const prefix = try readSelectionPrefixAlloc(allocator, source, selection, options);
-    defer allocator.free(prefix);
-    const preselection = if (selection) |selected|
+    var prefix = try readSelectionPrefixAlloc(allocator, source, selection, options);
+    defer prefix.deinit(allocator);
+    var preselection = if (selection) |selected|
         try preselectSession(
             io,
             allocator,
@@ -310,26 +349,37 @@ fn admitSelectedInput(
         )
     else
         Preselection{};
+    defer preselection.deinit(allocator);
     if (!preselection.passes) {
         return skippedSelection(true, preselection.bytes_read);
+    }
+    var body_options = options;
+    if (body_options.claude_discovery == null) {
+        if (preselection.discovery) |*facts| body_options.claude_discovery = facts;
     }
     if (!SessionInput.isCompressed(path) and stat.size > options.max_input_bytes) {
         return error.ObservationInputByteBoundExceeded;
     }
     var remainder = source.limited(
-        .limited((options.max_input_bytes +| 1) -| prefix.len),
+        .limited((options.max_input_bytes +| 1) -| prefix.bytes.len),
         &.{},
     );
-    var replay_reader = PrefixReader.init(prefix, &remainder.interface);
+    var replay_reader = PrefixReader.init(prefix.bytes, &remainder.interface);
+    var parsed = try parser.parse(
+        io,
+        allocator,
+        path,
+        &replay_reader.interface,
+        stat.mtime.nanoseconds,
+        body_options,
+    );
+    errdefer parsed.deinit(allocator);
+    parsed.metrics.bytes_read +|= preselection.discovery_bytes;
+    if (parsed.metrics.bytes_read > options.max_input_bytes) {
+        return error.ObservationInputByteBoundExceeded;
+    }
     return .{
-        .parsed = try parser.parse(
-            io,
-            allocator,
-            path,
-            &replay_reader.interface,
-            stat.mtime.nanoseconds,
-            options,
-        ),
+        .parsed = parsed,
         .discovery_bytes_read = 0,
         .file_opened = true,
     };
@@ -361,11 +411,17 @@ fn parseSelectedRelations(
     if (metrics.bytes_read > options.max_input_bytes) {
         return error.ObservationInputByteBoundExceeded;
     }
+    corpus_hasher.addDiscovery(&trace);
+    metrics.bytes_read +|= trace.claude_discovery_bytes;
+    if (metrics.bytes_read > options.max_input_bytes) {
+        return error.ObservationInputByteBoundExceeded;
+    }
     return .{
         .trace = trace,
         .metrics = metrics,
         .corpus_digest = corpus_hasher.digest(),
         .source_mtime_ns = modified_at,
+        .sidecar_mtime_ns = discoveryMtime(trace.claude_discovery),
     };
 }
 
@@ -472,10 +528,10 @@ test "a discovery read admits exactly the first lines the parser's line limit ad
             try std.testing.expectError(error.ObservationDiscoveryByteBoundExceeded, result);
             continue;
         }
-        const prefix = try result;
-        defer allocator.free(prefix);
-        try std.testing.expect(std.mem.startsWith(u8, prefix, source.items[0..length]));
-        try std.testing.expectEqualSlices(u8, source.items, prefix);
+        var prefix = try result;
+        defer prefix.deinit(allocator);
+        try std.testing.expect(std.mem.startsWith(u8, prefix.bytes, source.items[0..length]));
+        try std.testing.expectEqualSlices(u8, source.items, prefix.bytes);
     }
 }
 
@@ -629,6 +685,9 @@ pub fn relationParseOptions(
     var result = trace_core.TraceParseOptions{
         .ongoing_threshold_secs = options.ongoing_threshold_secs,
         .as_of_ns = options.as_of_ns,
+        .sidecar_dir = options.sidecar_dir,
+        .claude_discovery = options.claude_discovery,
+        .admission = options.admission,
         .include_occurrences = false,
         .include_message_bodies = false,
         .include_tool_output_parts = false,
@@ -670,20 +729,20 @@ fn readSelectionPrefixAlloc(
     reader: *std.Io.Reader,
     selection: ?SessionSelection,
     options: Options,
-) ![]u8 {
+) !trace_core.DiscoveryPrefix {
     if (selection != null and requiresSummaryPreselection(selection.?)) {
         return readDiscoveryPrefixAlloc(allocator, reader, options);
     }
-    return allocator.alloc(u8, 0);
+    return .{ .bytes = try allocator.alloc(u8, 0), .parse_len = 0 };
 }
 
 fn readDiscoveryPrefixAlloc(
     allocator: std.mem.Allocator,
     source: *std.Io.Reader,
     options: Options,
-) ![]u8 {
+) !trace_core.DiscoveryPrefix {
     const limit = options.discovery_prefix_limit;
-    return trace_core.readFirstLinePrefixAlloc(allocator, source, limit) catch |err| switch (err) {
+    return trace_core.readDiscoveryPrefixAlloc(allocator, source, limit) catch |err| switch (err) {
         error.LineTooLong => error.ObservationDiscoveryByteBoundExceeded,
         else => err,
     };
@@ -749,17 +808,29 @@ fn parseSelectedReader(
     if (metrics.bytes_read > options.max_input_bytes) {
         return error.ObservationInputByteBoundExceeded;
     }
+    corpus_hasher.addDiscovery(&trace);
+    metrics.bytes_read +|= trace.claude_discovery_bytes;
+    if (metrics.bytes_read > options.max_input_bytes) {
+        return error.ObservationInputByteBoundExceeded;
+    }
     return ParsedTrace{
         .trace = trace,
         .metrics = metrics,
         .corpus_digest = corpus_hasher.digest(),
         .source_mtime_ns = source_mtime_ns,
+        .sidecar_mtime_ns = discoveryMtime(trace.claude_discovery),
     };
 }
 
 const Preselection = struct {
     passes: bool = true,
     bytes_read: usize = 0,
+    discovery: ?trace_core.claude_parser.Discovery = null,
+    discovery_bytes: usize = 0,
+
+    fn deinit(self: *Preselection, allocator: std.mem.Allocator) void {
+        if (self.discovery) |*facts| facts.deinit(allocator);
+    }
 };
 
 fn canonicalPathPassesSessionSelection(
@@ -797,17 +868,7 @@ fn canonicalSessionFilenameSuffix(session_id: []const u8) ?[42]u8 {
     return suffix;
 }
 
-fn canonicalSessionId(session_id: []const u8) bool {
-    if (session_id.len != 36) return false;
-    for (session_id, 0..) |byte, index| {
-        if (index == 8 or index == 13 or index == 18 or index == 23) {
-            if (byte != '-') return false;
-        } else if (!std.ascii.isHex(byte)) {
-            return false;
-        }
-    }
-    return true;
-}
+const canonicalSessionId = trace_core.claude_parser.isUuid;
 
 test "canonical rollout paths preselect exact and excluded sessions" {
     const wanted = "019f9cf9-37b3-7692-9bd6-f479dc16e385";
@@ -861,15 +922,21 @@ fn parseDiscoveryLine(
     source_mtime_ns: i128,
     options: Options,
 ) !trace_core.CanonicalSessionTrace {
-    const line_end = if (std.mem.indexOfScalar(u8, prefix, '\n')) |index| index + 1 else prefix.len;
-    var reader = std.Io.Reader.fixed(prefix[0..line_end]);
+    var reader = std.Io.Reader.fixed(prefix);
     return trace_core.parseSessionSummaryTraceReader(
         io,
         allocator,
         path,
         &reader,
         source_mtime_ns,
-        .{ .ongoing_threshold_secs = options.ongoing_threshold_secs, .as_of_ns = options.as_of_ns },
+        .{
+            .ongoing_threshold_secs = options.ongoing_threshold_secs,
+            .as_of_ns = options.as_of_ns,
+            .sidecar_dir = options.sidecar_dir,
+            .admission = options.admission,
+            .claude_discovery = options.claude_discovery,
+            .discovery_prefix = true,
+        },
     );
 }
 
@@ -880,29 +947,46 @@ fn preselectSession(
     source_mtime_ns: i128,
     options: Options,
     selection: SessionSelection,
-    prefix: []const u8,
+    discovery: trace_core.DiscoveryPrefix,
 ) !Preselection {
     if (!requiresSummaryPreselection(selection)) {
         return .{};
     }
-    var summary = try parseDiscoveryLine(io, allocator, path, prefix, source_mtime_ns, options);
+    var summary = try parseDiscoveryLine(
+        io,
+        allocator,
+        path,
+        discovery.parsed(),
+        source_mtime_ns,
+        options,
+    );
     defer summary.deinit(allocator);
+    const read_bytes = discovery.bytes.len +| summary.claude_discovery_bytes;
+    if (!summaryPasses(summary, selection)) return .{ .passes = false, .bytes_read = read_bytes };
+    return .{
+        .bytes_read = discovery.bytes.len,
+        .discovery = if (summary.claude_discovery) |facts| try facts.clone(allocator) else null,
+        .discovery_bytes = summary.claude_discovery_bytes,
+    };
+}
+
+fn summaryPasses(summary: trace_core.CanonicalSessionTrace, selection: SessionSelection) bool {
     if (selection.session_id) |wanted| {
         if (!exactSessionPasses(summary.session.session_id, wanted)) {
-            return .{ .passes = false, .bytes_read = prefix.len };
+            return false;
         }
     }
     if (selection.exclude_session_id) |excluded| {
         if (summary.session.session_id) |actual| {
             if (std.mem.eql(u8, excluded, actual)) {
-                return .{ .passes = false, .bytes_read = prefix.len };
+                return false;
             }
         }
     }
     if (selection.repo) |repo| {
         if (summary.session.cwd) |cwd| {
             if (!pathEqualOrDescendant(cwd, repo)) {
-                return .{ .passes = false, .bytes_read = prefix.len };
+                return false;
             }
         }
     }
@@ -917,11 +1001,11 @@ fn preselectSession(
                     (actual_ms == null or
                         actual_ms.? > selection.until_ms.?)))
             {
-                return .{ .passes = false, .bytes_read = prefix.len };
+                return false;
             }
         }
     }
-    return .{ .bytes_read = prefix.len };
+    return true;
 }
 
 fn exactSessionPasses(actual: ?[]const u8, wanted: []const u8) bool {
@@ -1860,6 +1944,9 @@ pub fn traceParseOptions(
     return .{
         .ongoing_threshold_secs = options.ongoing_threshold_secs,
         .as_of_ns = options.as_of_ns,
+        .sidecar_dir = options.sidecar_dir,
+        .claude_discovery = options.claude_discovery,
+        .admission = options.admission,
         .include_raw = relation == .source_events and
             containsField(demanded_fields, 8),
         .include_occurrence_payloads = (relation == .source_events and
@@ -1914,6 +2001,15 @@ const CorpusHasher = struct {
         std.mem.writeInt(u64, &length, @intCast(line.len), .big);
         self.hasher.update(&length);
         self.hasher.update(line);
+    }
+
+    fn addDiscovery(self: *CorpusHasher, trace: *const trace_core.CanonicalSessionTrace) void {
+        const facts = trace.claude_discovery orelse return;
+        self.hasher.update("\x00claude-discovery\x00");
+        const state: u8 = if (facts.sidecar) |value| @as(u8, @backingInt(value)) + 1 else 0;
+        const missing = trace.claude_limitations.worker_parent_missing;
+        self.hasher.update(&.{ state, @intFromBool(missing) });
+        self.hasher.update(&facts.sidecar_digest);
     }
 
     fn digest(self: CorpusHasher) [71]u8 {
@@ -2014,7 +2110,7 @@ fn fillMessage(
 ) !void {
     for (fields, 0..) |field, index| {
         row[index] = switch (field) {
-            0 => .{ .string = occurrence.sourceEventId() },
+            0 => .{ .string = occurrence.message_id orelse occurrence.sourceEventId() },
             1 => optionalString(session.session_id),
             2 => optionalInteger(occurrence.turn_index),
             3 => optionalString(occurrence.role),
@@ -2060,6 +2156,7 @@ fn fillTurn(
             22 => optionalString(turn.@"error"),
             23 => optionalString(turn.aborted_reason),
             24 => .{ .integer = turn.spawned_worker_count },
+            25 => optionalString(turn.origin),
             else => return error.InvalidTracePhysicalFieldIndex,
         };
     }
@@ -2191,7 +2288,7 @@ fn fillTokenEvent(
     for (fields, 0..) |field, index| {
         row[index] = switch (field) {
             0 => optionalString(session.session_id),
-            1 => .{ .integer = event.turn_index },
+            1 => optionalInteger(event.turn_index),
             2 => optionalString(occurrence.timestamp),
             3 => optionalInteger(event.input_tokens),
             4 => optionalInteger(event.cached_input_tokens),
@@ -2233,6 +2330,12 @@ fn fillTokenEvent(
             else
                 null),
             30 => optionalString(session.parent_session_id),
+            31 => optionalString(event.usage_model),
+            32 => optionalString(event.request_key),
+            33 => optionalString(event.request_record),
+            34 => optionalString(event.usage_finality),
+            35 => optionalString(event.quantity_state),
+            36 => optionalInteger(event.cache_creation_input_tokens),
             else => return error.InvalidTracePhysicalFieldIndex,
         };
     }
@@ -2704,3 +2807,9 @@ test "trace adapter applies temporal selectors to physical event rows" {
         result.rows().row(0)[2].string,
     );
 }
+
+pub fn discoveryMtime(discovery: ?trace_core.claude_parser.Discovery) ?i128 {
+    const facts = discovery orelse return null;
+    return facts.sidecarMtime();
+}
+pub const ClaudeLimitations = trace_core.claude_parser.Limitations;
