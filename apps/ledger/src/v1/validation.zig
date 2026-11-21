@@ -481,7 +481,10 @@ const Builder = struct {
 
     fn inputIndex(self: Builder, name: []const u8) !u8 {
         for (self.inputs, 0..) |input, index| {
-            if (std.mem.eql(u8, input.name, name)) return @intCast(index);
+            if (std.mem.eql(u8, input.name, name)) {
+                if (input.codec != .json) return error.RuleInputNotJson;
+                return @intCast(index);
+            }
         }
         return error.UnknownRuleInput;
     }
@@ -1808,10 +1811,12 @@ const Builder = struct {
                 try work.builder.inputIndex(try definition_core.json.string(raw))
             else if (inherited_input) |index|
                 index
-            else if (work.builder.inputs.len == 1)
-                0
-            else
-                return error.AmbiguousRuleInput;
+            else if (work.builder.inputs.len == 1) blk: {
+                if (work.builder.inputs[0].codec != .json) {
+                    return error.RuleInputNotJson;
+                }
+                break :blk @as(u8, 0);
+            } else return error.AmbiguousRuleInput;
             work.rule.* = work.builder.initRule(
                 source_rule.operator,
                 input_index,
@@ -12880,4 +12885,95 @@ test "iterative validation cache cleanup handles maximum construction depth with
     plan.deinit(failing.allocator());
     try std.testing.expect(!failing.has_induced_failure);
     try std.testing.expectEqual(@as(usize, 0), failing.alloc_index);
+}
+
+fn compileCodecRuleDefinition(
+    inputs: []const u8,
+    operators: []const u8,
+    shape: []const u8,
+    laws: []const u8,
+    storage: []const u8,
+) !void {
+    const source = try std.fmt.allocPrint(
+        std.testing.allocator,
+        "{{\"schema\":\"ledger-artifact-definition/v1\"," ++
+            "\"id\":\"example/codec-rule\",\"owner\":\"example\"," ++
+            "\"requires\":{{\"abi\":\"ledger-artifact-abi/v1\",\"operators\":{s}}}," ++
+            "\"parameters\":{{}},\"inputs\":{s},\"canonicalization\":{{}}," ++
+            "\"shape\":{s},\"constraints\":{{\"laws\":{s}}},\"identity\":{{}}," ++
+            "\"storage\":{s},\"operations\":{{}},\"projections\":{{}}," ++
+            "\"bounds\":{{\"max_input_bytes\":4096,\"max_store_bytes\":65536," ++
+            "\"max_records\":4,\"max_output_bytes\":4096,\"max_diagnostics\":8," ++
+            "\"max_reducer_states\":1}}}}",
+        .{ operators, inputs, shape, laws, storage },
+    );
+    defer std.testing.allocator.free(source);
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "artifact.json",
+        .data = source,
+    });
+    var closure = try definition_core.closure.loadFromDir(
+        std.testing.io,
+        std.testing.allocator,
+        &tmp.dir,
+        "artifact.json",
+        .{},
+    );
+    defer closure.deinit(std.testing.allocator);
+    var definition_plan = try definition.compile(
+        std.testing.allocator,
+        &closure,
+        "artifact.json",
+    );
+    defer definition_plan.deinit(std.testing.allocator);
+    var plan = try compile(std.testing.allocator, &definition_plan);
+    plan.deinit(std.testing.allocator);
+}
+
+test "validation rejects rules bound to non-JSON inputs" {
+    const pure = "{\"kind\":\"pure\"}";
+    const mixed_inputs =
+        "{\"record\":{\"codec\":\"json\",\"max_bytes\":1024}," ++
+        "\"context\":{\"codec\":\"text\",\"required\":false,\"max_bytes\":1024}}";
+    const cross_input = "[\"cross-input-equal\"]";
+    const record_law =
+        "[[\"cross-input-equal\",{\"input\":\"record\",\"left_input\":\"record\"," ++
+        "\"left\":\"/a\",\"right_input\":\"record\",\"right\":\"/b\"}]]";
+    try compileCodecRuleDefinition(mixed_inputs, cross_input, "{}", record_law, pure);
+    const right_text_law =
+        "[[\"cross-input-equal\",{\"input\":\"record\",\"left_input\":\"record\"," ++
+        "\"left\":\"/a\",\"right_input\":\"context\",\"right\":\"/b\"}]]";
+    try std.testing.expectError(
+        error.RuleInputNotJson,
+        compileCodecRuleDefinition(mixed_inputs, cross_input, "{}", right_text_law, pure),
+    );
+    const scalar = "[\"scalar-type\"]";
+    const text_input = "{\"context\":{\"codec\":\"text\",\"max_bytes\":1024}}";
+    const jsonl_input = "{\"context\":{\"codec\":\"jsonl\",\"max_bytes\":1024}}";
+    const json_input = "{\"context\":{\"codec\":\"json\",\"max_bytes\":1024}}";
+    const named_law = "[[\"scalar-type\",{\"input\":\"context\",\"type\":\"string\"}]]";
+    const native_shape = "{\"rules\":[{\"op\":\"scalar-type\",\"type\":\"string\"}]}";
+    for ([_][]const u8{ text_input, jsonl_input }) |inputs| {
+        try std.testing.expectError(
+            error.RuleInputNotJson,
+            compileCodecRuleDefinition(inputs, scalar, "{}", named_law, pure),
+        );
+        try std.testing.expectError(
+            error.RuleInputNotJson,
+            compileCodecRuleDefinition(inputs, scalar, native_shape, "[]", pure),
+        );
+        try compileCodecRuleDefinition(inputs, "[]", "{}", "[]", pure);
+    }
+    try compileCodecRuleDefinition(json_input, scalar, "{}", named_law, pure);
+    try compileCodecRuleDefinition(json_input, scalar, native_shape, "[]", pure);
+    try compileCodecRuleDefinition(
+        "{\"event\":{\"codec\":\"json\",\"max_bytes\":1024}}",
+        "[]",
+        "{}",
+        "[]",
+        "{\"kind\":\"event-log\",\"slots\":{\"events\":{\"path\":\"example/events.jsonl\"," ++
+            "\"kind\":\"event-log\",\"codec\":\"jsonl\",\"max_bytes\":4096}}}",
+    );
 }

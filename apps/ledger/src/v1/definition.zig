@@ -798,13 +798,16 @@ fn lowerDefinitionSources(
 ) !LoweredDefinitionSources {
     const input_names = try allocator.alloc([]const u8, inputs.len);
     for (inputs, input_names) |input, *name| name.* = input.name;
+    const shape = try definition_core.json.field(root, "shape");
+    const shape_rules = try source_graph.lowerShape(
+        allocator,
+        shape,
+        input_names,
+        budget,
+    );
+    try requireJsonShapeDocuments(shape, inputs);
     return .{
-        .shape_rules = try source_graph.lowerShape(
-            allocator,
-            try definition_core.json.field(root, "shape"),
-            input_names,
-            budget,
-        ),
+        .shape_rules = shape_rules,
         .constraint_rules = try source_graph.lowerConstraints(
             allocator,
             try definition_core.json.field(root, "constraints"),
@@ -817,6 +820,20 @@ fn lowerDefinitionSources(
             budget,
         ),
     };
+}
+
+/// Shape documents apply only to parsed JSON inputs; validation never parses
+/// text or JSONL inputs into a document, so such a shape could never hold.
+fn requireJsonShapeDocuments(shape: std.json.Value, inputs: []const Input) !void {
+    const documents = shape.object.get("documents") orelse return;
+    var iterator = documents.object.iterator();
+    while (iterator.next()) |entry| {
+        for (inputs) |input| {
+            if (!std.mem.eql(u8, input.name, entry.key_ptr.*)) continue;
+            if (input.codec != .json) return error.ShapeInputNotJson;
+            break;
+        }
+    }
 }
 
 const DefinitionJson = struct {
@@ -2305,4 +2322,61 @@ test "artifact input declarations validate fields before acquiring names" {
             parseInputs(std.testing.allocator, parsed.value.object),
         );
     }
+}
+
+fn codecShapeDefinitionAlloc(codec: []const u8, shape: []const u8) ![]u8 {
+    return std.fmt.allocPrint(
+        std.testing.allocator,
+        "{{\"schema\":\"ledger-artifact-definition/v1\"," ++
+            "\"id\":\"example/codec-shape\",\"owner\":\"example\"," ++
+            "\"requires\":{{\"abi\":\"ledger-artifact-abi/v1\"," ++
+            "\"operators\":[\"bounded-string\"]}}," ++
+            "\"inputs\":{{\"context\":{{\"codec\":\"{s}\",\"max_bytes\":1024}}}}," ++
+            "\"canonicalization\":{{}},\"shape\":{s}," ++
+            "\"constraints\":{{\"laws\":[]}},\"identity\":{{}}," ++
+            "\"storage\":{{\"kind\":\"pure\"}},\"operations\":{{}},\"projections\":{{}}," ++
+            "\"bounds\":{{\"max_input_bytes\":1024,\"max_store_bytes\":1024," ++
+            "\"max_records\":1,\"max_output_bytes\":1024,\"max_diagnostics\":1," ++
+            "\"max_reducer_states\":1}}}}",
+        .{ codec, shape },
+    );
+}
+
+fn compileCodecShapeDefinition(codec: []const u8, shape: []const u8) !void {
+    const source = try codecShapeDefinitionAlloc(codec, shape);
+    defer std.testing.allocator.free(source);
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "artifact.json",
+        .data = source,
+    });
+    var closure = try definition_core.closure.loadFromDir(
+        std.testing.io,
+        std.testing.allocator,
+        &tmp.dir,
+        "artifact.json",
+        .{},
+    );
+    defer closure.deinit(std.testing.allocator);
+    var plan = try compile(std.testing.allocator, &closure, "artifact.json");
+    plan.deinit(std.testing.allocator);
+}
+
+test "artifact definition rejects shape documents on non-JSON inputs" {
+    const string_shape = "{\"documents\":{\"context\":{\"string\":{\"min\":1,\"max\":8}}}}";
+    const empty_document = "{\"documents\":{\"context\":{}}}";
+    for ([_][]const u8{ "text", "jsonl" }) |codec| {
+        try std.testing.expectError(
+            error.ShapeInputNotJson,
+            compileCodecShapeDefinition(codec, string_shape),
+        );
+        try std.testing.expectError(
+            error.ShapeInputNotJson,
+            compileCodecShapeDefinition(codec, empty_document),
+        );
+        try compileCodecShapeDefinition(codec, "{}");
+    }
+    try compileCodecShapeDefinition("json", string_shape);
+    try compileCodecShapeDefinition("json", empty_document);
 }

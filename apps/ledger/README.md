@@ -199,7 +199,9 @@ ledger definition describe \
 Definitions are passive JSON. They may declare bounded JSON, JSONL, and UTF-8
 text inputs, imports under an admitted definition root, native structural
 operators, identity, logical storage, transactions, reducers, and projections.
-They cannot name hooks or executable code.
+They cannot name hooks or executable code. Shapes and validation laws apply
+only to JSON inputs; a definition that targets a JSONL or text input with either
+is rejected (`ShapeInputNotJson`, `RuleInputNotJson`).
 
 ## Pure operations
 
