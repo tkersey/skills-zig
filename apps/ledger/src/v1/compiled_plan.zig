@@ -11,7 +11,9 @@ const projection = @import("projection.zig");
 const storage = @import("storage.zig");
 const validation = @import("validation.zig");
 
-const payload_version: u16 = 34;
+// Bump whenever code changes what a cached plan may contain or admit, so plans
+// written by earlier code under the same runtime version are recompiled.
+const payload_version: u16 = 37;
 const locator_version: u16 = 1;
 const cache_limits: definition_core.cache.Limits = .{};
 const locator_max_payload_bytes: usize = 2 * 1024 * 1024;
@@ -35,6 +37,9 @@ pub const RouteKind = enum {
 pub const Route = struct {
     kind: RouteKind,
     name: ?[]const u8 = null,
+    /// How to admit the definition; null takes the route kind's default (see
+    /// `routeAdmission`). Host flows that relocate existing data pass `.archived`.
+    admission: ?definition.Admission = null,
 
     pub fn validate(self: Route) !void {
         switch (self.kind) {
@@ -176,10 +181,11 @@ fn compileFromSource(
         errdefer closure.deinit(allocator);
         const owned_entry_path = try allocator.dupe(u8, entry_path);
         errdefer allocator.free(owned_entry_path);
-        var definition_plan = try definition.compile(
+        var definition_plan = try definition.compileAdmitted(
             allocator,
             &closure,
             entry_path,
+            routeAdmission(route),
         );
         errdefer definition_plan.deinit(allocator);
         break :result .{
@@ -195,8 +201,33 @@ fn compileFromSource(
     };
     errdefer result.deinit(allocator);
     try compileRoutePlans(allocator, &result, route);
+    try requireAdmittedRules(allocator, &result, route);
     try validatePlanSet(&result, route);
     return result;
+}
+
+/// The doctor route serves `ledger doctor`, `ledger prepare`, and the host
+/// migration, adoption, and owner flows. They inspect or relocate existing
+/// data, so, like replay, they keep shapes and rules on non-JSON inputs as
+/// before 1.9.1 and can work on a store before its definition is fixed. New
+/// events still go through transact, which admits its definition.
+fn routeAdmission(route: Route) definition.Admission {
+    if (route.admission) |admission| return admission;
+    return if (route.kind == .doctor) .archived else .current;
+}
+
+/// A route that admits its definition rejects any rule bound to a non-JSON
+/// input. Routes that apply rules have already compiled them. The others reject
+/// it only in a definition whose rules otherwise compile; before 1.9.1 they
+/// reported no rule error, so they still open an otherwise invalid definition.
+fn requireAdmittedRules(
+    allocator: std.mem.Allocator,
+    result: *const PlanSet,
+    route: Route,
+) !void {
+    if (result.validation_plan != null) return;
+    if (routeAdmission(route) == .archived) return;
+    try validation.requireJsonRuleInputs(allocator, &result.definition_plan);
 }
 
 fn compileRoutePlans(
@@ -204,12 +235,13 @@ fn compileRoutePlans(
     result: *PlanSet,
     route: Route,
 ) !void {
+    const admission = routeAdmission(route);
     switch (route.kind) {
         .definition => {},
-        .definition_check => try compileDefinitionCheck(allocator, result),
-        .validation => try compileValidation(allocator, result),
-        .materialization => try compileMaterialization(allocator, result),
-        .transact => try compileTransaction(allocator, result, route.name.?),
+        .definition_check => try compileDefinitionCheck(allocator, result, admission),
+        .validation => try compileValidation(allocator, result, admission),
+        .materialization => try compileMaterialization(allocator, result, admission),
+        .transact => try compileTransaction(allocator, result, route.name.?, admission),
         .project => try compileProjection(allocator, result, route.name.?),
         .doctor => try compileDurablePlans(allocator, result),
         .migration => try compileDurablePlans(allocator, result),
@@ -219,10 +251,12 @@ fn compileRoutePlans(
 fn compileDefinitionCheck(
     allocator: std.mem.Allocator,
     result: *PlanSet,
+    admission: definition.Admission,
 ) !void {
-    result.validation_plan = try validation.compile(
+    result.validation_plan = try validation.compileAdmitted(
         allocator,
         &result.definition_plan,
+        admission,
     );
     try compileDurablePlans(allocator, result);
     result.projection_plan = try projection.compile(
@@ -236,10 +270,12 @@ fn compileDefinitionCheck(
 fn compileValidation(
     allocator: std.mem.Allocator,
     result: *PlanSet,
+    admission: definition.Admission,
 ) !void {
-    result.validation_plan = try validation.compile(
+    result.validation_plan = try validation.compileAdmitted(
         allocator,
         &result.definition_plan,
+        admission,
     );
     result.materialization_plan = try materialization.compileForValidation(
         allocator,
@@ -250,10 +286,12 @@ fn compileValidation(
 fn compileMaterialization(
     allocator: std.mem.Allocator,
     result: *PlanSet,
+    admission: definition.Admission,
 ) !void {
-    result.validation_plan = try validation.compile(
+    result.validation_plan = try validation.compileAdmitted(
         allocator,
         &result.definition_plan,
+        admission,
     );
     result.materialization_plan = try materialization.compile(
         allocator,
@@ -265,10 +303,12 @@ fn compileTransaction(
     allocator: std.mem.Allocator,
     result: *PlanSet,
     operation: []const u8,
+    admission: definition.Admission,
 ) !void {
-    result.validation_plan = try validation.compile(
+    result.validation_plan = try validation.compileAdmitted(
         allocator,
         &result.definition_plan,
+        admission,
     );
     try compileDurablePlans(allocator, result);
     if (result.storage_plan.?.findOperation(operation) == null) {
@@ -820,6 +860,7 @@ fn encodeRoute(
     try route.validate();
     try encoder.writeEnum(route.kind);
     try encoder.writeOptionalBytes(route.name);
+    try encoder.writeEnum(routeAdmission(route));
 }
 
 fn decodeRoute(
@@ -829,6 +870,7 @@ fn decodeRoute(
     const route: Route = .{
         .kind = try decoder.readEnum(RouteKind),
         .name = try decoder.readOptionalBytesAlloc(allocator, 128),
+        .admission = try decoder.readEnum(definition.Admission),
     };
     errdefer if (route.name) |name| allocator.free(@constCast(name));
     try route.validate();
@@ -837,6 +879,7 @@ fn decodeRoute(
 
 fn routesEqual(left: Route, right: Route) bool {
     if (left.kind != right.kind or
+        routeAdmission(left) != routeAdmission(right) or
         (left.name == null) != (right.name == null))
     {
         return false;
@@ -868,6 +911,7 @@ fn planKey(
         definition_plan.closure_digest[0..],
         @tagName(route.kind),
         route.name orelse "",
+        @tagName(routeAdmission(route)),
         definition_plan.parameter_declarations.shape_digest[0..],
     });
 }
@@ -886,6 +930,7 @@ fn locatorKey(
         entry_path,
         @tagName(route.kind),
         route.name orelse "",
+        @tagName(routeAdmission(route)),
     });
 }
 
@@ -1478,4 +1523,209 @@ test "warm cache cancellation survives the locator source and plan reader adapte
         try std.testing.expectEqual(@as(usize, 1), CacheCancellationProbe.cancellations);
         try std.testing.expectEqual(@as(usize, 0), CacheCancellationProbe.rename_count);
     }
+}
+
+/// The event fixture plus an optional `note` input of the given codec and the
+/// given law.
+fn noteLawDefinitionAlloc(codec: []const u8, law: []const u8) ![]u8 {
+    const fixture = @embedFile("fixtures/event-definition.json");
+    const operators = "\"operators\":[\"atomic-transaction\",";
+    const inputs = "\"inputs\":{\"event\":{\"codec\":\"json\",\"max_bytes\":4096}}";
+    const laws = "\"laws\":[]";
+    std.debug.assert(std.mem.count(u8, fixture, operators) == 1);
+    std.debug.assert(std.mem.count(u8, fixture, inputs) == 1);
+    std.debug.assert(std.mem.count(u8, fixture, laws) == 1);
+    const with_operator = try std.mem.replaceOwned(
+        u8,
+        std.testing.allocator,
+        fixture,
+        operators,
+        "\"operators\":[\"atomic-transaction\",\"scalar-type\",",
+    );
+    defer std.testing.allocator.free(with_operator);
+    const note = try std.fmt.allocPrint(
+        std.testing.allocator,
+        "\"inputs\":{{\"event\":{{\"codec\":\"json\",\"max_bytes\":4096}}," ++
+            "\"note\":{{\"codec\":\"{s}\",\"required\":false,\"max_bytes\":64}}}}",
+        .{codec},
+    );
+    defer std.testing.allocator.free(note);
+    const with_input = try std.mem.replaceOwned(
+        u8,
+        std.testing.allocator,
+        with_operator,
+        inputs,
+        note,
+    );
+    defer std.testing.allocator.free(with_input);
+    const with_law = try std.fmt.allocPrint(std.testing.allocator, "\"laws\":[{s}]", .{law});
+    defer std.testing.allocator.free(with_law);
+    return std.mem.replaceOwned(u8, std.testing.allocator, with_input, laws, with_law);
+}
+
+const note_law = "[\"scalar-type\",{\"input\":\"note\",\"type\":\"string\"}]";
+/// No `input` while two inputs exist: invalid for reasons unrelated to codecs.
+const ambiguous_law = "[\"scalar-type\",{\"type\":\"string\"}]";
+
+const law_routes = [_]Route{
+    .{ .kind = .definition },
+    .{ .kind = .definition_check },
+    .{ .kind = .validation },
+    .{ .kind = .transact, .name = "append" },
+    .{ .kind = .project, .name = "all" },
+    .{ .kind = .doctor },
+    .{ .kind = .migration },
+};
+
+fn loadLawDefinition(
+    scope: *storage_root.Scope,
+    dir: *std.testing.TmpDir,
+    root: []const u8,
+    source: []const u8,
+    route: Route,
+) !PlanSet {
+    try dir.dir.writeFile(std.testing.io, .{ .sub_path = "law.json", .data = source });
+    return load(scope, std.testing.allocator, root, "law.json", route, "1.0.0-test", .{});
+}
+
+/// Whether a route compiles validation rules for its own use.
+fn routeAppliesRules(route: Route) bool {
+    return route.kind == .definition_check or route.kind == .validation or
+        route.kind == .transact;
+}
+
+fn expectLoads(loaded: anyerror!PlanSet) !void {
+    var plans = try loaded;
+    plans.deinit(std.testing.allocator);
+}
+
+const LawRoutesTest = struct {
+    scope: *storage_root.Scope,
+    dir: *std.testing.TmpDir,
+    root: []const u8,
+
+    fn load(self: LawRoutesTest, source: []const u8, route: Route) anyerror!PlanSet {
+        return loadLawDefinition(self.scope, self.dir, self.root, source, route);
+    }
+};
+
+test "admitting routes reject laws on non-JSON inputs and doctor still inspects them" {
+    var test_scope = storage_root.Scope.init(.init(std.testing.io, std.Io.Dir.cwd()));
+    var definitions = std.testing.tmpDir(.{});
+    defer definitions.cleanup();
+    const root = try definitions.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
+    defer std.testing.allocator.free(root);
+    const t: LawRoutesTest = .{ .scope = &test_scope, .dir = &definitions, .root = root };
+    for ([_][]const u8{ "text", "jsonl", "json" }) |codec| {
+        const source = try noteLawDefinitionAlloc(codec, note_law);
+        defer std.testing.allocator.free(source);
+        for (law_routes) |route| {
+            if (std.mem.eql(u8, codec, "json") or route.kind == .doctor) {
+                try expectLoads(t.load(source, route));
+            } else {
+                try std.testing.expectError(error.RuleInputNotJson, t.load(source, route));
+            }
+        }
+    }
+}
+
+test "read routes open otherwise invalid definitions whatever the rule order" {
+    var test_scope = storage_root.Scope.init(.init(std.testing.io, std.Io.Dir.cwd()));
+    var definitions = std.testing.tmpDir(.{});
+    defer definitions.cleanup();
+    const root = try definitions.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
+    defer std.testing.allocator.free(root);
+    const t: LawRoutesTest = .{ .scope = &test_scope, .dir = &definitions, .root = root };
+    const ambiguous = try noteLawDefinitionAlloc("json", ambiguous_law);
+    defer std.testing.allocator.free(ambiguous);
+    // An ambiguous law and a law on a text input, in both orders.
+    const ambiguous_first = try noteLawDefinitionAlloc("text", ambiguous_law ++ "," ++ note_law);
+    defer std.testing.allocator.free(ambiguous_first);
+    const text_first = try noteLawDefinitionAlloc("text", note_law ++ "," ++ ambiguous_law);
+    defer std.testing.allocator.free(text_first);
+    for (law_routes) |route| {
+        if (routeAppliesRules(route)) {
+            try std.testing.expectError(error.AmbiguousRuleInput, t.load(ambiguous, route));
+            try std.testing.expectError(error.AmbiguousRuleInput, t.load(ambiguous_first, route));
+            try std.testing.expectError(error.RuleInputNotJson, t.load(text_first, route));
+        } else {
+            try expectLoads(t.load(ambiguous, route));
+            try expectLoads(t.load(ambiguous_first, route));
+            try expectLoads(t.load(text_first, route));
+        }
+    }
+}
+
+test "doctor inspects a definition with a shape on a non-JSON input" {
+    var test_scope = storage_root.Scope.init(.init(std.testing.io, std.Io.Dir.cwd()));
+    var definitions = std.testing.tmpDir(.{});
+    defer definitions.cleanup();
+    const root = try definitions.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
+    defer std.testing.allocator.free(root);
+    const t: LawRoutesTest = .{ .scope = &test_scope, .dir = &definitions, .root = root };
+    const no_law = try noteLawDefinitionAlloc("text", "");
+    defer std.testing.allocator.free(no_law);
+    const documents = "\"shape\":{\"documents\":{";
+    std.debug.assert(std.mem.count(u8, no_law, documents) == 1);
+    const source = try std.mem.replaceOwned(
+        u8,
+        std.testing.allocator,
+        no_law,
+        documents,
+        "\"shape\":{\"documents\":{\"note\":{},",
+    );
+    defer std.testing.allocator.free(source);
+    for (law_routes) |route| {
+        if (route.kind == .doctor) {
+            try expectLoads(t.load(source, route));
+        } else {
+            try std.testing.expectError(error.ShapeInputNotJson, t.load(source, route));
+        }
+    }
+}
+
+const CachedLawTest = struct {
+    scope: *storage_root.Scope,
+    root: []const u8,
+    cache_root: []const u8,
+
+    fn load(self: CachedLawTest, route: Route) anyerror!PlanSet {
+        const options: Options = .{ .cache_dir = self.cache_root };
+        return loadCachedLaw(self.scope, self.root, route, options);
+    }
+};
+
+fn loadCachedLaw(
+    scope: *storage_root.Scope,
+    root: []const u8,
+    route: Route,
+    options: Options,
+) anyerror!PlanSet {
+    return load(scope, std.testing.allocator, root, "law.json", route, "1.0.0-test", options);
+}
+
+test "archived host loads never share a cached plan with strict loads" {
+    var test_scope = storage_root.Scope.init(.init(std.testing.io, std.Io.Dir.cwd()));
+    var definitions = std.testing.tmpDir(.{});
+    defer definitions.cleanup();
+    const root = try definitions.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
+    defer std.testing.allocator.free(root);
+    var cache = std.testing.tmpDir(.{});
+    defer cache.cleanup();
+    const cache_root = try cache.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
+    defer std.testing.allocator.free(cache_root);
+    const source = try noteLawDefinitionAlloc("text", note_law);
+    defer std.testing.allocator.free(source);
+    try definitions.dir.writeFile(std.testing.io, .{ .sub_path = "law.json", .data = source });
+    const t: CachedLawTest = .{ .scope = &test_scope, .root = root, .cache_root = cache_root };
+    const strict: Route = .{ .kind = .transact, .name = "append" };
+    const archived: Route = .{ .kind = .transact, .name = "append", .admission = .archived };
+    // Archived first: its cached plan must not satisfy the strict load.
+    for (0..2) |_| {
+        try expectLoads(t.load(archived));
+        try std.testing.expectError(error.RuleInputNotJson, t.load(strict));
+    }
+    var warm = try t.load(archived);
+    defer warm.deinit(std.testing.allocator);
+    try std.testing.expect(warm.stats.cache_hit);
 }

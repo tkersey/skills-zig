@@ -481,10 +481,31 @@ const Compiler = struct {
     }
 };
 
+/// When a definition was admitted, which decides how compilation treats shape
+/// documents and validation rules that target text or JSONL inputs. Validation
+/// parses only JSON inputs, so such rules never ran as written: most were
+/// skipped, and a few, such as a comparison against one, always failed.
+pub const Admission = enum {
+    /// A definition admitted now: reject those rules.
+    current,
+    /// An archived definition recompiled to replay its recorded history. It may
+    /// predate the rejection, so keep the behavior those rules had in 1.9.0.
+    archived,
+};
+
 pub fn compile(
     allocator: std.mem.Allocator,
     closure: *const definition_core.Closure,
     entry_path: []const u8,
+) !Plan {
+    return compileAdmitted(allocator, closure, entry_path, .current);
+}
+
+pub fn compileAdmitted(
+    allocator: std.mem.Allocator,
+    closure: *const definition_core.Closure,
+    entry_path: []const u8,
+    admission: Admission,
 ) !Plan {
     var result: Plan = undefined;
     var compiled_count: usize = 0;
@@ -512,7 +533,7 @@ pub fn compile(
             frames[count] = child;
             count += 1;
         } else {
-            frame.target.* = try finishCompiledPlan(allocator, closure.digest, frame);
+            frame.target.* = try finishCompiledPlan(allocator, closure.digest, frame, admission);
             frame.parsed.deinit();
             allocator.free(frame.entry_path);
             count -= 1;
@@ -622,6 +643,7 @@ fn finishCompiledPlan(
     allocator: std.mem.Allocator,
     closure_digest: [71]u8,
     frame: *CompileFrame,
+    admission: Admission,
 ) !Plan {
     const root = frame.parsed.value.object;
     const header = &frame.header;
@@ -633,6 +655,7 @@ fn finishCompiledPlan(
         header.operator_mask,
         header.imports,
         header.inputs,
+        admission,
     );
     errdefer body.deinit(allocator);
     const owned_id = try allocator.dupe(u8, try definition_core.json.requiredString(root, "id"));
@@ -794,17 +817,21 @@ fn lowerDefinitionSources(
     allocator: std.mem.Allocator,
     root: std.json.ObjectMap,
     inputs: []const Input,
+    admission: Admission,
     budget: *source_graph.ExpansionBudget,
 ) !LoweredDefinitionSources {
     const input_names = try allocator.alloc([]const u8, inputs.len);
     for (inputs, input_names) |input, *name| name.* = input.name;
+    const shape = try definition_core.json.field(root, "shape");
+    const shape_rules = try source_graph.lowerShape(
+        allocator,
+        shape,
+        input_names,
+        budget,
+    );
+    if (admission == .current) try requireJsonShapeDocuments(shape, inputs);
     return .{
-        .shape_rules = try source_graph.lowerShape(
-            allocator,
-            try definition_core.json.field(root, "shape"),
-            input_names,
-            budget,
-        ),
+        .shape_rules = shape_rules,
         .constraint_rules = try source_graph.lowerConstraints(
             allocator,
             try definition_core.json.field(root, "constraints"),
@@ -817,6 +844,21 @@ fn lowerDefinitionSources(
             budget,
         ),
     };
+}
+
+/// Shape documents apply only to parsed JSON inputs. Validation never parses
+/// text or JSONL inputs into a document, so a shape on one was silently skipped
+/// and passed whatever the input held.
+fn requireJsonShapeDocuments(shape: std.json.Value, inputs: []const Input) !void {
+    const documents = shape.object.get("documents") orelse return;
+    var iterator = documents.object.iterator();
+    while (iterator.next()) |entry| {
+        for (inputs) |input| {
+            if (!std.mem.eql(u8, input.name, entry.key_ptr.*)) continue;
+            if (input.codec != .json) return error.ShapeInputNotJson;
+            break;
+        }
+    }
 }
 
 const DefinitionJson = struct {
@@ -862,6 +904,7 @@ fn compileDefinitionBody(
     operator_mask: u128,
     imports: []const Plan,
     inputs: []const Input,
+    admission: Admission,
 ) !DefinitionBody {
     var source_arena = std.heap.ArenaAllocator.init(allocator);
     defer source_arena.deinit();
@@ -871,6 +914,7 @@ fn compileDefinitionBody(
         source_allocator,
         root,
         inputs,
+        admission,
         &expansion_budget,
     );
     var compiler = Compiler{
@@ -2305,4 +2349,61 @@ test "artifact input declarations validate fields before acquiring names" {
             parseInputs(std.testing.allocator, parsed.value.object),
         );
     }
+}
+
+fn codecShapeDefinitionAlloc(codec: []const u8, shape: []const u8) ![]u8 {
+    return std.fmt.allocPrint(
+        std.testing.allocator,
+        "{{\"schema\":\"ledger-artifact-definition/v1\"," ++
+            "\"id\":\"example/codec-shape\",\"owner\":\"example\"," ++
+            "\"requires\":{{\"abi\":\"ledger-artifact-abi/v1\"," ++
+            "\"operators\":[\"bounded-string\"]}}," ++
+            "\"inputs\":{{\"context\":{{\"codec\":\"{s}\",\"max_bytes\":1024}}}}," ++
+            "\"canonicalization\":{{}},\"shape\":{s}," ++
+            "\"constraints\":{{\"laws\":[]}},\"identity\":{{}}," ++
+            "\"storage\":{{\"kind\":\"pure\"}},\"operations\":{{}},\"projections\":{{}}," ++
+            "\"bounds\":{{\"max_input_bytes\":1024,\"max_store_bytes\":1024," ++
+            "\"max_records\":1,\"max_output_bytes\":1024,\"max_diagnostics\":1," ++
+            "\"max_reducer_states\":1}}}}",
+        .{ codec, shape },
+    );
+}
+
+fn compileCodecShapeDefinition(codec: []const u8, shape: []const u8) !void {
+    const source = try codecShapeDefinitionAlloc(codec, shape);
+    defer std.testing.allocator.free(source);
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "artifact.json",
+        .data = source,
+    });
+    var closure = try definition_core.closure.loadFromDir(
+        std.testing.io,
+        std.testing.allocator,
+        &tmp.dir,
+        "artifact.json",
+        .{},
+    );
+    defer closure.deinit(std.testing.allocator);
+    var plan = try compile(std.testing.allocator, &closure, "artifact.json");
+    plan.deinit(std.testing.allocator);
+}
+
+test "artifact definition rejects shape documents on non-JSON inputs" {
+    const string_shape = "{\"documents\":{\"context\":{\"string\":{\"min\":1,\"max\":8}}}}";
+    const empty_document = "{\"documents\":{\"context\":{}}}";
+    for ([_][]const u8{ "text", "jsonl" }) |codec| {
+        try std.testing.expectError(
+            error.ShapeInputNotJson,
+            compileCodecShapeDefinition(codec, string_shape),
+        );
+        try std.testing.expectError(
+            error.ShapeInputNotJson,
+            compileCodecShapeDefinition(codec, empty_document),
+        );
+        try compileCodecShapeDefinition(codec, "{}");
+    }
+    try compileCodecShapeDefinition("json", string_shape);
+    try compileCodecShapeDefinition("json", empty_document);
 }

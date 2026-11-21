@@ -199,7 +199,20 @@ ledger definition describe \
 Definitions are passive JSON. They may declare bounded JSON, JSONL, and UTF-8
 text inputs, imports under an admitted definition root, native structural
 operators, identity, logical storage, transactions, reducers, and projections.
-They cannot name hooks or executable code.
+They cannot name hooks or executable code. Shapes and validation laws apply
+only to JSON inputs; a definition that targets a JSONL or text input with either
+is rejected (`ShapeInputNotJson`, `RuleInputNotJson`) by `definition check`,
+`definition describe`, `validate`, `materialize`, `transact`, `project`, and
+segmented migration. Commands that apply no rules (`definition describe`,
+`project`, and segmented migration) reject such a law only when the
+definition's rules otherwise compile, and still open an otherwise invalid
+definition. Before 1.9.1 such rules were accepted but never ran as written: most
+were skipped, and a few, such as a comparison against a text input, always
+failed. Replay reads archived definitions that contain them with that earlier
+behavior, so existing stores keep working after the definition is fixed.
+`doctor`, `prepare`, and the host migration, adoption, and owner flows read the
+current definition the same way, so they can work on a store before its
+definition is fixed; new events still go through `transact`.
 
 ## Pure operations
 
