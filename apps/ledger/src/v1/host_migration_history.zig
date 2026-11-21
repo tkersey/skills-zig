@@ -196,7 +196,7 @@ fn captureRepair(
         allocator,
         environment,
         owner.definition,
-        .{ .kind = .transact, .name = operation },
+        .{ .kind = .transact, .name = operation, .admission = .archived },
         false,
     );
     defer plan.deinit(allocator);

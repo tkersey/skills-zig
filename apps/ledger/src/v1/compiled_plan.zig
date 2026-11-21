@@ -13,7 +13,7 @@ const validation = @import("validation.zig");
 
 // Bump whenever code changes what a cached plan may contain or admit, so plans
 // written by earlier code under the same runtime version are recompiled.
-const payload_version: u16 = 36;
+const payload_version: u16 = 37;
 const locator_version: u16 = 1;
 const cache_limits: definition_core.cache.Limits = .{};
 const locator_max_payload_bytes: usize = 2 * 1024 * 1024;
@@ -37,6 +37,9 @@ pub const RouteKind = enum {
 pub const Route = struct {
     kind: RouteKind,
     name: ?[]const u8 = null,
+    /// How to admit the definition; null takes the route kind's default (see
+    /// `routeAdmission`). Host flows that relocate existing data pass `.archived`.
+    admission: ?definition.Admission = null,
 
     pub fn validate(self: Route) !void {
         switch (self.kind) {
@@ -209,6 +212,7 @@ fn compileFromSource(
 /// before 1.9.1 and can work on a store before its definition is fixed. New
 /// events still go through transact, which admits its definition.
 fn routeAdmission(route: Route) definition.Admission {
+    if (route.admission) |admission| return admission;
     return if (route.kind == .doctor) .archived else .current;
 }
 
@@ -231,12 +235,13 @@ fn compileRoutePlans(
     result: *PlanSet,
     route: Route,
 ) !void {
+    const admission = routeAdmission(route);
     switch (route.kind) {
         .definition => {},
-        .definition_check => try compileDefinitionCheck(allocator, result),
-        .validation => try compileValidation(allocator, result),
-        .materialization => try compileMaterialization(allocator, result),
-        .transact => try compileTransaction(allocator, result, route.name.?),
+        .definition_check => try compileDefinitionCheck(allocator, result, admission),
+        .validation => try compileValidation(allocator, result, admission),
+        .materialization => try compileMaterialization(allocator, result, admission),
+        .transact => try compileTransaction(allocator, result, route.name.?, admission),
         .project => try compileProjection(allocator, result, route.name.?),
         .doctor => try compileDurablePlans(allocator, result),
         .migration => try compileDurablePlans(allocator, result),
@@ -246,10 +251,12 @@ fn compileRoutePlans(
 fn compileDefinitionCheck(
     allocator: std.mem.Allocator,
     result: *PlanSet,
+    admission: definition.Admission,
 ) !void {
-    result.validation_plan = try validation.compile(
+    result.validation_plan = try validation.compileAdmitted(
         allocator,
         &result.definition_plan,
+        admission,
     );
     try compileDurablePlans(allocator, result);
     result.projection_plan = try projection.compile(
@@ -263,10 +270,12 @@ fn compileDefinitionCheck(
 fn compileValidation(
     allocator: std.mem.Allocator,
     result: *PlanSet,
+    admission: definition.Admission,
 ) !void {
-    result.validation_plan = try validation.compile(
+    result.validation_plan = try validation.compileAdmitted(
         allocator,
         &result.definition_plan,
+        admission,
     );
     result.materialization_plan = try materialization.compileForValidation(
         allocator,
@@ -277,10 +286,12 @@ fn compileValidation(
 fn compileMaterialization(
     allocator: std.mem.Allocator,
     result: *PlanSet,
+    admission: definition.Admission,
 ) !void {
-    result.validation_plan = try validation.compile(
+    result.validation_plan = try validation.compileAdmitted(
         allocator,
         &result.definition_plan,
+        admission,
     );
     result.materialization_plan = try materialization.compile(
         allocator,
@@ -292,10 +303,12 @@ fn compileTransaction(
     allocator: std.mem.Allocator,
     result: *PlanSet,
     operation: []const u8,
+    admission: definition.Admission,
 ) !void {
-    result.validation_plan = try validation.compile(
+    result.validation_plan = try validation.compileAdmitted(
         allocator,
         &result.definition_plan,
+        admission,
     );
     try compileDurablePlans(allocator, result);
     if (result.storage_plan.?.findOperation(operation) == null) {
@@ -847,6 +860,7 @@ fn encodeRoute(
     try route.validate();
     try encoder.writeEnum(route.kind);
     try encoder.writeOptionalBytes(route.name);
+    try encoder.writeEnum(routeAdmission(route));
 }
 
 fn decodeRoute(
@@ -856,6 +870,7 @@ fn decodeRoute(
     const route: Route = .{
         .kind = try decoder.readEnum(RouteKind),
         .name = try decoder.readOptionalBytesAlloc(allocator, 128),
+        .admission = try decoder.readEnum(definition.Admission),
     };
     errdefer if (route.name) |name| allocator.free(@constCast(name));
     try route.validate();
@@ -864,6 +879,7 @@ fn decodeRoute(
 
 fn routesEqual(left: Route, right: Route) bool {
     if (left.kind != right.kind or
+        routeAdmission(left) != routeAdmission(right) or
         (left.name == null) != (right.name == null))
     {
         return false;
@@ -895,6 +911,7 @@ fn planKey(
         definition_plan.closure_digest[0..],
         @tagName(route.kind),
         route.name orelse "",
+        @tagName(routeAdmission(route)),
         definition_plan.parameter_declarations.shape_digest[0..],
     });
 }
@@ -913,6 +930,7 @@ fn locatorKey(
         entry_path,
         @tagName(route.kind),
         route.name orelse "",
+        @tagName(routeAdmission(route)),
     });
 }
 
@@ -1664,4 +1682,50 @@ test "doctor inspects a definition with a shape on a non-JSON input" {
             try std.testing.expectError(error.ShapeInputNotJson, t.load(source, route));
         }
     }
+}
+
+const CachedLawTest = struct {
+    scope: *storage_root.Scope,
+    root: []const u8,
+    cache_root: []const u8,
+
+    fn load(self: CachedLawTest, route: Route) anyerror!PlanSet {
+        const options: Options = .{ .cache_dir = self.cache_root };
+        return loadCachedLaw(self.scope, self.root, route, options);
+    }
+};
+
+fn loadCachedLaw(
+    scope: *storage_root.Scope,
+    root: []const u8,
+    route: Route,
+    options: Options,
+) anyerror!PlanSet {
+    return load(scope, std.testing.allocator, root, "law.json", route, "1.0.0-test", options);
+}
+
+test "archived host loads never share a cached plan with strict loads" {
+    var test_scope = storage_root.Scope.init(.init(std.testing.io, std.Io.Dir.cwd()));
+    var definitions = std.testing.tmpDir(.{});
+    defer definitions.cleanup();
+    const root = try definitions.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
+    defer std.testing.allocator.free(root);
+    var cache = std.testing.tmpDir(.{});
+    defer cache.cleanup();
+    const cache_root = try cache.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
+    defer std.testing.allocator.free(cache_root);
+    const source = try noteLawDefinitionAlloc("text", note_law);
+    defer std.testing.allocator.free(source);
+    try definitions.dir.writeFile(std.testing.io, .{ .sub_path = "law.json", .data = source });
+    const t: CachedLawTest = .{ .scope = &test_scope, .root = root, .cache_root = cache_root };
+    const strict: Route = .{ .kind = .transact, .name = "append" };
+    const archived: Route = .{ .kind = .transact, .name = "append", .admission = .archived };
+    // Archived first: its cached plan must not satisfy the strict load.
+    for (0..2) |_| {
+        try expectLoads(t.load(archived));
+        try std.testing.expectError(error.RuleInputNotJson, t.load(strict));
+    }
+    var warm = try t.load(archived);
+    defer warm.deinit(std.testing.allocator);
+    try std.testing.expect(warm.stats.cache_hit);
 }

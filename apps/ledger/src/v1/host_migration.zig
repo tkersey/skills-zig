@@ -1017,7 +1017,7 @@ fn repairBinding(
         allocator,
         environment,
         owner.descriptor.definition,
-        .{ .kind = .transact, .name = operation },
+        .{ .kind = .transact, .name = operation, .admission = .archived },
         false,
     );
     defer plan.deinit(allocator);
@@ -2799,4 +2799,46 @@ test "host migration reports visible publication through fresh and receipt retry
             try std.testing.expectEqualStrings(root, try string(resumed, "store_root"));
         }
     }
+}
+
+/// The plain owner definition plus an optional text input bound by a law, which
+/// only rejects when admitted, as a definition written before 1.9.1 could.
+fn textLawOwnerDefinitionAlloc() ![]u8 {
+    const allocator = std.testing.allocator;
+    const plain = @embedFile("fixtures/plain-event-definition.json");
+    const edits = [_][2][]const u8{
+        .{ "\"replay\",\"sort\"", "\"replay\",\"scalar-type\",\"sort\"" },
+        .{
+            "\"inputs\":{\"event\":{\"codec\":\"json\",\"max_bytes\":4096}}",
+            "\"inputs\":{\"event\":{\"codec\":\"json\",\"max_bytes\":4096}," ++
+                "\"note\":{\"codec\":\"text\",\"required\":false,\"max_bytes\":64}}",
+        },
+        .{
+            "\"laws\":[[\"append-only-log\",{\"input\":\"event\"}]",
+            "\"laws\":[[\"append-only-log\",{\"input\":\"event\"}]," ++
+                "[\"scalar-type\",{\"input\":\"note\",\"type\":\"string\"}]",
+        },
+    };
+    var source = try allocator.dupe(u8, plain);
+    for (edits) |edit| {
+        std.debug.assert(std.mem.count(u8, source, edit[0]) == 1);
+        const next = try std.mem.replaceOwned(u8, allocator, source, edit[0], edit[1]);
+        allocator.free(source);
+        source = next;
+    }
+    return source;
+}
+
+test "host migration relocates a store whose owner definition binds a text input" {
+    var fixture = try Fixture.init(false);
+    defer fixture.deinit();
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const definition_source = try textLawOwnerDefinitionAlloc();
+    defer allocator.free(definition_source);
+    try fixtureWrite(fixture.root, "owner/definition.json", definition_source);
+    var applied = try execute(allocator, io, &fixture.environment, fixture.options(true));
+    defer applied.deinit();
+    try expectStatus(applied, "verified");
+    try std.testing.expect(applied.value.object.get("storage_mutated").?.bool);
 }
