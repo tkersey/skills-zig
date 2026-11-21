@@ -483,12 +483,13 @@ const Compiler = struct {
 
 /// When a definition was admitted, which decides how compilation treats shape
 /// documents and validation rules that target text or JSONL inputs. Validation
-/// parses only JSON inputs, so such rules were never applied.
+/// parses only JSON inputs, so such rules never ran as written: most were
+/// skipped, and a few, such as a comparison against one, always failed.
 pub const Admission = enum {
-    /// A definition admitted now: reject those rules as unenforceable.
+    /// A definition admitted now: reject those rules.
     current,
-    /// An archived definition recompiled to replay its recorded history. It
-    /// may predate the rejection, so keep those rules inert, as they always were.
+    /// An archived definition recompiled to replay its recorded history. It may
+    /// predate the rejection, so keep the behavior those rules had in 1.9.0.
     archived,
 };
 

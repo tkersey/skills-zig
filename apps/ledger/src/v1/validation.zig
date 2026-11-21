@@ -446,7 +446,7 @@ const Builder = struct {
     item_rule_count: usize = 0,
 
     /// A current rule may bind only a JSON input; an archived one keeps the
-    /// inert binding it was admitted with.
+    /// binding it was admitted with and the behavior that binding had.
     fn requireRuleInput(self: Builder, input: definition.Input) !void {
         if (self.admission == .current and input.codec != .json) {
             return error.RuleInputNotJson;

@@ -11,7 +11,9 @@ const projection = @import("projection.zig");
 const storage = @import("storage.zig");
 const validation = @import("validation.zig");
 
-const payload_version: u16 = 34;
+// Bump whenever code changes what a cached plan may contain or admit, so plans
+// written by earlier code under the same runtime version are recompiled.
+const payload_version: u16 = 35;
 const locator_version: u16 = 1;
 const cache_limits: definition_core.cache.Limits = .{};
 const locator_max_payload_bytes: usize = 2 * 1024 * 1024;
@@ -195,8 +197,18 @@ fn compileFromSource(
     };
     errdefer result.deinit(allocator);
     try compileRoutePlans(allocator, &result, route);
+    try requireAdmittedRules(allocator, &result);
     try validatePlanSet(&result, route);
     return result;
+}
+
+/// Every route admits the definition it is given, so every route rejects the
+/// validation rules `definition check` rejects. A route that applies no rules
+/// compiles them once here and keeps no plan.
+fn requireAdmittedRules(allocator: std.mem.Allocator, result: *const PlanSet) !void {
+    if (result.validation_plan != null) return;
+    var admitted = try validation.compile(allocator, &result.definition_plan);
+    admitted.deinit(allocator);
 }
 
 fn compileRoutePlans(
@@ -1477,5 +1489,93 @@ test "warm cache cancellation survives the locator source and plan reader adapte
         try std.testing.expectEqual(file_number, CacheCancellationProbe.read_count);
         try std.testing.expectEqual(@as(usize, 1), CacheCancellationProbe.cancellations);
         try std.testing.expectEqual(@as(usize, 0), CacheCancellationProbe.rename_count);
+    }
+}
+
+/// The event fixture plus an optional `note` input of the given codec and a law
+/// that binds it.
+fn noteLawDefinitionAlloc(codec: []const u8) ![]u8 {
+    const fixture = @embedFile("fixtures/event-definition.json");
+    const operators = "\"operators\":[\"atomic-transaction\",";
+    const inputs = "\"inputs\":{\"event\":{\"codec\":\"json\",\"max_bytes\":4096}}";
+    const laws = "\"laws\":[]";
+    std.debug.assert(std.mem.count(u8, fixture, operators) == 1);
+    std.debug.assert(std.mem.count(u8, fixture, inputs) == 1);
+    std.debug.assert(std.mem.count(u8, fixture, laws) == 1);
+    const with_operator = try std.mem.replaceOwned(
+        u8,
+        std.testing.allocator,
+        fixture,
+        operators,
+        "\"operators\":[\"atomic-transaction\",\"scalar-type\",",
+    );
+    defer std.testing.allocator.free(with_operator);
+    const note = try std.fmt.allocPrint(
+        std.testing.allocator,
+        "\"inputs\":{{\"event\":{{\"codec\":\"json\",\"max_bytes\":4096}}," ++
+            "\"note\":{{\"codec\":\"{s}\",\"required\":false,\"max_bytes\":64}}}}",
+        .{codec},
+    );
+    defer std.testing.allocator.free(note);
+    const with_input = try std.mem.replaceOwned(
+        u8,
+        std.testing.allocator,
+        with_operator,
+        inputs,
+        note,
+    );
+    defer std.testing.allocator.free(with_input);
+    return std.mem.replaceOwned(
+        u8,
+        std.testing.allocator,
+        with_input,
+        laws,
+        "\"laws\":[[\"scalar-type\",{\"input\":\"note\",\"type\":\"string\"}]]",
+    );
+}
+
+test "every route rejects laws on non-JSON inputs and admits them on JSON inputs" {
+    var test_scope = storage_root.Scope.init(.init(std.testing.io, std.Io.Dir.cwd()));
+    const scope = &test_scope;
+    var definitions = std.testing.tmpDir(.{});
+    defer definitions.cleanup();
+    const root = try definitions.dir.realPathFileAlloc(
+        std.testing.io,
+        ".",
+        std.testing.allocator,
+    );
+    defer std.testing.allocator.free(root);
+    const routes = [_]Route{
+        .{ .kind = .definition },
+        .{ .kind = .definition_check },
+        .{ .kind = .transact, .name = "append" },
+        .{ .kind = .project, .name = "all" },
+        .{ .kind = .doctor },
+        .{ .kind = .migration },
+    };
+    for ([_][]const u8{ "text", "jsonl", "json" }) |codec| {
+        const source = try noteLawDefinitionAlloc(codec);
+        defer std.testing.allocator.free(source);
+        try definitions.dir.writeFile(std.testing.io, .{
+            .sub_path = "law.json",
+            .data = source,
+        });
+        for (routes) |route| {
+            const loaded = load(
+                scope,
+                std.testing.allocator,
+                root,
+                "law.json",
+                route,
+                "1.0.0-test",
+                .{},
+            );
+            if (std.mem.eql(u8, codec, "json")) {
+                var plans = try loaded;
+                plans.deinit(std.testing.allocator);
+            } else {
+                try std.testing.expectError(error.RuleInputNotJson, loaded);
+            }
+        }
     }
 }
