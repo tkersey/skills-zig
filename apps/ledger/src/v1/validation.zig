@@ -2559,26 +2559,34 @@ pub fn compileAdmitted(
     );
 }
 
-/// Reject a rule bound to a non-JSON input without reporting any other rule
-/// error. Each top-level rule compiles in its own builder, so an unrelated
-/// error in one rule cannot hide another rule's binding.
+/// Reject a rule bound to a non-JSON input in a definition whose rules
+/// otherwise compile. A definition invalid for any other reason is left to the
+/// routes that apply rules, which reject it, so the result does not depend on
+/// which error the compiler meets first.
 pub fn requireJsonRuleInputs(
     allocator: std.mem.Allocator,
     definition_plan: *const definition.Plan,
 ) !void {
-    for (definition_plan.rules) |rule| {
-        var builder = Builder{
-            .allocator = allocator,
-            .definition_plan = definition_plan,
-            .inputs = definition_plan.inputs,
-        };
-        defer builder.deinit();
-        for (definition_plan.pointers) |pointer| _ = try builder.internPointer(pointer);
-        builder.compileRule(rule) catch |err| switch (err) {
-            error.RuleInputNotJson, error.OutOfMemory => return err,
-            else => {},
-        };
-    }
+    var current = compile(allocator, definition_plan) catch |err| switch (err) {
+        error.RuleInputNotJson => return requireOtherwiseInvalid(allocator, definition_plan),
+        error.OutOfMemory => return err,
+        else => return,
+    };
+    current.deinit(allocator);
+}
+
+/// The current compile met a non-JSON binding; the archived compile tells
+/// whether that is the definition's only problem.
+fn requireOtherwiseInvalid(
+    allocator: std.mem.Allocator,
+    definition_plan: *const definition.Plan,
+) !void {
+    var archived = compileAdmitted(allocator, definition_plan, .archived) catch |err| {
+        if (err == error.OutOfMemory) return err;
+        return;
+    };
+    archived.deinit(allocator);
+    return error.RuleInputNotJson;
 }
 
 pub fn compileEmbedded(

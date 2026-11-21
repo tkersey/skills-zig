@@ -203,19 +203,19 @@ fn compileFromSource(
     return result;
 }
 
-/// Doctor, and the host flows that load owners through its route, inspect
-/// existing stores. Like replay, they read a definition as it was admitted and
-/// keep shapes and rules on non-JSON inputs as before 1.9.1, so a store can be
-/// diagnosed before its definition is fixed. Every other route admits the
-/// definition it is given.
+/// The doctor route serves `ledger doctor`, `ledger prepare`, and the host
+/// migration, adoption, and owner flows. They inspect or relocate existing
+/// data, so, like replay, they keep shapes and rules on non-JSON inputs as
+/// before 1.9.1 and can work on a store before its definition is fixed. New
+/// events still go through transact, which admits its definition.
 fn routeAdmission(route: Route) definition.Admission {
     return if (route.kind == .doctor) .archived else .current;
 }
 
 /// A route that admits its definition rejects any rule bound to a non-JSON
-/// input. Routes that apply rules have already compiled them. The others check
-/// only that binding, since before 1.9.1 they reported no other rule error, so
-/// they can still open a store whose definition is otherwise invalid.
+/// input. Routes that apply rules have already compiled them. The others reject
+/// it only in a definition whose rules otherwise compile; before 1.9.1 they
+/// reported no rule error, so they still open an otherwise invalid definition.
 fn requireAdmittedRules(
     allocator: std.mem.Allocator,
     result: *const PlanSet,
@@ -1611,7 +1611,7 @@ test "admitting routes reject laws on non-JSON inputs and doctor still inspects 
     }
 }
 
-test "read routes keep other rule errors out but still find a later non-JSON law" {
+test "read routes open otherwise invalid definitions whatever the rule order" {
     var test_scope = storage_root.Scope.init(.init(std.testing.io, std.Io.Dir.cwd()));
     var definitions = std.testing.tmpDir(.{});
     defer definitions.cleanup();
@@ -1620,19 +1620,20 @@ test "read routes keep other rule errors out but still find a later non-JSON law
     const t: LawRoutesTest = .{ .scope = &test_scope, .dir = &definitions, .root = root };
     const ambiguous = try noteLawDefinitionAlloc("json", ambiguous_law);
     defer std.testing.allocator.free(ambiguous);
-    // An ambiguous law first, then a law on a text input.
-    const masked = try noteLawDefinitionAlloc("text", ambiguous_law ++ "," ++ note_law);
-    defer std.testing.allocator.free(masked);
+    // An ambiguous law and a law on a text input, in both orders.
+    const ambiguous_first = try noteLawDefinitionAlloc("text", ambiguous_law ++ "," ++ note_law);
+    defer std.testing.allocator.free(ambiguous_first);
+    const text_first = try noteLawDefinitionAlloc("text", note_law ++ "," ++ ambiguous_law);
+    defer std.testing.allocator.free(text_first);
     for (law_routes) |route| {
         if (routeAppliesRules(route)) {
             try std.testing.expectError(error.AmbiguousRuleInput, t.load(ambiguous, route));
-            try std.testing.expectError(error.AmbiguousRuleInput, t.load(masked, route));
-        } else if (route.kind == .doctor) {
-            try expectLoads(t.load(ambiguous, route));
-            try expectLoads(t.load(masked, route));
+            try std.testing.expectError(error.AmbiguousRuleInput, t.load(ambiguous_first, route));
+            try std.testing.expectError(error.RuleInputNotJson, t.load(text_first, route));
         } else {
             try expectLoads(t.load(ambiguous, route));
-            try std.testing.expectError(error.RuleInputNotJson, t.load(masked, route));
+            try expectLoads(t.load(ambiguous_first, route));
+            try expectLoads(t.load(text_first, route));
         }
     }
 }
