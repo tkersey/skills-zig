@@ -201,7 +201,9 @@ text inputs, imports under an admitted definition root, native structural
 operators, identity, logical storage, transactions, reducers, and projections.
 They cannot name hooks or executable code. Shapes and validation laws apply
 only to JSON inputs; a definition that targets a JSONL or text input with either
-is rejected (`ShapeInputNotJson`, `RuleInputNotJson`).
+is rejected (`ShapeInputNotJson`, `RuleInputNotJson`). Before 1.9.1 such rules
+were accepted and silently skipped. Replay still reads archived definitions that
+contain them, so existing stores keep working after the definition is fixed.
 
 ## Pure operations
 

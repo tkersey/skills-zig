@@ -481,10 +481,30 @@ const Compiler = struct {
     }
 };
 
+/// When a definition was admitted, which decides how compilation treats shape
+/// documents and validation rules that target text or JSONL inputs. Validation
+/// parses only JSON inputs, so such rules were never applied.
+pub const Admission = enum {
+    /// A definition admitted now: reject those rules as unenforceable.
+    current,
+    /// An archived definition recompiled to replay its recorded history. It
+    /// may predate the rejection, so keep those rules inert, as they always were.
+    archived,
+};
+
 pub fn compile(
     allocator: std.mem.Allocator,
     closure: *const definition_core.Closure,
     entry_path: []const u8,
+) !Plan {
+    return compileAdmitted(allocator, closure, entry_path, .current);
+}
+
+pub fn compileAdmitted(
+    allocator: std.mem.Allocator,
+    closure: *const definition_core.Closure,
+    entry_path: []const u8,
+    admission: Admission,
 ) !Plan {
     var result: Plan = undefined;
     var compiled_count: usize = 0;
@@ -512,7 +532,7 @@ pub fn compile(
             frames[count] = child;
             count += 1;
         } else {
-            frame.target.* = try finishCompiledPlan(allocator, closure.digest, frame);
+            frame.target.* = try finishCompiledPlan(allocator, closure.digest, frame, admission);
             frame.parsed.deinit();
             allocator.free(frame.entry_path);
             count -= 1;
@@ -622,6 +642,7 @@ fn finishCompiledPlan(
     allocator: std.mem.Allocator,
     closure_digest: [71]u8,
     frame: *CompileFrame,
+    admission: Admission,
 ) !Plan {
     const root = frame.parsed.value.object;
     const header = &frame.header;
@@ -633,6 +654,7 @@ fn finishCompiledPlan(
         header.operator_mask,
         header.imports,
         header.inputs,
+        admission,
     );
     errdefer body.deinit(allocator);
     const owned_id = try allocator.dupe(u8, try definition_core.json.requiredString(root, "id"));
@@ -794,6 +816,7 @@ fn lowerDefinitionSources(
     allocator: std.mem.Allocator,
     root: std.json.ObjectMap,
     inputs: []const Input,
+    admission: Admission,
     budget: *source_graph.ExpansionBudget,
 ) !LoweredDefinitionSources {
     const input_names = try allocator.alloc([]const u8, inputs.len);
@@ -805,7 +828,7 @@ fn lowerDefinitionSources(
         input_names,
         budget,
     );
-    try requireJsonShapeDocuments(shape, inputs);
+    if (admission == .current) try requireJsonShapeDocuments(shape, inputs);
     return .{
         .shape_rules = shape_rules,
         .constraint_rules = try source_graph.lowerConstraints(
@@ -822,8 +845,9 @@ fn lowerDefinitionSources(
     };
 }
 
-/// Shape documents apply only to parsed JSON inputs; validation never parses
-/// text or JSONL inputs into a document, so such a shape could never hold.
+/// Shape documents apply only to parsed JSON inputs. Validation never parses
+/// text or JSONL inputs into a document, so a shape on one was silently skipped
+/// and passed whatever the input held.
 fn requireJsonShapeDocuments(shape: std.json.Value, inputs: []const Input) !void {
     const documents = shape.object.get("documents") orelse return;
     var iterator = documents.object.iterator();
@@ -879,6 +903,7 @@ fn compileDefinitionBody(
     operator_mask: u128,
     imports: []const Plan,
     inputs: []const Input,
+    admission: Admission,
 ) !DefinitionBody {
     var source_arena = std.heap.ArenaAllocator.init(allocator);
     defer source_arena.deinit();
@@ -888,6 +913,7 @@ fn compileDefinitionBody(
         source_allocator,
         root,
         inputs,
+        admission,
         &expansion_budget,
     );
     var compiler = Compiler{

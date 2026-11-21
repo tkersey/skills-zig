@@ -440,9 +440,18 @@ const Builder = struct {
     allocator: std.mem.Allocator,
     definition_plan: *const definition.Plan,
     inputs: []const definition.Input,
+    admission: definition.Admission = .current,
     pointers: std.ArrayList(Pointer) = .empty,
     rules: std.ArrayList(CompiledRule) = .empty,
     item_rule_count: usize = 0,
+
+    /// A current rule may bind only a JSON input; an archived one keeps the
+    /// inert binding it was admitted with.
+    fn requireRuleInput(self: Builder, input: definition.Input) !void {
+        if (self.admission == .current and input.codec != .json) {
+            return error.RuleInputNotJson;
+        }
+    }
 
     fn initRule(
         _: *Builder,
@@ -482,7 +491,7 @@ const Builder = struct {
     fn inputIndex(self: Builder, name: []const u8) !u8 {
         for (self.inputs, 0..) |input, index| {
             if (std.mem.eql(u8, input.name, name)) {
-                if (input.codec != .json) return error.RuleInputNotJson;
+                try self.requireRuleInput(input);
                 return @intCast(index);
             }
         }
@@ -1812,9 +1821,7 @@ const Builder = struct {
             else if (inherited_input) |index|
                 index
             else if (work.builder.inputs.len == 1) blk: {
-                if (work.builder.inputs[0].codec != .json) {
-                    return error.RuleInputNotJson;
-                }
+                try work.builder.requireRuleInput(work.builder.inputs[0]);
                 break :blk @as(u8, 0);
             } else return error.AmbiguousRuleInput;
             work.rule.* = work.builder.initRule(
@@ -2528,10 +2535,19 @@ pub fn compile(
     allocator: std.mem.Allocator,
     definition_plan: *const definition.Plan,
 ) anyerror!Plan {
+    return compileAdmitted(allocator, definition_plan, .current);
+}
+
+pub fn compileAdmitted(
+    allocator: std.mem.Allocator,
+    definition_plan: *const definition.Plan,
+    admission: definition.Admission,
+) anyerror!Plan {
     var builder = Builder{
         .allocator = allocator,
         .definition_plan = definition_plan,
         .inputs = definition_plan.inputs,
+        .admission = admission,
     };
     errdefer builder.deinit();
     for (definition_plan.pointers) |pointer| _ = try builder.internPointer(pointer);

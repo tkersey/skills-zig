@@ -116,15 +116,18 @@ const PlanCache = struct {
         archive: definition_archive.Loaded,
         digest: []const u8,
     ) !ArchivedPlan {
-        var definition_plan = try definition.compile(
+        // An archive may predate rules admitted only now; replay must still read it.
+        var definition_plan = try definition.compileAdmitted(
             self.allocator,
             &archive.closure,
             archive.entry_path,
+            .archived,
         );
         errdefer definition_plan.deinit(self.allocator);
-        var validation_plan = try validation.compile(
+        var validation_plan = try validation.compileAdmitted(
             self.allocator,
             &definition_plan,
+            .archived,
         );
         errdefer validation_plan.deinit(self.allocator);
         var storage_plan = try storage.compile(
@@ -2589,4 +2592,108 @@ fn expectArchiveInsertionAllocationFailure(
         try std.testing.expectEqual(@as(u32, 0), cache.indices.count());
         try std.testing.expectEqual(@as(usize, 0), cache.definition_bytes);
     }
+}
+
+fn replaceOnceAlloc(source: []const u8, needle: []const u8, replacement: []const u8) ![]u8 {
+    std.debug.assert(std.mem.count(u8, source, needle) == 1);
+    return std.mem.replaceOwned(u8, std.testing.allocator, source, needle, replacement);
+}
+
+/// The plain fixture plus an optional text input that both a shape document
+/// and a law target, as a definition admitted before 1.9.1 could.
+fn textTargetDefinitionAlloc() ![]u8 {
+    const edits = [_][2][]const u8{
+        .{
+            "\"operators\":[\"append-only-log\",\"bind-existing\",",
+            "\"operators\":[\"append-only-log\",\"bind-existing\",\"bounded-string\",",
+        },
+        .{ "\"replay\",\"sort\"", "\"replay\",\"scalar-type\",\"sort\"" },
+        .{
+            "\"inputs\":{\"event\":{\"codec\":\"json\",\"max_bytes\":4096}}",
+            "\"inputs\":{\"event\":{\"codec\":\"json\",\"max_bytes\":4096}," ++
+                "\"note\":{\"codec\":\"text\",\"required\":false,\"max_bytes\":64}}",
+        },
+        .{
+            "\"documents\":{\"event\":",
+            "\"documents\":{\"note\":{\"string\":{\"min\":64,\"max\":64}},\"event\":",
+        },
+        .{
+            "\"laws\":[[\"append-only-log\",{\"input\":\"event\"}]",
+            "\"laws\":[[\"append-only-log\",{\"input\":\"event\"}]," ++
+                "[\"scalar-type\",{\"input\":\"note\",\"type\":\"string\"}]",
+        },
+    };
+    const fixture = @embedFile("fixtures/plain-event-definition.json");
+    var source = try std.testing.allocator.dupe(u8, fixture);
+    for (edits) |edit| {
+        const next = try replaceOnceAlloc(source, edit[0], edit[1]);
+        std.testing.allocator.free(source);
+        source = next;
+    }
+    return source;
+}
+
+test "replay compiles archived definitions that target non-JSON inputs" {
+    var scope_storage = storage_root.Scope.init(.init(std.testing.io, std.Io.Dir.cwd()));
+    const scope = &scope_storage;
+    const allocator = std.testing.allocator;
+    const archived_source = try textTargetDefinitionAlloc();
+    defer allocator.free(archived_source);
+    var definitions = std.testing.tmpDir(.{});
+    defer definitions.cleanup();
+    try definitions.dir.writeFile(std.testing.io, .{
+        .sub_path = "first.json",
+        .data = archived_source,
+    });
+    try definitions.dir.writeFile(std.testing.io, .{
+        .sub_path = "second.json",
+        .data = @embedFile("fixtures/plain-event-definition.json"),
+    });
+    var archived = try definition_core.closure.loadFromDir(
+        scope.fs.io,
+        allocator,
+        &definitions.dir,
+        "first.json",
+        .{},
+    );
+    defer archived.deinit(allocator);
+    var current = try definition_core.closure.loadFromDir(
+        scope.fs.io,
+        allocator,
+        &definitions.dir,
+        "second.json",
+        .{},
+    );
+    defer current.deinit(allocator);
+
+    // Admitted now, the shape and the law are both rejected.
+    try std.testing.expectError(
+        error.ShapeInputNotJson,
+        definition.compile(allocator, &archived, "first.json"),
+    );
+    var lenient = try definition.compileAdmitted(allocator, &archived, "first.json", .archived);
+    defer lenient.deinit(allocator);
+    try std.testing.expectError(
+        error.RuleInputNotJson,
+        validation.compile(allocator, &lenient),
+    );
+
+    // Archived in a store, the same definition still replays beside a current one.
+    var repo = std.testing.tmpDir(.{});
+    defer repo.cleanup();
+    try repo.dir.createDirPath(std.testing.io, ".ledger/.definitions");
+    const repo_root = try repo.dir.realPathFileAlloc(std.testing.io, ".", allocator);
+    defer allocator.free(repo_root);
+    try archiveReplayTestDefinitions(scope, repo_root, &archived, &current);
+    var cache = PlanCache{
+        .scope = scope,
+        .allocator = allocator,
+        .repo_root = repo_root,
+        .definition_id = "example/plain-protocol",
+    };
+    defer cache.deinit();
+    const plan = try cache.get(archived.digestSlice());
+    try std.testing.expectEqual(@as(usize, 2), plan.definition_plan.inputs.len);
+    _ = try cache.get(current.digestSlice());
+    try std.testing.expectEqual(@as(usize, 2), cache.plans.items.len);
 }
