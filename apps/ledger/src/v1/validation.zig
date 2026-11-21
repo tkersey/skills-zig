@@ -2559,6 +2559,28 @@ pub fn compileAdmitted(
     );
 }
 
+/// Reject a rule bound to a non-JSON input without reporting any other rule
+/// error. Each top-level rule compiles in its own builder, so an unrelated
+/// error in one rule cannot hide another rule's binding.
+pub fn requireJsonRuleInputs(
+    allocator: std.mem.Allocator,
+    definition_plan: *const definition.Plan,
+) !void {
+    for (definition_plan.rules) |rule| {
+        var builder = Builder{
+            .allocator = allocator,
+            .definition_plan = definition_plan,
+            .inputs = definition_plan.inputs,
+        };
+        defer builder.deinit();
+        for (definition_plan.pointers) |pointer| _ = try builder.internPointer(pointer);
+        builder.compileRule(rule) catch |err| switch (err) {
+            error.RuleInputNotJson, error.OutOfMemory => return err,
+            else => {},
+        };
+    }
+}
+
 pub fn compileEmbedded(
     allocator: std.mem.Allocator,
     definition_plan: *const definition.Plan,

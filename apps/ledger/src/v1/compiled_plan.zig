@@ -13,7 +13,7 @@ const validation = @import("validation.zig");
 
 // Bump whenever code changes what a cached plan may contain or admit, so plans
 // written by earlier code under the same runtime version are recompiled.
-const payload_version: u16 = 35;
+const payload_version: u16 = 36;
 const locator_version: u16 = 1;
 const cache_limits: definition_core.cache.Limits = .{};
 const locator_max_payload_bytes: usize = 2 * 1024 * 1024;
@@ -178,10 +178,11 @@ fn compileFromSource(
         errdefer closure.deinit(allocator);
         const owned_entry_path = try allocator.dupe(u8, entry_path);
         errdefer allocator.free(owned_entry_path);
-        var definition_plan = try definition.compile(
+        var definition_plan = try definition.compileAdmitted(
             allocator,
             &closure,
             entry_path,
+            routeAdmission(route),
         );
         errdefer definition_plan.deinit(allocator);
         break :result .{
@@ -197,25 +198,32 @@ fn compileFromSource(
     };
     errdefer result.deinit(allocator);
     try compileRoutePlans(allocator, &result, route);
-    try requireAdmittedRules(allocator, &result);
+    try requireAdmittedRules(allocator, &result, route);
     try validatePlanSet(&result, route);
     return result;
 }
 
-/// Every route rejects a rule bound to a non-JSON input in the definition it is
-/// given. A route that applies no rules compiles them once here only for that
-/// check and keeps no plan. Its other validation errors stay with the routes
-/// that apply rules, as before 1.9.1, so read routes can still open a store
-/// whose definition is otherwise invalid.
-fn requireAdmittedRules(allocator: std.mem.Allocator, result: *const PlanSet) !void {
+/// Doctor, and the host flows that load owners through its route, inspect
+/// existing stores. Like replay, they read a definition as it was admitted and
+/// keep shapes and rules on non-JSON inputs as before 1.9.1, so a store can be
+/// diagnosed before its definition is fixed. Every other route admits the
+/// definition it is given.
+fn routeAdmission(route: Route) definition.Admission {
+    return if (route.kind == .doctor) .archived else .current;
+}
+
+/// A route that admits its definition rejects any rule bound to a non-JSON
+/// input. Routes that apply rules have already compiled them. The others check
+/// only that binding, since before 1.9.1 they reported no other rule error, so
+/// they can still open a store whose definition is otherwise invalid.
+fn requireAdmittedRules(
+    allocator: std.mem.Allocator,
+    result: *const PlanSet,
+    route: Route,
+) !void {
     if (result.validation_plan != null) return;
-    var admitted = validation.compile(allocator, &result.definition_plan) catch |err| {
-        switch (err) {
-            error.RuleInputNotJson, error.OutOfMemory => return err,
-            else => return,
-        }
-    };
-    admitted.deinit(allocator);
+    if (routeAdmission(route) == .archived) return;
+    try validation.requireJsonRuleInputs(allocator, &result.definition_plan);
 }
 
 fn compileRoutePlans(
@@ -1544,6 +1552,7 @@ const ambiguous_law = "[\"scalar-type\",{\"type\":\"string\"}]";
 const law_routes = [_]Route{
     .{ .kind = .definition },
     .{ .kind = .definition_check },
+    .{ .kind = .validation },
     .{ .kind = .transact, .name = "append" },
     .{ .kind = .project, .name = "all" },
     .{ .kind = .doctor },
@@ -1563,42 +1572,95 @@ fn loadLawDefinition(
 
 /// Whether a route compiles validation rules for its own use.
 fn routeAppliesRules(route: Route) bool {
-    return route.kind == .definition_check or route.kind == .transact;
+    return route.kind == .definition_check or route.kind == .validation or
+        route.kind == .transact;
 }
 
-test "every route rejects laws on non-JSON inputs and keeps other rule errors where they apply" {
+fn expectLoads(loaded: anyerror!PlanSet) !void {
+    var plans = try loaded;
+    plans.deinit(std.testing.allocator);
+}
+
+const LawRoutesTest = struct {
+    scope: *storage_root.Scope,
+    dir: *std.testing.TmpDir,
+    root: []const u8,
+
+    fn load(self: LawRoutesTest, source: []const u8, route: Route) anyerror!PlanSet {
+        return loadLawDefinition(self.scope, self.dir, self.root, source, route);
+    }
+};
+
+test "admitting routes reject laws on non-JSON inputs and doctor still inspects them" {
     var test_scope = storage_root.Scope.init(.init(std.testing.io, std.Io.Dir.cwd()));
-    const scope = &test_scope;
     var definitions = std.testing.tmpDir(.{});
     defer definitions.cleanup();
-    const root = try definitions.dir.realPathFileAlloc(
-        std.testing.io,
-        ".",
-        std.testing.allocator,
-    );
+    const root = try definitions.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
     defer std.testing.allocator.free(root);
+    const t: LawRoutesTest = .{ .scope = &test_scope, .dir = &definitions, .root = root };
     for ([_][]const u8{ "text", "jsonl", "json" }) |codec| {
         const source = try noteLawDefinitionAlloc(codec, note_law);
         defer std.testing.allocator.free(source);
         for (law_routes) |route| {
-            const loaded = loadLawDefinition(scope, &definitions, root, source, route);
-            if (std.mem.eql(u8, codec, "json")) {
-                var plans = try loaded;
-                plans.deinit(std.testing.allocator);
+            if (std.mem.eql(u8, codec, "json") or route.kind == .doctor) {
+                try expectLoads(t.load(source, route));
             } else {
-                try std.testing.expectError(error.RuleInputNotJson, loaded);
+                try std.testing.expectError(error.RuleInputNotJson, t.load(source, route));
             }
         }
     }
+}
+
+test "read routes keep other rule errors out but still find a later non-JSON law" {
+    var test_scope = storage_root.Scope.init(.init(std.testing.io, std.Io.Dir.cwd()));
+    var definitions = std.testing.tmpDir(.{});
+    defer definitions.cleanup();
+    const root = try definitions.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
+    defer std.testing.allocator.free(root);
+    const t: LawRoutesTest = .{ .scope = &test_scope, .dir = &definitions, .root = root };
     const ambiguous = try noteLawDefinitionAlloc("json", ambiguous_law);
     defer std.testing.allocator.free(ambiguous);
+    // An ambiguous law first, then a law on a text input.
+    const masked = try noteLawDefinitionAlloc("text", ambiguous_law ++ "," ++ note_law);
+    defer std.testing.allocator.free(masked);
     for (law_routes) |route| {
-        const loaded = loadLawDefinition(scope, &definitions, root, ambiguous, route);
         if (routeAppliesRules(route)) {
-            try std.testing.expectError(error.AmbiguousRuleInput, loaded);
+            try std.testing.expectError(error.AmbiguousRuleInput, t.load(ambiguous, route));
+            try std.testing.expectError(error.AmbiguousRuleInput, t.load(masked, route));
+        } else if (route.kind == .doctor) {
+            try expectLoads(t.load(ambiguous, route));
+            try expectLoads(t.load(masked, route));
         } else {
-            var plans = try loaded;
-            plans.deinit(std.testing.allocator);
+            try expectLoads(t.load(ambiguous, route));
+            try std.testing.expectError(error.RuleInputNotJson, t.load(masked, route));
+        }
+    }
+}
+
+test "doctor inspects a definition with a shape on a non-JSON input" {
+    var test_scope = storage_root.Scope.init(.init(std.testing.io, std.Io.Dir.cwd()));
+    var definitions = std.testing.tmpDir(.{});
+    defer definitions.cleanup();
+    const root = try definitions.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
+    defer std.testing.allocator.free(root);
+    const t: LawRoutesTest = .{ .scope = &test_scope, .dir = &definitions, .root = root };
+    const no_law = try noteLawDefinitionAlloc("text", "");
+    defer std.testing.allocator.free(no_law);
+    const documents = "\"shape\":{\"documents\":{";
+    std.debug.assert(std.mem.count(u8, no_law, documents) == 1);
+    const source = try std.mem.replaceOwned(
+        u8,
+        std.testing.allocator,
+        no_law,
+        documents,
+        "\"shape\":{\"documents\":{\"note\":{},",
+    );
+    defer std.testing.allocator.free(source);
+    for (law_routes) |route| {
+        if (route.kind == .doctor) {
+            try expectLoads(t.load(source, route));
+        } else {
+            try std.testing.expectError(error.ShapeInputNotJson, t.load(source, route));
         }
     }
 }
