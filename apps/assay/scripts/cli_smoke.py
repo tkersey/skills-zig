@@ -74,6 +74,13 @@ def test_help_version_capabilities():
     assert capabilities["kernel"] == "assay-kernel/v1"
     assert capabilities["commands"] == list(COMMANDS)
     assert capabilities["check_kinds"] == ["scalar_equal", "domain_judgment"]
+    assert capabilities["input_schemas"] == [
+        "assay-contract/v1", "assay-subject/v1", "assay-evidence/v1", "assay-assessment/v1",
+    ]
+    assert capabilities["output_schemas"] == [
+        "assay-capabilities/v1", "assay-assessment/v1", "assay-comparison/v1",
+        "assay-explanation/v2", "assay-command-error/v1",
+    ]
     assert capabilities["exit_codes"] == {
         "supported": 0, "refuted": 1, "command_error": 2, "unresolved": 3,
         "processing_complete": 0,

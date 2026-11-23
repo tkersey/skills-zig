@@ -13,7 +13,9 @@ repair, or close out work. Every result carries `authority_granted: false` and
 
 The implemented contract is the Assay CLI v1 specification
 ([gist](https://gist.github.com/tkersey/ce1d7d3c15b3b27d467c2e3a20bb4407),
-revision `631d061bfb6a0dc260548c4c386be1848c85675c`).
+revision `631d061bfb6a0dc260548c4c386be1848c85675c`), with one owner-approved
+revision: `explain` emits `assay-explanation/v2`, described under
+[Receipts, explain, and compare](#receipts-explain-and-compare).
 
 ## Commands
 
