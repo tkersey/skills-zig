@@ -41,9 +41,13 @@ case "$mode" in
       mark_app ledger
     }
 
-    mark_definition_consumers() {
+    mark_definition_compat_consumers() {
       mark_app seq
       mark_app ledger
+    }
+
+    mark_definition_core_consumers() {
+      mark_definition_compat_consumers
       mark_app assay
     }
 
@@ -93,8 +97,11 @@ case "$mode" in
         libs/core/*)
           mark_all
           ;;
-        libs/definition_core/*|libs/definition_compat/*)
-          mark_definition_consumers
+        libs/definition_core/*)
+          mark_definition_core_consumers
+          ;;
+        libs/definition_compat/*)
+          mark_definition_compat_consumers
           ;;
         libs/trace_core/*)
           mark_trace_consumers
@@ -110,7 +117,7 @@ case "$mode" in
           mark_all
           ;;
         scripts/guards/definition-core-domain.sh)
-          mark_definition_consumers
+          mark_definition_core_consumers
           ;;
         scripts/test-seq-cli.sh|scripts/test-seq-observation-contract.sh)
           mark_app seq

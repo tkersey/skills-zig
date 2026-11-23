@@ -376,8 +376,19 @@ pub const Unsigned = union(enum) {
     too_large,
 };
 
+fn classifyUnparsed(token: []const u8) Unsigned {
+    const exponent_at = std.mem.indexOfAny(u8, token, "eE") orelse return .invalid;
+    const mantissa = token[0..exponent_at];
+    const nonzero = std.mem.indexOfNone(u8, mantissa, "-0.") != null;
+    if (!nonzero) return .{ .value = 0 };
+    if (mantissa[0] == '-') return .invalid;
+    const exponent = token[exponent_at + 1 ..];
+    if (exponent.len > 0 and exponent[0] == '-') return .invalid;
+    return .too_large;
+}
+
 pub fn decodeUnsigned(token: []const u8) Unsigned {
-    const number = exact_number.parse(token) orelse return .invalid;
+    const number = exact_number.parse(token) orelse return classifyUnparsed(token);
     if (number.significant_len == 0) return .{ .value = 0 };
     if (number.negative or number.scale < 0) return .invalid;
     const digits_max = std.math.log10_int(@as(u64, std.math.maxInt(u64))) + 1;
@@ -393,13 +404,9 @@ pub fn decodeUnsigned(token: []const u8) Unsigned {
     return .{ .value = result };
 }
 
-pub fn writeString(writer: *std.Io.Writer, text: []const u8) !void {
-    try std.json.Stringify.encodeJsonString(text, .{}, writer);
-}
-
 const testing = std.testing;
 
-pub fn repeat(comptime byte: u8, comptime count: usize) [count]u8 {
+fn repeat(comptime byte: u8, comptime count: usize) [count]u8 {
     return @splat(byte);
 }
 
@@ -491,14 +498,23 @@ test "unsigned integers accept every exact spelling and reject overflow" {
         .{ "1e3", 1000 },
         .{ "18446744073709551615", std.math.maxInt(u64) },
         .{ "1.8446744073709551615e19", std.math.maxInt(u64) },
+        .{ "0e99999999999999999999", 0 },
+        .{ "-0.0e-99999999999999999999", 0 },
     };
     for (accepted) |case| {
         try testing.expectEqual(Unsigned{ .value = case[1] }, decodeUnsigned(case[0]));
     }
-    for ([_][]const u8{ "-1", "1.5", "2.245e2", "1e-1" }) |token| {
+    const invalid = [_][]const u8{
+        "-1", "1.5", "2.245e2", "1e-1", "1e-99999999999999999999", "-1e99999999999999999999",
+    };
+    for (invalid) |token| {
         try testing.expectEqual(Unsigned.invalid, decodeUnsigned(token));
     }
-    for ([_][]const u8{ "18446744073709551616", "99999999999999999999", "1e20", "1e999" }) |token| {
+    const huge = [_][]const u8{
+        "18446744073709551616",   "99999999999999999999",    "1e20", "1e999",
+        "1e99999999999999999999", "2E+99999999999999999999",
+    };
+    for (huge) |token| {
         try testing.expectEqual(Unsigned.too_large, decodeUnsigned(token));
     }
 }

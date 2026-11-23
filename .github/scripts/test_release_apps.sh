@@ -357,7 +357,7 @@ done
 assert_affected ledger write_ledger
 assert_affected "$all_apps" write_frozen_cas_automation_fixture
 assert_affected seq,ledger,assay write_definition_core
-assert_affected seq,ledger,assay write_definition_compat
+assert_affected seq,ledger write_definition_compat
 assert_affected seq write_trace_core
 assert_affected "$all_apps" write_cas_runtime
 assert_affected "$all_apps" write_cas_hook_policy_source
@@ -420,7 +420,8 @@ done
 # Every shared group keeps its established conservative consumer set.
 for owner in "${shared_owners[@]}"; do
   case "$owner" in
-    definition_core|definition_compat) expected=seq,ledger,assay ;;
+    definition_core) expected=seq,ledger,assay ;;
+    definition_compat) expected=seq,ledger ;;
     trace_core) expected=seq ;;
     cas_runtime) expected=$all_apps ;;
     siwc) expected=siwc ;;

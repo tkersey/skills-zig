@@ -150,8 +150,8 @@ that app. Root `build.zig`, `build.zig.zon`, shared build support, and unknown
 `build/**` or `libs/**` paths count for every shipped CLI. Broad shared shipped
 surfaces such as
 `libs/core/**` count for every shipped CLI;
-`libs/definition_core/**` and `libs/definition_compat/**` count for `seq`,
-`ledger`, and `assay`;
+`libs/definition_core/**` counts for `seq`, `ledger`, and `assay`;
+`libs/definition_compat/**` counts for `seq` and `ledger`;
 `libs/durable_store/**` and `libs/jsonl_core/**` count for `seq`,
 `ledger`, `memory-note`, and `siwc`;
 `libs/trace_core/**` counts for `seq`; and

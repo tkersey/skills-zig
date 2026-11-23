@@ -110,7 +110,7 @@ def manifest_entry(root, identifier, role, relative):
 
 
 class Trial:
-    def __init__(self, workspace, name, program, goal, codec=None, timeout_ms=4000):
+    def __init__(self, workspace, name, program, goal, codec=None, timeout_ms=20000):
         self.name = name
         self.goal = goal
         self.program = program

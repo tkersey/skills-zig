@@ -133,13 +133,15 @@ pub const Diagnostic = struct {
         self: *Diagnostic,
         code: Code,
         loc: ?*const Loc,
-        comptime prefix: []const u8,
+        role: []const u8,
+        comptime summary: []const u8,
     ) error{Rejected} {
         var inner: [limits.error_message_bytes_max]u8 = undefined;
         const inner_message = inner[0..self.message_len];
         @memcpy(inner_message, self.message());
         const inner_code = self.code;
-        return self.fail(code, loc, prefix ++ " ({s}: {s})", .{
+        return self.fail(code, loc, "{s}: " ++ summary ++ " ({s}: {s})", .{
+            role,
             @tagName(inner_code),
             inner_message,
         });

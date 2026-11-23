@@ -31,7 +31,8 @@ Release contract:
    - Root `build.zig`, `build.zig.zon`, shared `build/support.zig`, and unknown `build/**` or `libs/**` paths count for every shipped CLI. Classification uses both sides of renamed or moved paths; root-build diff text is never interpreted as ownership.
    - broad shared shipped surfaces (`libs/core/**`) count for every shipped CLI.
    - shared install admission (`apps/seq/build_support.zig` and `tools/install_guard.zig`) counts for every shipped CLI, regardless of its source directory.
-   - `libs/definition_core/**` and `libs/definition_compat/**` count for their shipped consumers: `seq`, `ledger`, and `assay`.
+   - `libs/definition_core/**` counts for its shipped consumers: `seq`, `ledger`, and `assay` (Assay imports only its exact-number module).
+   - `libs/definition_compat/**` counts for its shipped consumers: `seq` and `ledger`.
    - `libs/durable_store/**` and `libs/jsonl_core/**` count for their shipped consumers: `seq`, `ledger`, `memory-note`, and `siwc`.
    - `libs/trace_core/**` counts for its shipped consumers: `seq`.
    - `libs/siwc/**` counts for SIWC, its sole shipped consumer.

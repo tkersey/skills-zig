@@ -36,7 +36,7 @@ pub fn check(
         error.OutOfMemory => return error.OutOfMemory,
         error.Rejected => {
             const loc = Loc.root.key("inputs");
-            return d.rewrap(.receipt_mismatch, &loc, "receipt: embedded documents are invalid");
+            return d.rewrap(.receipt_mismatch, &loc, role, "embedded documents are invalid");
         },
     };
     if (!std.mem.eql(u8, claimed_id, &loaded.assessment_id)) {
@@ -133,21 +133,23 @@ fn compareDerivation(
         return fields.d.fail(
             .receipt_mismatch,
             &derivation_loc,
-            "receipt: derivation fields differ",
-            .{},
+            "{s}: derivation fields differ",
+            .{fields.role},
         );
     }
     for (expected.object.keys(), expected.object.values()) |key, value| {
         const loc = derivation_loc.key(key);
         const actual = stored.object.get(key) orelse {
-            return fields.d.fail(.receipt_mismatch, &loc, "receipt: derivation field missing", .{});
+            return fields.d.fail(.receipt_mismatch, &loc, "{s}: derivation field missing", .{
+                fields.role,
+            });
         };
         if (!try sameValue(arena, value, actual)) {
             return fields.d.fail(
                 .receipt_mismatch,
                 &loc,
-                "receipt: stored derivation differs",
-                .{},
+                "{s}: stored derivation differs",
+                .{fields.role},
             );
         }
     }

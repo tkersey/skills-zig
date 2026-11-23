@@ -218,8 +218,14 @@ def test_explain_and_compare(receipts):
     tampered.write_text(original.replace('"overall":"refuted"', '"overall":"supported"', 1))
     error = command_error(["explain", "--assessment", str(tampered)], "receipt_mismatch")
     assert error["location"] == "/derivation/overall"
-    command_error(["compare", "--baseline", str(tampered), "--candidate", str(receipts["refuted"])],
-                  "receipt_mismatch")
+    baseline_error = command_error(
+        ["compare", "--baseline", str(tampered), "--candidate", str(receipts["refuted"])],
+        "receipt_mismatch")
+    assert baseline_error["message"].startswith("baseline:"), baseline_error
+    candidate_error = command_error(
+        ["compare", "--baseline", str(receipts["refuted"]), "--candidate", str(tampered)],
+        "receipt_mismatch")
+    assert candidate_error["message"].startswith("candidate:"), candidate_error
 
 
 def test_subject_root(workspace):
@@ -281,6 +287,34 @@ def test_bounds_and_output(workspace):
     assert result.returncode != 0 and result.returncode != 1, result
 
 
+def test_receipt_and_output_bounds(workspace):
+    documents = Documents(workspace / "large", outcome="complete", value="null")
+    huge = documents.write_raw("huge-receipt.json", " " * (64 * 1024 * 1024) + "{}")
+    command_error(["explain", "--assessment", str(huge)], "resource_limit")
+    contract = json.loads(documents.contract.read_text())
+    template = contract["obligations"][0]
+    contract["obligations"] = [dict(template, id=f"case-{index}") for index in range(4096)]
+    documents.contract = documents.write("contract.json", contract)
+    reason = "r" * 16384
+    evidence = {
+        "schema": "assay-evidence/v1",
+        "contract_sha256": digest(documents.contract.read_bytes()),
+        "subject_sha256": digest(documents.subject.read_bytes()),
+        "context_sha256": contract["context_sha256"],
+        "runs": [{"id": "run", "evaluator_id": "codec-observer/v1",
+                  "evaluator_sha256": contract["evaluators"][0]["sha256"],
+                  "outcome": "interrupted", "reason": reason}],
+        "records": [{"obligation_id": f"case-{index}", "run_id": "run", "status": "skipped",
+                     "reason": "Skipped.", "artifact_ids": []} for index in range(4096)],
+        "artifacts": [],
+    }
+    documents.evidence = documents.write("evidence.json", evidence)
+    receipt = execute(documents.arguments(), 3).stdout
+    path = documents.write_raw("receipt.json", receipt.decode())
+    error = command_error(["explain", "--assessment", str(path)], "resource_limit")
+    assert "output exceeds" in error["message"], error
+
+
 def main():
     test_help_version_capabilities()
     with tempfile.TemporaryDirectory(prefix="assay-cli-") as directory:
@@ -290,6 +324,7 @@ def main():
         test_explain_and_compare(receipts)
         test_subject_root(workspace)
         test_bounds_and_output(workspace)
+        test_receipt_and_output_bounds(workspace)
     print("Assay CLI smoke passed (local documents only; no evaluator execution).")
 
 

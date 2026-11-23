@@ -11,6 +11,10 @@ const testing = std.testing;
 const Allocator = std.mem.Allocator;
 const Judgment = @import("documents.zig").Judgment;
 
+fn repeat(comptime byte: u8, comptime count: usize) [count]u8 {
+    return @splat(byte);
+}
+
 const Parts = struct {
     obligations: []const u8 = "",
     runs: []const u8 = "[]",
@@ -246,9 +250,9 @@ test "scalar checks reject structured, malformed, and oversized values" {
     var missing = single(arena, witness, "complete", "null");
     missing.records = list1(arena, observed(arena, "case", "r1", "{\"kind\":\"scalar\"}"));
     try rejects(arena, missing, .invalid_document, value_at);
-    const at_limit = print(arena, "\"{s}\"", .{&json.repeat('x', 16 * 1024)});
+    const at_limit = print(arena, "\"{s}\"", .{&repeat('x', 16 * 1024)});
     try expectOne(single(arena, witness, "complete", at_limit), .refuted, .scalar_unequal);
-    const above = print(arena, "\"{s}\"", .{&json.repeat('x', 16 * 1024 + 1)});
+    const above = print(arena, "\"{s}\"", .{&repeat('x', 16 * 1024 + 1)});
     try rejects(arena, single(arena, witness, "complete", above), .resource_limit, null);
     const huge = "1e99999999999999999999";
     try rejects(arena, single(arena, witness, "complete", huge), .invalid_document, null);
@@ -689,7 +693,7 @@ test "receipts recover exact inputs and reject altered derivations" {
     }
     const evidence_sha256 = &result.loaded.evidence_sha256;
     const evidence_hash = print(arena, "\"evidence_sha256\":\"{s}\"", .{evidence_sha256});
-    const zeros = "\"evidence_sha256\":\"" ++ &json.repeat('0', 64) ++ "\"";
+    const zeros = "\"evidence_sha256\":\"" ++ &repeat('0', 64) ++ "\"";
     const zeroed = replace(arena, bytes, evidence_hash, zeros);
     try expectReceiptRejected(arena, zeroed, .receipt_mismatch, "/derivation/evidence_sha256");
     try expectReceiptRejected(arena, bytes[0 .. bytes.len / 2], .invalid_json, null);
@@ -813,4 +817,186 @@ test "comparison refuses to align different contracts, contexts, or controls" {
     parts.target = "different target";
     const different_target = try verified(arena, parts);
     try testing.expect((try compare.compare(arena, &baseline, &different_target)).comparable());
+}
+
+fn listOf(
+    arena: Allocator,
+    count: usize,
+    comptime format: []const u8,
+    extra: []const u8,
+) []const u8 {
+    var out: std.ArrayList(u8) = .empty;
+    for (0..count) |index| {
+        if (index > 0) out.append(arena, ',') catch @panic("test allocation");
+        out.appendSlice(arena, print(arena, format, .{ index, extra })) catch {
+            @panic("test allocation");
+        };
+    }
+    return out.items;
+}
+
+const obligation_format = "{{\"id\":\"o{d}\",\"required\":true,\"statement\":\"S.{s}\"," ++
+    "\"scope\":\"C.\",\"basis\":\"empirical\",\"evaluator_id\":\"observer/v1\"," ++
+    "\"decisive_when\":{{\"supported\":\"observation\",\"refuted\":\"observation\"}}," ++
+    "\"check\":{{\"kind\":\"scalar_equal\",\"expected\":null}}}}";
+const run_format = "{{\"id\":\"r{d}\",\"evaluator_id\":\"observer/v1\"," ++
+    "\"evaluator_sha256\":\"{s}\",\"outcome\":\"complete\",\"reason\":\"\"}}";
+const evidence_artifact_format = "{{\"id\":\"log{d}\",\"sha256\":\"{s}\"," ++
+    "\"size_bytes\":1,\"locator\":\"l\",\"description\":\"\"}}";
+const support_format = "{{\"id\":\"extra{0d}\",\"role\":\"support\",\"path\":\"extra{0d}\"," ++
+    "\"sha256\":\"{1s}\",\"size_bytes\":1}}";
+const evaluator_format = "{{\"id\":\"extra{d}\",\"artifact_id\":\"observer\"," ++
+    "\"sha256\":\"{s}\",\"method\":\"M.\"}}";
+
+fn withCount(arena: Allocator, which: enum { obligations, runs, artifacts }, count: usize) Parts {
+    var parts = single(arena, witness, "complete", "null");
+    parts.records = "[]";
+    switch (which) {
+        .obligations => parts.obligations = listOf(arena, count, obligation_format, ""),
+        .runs => parts.runs = print(arena, "[{s}]", .{
+            listOf(arena, count, run_format, &digest("evaluator bytes")),
+        }),
+        .artifacts => parts.artifacts = print(arena, "[{s}]", .{
+            listOf(arena, count, evidence_artifact_format, &digest("l")),
+        }),
+    }
+    return parts;
+}
+
+test "contract and evidence collections are bounded at and above their limits" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const limits = @import("limits.zig");
+    _ = try derive(arena, sources(arena, withCount(arena, .obligations, limits.obligations_max)));
+    const too_many = withCount(arena, .obligations, limits.obligations_max + 1);
+    try rejects(arena, too_many, .resource_limit, "/obligations");
+    _ = try derive(arena, sources(arena, withCount(arena, .runs, limits.runs_max)));
+    try rejects(arena, withCount(arena, .runs, limits.runs_max + 1), .resource_limit, "/runs");
+    const logs_max = limits.evidence_artifacts_max;
+    _ = try derive(arena, sources(arena, withCount(arena, .artifacts, logs_max)));
+    try rejects(arena, withCount(arena, .artifacts, logs_max + 1), .resource_limit, "/artifacts");
+    var records = withCount(arena, .obligations, limits.obligations_max);
+    const record_format = "{{\"obligation_id\":\"o{d}\",\"run_id\":\"r1\"," ++
+        "\"status\":\"skipped\",\"reason\":\"x{s}\",\"artifact_ids\":[]}}";
+    const record_list = listOf(arena, limits.records_max + 1, record_format, "");
+    records.records = print(arena, "[{s}]", .{record_list});
+    try rejects(arena, records, .resource_limit, "/records");
+}
+
+fn expandList(
+    arena: Allocator,
+    bytes: []const u8,
+    anchor: []const u8,
+    count: usize,
+    comptime format: []const u8,
+    extra: []const u8,
+) []const u8 {
+    const items = listOf(arena, count, format, extra);
+    return replace(arena, bytes, anchor, print(arena, "{s}{s},", .{ anchor, items }));
+}
+
+test "subject artifacts and contract evaluators are bounded at and above their limits" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const limits = @import("limits.zig");
+    const parts = single(arena, witness, "complete", "null");
+    const base = sources(arena, parts);
+    const declared = 4;
+    for ([_]usize{ limits.subject_artifacts_max, limits.subject_artifacts_max + 1 }) |total| {
+        var input = base;
+        const anchor = "\"artifacts\":[";
+        const extra = total - declared;
+        const support_digest = digest("x");
+        input.subject = expandList(
+            arena,
+            base.subject,
+            anchor,
+            extra,
+            support_format,
+            &support_digest,
+        );
+        input.evidence = evidenceBytes(arena, parts, input.contract, input.subject);
+        if (total == limits.subject_artifacts_max) {
+            _ = try derive(arena, input);
+        } else try expectRejected(arena, input, .resource_limit, "/artifacts");
+    }
+    for ([_]usize{ limits.evaluators_max, limits.evaluators_max + 1 }) |total| {
+        var input = base;
+        const anchor = "\"evaluators\":[";
+        const evaluator_digest = digest("evaluator bytes");
+        input.contract = expandList(
+            arena,
+            base.contract,
+            anchor,
+            total - 1,
+            evaluator_format,
+            &evaluator_digest,
+        );
+        input.evidence = evidenceBytes(arena, parts, input.contract, input.subject);
+        if (total == limits.evaluators_max) {
+            _ = try derive(arena, input);
+        } else try expectRejected(arena, input, .resource_limit, "/evaluators");
+    }
+}
+
+test "paths and locators are bounded at and above their limits" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const parts = single(arena, witness, "complete", "null");
+    const base = sources(arena, parts);
+    const at_limit: [4096]u8 = @splat('p');
+    const above: [4097]u8 = @splat('p');
+    for ([_][]const u8{ &at_limit, &above }) |path| {
+        var input = base;
+        input.subject = replace(arena, base.subject, "fixture.txt", path);
+        input.evidence = evidenceBytes(arena, parts, input.contract, input.subject);
+        if (path.len == at_limit.len) {
+            _ = try derive(arena, input);
+        } else try expectRejected(arena, input, .resource_limit, "/artifacts/3/path");
+    }
+    var with_log = parts;
+    for ([_][]const u8{ &at_limit, &above }) |locator| {
+        const log_format = "[{{\"id\":\"log\",\"sha256\":\"{s}\",\"size_bytes\":1," ++
+            "\"locator\":\"{s}\",\"description\":\"\"}}]";
+        with_log.artifacts = print(arena, log_format, .{ &digest("l"), locator });
+        if (locator.len == at_limit.len) {
+            _ = try derive(arena, sources(arena, with_log));
+        } else try rejects(arena, with_log, .resource_limit, "/artifacts/0/locator");
+    }
+}
+
+test "allocation exhaustion is a clean out-of-memory error" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const input = sources(arena, withCount(arena, .obligations, 512));
+    var budget = @import("budget.zig").Budget.init(testing.allocator, 64 * 1024);
+    var limited = std.heap.ArenaAllocator.init(budget.allocator());
+    defer limited.deinit();
+    var d: diag.Diagnostic = .{};
+    try testing.expectError(error.OutOfMemory, assess.load(limited.allocator(), &d, input));
+}
+
+test "maximally escaped inputs survive a receipt round trip" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var statement: std.ArrayList(u8) = .empty;
+    for (0..8000) |_| try statement.appendSlice(arena, "\\\\");
+    var parts = withCount(arena, .obligations, 120);
+    parts.obligations = listOf(arena, 120, obligation_format, statement.items);
+    const input = sources(arena, parts);
+    try testing.expect(input.contract.len > 1900 * 1024);
+    try testing.expect(input.contract.len <= 2 * 1024 * 1024);
+    const result = try derive(arena, input);
+    const bytes = receiptBytes(arena, &result, .{});
+    try testing.expect(bytes.len > 2 * input.contract.len);
+    var d: diag.Diagnostic = .{};
+    const checked = try receipt.check(arena, &d, bytes, "assessment");
+    try testing.expectEqualStrings(input.contract, checked.loaded.sources.contract);
+    const first = checked.loaded.contract.obligations[0].statement;
+    try testing.expectEqual(@as(usize, 2 + 8000), first.len);
 }

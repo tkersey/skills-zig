@@ -138,9 +138,11 @@ Assay opens the root one component at a time from `/` or the working directory
 without following links, so a symbolic link anywhere in the root path is an
 `identity_mismatch` (pass a physical path, for example from `realpath`) and a
 `..` component is `invalid_usage`. It opens each artifact path component without
-following links, requires regular files, checks the size
-before reading, streams SHA-256 through a 64 KiB buffer, and rejects visible
-changes in inode, size, or timestamps during the read. Any failure is exit 2; a
+following links, then opens the file once with `O_NOFOLLOW | O_NONBLOCK`, so a
+substituted FIFO or device cannot block it. It decides file kind and size from
+that open descriptor (a regular file of the manifest size), streams SHA-256
+through a 64 KiB buffer until end of file whatever the read sizes, and rejects
+visible changes in inode, size, or timestamps during the read. Any failure is exit 2; a
 requested verification is never downgraded. Success proves which bytes Assay read
 during this invocation, not that they were executed or that the manifest omits
 nothing.

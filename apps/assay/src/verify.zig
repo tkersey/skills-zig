@@ -88,37 +88,35 @@ fn verifyArtifact(
         }
     }
     const dir = parent orelse root;
-    const before = dir.statFile(io, name, .{ .follow_symlinks = false }) catch |err| {
+    const file = openArtifact(dir, name) catch |err| {
         return mapError(d, loc, "subject artifact", err);
     };
-    if (before.kind != .file) {
-        return d.fail(.identity_mismatch, loc, "subject: artifact is not a regular file", .{});
-    }
-    const file = dir.openFile(io, name, .{
-        .follow_symlinks = false,
-        .allow_directory = false,
-    }) catch |err| return mapError(d, loc, "subject artifact", err);
     defer file.close(io);
-    return hashFile(io, d, file, before, artifact, loc, buffer);
+    return hashFile(io, d, file, artifact, loc, buffer);
+}
+
+fn openArtifact(dir: Io.Dir, name: []const u8) std.posix.OpenError!Io.File {
+    const handle = try std.posix.openat(dir.handle, name, .{
+        .ACCMODE = .RDONLY,
+        .NOFOLLOW = true,
+        .NONBLOCK = true,
+        .NOCTTY = true,
+        .CLOEXEC = true,
+    }, 0);
+    return .{ .handle = handle, .flags = .{ .nonblocking = true } };
 }
 
 fn hashFile(
     io: Io,
     d: *Diagnostic,
     file: Io.File,
-    before: Io.File.Stat,
     artifact: documents.Artifact,
     loc: *const Loc,
     buffer: *[limits.hash_buffer_bytes]u8,
 ) diag.Error!u64 {
     const opened = file.stat(io) catch |err| return mapError(d, loc, "subject artifact", err);
-    if (opened.kind != .file or opened.inode != before.inode) {
-        return d.fail(
-            .identity_mismatch,
-            loc,
-            "subject: artifact was replaced during verification",
-            .{},
-        );
+    if (opened.kind != .file) {
+        return d.fail(.identity_mismatch, loc, "subject: artifact is not a regular file", .{});
     }
     if (opened.size != artifact.size_bytes) {
         return d.fail(
@@ -130,7 +128,7 @@ fn hashFile(
     }
     var hasher = std.crypto.hash.sha2.Sha256.init(.{});
     var offset: u64 = 0;
-    const reads_max = artifact.size_bytes / limits.hash_buffer_bytes + 2;
+    const reads_max = artifact.size_bytes + 2;
     var reads: u64 = 0;
     while (reads < reads_max) : (reads += 1) {
         const count = file.readPositional(io, &.{buffer}, offset) catch |err| {
@@ -300,6 +298,56 @@ test "subject roots reject symbolic links in every spelling" {
     }
     try testing.expectError(error.Rejected, verify(io, &d, "", subject, &buffer));
     try testing.expectEqual(diag.Code.invalid_usage, d.code);
+}
+
+const ShortReads = struct {
+    var delegate: *const @TypeOf(std.testing.io.vtable.fileReadPositional) = undefined;
+    var calls: usize = 0;
+
+    fn read(
+        userdata: ?*anyopaque,
+        file: Io.File,
+        buffers: []const []u8,
+        offset: u64,
+    ) Io.File.ReadPositionalError!usize {
+        calls += 1;
+        const first = buffers[0];
+        const limited = [_][]u8{first[0..@min(first.len, 3)]};
+        return delegate.*(userdata, file, &limited, offset);
+    }
+};
+
+test "short positional reads still verify every byte" {
+    var vtable = testing.io.vtable.*;
+    ShortReads.delegate = &testing.io.vtable.fileReadPositional;
+    ShortReads.calls = 0;
+    vtable.fileReadPositional = ShortReads.read;
+    const io: Io = .{ .userdata = testing.io.userdata, .vtable = &vtable };
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const data: [200 * 1024]u8 = @splat('q');
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = "large", .data = &data });
+    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(testing.io, &root_buffer);
+    const hex = assess.sha256Hex(&data);
+    var storage = [1]documents.Artifact{.{
+        .id = "a",
+        .role = .context,
+        .path = "large",
+        .sha256 = &hex,
+        .size_bytes = data.len,
+    }};
+    const subject: documents.Subject = .{
+        .id = "s",
+        .context = 0,
+        .artifacts = &storage,
+        .artifact_ids = .empty,
+    };
+    var buffer: [limits.hash_buffer_bytes]u8 = undefined;
+    var d: Diagnostic = .{};
+    const result = try verify(io, &d, root_buffer[0..root_len], subject, &buffer);
+    try testing.expectEqual(@as(u64, data.len), result.bytes_read);
+    try testing.expect(ShortReads.calls > data.len / 3);
 }
 
 test "visible metadata changes are detected" {
