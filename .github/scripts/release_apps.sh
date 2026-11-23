@@ -9,7 +9,7 @@ fi
 mode=$1
 base_ref=$2
 head_ref=$3
-apps=(seq lift ledger memory-note siwc)
+apps=(seq lift ledger memory-note siwc assay)
 
 resolve_ref() {
   local ref=$1
@@ -41,9 +41,14 @@ case "$mode" in
       mark_app ledger
     }
 
-    mark_definition_consumers() {
+    mark_definition_compat_consumers() {
       mark_app seq
       mark_app ledger
+    }
+
+    mark_definition_core_consumers() {
+      mark_definition_compat_consumers
+      mark_app assay
     }
 
     mark_trace_consumers() {
@@ -92,8 +97,11 @@ case "$mode" in
         libs/core/*)
           mark_all
           ;;
-        libs/definition_core/*|libs/definition_compat/*)
-          mark_definition_consumers
+        libs/definition_core/*)
+          mark_definition_core_consumers
+          ;;
+        libs/definition_compat/*)
+          mark_definition_compat_consumers
           ;;
         libs/trace_core/*)
           mark_trace_consumers
@@ -109,7 +117,7 @@ case "$mode" in
           mark_all
           ;;
         scripts/guards/definition-core-domain.sh)
-          mark_definition_consumers
+          mark_definition_core_consumers
           ;;
         scripts/test-seq-cli.sh|scripts/test-seq-observation-contract.sh)
           mark_app seq
@@ -134,6 +142,9 @@ case "$mode" in
           ;;
         .github/workflows/release-siwc.yml)
           mark_app siwc
+          ;;
+        .github/workflows/release-assay.yml)
+          mark_app assay
           ;;
         apps/*)
           matched=0

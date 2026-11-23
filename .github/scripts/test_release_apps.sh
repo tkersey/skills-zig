@@ -11,8 +11,8 @@ git init -q
 git config user.email test@example.invalid
 git config user.name release-apps-test
 
-apps=(seq lift ledger memory-note siwc)
-all_apps=seq,lift,ledger,memory-note,siwc
+apps=(seq lift ledger memory-note siwc assay)
+all_apps=seq,lift,ledger,memory-note,siwc,assay
 shared_build_paths=(apps/seq/build_support.zig tools/install_guard.zig)
 for path in "${shared_build_paths[@]}"; do
   mkdir -p "$(dirname "$path")"
@@ -351,12 +351,12 @@ write_frozen_cas_automation_fixture() {
 
 assert_affected seq write_seq
 for helper_path in "${shared_build_paths[@]}"; do
-  assert_affected seq,lift,ledger,memory-note,siwc write_shared_build_helper "$helper_path"
-  assert_ci_affected seq,lift,ledger,memory-note,siwc write_shared_build_helper "$helper_path"
+  assert_affected seq,lift,ledger,memory-note,siwc,assay write_shared_build_helper "$helper_path"
+  assert_ci_affected seq,lift,ledger,memory-note,siwc,assay write_shared_build_helper "$helper_path"
 done
 assert_affected ledger write_ledger
 assert_affected "$all_apps" write_frozen_cas_automation_fixture
-assert_affected seq,ledger write_definition_core
+assert_affected seq,ledger,assay write_definition_core
 assert_affected seq,ledger write_definition_compat
 assert_affected seq write_trace_core
 assert_affected "$all_apps" write_cas_runtime
@@ -366,7 +366,7 @@ assert_affected seq,ledger,memory-note,siwc write_store_core
 assert_affected "$all_apps" write_retired_build
 assert_affected "$all_apps" write_mixed_memory_note_retired_build
 assert_affected seq,ledger,memory-note,siwc write_jsonl_core
-assert_affected seq,lift,ledger,memory-note,siwc change_shared_perf_contract
+assert_affected seq,lift,ledger,memory-note,siwc,assay change_shared_perf_contract
 assert_affected "" move_perf_contract_to_tools
 assert_affected "" write_tool_perf_contract
 assert_affected "$all_apps" write_perf_hub_build
@@ -374,7 +374,7 @@ assert_affected "$all_apps" write_seq_build
 assert_affected "$all_apps" write_cas_control_plane_build
 assert_affected "$all_apps" write_cas_runtime_only_build
 assert_affected "$all_apps" write_cas_hook_policy_only_build
-assert_affected seq,lift,ledger,memory-note,siwc write_unknown_bare_identifier_build
+assert_affected seq,lift,ledger,memory-note,siwc,assay write_unknown_bare_identifier_build
 assert_affected "$all_apps" write_ledger_build
 assert_affected "$all_apps" write_ledger_module_build
 assert_affected "$all_apps" write_ledger_filtered_test_build
@@ -382,24 +382,24 @@ assert_affected "$all_apps" write_mixed_unknown_before_ledger_build
 assert_affected "$all_apps" write_universalist_build
 assert_affected "$all_apps" write_seq_strip_build
 assert_affected "$all_apps" move_build_line
-assert_affected seq,lift,ledger,memory-note,siwc write_mixed_seq_unknown_build
+assert_affected seq,lift,ledger,memory-note,siwc,assay write_mixed_seq_unknown_build
 assert_affected "$all_apps" write_definition_package_path
 assert_affected "$all_apps" write_ledger_package_path
 assert_affected "$all_apps" write_learnings_package_path
 assert_affected "$all_apps" write_synesthesia_package_path
-assert_affected seq,lift,ledger,memory-note,siwc write_unknown_package_change
-assert_affected seq,lift,ledger,memory-note,siwc write_build_only
-assert_affected seq,lift,ledger,memory-note,siwc write_unknown_app
+assert_affected seq,lift,ledger,memory-note,siwc,assay write_unknown_package_change
+assert_affected seq,lift,ledger,memory-note,siwc,assay write_build_only
+assert_affected seq,lift,ledger,memory-note,siwc,assay write_unknown_app
 assert_affected "" write_readme
 assert_affected seq write_durable_store_perf
-assert_ci_affected seq,ledger write_definition_guard
+assert_ci_affected seq,ledger,assay write_definition_guard
 assert_ci_affected "$all_apps" write_cas_runtime
 assert_ci_affected seq write_seq_smoke
 assert_ci_affected seq write_seq_observation_contract
 assert_ci_affected ledger write_ledger_smoke
 assert_ci_affected ledger write_path scripts/test-ledger-gist.sh
 assert_affected "" write_ci_helper
-assert_ci_affected seq,lift,ledger,memory-note,siwc write_ci_helper
+assert_ci_affected seq,lift,ledger,memory-note,siwc,assay write_ci_helper
 assert_affected "" write_path .github/workflows/pr-ci.yml
 assert_ci_affected "$all_apps" write_path .github/workflows/pr-ci.yml
 
@@ -420,7 +420,8 @@ done
 # Every shared group keeps its established conservative consumer set.
 for owner in "${shared_owners[@]}"; do
   case "$owner" in
-    definition_core|definition_compat) expected=seq,ledger ;;
+    definition_core) expected=seq,ledger,assay ;;
+    definition_compat) expected=seq,ledger ;;
     trace_core) expected=seq ;;
     cas_runtime) expected=$all_apps ;;
     siwc) expected=siwc ;;
@@ -454,6 +455,9 @@ assert_classification "$all_apps" move_path libs/cas_runtime/release-owner.zig l
 assert_classification "" write_path tools/new-test-tool.zig
 assert_classification "" write_readme
 assert_classification "" write_path README.md
+assert_classification assay write_path apps/assay/scripts/acceptance-gate.py
+assert_classification assay write_path .github/workflows/release-assay.yml
+assert_classification "" write_path apps/assay/README.md
 
 # Keep the former hunk-inference corpus: all root build edits now select every
 # product, regardless of imported names, adjacent functions, or line movement.
@@ -503,9 +507,9 @@ mv build.next build.zig
 git add build.zig
 git commit -qm unowned-dotted-dependency-import
 test "$(bash "$classifier" affected "$unowned_dependency_base" HEAD | paste -sd, -)" = \
-  seq,lift,ledger,memory-note,siwc
+  seq,lift,ledger,memory-note,siwc,assay
 test "$(bash "$classifier" ci-affected "$unowned_dependency_base" HEAD | paste -sd, -)" = \
-  seq,lift,ledger,memory-note,siwc
+  seq,lift,ledger,memory-note,siwc,assay
 
 # Adjacent functions and referenced helper names cannot narrow root ownership.
 git reset --hard -q "$base"

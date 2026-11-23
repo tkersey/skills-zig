@@ -23,12 +23,14 @@ pub fn build(b: *std.Build) void {
     const shared = SharedModules.init(ctx);
     const seq = @import("build/apps/seq.zig").build(ctx, shared);
     const ledger = @import("build/apps/ledger.zig").build(ctx, shared);
+    const assay = @import("build/apps/assay.zig").build(ctx, shared);
     const surfaces = [_]AppSurface{
         seq.surface,
         @import("build/apps/lift.zig").build(ctx, shared),
         ledger.surface,
         @import("build/apps/memory-note.zig").build(ctx, shared),
         @import("build/apps/siwc.zig").build(ctx, shared),
+        assay.surface,
     };
     for (surfaces) |surface| {
         _ = support.addGroupedStep(
@@ -44,6 +46,7 @@ pub fn build(b: *std.Build) void {
     }
     const full = b.step("test-full", "Run routine tests and explicit slow qualification lanes");
     full.dependOn(routine);
+    full.dependOn(assay.acceptance);
     addSharedTests(ctx, shared, routine);
     addCoreTests(ctx, shared, routine);
     const install_guard_tests = support.addTestStep(

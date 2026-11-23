@@ -37,6 +37,7 @@ jobs:
       ledger: ${{ steps.classify.outputs.ledger }}
       memory_note: ${{ steps.classify.outputs.memory_note }}
       siwc: ${{ steps.classify.outputs.siwc }}
+      assay: ${{ steps.classify.outputs.assay }}
       perf: ${{ steps.classify.outputs.perf }}
     steps:
       - uses: actions/checkout@v4
@@ -60,7 +61,7 @@ jobs:
             selected[lift]=true
           fi
 
-          for app in seq lift ledger memory-note siwc; do
+          for app in seq lift ledger memory-note siwc assay; do
             output_name="${app//-/_}"
             echo "${output_name}=${selected[$app]:-false}" >> "$GITHUB_OUTPUT"
           done
@@ -237,7 +238,7 @@ jobs:
       - name: Build and verify the surviving executable inventory
         run: |
           zig build -Doptimize=fast -j2 --summary all
-          printf '%s\n' bench_stats ledger memory-note perf_hub seq siwc > expected-binaries.txt
+          printf '%s\n' assay bench_stats ledger memory-note perf_hub seq siwc > expected-binaries.txt
           find zig-out/bin -maxdepth 1 -type f -printf '%f\n' | LC_ALL=C sort > actual-binaries.txt
           diff -u expected-binaries.txt actual-binaries.txt
 
@@ -320,3 +321,39 @@ jobs:
           expected="$(tr -d '[:space:]' < apps/siwc/VERSION)"
           test "$(zig-out/bin/siwc --version)" = "$expected"
           zig-out/bin/siwc --help
+
+  assay:
+    needs: changes
+    if: needs.changes.outputs.assay == 'true'
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-linux-musl
+          - os: macos-15
+            target: aarch64-macos.15.0
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.17.1
+      - name: Build Assay release surface
+        run: zig build build-assay -Dtarget=${{ matrix.target }} -Dcpu=baseline -Doptimize=fast
+      - name: Test Assay in Debug
+        run: zig build test-assay -Dtarget=${{ matrix.target }} -Dcpu=baseline -Doptimize=debug
+      - name: Test Assay in ReleaseSafe
+        run: zig build test-assay -Dtarget=${{ matrix.target }} -Dcpu=baseline -Doptimize=safe
+      - name: Run Assay codec acceptance controls
+        run: zig build test-assay-acceptance -Dtarget=${{ matrix.target }} -Dcpu=baseline -Doptimize=safe
+      - name: Verify Assay version, help, and capabilities
+        shell: bash
+        run: |
+          set -euo pipefail
+          expected="$(tr -d '[:space:]' < apps/assay/VERSION)"
+          test "$(zig-out/bin/assay --version)" = "$expected"
+          zig-out/bin/assay --help
+          zig-out/bin/assay capabilities |
+            jq -e '.schema == "assay-capabilities/v1" and .product == "assay"' >/dev/null

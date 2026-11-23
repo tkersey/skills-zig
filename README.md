@@ -9,11 +9,13 @@ Monorepo for Zig CLIs with shared internal libraries and independent release str
 - `ledger` (passive artifact definitions, validation, transactions, replay, and projections)
 - `memory-note` (`memory-note`)
 - `siwc` (Sign in with ChatGPT credentials and application launching)
+- `assay` (passive assessment kernel deriving supported, refuted, and unresolved obligations from a contract, subject manifest, and evidence; no execution, network, or authority)
 
 The five Homebrew formulas expose five executable names: `seq`, `bench_stats`,
-`ledger`, `memory-note`, and `siwc`. A clean root `zig build` also installs the
-local `perf_hub`, for six names in `zig-out/bin`. There is no umbrella `lift`
-executable.
+`ledger`, `memory-note`, and `siwc`. Assay ships `assay` from GitHub releases;
+its tap formula follows the first release. A clean root `zig build` installs
+those six executables plus the local `perf_hub`, for seven names in
+`zig-out/bin`. There is no umbrella `lift` executable.
 
 CAS, TypeSafe, and `perf_report` are retired. Native Codex now owns the review
 and app-server execution used by the operating skills; no forwarding CAS binary
@@ -28,6 +30,7 @@ an existing CAS package, especially when local automations use its runner.
 - `apps/ledger`
 - `apps/memory-note`
 - `apps/siwc`
+- `apps/assay`
 - `libs/core`
 - `libs/definition_core`
 - `libs/durable_store`
@@ -71,6 +74,7 @@ zig build build-lift -Doptimize=fast
 zig build build-ledger -Doptimize=fast
 zig build build-memory-note -Doptimize=fast
 zig build build-siwc -Doptimize=fast
+zig build build-assay -Doptimize=fast
 ```
 
 Run helpers:
@@ -80,11 +84,16 @@ zig build -Doptimize=fast
 ./zig-out/bin/seq --help
 ./zig-out/bin/bench_stats --help
 ./zig-out/bin/siwc --help
+./zig-out/bin/assay --help
 ```
 
 SIWC's offline authentication and command tests run with `zig build test-siwc`.
 Its PR and release qualification run both Debug and ReleaseSafe on Linux and
 macOS; qualification uses synthetic credentials and does not sign in to an account.
+
+Assay's process smoke lane (part of routine `zig build test`) needs `python3`;
+its codec acceptance lane (`zig build test-assay-acceptance`, included in
+`test-full`) also needs `node`.
 
 ## Local Perf
 
@@ -136,6 +145,7 @@ Per-app VERSION files are the source of truth:
 - `apps/ledger/VERSION`
 - `apps/memory-note/VERSION`
 - `apps/siwc/VERSION`
+- `apps/assay/VERSION`
 
 PRs that touch release-relevant CLI surfaces must bump the corresponding
 `VERSION` file. The check is conservative: app-local changes count for that
@@ -144,8 +154,8 @@ that app. Root `build.zig`, `build.zig.zon`, shared build support, and unknown
 `build/**` or `libs/**` paths count for every shipped CLI. Broad shared shipped
 surfaces such as
 `libs/core/**` count for every shipped CLI;
-`libs/definition_core/**` and `libs/definition_compat/**` count for `seq`
-and `ledger`;
+`libs/definition_core/**` counts for `seq`, `ledger`, and `assay`;
+`libs/definition_compat/**` counts for `seq` and `ledger`;
 `libs/durable_store/**` and `libs/jsonl_core/**` count for `seq`,
 `ledger`, `memory-note`, and `siwc`;
 `libs/trace_core/**` counts for `seq`; and
@@ -160,6 +170,7 @@ Independent tags trigger independent workflows, and each tag must match its app 
 - `ledger-v*` -> `.github/workflows/release-ledger.yml`
 - `memory-note-v*` -> `.github/workflows/release-memory-note.yml`
 - `siwc-v*` -> `.github/workflows/release-siwc.yml`
+- `assay-v*` -> `.github/workflows/release-assay.yml`
 
 Pushes to `main` auto-create any missing release tags for changed `VERSION` files and dispatch the matching release workflow.
 Manual tag pushes still work, but they are no longer the only path.
@@ -171,6 +182,7 @@ Required tag forms:
 - `ledger-v<version>` where `<version>` equals `apps/ledger/VERSION`
 - `memory-note-v<version>` where `<version>` equals `apps/memory-note/VERSION`
 - `siwc-v<version>` where `<version>` equals `apps/siwc/VERSION`
+- `assay-v<version>` where `<version>` equals `apps/assay/VERSION`
 
 Artifacts are published as:
 

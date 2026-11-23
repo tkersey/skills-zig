@@ -7,6 +7,7 @@ This monorepo uses independent GitHub Actions release workflows per CLI:
 - `ledger`: `.github/workflows/release-ledger.yml` on tag `ledger-v*`
 - `memory-note`: `.github/workflows/release-memory-note.yml` on tag `memory-note-v*`
 - `siwc`: `.github/workflows/release-siwc.yml` on tag `siwc-v*`
+- `assay`: `.github/workflows/release-assay.yml` on tag `assay-v*`
 
 CAS is retired; it has no current build, VERSION, tag dispatcher, or release
 workflow. Existing releases and local automation data are not deleted. See
@@ -19,6 +20,7 @@ Per-app VERSION files:
 - `apps/ledger/VERSION`
 - `apps/memory-note/VERSION`
 - `apps/siwc/VERSION`
+- `apps/assay/VERSION`
 
 Release contract:
 
@@ -29,7 +31,8 @@ Release contract:
    - Root `build.zig`, `build.zig.zon`, shared `build/support.zig`, and unknown `build/**` or `libs/**` paths count for every shipped CLI. Classification uses both sides of renamed or moved paths; root-build diff text is never interpreted as ownership.
    - broad shared shipped surfaces (`libs/core/**`) count for every shipped CLI.
    - shared install admission (`apps/seq/build_support.zig` and `tools/install_guard.zig`) counts for every shipped CLI, regardless of its source directory.
-   - `libs/definition_core/**` and `libs/definition_compat/**` count for their shipped consumers: `seq` and `ledger`.
+   - `libs/definition_core/**` counts for its shipped consumers: `seq`, `ledger`, and `assay` (Assay imports only its exact-number module).
+   - `libs/definition_compat/**` counts for its shipped consumers: `seq` and `ledger`.
    - `libs/durable_store/**` and `libs/jsonl_core/**` count for their shipped consumers: `seq`, `ledger`, `memory-note`, and `siwc`.
    - `libs/trace_core/**` counts for its shipped consumers: `seq`.
    - `libs/siwc/**` counts for SIWC, its sole shipped consumer.
@@ -40,7 +43,7 @@ Release contract:
 5. Generic release builds must declare their target architecture and use Zig's baseline CPU. Build-time dependencies carried by a release binary must be content-addressed rather than inherited from the build runner. Direct Zig downloads must match the pinned archive checksum; setup-zig verifies the upstream signature. Clean runners prepare the package-cache directory before fetching dependencies. macOS artifacts require macOS 15 and use the explicit `aarch64-macos.15.0` target; tap formulas must declare the same minimum.
 
 Root build assembly creates the shared modules once through `build/support.zig` and
-passes them to the five `build/apps/<cli>.zig` owners. The root package includes the
+passes them to the six `build/apps/<cli>.zig` owners. The root package includes the
 whole `build/` directory; PR CI, Auto Release, cache inputs, and lint cover it.
 The install guard remains in `apps/seq/build_support.zig` so both root and standalone
 Seq builds share the same make-time admission. Releases build the repository checkout
@@ -59,6 +62,7 @@ Release tags must match file versions:
 - `ledger-v<version>` where `<version>` equals `apps/ledger/VERSION`
 - `memory-note-v<version>` where `<version>` equals `apps/memory-note/VERSION`
 - `siwc-v<version>` where `<version>` equals `apps/siwc/VERSION`
+- `assay-v<version>` where `<version>` equals `apps/assay/VERSION`
 
 Each workflow publishes two release archives for its independently versioned CLI.
 
@@ -77,6 +81,8 @@ Examples:
 - `memory-note-v1.2.3-darwin-arm64.tar.gz`
 - `siwc-v1.2.3-linux-x86_64.tar.gz`
 - `siwc-v1.2.3-darwin-arm64.tar.gz`
+- `assay-v1.2.3-linux-x86_64.tar.gz`
+- `assay-v1.2.3-darwin-arm64.tar.gz`
 
 SIWC qualifies its offline authentication and command tests in Debug and
 ReleaseSafe on both platforms before producing release archives. Its Linux
@@ -84,6 +90,14 @@ target is `x86_64-linux-musl`; macOS uses `aarch64-macos.15.0`. Each archive
 contains only `siwc`, and qualification verifies its version and help surface.
 No release or CI job uses a real ChatGPT account or performs paid inference.
 The initial Homebrew formula is a separate tap handoff after the first release.
+
+Assay qualifies `test-assay` in Debug and ReleaseSafe and its retained codec
+acceptance controls (`test-assay-acceptance`, which needs `python3` and `node`) on
+both platforms before producing release archives, with the same Linux and macOS targets as SIWC. Each
+archive contains only `assay`, and qualification verifies its version, help, and
+`assay capabilities` output. Registering Assay in the root build is a shared
+root-build change, so all five existing CLIs received VERSION bumps with it.
+The Homebrew formula is a separate manual tap handoff after the first release.
 
 ## Homebrew Tap Handoff
 
