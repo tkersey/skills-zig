@@ -3,6 +3,8 @@ set -euo pipefail
 
 GH=${GH:-gh}
 SLEEP=${SLEEP:-sleep}
+POLL_SECONDS=${POLL_SECONDS:-30}
+POLLS_MAX=${POLLS_MAX:-480}
 not_acquired_marker='was not acquired by Runner'
 
 usage() {
@@ -46,10 +48,21 @@ resolve_run() {
   printf '%s\n' "$id"
 }
 
+wait_for_completion() {
+  local repo=$1 run=$2 status
+  for _ in $(seq 1 "$POLLS_MAX"); do
+    status=$("$GH" run view "$run" --repo "$repo" --json status --jq '.status')
+    [[ "$status" == completed ]] && return 0
+    "$SLEEP" "$POLL_SECONDS"
+  done
+  echo "::error::run $run did not complete after $POLLS_MAX polls" >&2
+  return 1
+}
+
 supervise_run() {
   local repo=$1 run=$2 attempts_max=$3 backoff=$4 attempt=1 conclusion
   while true; do
-    "$GH" run watch "$run" --repo "$repo" --interval 30 >/dev/null 2>&1 || true
+    wait_for_completion "$repo" "$run"
     conclusion=$("$GH" run view "$run" --repo "$repo" --json conclusion --jq '.conclusion')
     if [[ "$conclusion" == success ]]; then
       echo "run $run succeeded after $attempt attempt(s)"

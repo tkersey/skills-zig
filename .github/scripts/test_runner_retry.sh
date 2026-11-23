@@ -37,9 +37,19 @@ case "$1 $2" in
       echo "unexpected api path $path" >&2; exit 1
     fi
     ;;
-  "run watch") ;;
   "run view")
-    cat "$state/conclusion-$3-$(attempt_of "$3")"
+    if [[ " $* " == *" status "* ]]; then
+      pending="$state/pending-$3-$(attempt_of "$3")"
+      left=$(cat "$pending" 2>/dev/null || echo 0)
+      if [[ "$left" -gt 0 ]]; then
+        echo $((left - 1)) >"$pending"
+        echo in_progress
+      else
+        echo completed
+      fi
+    else
+      cat "$state/conclusion-$3-$(attempt_of "$3")"
+    fi
     ;;
   "run rerun")
     run=$3
@@ -119,6 +129,18 @@ reset_state supervise-success
 echo success >"$FAKE_DIR/conclusion-200-1"
 expect "a successful run needs no retry" "$script" supervise o/r 200 4 60
 [[ ! -f "$FAKE_DIR/reruns" ]] || { echo "FAIL: unexpected rerun" >&2; exit 1; }
+
+reset_state supervise-in-progress
+echo success >"$FAKE_DIR/conclusion-205-1"
+echo 3 >"$FAKE_DIR/pending-205-1"
+expect "supervise waits for an in-progress run to complete" env POLL_SECONDS=7 "$script" supervise o/r 205 4 60
+[[ "$(paste -sd, "$FAKE_DIR/sleeps")" == 7,7,7 ]] || { echo "FAIL: polling" >&2; exit 1; }
+[[ ! -f "$FAKE_DIR/reruns" ]] || { echo "FAIL: in-progress run was re-run" >&2; exit 1; }
+
+reset_state supervise-poll-cap
+echo success >"$FAKE_DIR/conclusion-206-1"
+echo 99 >"$FAKE_DIR/pending-206-1"
+expect_not "supervise gives up when a run never completes" env POLLS_MAX=3 "$script" supervise o/r 206 4 60
 
 reset_state supervise-retry
 echo failure >"$FAKE_DIR/conclusion-201-1"
