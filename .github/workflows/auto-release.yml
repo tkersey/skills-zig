@@ -170,9 +170,9 @@ jobs:
       - name: Hand off to the Homebrew tap
         if: >-
           steps.release.outputs.dispatch == 'true' &&
-          matrix.app != 'seq' && matrix.app != 'ledger'
+          !contains(fromJSON('["seq", "ledger"]'), matrix.app)
         run: |
           set -euo pipefail
           gh workflow run tap-handoff.yml --repo "$GITHUB_REPOSITORY" --ref main \
             -f "app=${{ matrix.app }}" -f "tag_name=${{ steps.release.outputs.tag }}" \
-            -f "commit_sha=${GITHUB_SHA}"
+            -f "commit_sha=$GITHUB_SHA"
