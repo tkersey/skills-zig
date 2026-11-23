@@ -1,6 +1,7 @@
 const assert = require('node:assert/strict');
 const { test } = require('node:test');
 const { validateAutoMerge, checksReady } = require('./auto-merge.cjs');
+const { tapApps } = require('./apps.cjs');
 
 function fixture(app = 'ledger') {
   return {
@@ -22,7 +23,7 @@ function fixture(app = 'ledger') {
 }
 
 test('admits only the exact verified formula PR under both platform requirements', () => {
-  for (const app of ['ledger', 'seq']) assert.doesNotThrow(() => validateAutoMerge(fixture(app)));
+  for (const app of tapApps) assert.doesNotThrow(() => validateAutoMerge(fixture(app)));
 });
 
 test('a product cannot merge another product\'s formula or branch', () => {
@@ -67,14 +68,15 @@ test('missing requirements, spoofed check providers and review intervention bloc
   }
 });
 
-test('both required checks must pass; missing, pending, failed or skipped checks do not admit merging', () => {
+test('both required checks must pass; missing, pending, cancelled, failed or skipped checks do not admit merging', () => {
   const checks = ['test-bot (macos-latest)', 'test-bot (ubuntu-latest)'].map(name =>
     ({ name, bucket: 'pass' }));
   assert.equal(checksReady(checks), true);
   assert.equal(checksReady([]), false);
   assert.equal(checksReady(checks.slice(0, 1)), false);
   assert.equal(checksReady(checks.map(c => ({ ...c, bucket: 'pending' }))), false);
-  for (const bucket of ['fail', 'cancel', 'skipping', 'unknown']) {
+  assert.equal(checksReady([checks[0], { ...checks[1], bucket: 'cancel' }]), false);
+  for (const bucket of ['fail', 'skipping', 'unknown']) {
     assert.throws(() => checksReady([checks[0], { ...checks[1], bucket }]));
   }
   assert.throws(() => checksReady([...checks, checks[0]]));
@@ -86,7 +88,8 @@ test('CLI merges only the revalidated head and requires terminal merged readback
   const { join, resolve } = require('node:path');
   const { spawnSync } = require('node:child_process');
   for (const [app, scenario] of [['ledger', 'success'], ['seq', 'success'], ['ledger', 'head-drift'],
-    ['seq', 'unmerged'], ['ledger', 'no-checks'], ['seq', 'no-required-checks'], ['lift', 'unsupported']]) {
+    ['seq', 'unmerged'], ['ledger', 'no-checks'], ['seq', 'no-required-checks'], ['assay', 'success'],
+    ['memory-note', 'success'], ['cas', 'unsupported']]) {
     const dir = mkdtempSync(join(tmpdir(), 'tap-merge-test-'));
     try {
       writeFileSync(join(dir, 'fixture.json'), JSON.stringify(fixture(app)));

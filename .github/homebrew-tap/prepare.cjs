@@ -4,6 +4,7 @@ const { execFileSync } = require('node:child_process');
 const { readFileSync, writeFileSync, appendFileSync, mkdtempSync, rmSync } = require('node:fs');
 const { tmpdir } = require('node:os');
 const { join } = require('node:path');
+const { tapApps } = require('./apps.cjs');
 
 const repository = 'tkersey/skills-zig';
 const platforms = ['darwin-arm64', 'linux-x86_64'];
@@ -14,7 +15,7 @@ function versionParts(version) {
 }
 
 function releaseTagFromVersion(app, version, requestedTag) {
-  assert.ok(['ledger', 'seq'].includes(app), 'Unsupported tap product');
+  assert.ok(tapApps.includes(app), 'Unsupported tap product');
   versionParts(version.trim());
   const tag = `${app}-v${version.trim()}`;
   if (requestedTag) assert.equal(requestedTag, tag, 'Requested tag differs from release commit VERSION');
@@ -22,7 +23,7 @@ function releaseTagFromVersion(app, version, requestedTag) {
 }
 
 function prepareFormula(app, formula, release, archives) {
-  assert.ok(['ledger', 'seq'].includes(app), 'Unsupported tap product');
+  assert.ok(tapApps.includes(app), 'Unsupported tap product');
   assert.equal(release.draft, false);
   assert.equal(release.prerelease, false);
   assert.ok(release.tag_name.startsWith(`${app}-v`));
@@ -63,7 +64,7 @@ function prepareFormula(app, formula, release, archives) {
 
 function main() {
   const app = process.argv[2];
-  assert.ok(['ledger', 'seq'].includes(app), 'Unsupported tap product');
+  assert.ok(tapApps.includes(app), 'Unsupported tap product');
   const gh = (...args) => execFileSync('gh', args, { encoding: 'utf8' });
   let tag = process.env.RELEASE_TAG;
   const commit = process.env.RELEASE_COMMIT;

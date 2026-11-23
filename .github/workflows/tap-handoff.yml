@@ -1,0 +1,120 @@
+name: Update tap
+
+on:
+  workflow_call:
+    inputs:
+      app:
+        required: true
+        type: string
+      tag_name:
+        required: true
+        type: string
+      commit_sha:
+        required: false
+        type: string
+        default: ""
+  workflow_dispatch:
+    inputs:
+      app:
+        description: Released CLI (seq, lift, ledger, memory-note, siwc, assay)
+        required: true
+        type: string
+      tag_name:
+        description: Published release tag
+        required: true
+        type: string
+      commit_sha:
+        description: Expected release commit
+        required: false
+        type: string
+  pull_request:
+    paths:
+      - ".github/workflows/tap-handoff.yml"
+      - ".github/workflows/seq-tap.yml"
+      - ".github/workflows/ledger-tap.yml"
+      - ".github/homebrew-tap/**"
+      - ".github/scripts/release_apps.sh"
+
+permissions:
+  actions: read
+  contents: read
+
+concurrency:
+  group: tap-handoff-${{ github.event_name == 'pull_request' && github.event.pull_request.number || inputs.app }}
+  cancel-in-progress: false
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
+        with:
+          persist-credentials: false
+      - run: node --test .github/homebrew-tap/*.test.cjs
+
+  update:
+    needs: test
+    if: >-
+      github.repository == 'tkersey/skills-zig' &&
+      github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 75
+    env:
+      TAP_APP: ${{ inputs.app }}
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
+        with:
+          persist-credentials: false
+      - name: Check tap product and credential
+        env:
+          TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+        run: |
+          set -euo pipefail
+          node -e "const { tapApps } = require('./.github/homebrew-tap/apps.cjs');
+            if (!tapApps.includes(process.env.TAP_APP)) { console.error('Unsupported tap product: ' + process.env.TAP_APP); process.exit(1); }"
+          if [ -z "$TAP_TOKEN" ]; then
+            echo "::error::Set HOMEBREW_TAP_TOKEN with Contents and Pull requests write access to tkersey/homebrew-tap."
+            exit 1
+          fi
+      - name: Check out tap
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
+        with:
+          repository: tkersey/homebrew-tap
+          ref: main
+          path: tap
+          token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          persist-credentials: false
+      - name: Verify published archives and update formula
+        id: formula
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ inputs.tag_name }}
+          RELEASE_COMMIT: ${{ inputs.commit_sha }}
+        run: |
+          set -euo pipefail
+          node .github/homebrew-tap/prepare.cjs "$TAP_APP" "tap/Formula/$TAP_APP.rb"
+          cp "tap/Formula/$TAP_APP.rb" "$RUNNER_TEMP/$TAP_APP-verified.rb"
+      - name: Open or update tap PR
+        id: pr
+        if: steps.formula.outputs.changed == 'true'
+        uses: peter-evans/create-pull-request@5f6978faf089d4d20b00c7766989d076bb2fc7f1
+        with:
+          token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          path: tap
+          base: main
+          branch: automation/${{ inputs.app }}-${{ steps.formula.outputs.version }}
+          add-paths: Formula/${{ inputs.app }}.rb
+          commit-message: "${{ inputs.app }} ${{ steps.formula.outputs.version }}"
+          title: "${{ inputs.app }} ${{ steps.formula.outputs.version }}"
+          body: |
+            Update ${{ inputs.app }} to [${{ steps.formula.outputs.version }}](https://github.com/tkersey/skills-zig/releases/tag/${{ inputs.app }}-v${{ steps.formula.outputs.version }}).
+
+            Both published platform archives were downloaded and their SHA256 digests verified before updating the formula. The tap's macOS and Linux CI must pass before merge.
+      - name: Wait for checks and merge verified head
+        if: steps.pr.outputs.pull-request-number != ''
+        env:
+          GH_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          TAP_PR: ${{ steps.pr.outputs.pull-request-number }}
+          TAP_HEAD: ${{ steps.pr.outputs.pull-request-head-sha }}
+          TAP_VERSION: ${{ steps.formula.outputs.version }}
+        run: node .github/homebrew-tap/auto-merge.cjs "$RUNNER_TEMP/$TAP_APP-verified.rb"

@@ -89,7 +89,7 @@ ReleaseSafe on both platforms before producing release archives. Its Linux
 target is `x86_64-linux-musl`; macOS uses `aarch64-macos.15.0`. Each archive
 contains only `siwc`, and qualification verifies its version and help surface.
 No release or CI job uses a real ChatGPT account or performs paid inference.
-The initial Homebrew formula is a separate tap handoff after the first release.
+Its formula update flows through the automated tap handoff below.
 
 Assay qualifies `test-assay` in Debug and ReleaseSafe and its retained codec
 acceptance controls (`test-assay-acceptance`, which needs `python3` and `node`) on
@@ -97,42 +97,83 @@ both platforms before producing release archives, with the same Linux and macOS 
 archive contains only `assay`, and qualification verifies its version, help, and
 `assay capabilities` output. Registering Assay in the root build is a shared
 root-build change, so all five existing CLIs received VERSION bumps with it.
-The Homebrew formula is a separate manual tap handoff after the first release.
+Its formula update flows through the automated tap handoff below.
+
+## Hosted macOS runner capacity
+
+GitHub-hosted macOS arm64 runners can be capacity-constrained. A job that no runner
+acquires is cancelled after about 15 minutes with zero steps, the annotation "The
+job was not acquired by Runner of type hosted even after multiple attempts", and a
+"capacity constraints" notice. On 2026-11-23 this hit both `macos-15` and
+`macos-latest` (macOS 26), so changing the label does not avoid it.
+
+Two mechanisms absorb it without masking real failures:
+
+- Auto Release dispatches version-bumped releases one at a time
+  (`max-parallel: 1`). Each dispatch step then supervises its own run with
+  `.github/scripts/runner_retry.sh supervise`. Releases no longer start a burst of
+  macOS jobs at once.
+- `.github/workflows/retry-unacquired-runners.yml` sweeps completed runs from the
+  last six hours every 20 minutes. It skips runs whose branch or tag has moved
+  since they ran.
+
+Both re-run a run's failed jobs (`gh run rerun --failed`) only when every
+failed job is a zero-step cancellation that never had a runner and carries the
+not-acquired annotation. Retries are capped at four attempts per run and back
+off between attempts. Any real test, build, or timeout failure is reported
+unchanged and never retried. `.github/scripts/test_runner_retry.sh` covers these
+rules in PR CI.
 
 ## Homebrew Tap Handoff
 
 Homebrew formula updates are intentionally handled in a separate tap repository.
 This repo does not support installing its CLIs into user-global paths from source builds.
 Build artifacts are only allowed under repo-local `zig-out/bin`; shipped installs must flow through a tagged release plus the tap formula update.
-The `Release ledger` and `Release seq` publish jobs explicitly dispatch
-`Update Ledger tap` and `Update Seq tap` on `main` after both platform archives
-have been published. GitHub does not emit `workflow_run` events for runs started
-with `GITHUB_TOKEN`, so an Auto Release dispatch cannot hand off by completion
-event. The handoff carries the exact release tag and commit; dispatch failure fails the publishing job instead
-of leaving an unobserved completion-event handoff. The tap workflow verifies the
-tag against the commit's VERSION and tag target, downloads both archives, and
-checks their SHA256 digests against GitHub's release metadata. It changes only
-the version and platform checksums in `Formula/ledger.rb`, then opens or updates
-a version-specific PR in `tkersey/homebrew-tap`. Older releases cannot downgrade
-the formula already on the tap's main branch.
 
-Ledger updates automatically squash-merge only after verifying the exact PR head,
-repository/branch, sole changed file, and formula bytes against the verified
-release. An active tap ruleset without bypass actors must require both
-`test-bot (macos-latest)` and `test-bot (ubuntu-latest)` from GitHub Actions
-(app ID 15368) and resolved review conversations. Active change requests or review
-requests block the merge. The job waits up to thirty minutes for both checks on the
-verified head, revalidates, then uses an exact-head merge guard. It does not arm
-GitHub auto-merge for unverified successor commits. GitHub also enforces the
-required checks. Manual retries use the same verification and merge path.
-Repo settings are configured through GitHub. The workflow verifies the effective
-status-check and review-thread requirements before merging.
+Every shipped CLI has an automated tap handoff through one reusable workflow,
+`.github/workflows/tap-handoff.yml` ("Update tap"). It covers `seq`, `lift`,
+`ledger`, `memory-note`, `siwc`, and `assay`. `.github/homebrew-tap/apps.cjs` lists
+those products, and a test keeps that list equal to the release classifier's
+apps.
 
-`Update Seq tap` performs the same verification, PR, and exact-head merge for
-`Formula/seq.rb`. `Release seq` passes its qualified `RELEASE_COMMIT`, which
-for a tagless Auto Release dispatch may differ from the workflow's `main` commit.
-Both workflows use `.github/homebrew-tap/prepare.cjs` and
-`.github/homebrew-tap/auto-merge.cjs`.
+- `Release seq` and `Release ledger` dispatch their thin callers, `Update Seq tap`
+  (`seq-tap.yml`) and `Update Ledger tap` (`ledger-tap.yml`), after both platform
+  archives are published. Each caller passes the exact release tag and commit.
+- For the other CLIs, Auto Release supervises each release run until it
+  succeeds, then dispatches `tap-handoff.yml` with the app, tag, and commit.
+- GitHub does not emit `workflow_run` events for runs started with
+  `GITHUB_TOKEN`, so every handoff is an explicit dispatch. A failed dispatch
+  fails the dispatching job, so it is never silently lost.
+
+The handoff runs these checks:
+
+1. It verifies the tag against the commit's VERSION and the tag target.
+2. It downloads both archives and checks their SHA256 digests against GitHub's
+   release metadata.
+3. It changes only the version and the two platform checksums in
+   `Formula/<app>.rb`, then opens or updates `automation/<app>-<version>` in
+   `tkersey/homebrew-tap`. An older release never downgrades the formula on the
+   tap's main branch.
+
+It then squash-merges only after verifying the exact PR head, the repository and
+branch, the sole changed file, and the formula bytes against the verified release:
+
+- **Required checks:** an active tap ruleset without bypass actors must require
+  both `test-bot (macos-latest)` and `test-bot (ubuntu-latest)` from GitHub
+  Actions (app ID 15368), plus resolved review conversations.
+- **Review blocks:** active change requests or review requests block the merge.
+- **Waiting:** the job waits up to sixty minutes for both checks on the verified
+  head. A cancelled check counts as not yet ready rather than failed, because the
+  tap repository's `retry-unacquired-runners.yml` re-runs test-bot jobs that no
+  hosted macOS runner acquired. Before merging, the job revalidates and uses an
+  exact-head merge guard.
+- **No auto-merge:** it does not arm GitHub auto-merge for unverified successor
+  commits.
+
+GitHub also enforces the required checks. Manual retries use the same
+verification and merge path. Repo settings are configured through GitHub. The
+workflow verifies the effective status-check and review-thread requirements
+before merging.
 
 One-time setup: add the Actions secret `HOMEBREW_TAP_TOKEN` to this repository.
 Use a fine-grained personal access token scoped only to
@@ -143,11 +184,16 @@ changing the already-published release.
 
 The tap workflows must be on this repository's default branch for their
 automatic handoffs. To retry a published release without rebuilding it, dispatch
-`Update Ledger tap` on `main` with `tag_name=ledger-v<VERSION>`, or
-`Update Seq tap` with `tag_name=seq-v<VERSION>`. Manual retries
-also verify both published assets and refuse draft or prerelease releases.
+the handoff on `main`. Manual retries also verify both published assets and
+refuse draft or prerelease releases.
 
-For other CLIs, or a manual fallback:
+```bash
+gh workflow run tap-handoff.yml --ref main -f app=<cli> -f tag_name=<cli>-v<VERSION>
+gh workflow run seq-tap.yml --ref main -f tag_name=seq-v<VERSION>      # equivalent for seq
+gh workflow run ledger-tap.yml --ref main -f tag_name=ledger-v<VERSION> # equivalent for ledger
+```
+
+For a manual fallback:
 
 1. Copy the release asset URL and SHA256 for the relevant CLI archive.
 2. Open the separate tap repo and update only that CLI formula.

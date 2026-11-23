@@ -103,6 +103,8 @@ jobs:
         run: .github/scripts/test_seq_release_transaction.sh
       - name: Test Lift archive verifier
         run: .github/scripts/test_verify_lift_archive.sh
+      - name: Test hosted-runner retry supervisor
+        run: .github/scripts/test_runner_retry.sh
       - name: Require VERSION bumps for release-relevant CLI changes
         run: |
           set -euo pipefail
