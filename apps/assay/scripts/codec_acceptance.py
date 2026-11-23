@@ -11,6 +11,7 @@ BINARY = str(Path(sys.argv[1]).resolve(strict=True))
 FIXTURES = Path(sys.argv[2]).resolve(strict=True)
 NODE = shutil.which("node")
 EPISODE_SHA256 = "e909932c2fa27551a27a8bba191be51b5c693cdad4bcc17785c506547daa3440"
+FIXTURE_SHA256 = "f09102531a5ae7b8ed8d37a1eb39746f3a35965d52b1ae93426d1a51c9caa560"
 INPUTS = [("absent", None), ("null", None), ("0", 0), ("1", 1), ("2", 2), ("3", 3)]
 INHERITED = (7, 11)
 EVALUATOR_FILES = ("observe-codec.mjs", "review-action-fixture.mjs")
@@ -304,6 +305,8 @@ def main():
     assert NODE, "node is required for the retained codec fixture"
     episode = (FIXTURES / "episode-codec.mjs").read_bytes()
     assert digest(episode) == EPISODE_SHA256, "retained episode codec bytes changed"
+    fixture = (FIXTURES / "review-action-fixture.mjs").read_bytes()
+    assert digest(fixture) == FIXTURE_SHA256, "retained review action fixture bytes changed"
     with tempfile.TemporaryDirectory(prefix="assay-codec-") as directory:
         workspace = Path(directory).resolve(strict=True)
         specifications = {

@@ -23,9 +23,7 @@ pub fn verify(
     subject: documents.Subject,
     buffer: *[limits.hash_buffer_bytes]u8,
 ) diag.Error!Verification {
-    var root = Io.Dir.cwd().openDir(io, root_path, .{ .follow_symlinks = false }) catch |err| {
-        return mapError(d, null, "subject root", err);
-    };
+    var root = try openRoot(io, d, root_path);
     defer root.close(io);
     var result: Verification = .{ .status = .matched_manifest_during_this_invocation };
     const list_loc = Loc.root.key("artifacts");
@@ -37,6 +35,32 @@ pub fn verify(
     }
     std.debug.assert(result.bytes_read == subject.bytesDeclared());
     return result;
+}
+
+fn openRoot(io: Io, d: *Diagnostic, root_path: []const u8) diag.Error!Io.Dir {
+    if (root_path.len == 0 or root_path.len > limits.path_bytes_max) {
+        return d.fail(.invalid_usage, null, "--subject-root must be a nonempty bounded path", .{});
+    }
+    const absolute = root_path[0] == '/';
+    const start: []const u8 = if (absolute) "/" else ".";
+    var current = Io.Dir.cwd().openDir(io, start, .{}) catch |err| {
+        return mapError(d, null, "subject root", err);
+    };
+    errdefer current.close(io);
+    var components = std.mem.splitScalar(u8, root_path, '/');
+    while (components.next()) |component| {
+        if (component.len == 0 or std.mem.eql(u8, component, ".")) continue;
+        if (std.mem.eql(u8, component, "..")) {
+            const message = "--subject-root must not contain .. components";
+            return d.fail(.invalid_usage, null, message, .{});
+        }
+        const next = current.openDir(io, component, .{ .follow_symlinks = false }) catch |err| {
+            return mapError(d, null, "subject root component", err);
+        };
+        current.close(io);
+        current = next;
+    }
+    return current;
 }
 
 fn verifyArtifact(
@@ -166,22 +190,6 @@ fn mapError(d: *Diagnostic, loc: ?*const Loc, label: []const u8, err: anyerror) 
 
 const testing = std.testing;
 
-fn subjectFor(
-    path: []const u8,
-    bytes: []const u8,
-    storage: *[1]documents.Artifact,
-) documents.Subject {
-    const hex = assess.sha256Hex(bytes);
-    storage[0] = .{
-        .id = "a",
-        .role = .context,
-        .path = path,
-        .sha256 = &hex,
-        .size_bytes = bytes.len,
-    };
-    return .{ .id = "s", .context = 0, .artifacts = storage };
-}
-
 test "file verification matches regular files and rejects substitution" {
     const io = testing.io;
     var tmp = testing.tmpDir(.{});
@@ -203,7 +211,12 @@ test "file verification matches regular files and rejects substitution" {
         .sha256 = &hex,
         .size_bytes = 7,
     };
-    const subject: documents.Subject = .{ .id = "s", .context = 0, .artifacts = &storage };
+    const subject: documents.Subject = .{
+        .id = "s",
+        .context = 0,
+        .artifacts = &storage,
+        .artifact_ids = .empty,
+    };
     var d: Diagnostic = .{};
     const result = try verify(io, &d, root, subject, &buffer);
     try testing.expectEqual(@as(u64, 7), result.bytes_read);
@@ -237,6 +250,56 @@ test "file verification matches regular files and rejects substitution" {
     storage[0].path = "file";
     try testing.expectError(error.Rejected, verify(io, &d, linked_root, subject, &buffer));
     try testing.expectEqual(diag.Code.identity_mismatch, d.code);
+}
+
+test "subject roots reject symbolic links in every spelling" {
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDir(io, "dir", .default_dir);
+    try tmp.dir.writeFile(io, .{ .sub_path = "dir/file", .data = "payload" });
+    try tmp.dir.symLink(io, "dir", "alias", .{ .is_directory = true });
+    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(io, &root_buffer);
+    const base = root_buffer[0..root_len];
+    var buffer: [limits.hash_buffer_bytes]u8 = undefined;
+    const hex = assess.sha256Hex("payload");
+    var storage = [1]documents.Artifact{.{
+        .id = "a",
+        .role = .context,
+        .path = "file",
+        .sha256 = &hex,
+        .size_bytes = 7,
+    }};
+    const subject: documents.Subject = .{
+        .id = "s",
+        .context = 0,
+        .artifacts = &storage,
+        .artifact_ids = .empty,
+    };
+    const cases = [_]struct { suffix: []const u8, code: ?diag.Code }{
+        .{ .suffix = "/dir", .code = null },
+        .{ .suffix = "/dir/", .code = null },
+        .{ .suffix = "/./dir/.", .code = null },
+        .{ .suffix = "/alias", .code = .identity_mismatch },
+        .{ .suffix = "/alias/", .code = .identity_mismatch },
+        .{ .suffix = "/alias/.", .code = .identity_mismatch },
+        .{ .suffix = "/dir/../dir", .code = .invalid_usage },
+        .{ .suffix = "/absent", .code = .missing_input },
+    };
+    var d: Diagnostic = .{};
+    for (cases) |case| {
+        const path = try std.mem.concat(testing.allocator, u8, &.{ base, case.suffix });
+        defer testing.allocator.free(path);
+        const code = case.code orelse {
+            _ = try verify(io, &d, path, subject, &buffer);
+            continue;
+        };
+        try testing.expectError(error.Rejected, verify(io, &d, path, subject, &buffer));
+        try testing.expectEqual(code, d.code);
+    }
+    try testing.expectError(error.Rejected, verify(io, &d, "", subject, &buffer));
+    try testing.expectEqual(diag.Code.invalid_usage, d.code);
 }
 
 test "visible metadata changes are detected" {

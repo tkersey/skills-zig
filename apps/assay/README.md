@@ -50,9 +50,14 @@ Messages name the document and never echo input bodies or environment values.
 
 Inputs are strict UTF-8 JSON without a byte order mark. Unpaired surrogate
 escapes, duplicate keys at any depth (compared after decoding escapes), unknown
-fields, duplicate identifiers, and unknown references are rejected. Identifiers
-match `[A-Za-z0-9][A-Za-z0-9._:/-]*` (1–128 bytes); digests are 64 lowercase hex
-digits of SHA-256. Byte counts are plain unsigned integer tokens.
+fields, duplicate identifiers, and unknown references are rejected. The `schema`
+string is checked before any other field, so a newer schema is
+`unsupported_schema` rather than an unknown-field error. Identifiers match
+`[A-Za-z0-9][A-Za-z0-9._:/-]*` (1–128 bytes, fixed by the protocol); digests are
+64 lowercase hex digits of SHA-256. Counts and byte sizes accept any JSON number
+spelling that denotes an exact non-negative integer (`224`, `224.0`, `2.24e2`);
+fractions and negatives are invalid, and values beyond `u64` or a published limit
+are `resource_limit`.
 
 - `assay-contract/v1`: `schema`, `id`, `claim_kind` (`artifact`, `repair`,
   `procedure`), `scope`, `context_sha256`, `evaluators`, `obligations`. Each
@@ -129,8 +134,11 @@ baseline supported. Neither exit 0 nor any field is an adoption recommendation.
 ## Subject verification
 
 Without `--subject-root` the manifest is an assertion (`not_checked`). With it,
-Assay opens the root without following a final symlink, opens each path
-component without following links, requires regular files, checks the size
+Assay opens the root one component at a time from `/` or the working directory
+without following links, so a symbolic link anywhere in the root path is an
+`identity_mismatch` (pass a physical path, for example from `realpath`) and a
+`..` component is `invalid_usage`. It opens each artifact path component without
+following links, requires regular files, checks the size
 before reading, streams SHA-256 through a 64 KiB buffer, and rejects visible
 changes in inode, size, or timestamps during the read. Any failure is exit 2; a
 requested verification is never downgraded. Success proves which bytes Assay read
@@ -139,21 +147,28 @@ nothing.
 
 ## Limits
 
-`assay capabilities` publishes every limit: 2 MiB per source document, 6 MiB
+`assay capabilities` publishes every configurable limit (the 128-byte identifier
+length is fixed by the protocol): 2 MiB per source document, 6 MiB
 combined, 64 MiB per receipt input or result, JSON depth 32, 4,096 obligations,
 runs, records, subject artifacts, and evidence artifacts, 256 evaluators, 16 KiB
 per text field or scalar string, 1,024-byte number tokens, 4,096-byte paths and
 locators, 4 GiB per verified artifact, 16 GiB in total, 4 KiB error messages, and
-a 512 MiB allocation budget enforced by a bounded allocator.
+a 512 MiB allocation budget enforced by a bounded allocator. `explain` repeats
+each obligation's run reason, so a maximal receipt can produce an explanation
+above 64 MiB; that is a clean `resource_limit` error.
 
 ## Tests
 
 ```bash
-zig build test-assay              # all lanes below
+zig build test-assay              # routine: core, entry point, and process smoke
 zig build test-assay-core         # kernel unit and behavior matrix
 zig build test-assay-cli-smoke    # executable process contract (python3)
 zig build test-assay-acceptance   # retained codec controls (python3, node)
+zig build test-full               # routine lanes plus the acceptance controls
 ```
+
+The acceptance controls include timeout and output-exhaustion probes, so they run
+in `test-full`, PR CI, and release qualification rather than routine `test`.
 
 The acceptance lane vendors the retained codec fixture from
 `tkersey/dotfiles@82f46ad1dffacbbe1600abda0210722d0cde5e59`

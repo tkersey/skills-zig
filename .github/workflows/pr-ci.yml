@@ -346,6 +346,8 @@ jobs:
         run: zig build test-assay -Dtarget=${{ matrix.target }} -Dcpu=baseline -Doptimize=debug
       - name: Test Assay in ReleaseSafe
         run: zig build test-assay -Dtarget=${{ matrix.target }} -Dcpu=baseline -Doptimize=safe
+      - name: Run Assay codec acceptance controls
+        run: zig build test-assay-acceptance -Dtarget=${{ matrix.target }} -Dcpu=baseline -Doptimize=safe
       - name: Verify Assay version, help, and capabilities
         shell: bash
         run: |

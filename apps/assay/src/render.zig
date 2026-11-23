@@ -339,6 +339,20 @@ fn countsText(w: *Writer, counts: assess.Counts) Error!void {
     );
 }
 
+fn checkText(w: *Writer, value: documents.Check) Error!void {
+    switch (value) {
+        .scalar_equal => |expected| {
+            try w.writeAll("  check: scalar_equal, expected ");
+            try scalarText(w, expected);
+        },
+        .domain_judgment => |qualification| {
+            try w.writeAll("  check: qualified evaluator judgment, ");
+            try quoted(w, qualification);
+        },
+    }
+    try w.writeByte('\n');
+}
+
 fn obligationText(w: *Writer, loaded: *const assess.Loaded, item: assess.Derived) Error!void {
     const declared = loaded.contract.obligations[item.obligation];
     const run = runOf(loaded, item);
@@ -351,12 +365,15 @@ fn obligationText(w: *Writer, loaded: *const assess.Loaded, item: assess.Derived
     });
     try w.writeAll("  statement: ");
     try quoted(w, declared.statement);
-    try w.writeAll("\n  observed: ");
+    try w.writeAll("\n  scope: ");
+    try quoted(w, declared.scope);
+    try w.print("\n  basis: {s}; evaluator: {s}\n", .{
+        @tagName(declared.basis),
+        loaded.contract.evaluators[declared.evaluator].id,
+    });
+    try checkText(w, declared.check);
+    try w.writeAll("  observed: ");
     try observationText(w, if (record) |value| value.observation else null);
-    if (declared.check == .scalar_equal) {
-        try w.writeAll("; expected: ");
-        try scalarText(w, declared.check.scalar_equal);
-    }
     try w.writeAll("\n  run: ");
     if (run) |value| {
         try w.print("{s} ({s})", .{ value.id, @tagName(value.outcome) });

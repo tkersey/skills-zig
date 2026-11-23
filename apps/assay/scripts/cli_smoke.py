@@ -203,6 +203,9 @@ def test_explain_and_compare(receipts):
     assert_no_authority(explanation)
     text = execute(["explain", "--assessment", str(receipts["refuted"]), "--format", "text"], 0)
     assert b"receipt consistency: verified" in text.stdout
+    for fragment in (b'scope: "Input timeout=null; inherited timeout=7."', b"basis: empirical",
+                     b"evaluator: codec-observer/v1", b"check: scalar_equal, expected null"):
+        assert fragment in text.stdout, fragment
     compared = json.loads(execute([
         "compare", "--baseline", str(receipts["supported"]), "--candidate", str(receipts["refuted"]),
     ], 0).stdout)
@@ -233,8 +236,11 @@ def test_subject_root(workspace):
     assert explained["subject_bytes"] == "not_reverified"
     assert explained["recorded_verification"]["trust"] == "unauthenticated_receipt_claim"
     os.symlink(files, documents.root / "linked")
-    command_error(documents.arguments("--subject-root", str(documents.root / "linked")),
-                  "identity_mismatch")
+    for spelling in ("linked", "linked/", "linked/."):
+        command_error(documents.arguments("--subject-root", str(documents.root / "linked") +
+                                          spelling[len("linked"):]), "identity_mismatch")
+    command_error(documents.arguments("--subject-root", str(files / ".." / "files")),
+                  "invalid_usage")
     command_error(documents.arguments("--subject-root", str(documents.root / "absent")),
                   "missing_input")
     original = (files / "candidate.mjs").read_bytes()

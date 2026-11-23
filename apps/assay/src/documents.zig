@@ -49,6 +49,8 @@ pub const Contract = struct {
     context_sha256: []const u8,
     evaluators: []const Evaluator,
     obligations: []const Obligation,
+    evaluator_ids: IdSet,
+    obligation_ids: IdSet,
 };
 
 pub const Artifact = struct {
@@ -63,12 +65,10 @@ pub const Subject = struct {
     id: []const u8,
     context: u32,
     artifacts: []const Artifact,
+    artifact_ids: IdSet,
 
     pub fn find(self: Subject, id: []const u8) ?u32 {
-        for (self.artifacts, 0..) |artifact, index| {
-            if (std.mem.eql(u8, artifact.id, id)) return @intCast(index);
-        }
-        return null;
+        return self.artifact_ids.get(id);
     }
 
     pub fn bytesDeclared(self: Subject) u64 {
@@ -108,16 +108,13 @@ pub const EvidenceArtifact = struct {
 };
 
 pub const Evidence = struct {
-    contract_sha256: []const u8,
-    subject_sha256: []const u8,
-    context_sha256: []const u8,
     runs: []const Run,
     records: []const Record,
     artifacts: []const EvidenceArtifact,
     record_by_obligation: []const ?u32,
 };
 
-const IdSet = std.StringHashMapUnmanaged(u32);
+pub const IdSet = std.StringHashMapUnmanaged(u32);
 
 fn claim(
     arena: Allocator,
@@ -134,20 +131,21 @@ fn claim(
 }
 
 pub fn decodeContract(arena: Allocator, d: *Diagnostic, root: *const Value) diag.Error!Contract {
-    const fields = try Fields.of(d, "contract", &Loc.root, root);
-    try fields.closed(&.{
+    const fields = try Fields.document(d, "contract", root, "assay-contract/v1", &.{
         "schema", "id", "claim_kind", "scope", "context_sha256", "evaluators", "obligations",
     });
-    try fields.schema("assay-contract/v1");
     var evaluator_ids: IdSet = .empty;
     const evaluators = try decodeEvaluators(arena, fields, &evaluator_ids);
+    var obligation_ids: IdSet = .empty;
     return .{
         .id = try fields.identifier("id"),
         .claim_kind = try fields.enumeration(ClaimKind, "claim_kind"),
         .scope = try fields.text("scope", limits.text_bytes_max, true),
         .context_sha256 = try fields.digest("context_sha256"),
         .evaluators = evaluators,
-        .obligations = try decodeObligations(arena, fields, &evaluator_ids),
+        .obligations = try decodeObligations(arena, fields, &evaluator_ids, &obligation_ids),
+        .evaluator_ids = evaluator_ids,
+        .obligation_ids = obligation_ids,
     };
 }
 
@@ -170,17 +168,21 @@ fn decodeEvaluators(arena: Allocator, parent: Fields, ids: *IdSet) diag.Error![]
     return result;
 }
 
-fn decodeObligations(arena: Allocator, parent: Fields, evaluators: *const IdSet) ![]Obligation {
+fn decodeObligations(
+    arena: Allocator,
+    parent: Fields,
+    evaluators: *const IdSet,
+    ids: *IdSet,
+) ![]Obligation {
     const items = try parent.array("obligations", limits.obligations_max);
     const result = try arena.alloc(Obligation, items.len);
     const list_loc = parent.loc.key("obligations");
-    var ids: IdSet = .empty;
     var required_count: usize = 0;
     for (items, result, 0..) |*item, *obligation, index| {
         const loc = list_loc.index(index);
         obligation.* = try decodeObligation(parent.d, parent.role, &loc, item, evaluators);
         const fields = try Fields.of(parent.d, parent.role, &loc, item);
-        try claim(arena, &ids, fields, obligation.id, index);
+        try claim(arena, ids, fields, obligation.id, index);
         required_count += @intFromBool(obligation.required);
     }
     if (required_count == 0) {
@@ -247,11 +249,12 @@ fn decodeCheck(parent: Fields) diag.Error!Check {
 }
 
 pub fn decodeSubject(arena: Allocator, d: *Diagnostic, root: *const Value) diag.Error!Subject {
-    const fields = try Fields.of(d, "subject", &Loc.root, root);
-    try fields.closed(&.{ "schema", "id", "context_artifact", "artifacts" });
-    try fields.schema("assay-subject/v1");
+    const fields = try Fields.document(d, "subject", root, "assay-subject/v1", &.{
+        "schema", "id", "context_artifact", "artifacts",
+    });
     const id = try fields.identifier("id");
-    const artifacts = try decodeArtifacts(arena, fields);
+    var artifact_ids: IdSet = .empty;
+    const artifacts = try decodeArtifacts(arena, fields, &artifact_ids);
     const context_id = try fields.identifier("context_artifact");
     var context: ?u32 = null;
     var targets: usize = 0;
@@ -273,7 +276,7 @@ pub fn decodeSubject(arena: Allocator, d: *Diagnostic, root: *const Value) diag.
     }
     const subject: Subject = .{ .id = id, .context = context orelse {
         return fields.reject(.invalid_document, "artifacts", "exactly one context required", .{});
-    }, .artifacts = artifacts };
+    }, .artifacts = artifacts, .artifact_ids = artifact_ids };
     const named = subject.find(context_id) orelse {
         return fields.reject(.unknown_reference, "context_artifact", "unknown artifact {s}", .{
             context_id,
@@ -285,11 +288,10 @@ pub fn decodeSubject(arena: Allocator, d: *Diagnostic, root: *const Value) diag.
     return subject;
 }
 
-fn decodeArtifacts(arena: Allocator, parent: Fields) diag.Error![]Artifact {
+fn decodeArtifacts(arena: Allocator, parent: Fields, ids: *IdSet) diag.Error![]Artifact {
     const items = try parent.array("artifacts", limits.subject_artifacts_max);
     const result = try arena.alloc(Artifact, items.len);
     const list_loc = parent.loc.key("artifacts");
-    var ids: IdSet = .empty;
     var paths: IdSet = .empty;
     var total: u64 = 0;
     for (items, result, 0..) |*item, *artifact, index| {
@@ -306,7 +308,7 @@ fn decodeArtifacts(arena: Allocator, parent: Fields) diag.Error![]Artifact {
         if (!isRelativePath(artifact.path)) {
             return fields.reject(.invalid_document, "path", "relative POSIX path required", .{});
         }
-        try claim(arena, &ids, fields, artifact.id, index);
+        try claim(arena, ids, fields, artifact.id, index);
         const path_entry = try paths.getOrPut(arena, artifact.path);
         if (path_entry.found_existing) {
             return fields.reject(.invalid_document, "path", "duplicate artifact path", .{});
@@ -346,12 +348,10 @@ pub fn decodeEvidence(
     contract: Contract,
     raw: Raw,
 ) diag.Error!Evidence {
-    const fields = try Fields.of(d, "evidence", &Loc.root, root);
-    try fields.closed(&.{
+    const fields = try Fields.document(d, "evidence", root, "assay-evidence/v1", &.{
         "schema",    "contract_sha256", "subject_sha256", "context_sha256", "runs", "records",
         "artifacts",
     });
-    try fields.schema("assay-evidence/v1");
     const bindings = [_]struct { name: []const u8, expected: []const u8, label: []const u8 }{
         .{ .name = "contract_sha256", .expected = raw.contract_sha256, .label = "contract" },
         .{ .name = "subject_sha256", .expected = raw.subject_sha256, .label = "subject" },
@@ -382,9 +382,6 @@ pub fn decodeEvidence(
         .by_obligation = by_obligation,
     };
     return .{
-        .contract_sha256 = raw.contract_sha256,
-        .subject_sha256 = raw.subject_sha256,
-        .context_sha256 = contract.context_sha256,
         .runs = runs,
         .records = try decodeRecords(arena, fields, context),
         .artifacts = artifacts,
@@ -427,10 +424,8 @@ fn decodeRuns(arena: Allocator, parent: Fields, contract: Contract, ids: *IdSet)
 }
 
 fn findEvaluator(contract: Contract, id: []const u8) ?Evaluator {
-    for (contract.evaluators) |evaluator| {
-        if (std.mem.eql(u8, evaluator.id, id)) return evaluator;
-    }
-    return null;
+    const index = contract.evaluator_ids.get(id) orelse return null;
+    return contract.evaluators[index];
 }
 
 fn decodeEvidenceArtifacts(arena: Allocator, parent: Fields, ids: *IdSet) ![]EvidenceArtifact {
@@ -520,10 +515,7 @@ fn decodeRecord(arena: Allocator, fields: Fields, context: RecordContext) diag.E
 }
 
 fn findObligation(contract: Contract, id: []const u8) ?u32 {
-    for (contract.obligations, 0..) |obligation, index| {
-        if (std.mem.eql(u8, obligation.id, id)) return @intCast(index);
-    }
-    return null;
+    return contract.obligation_ids.get(id);
 }
 
 fn checkArtifactReferences(arena: Allocator, fields: Fields, known: *const IdSet) !void {

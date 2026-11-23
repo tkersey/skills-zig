@@ -26,11 +26,9 @@ pub fn check(
     role: []const u8,
 ) diag.Error!Verified {
     const root = try json.parse(arena, bytes, d, role);
-    const fields = try Fields.of(d, role, &Loc.root, &root);
-    try fields.closed(&.{
+    const fields = try Fields.document(d, role, &root, "assay-assessment/v1", &.{
         "schema", "assessment_id", "producer", "inputs", "derivation", "verification",
     });
-    try fields.schema("assay-assessment/v1");
     try checkProducer(fields);
     const sources = try recoverSources(fields);
     const claimed_id = try fields.digest("assessment_id");
@@ -61,11 +59,11 @@ pub fn check(
 fn checkProducer(parent: Fields) diag.Error!void {
     var loc: Loc = undefined;
     const fields = try parent.object("producer", &loc);
-    try fields.closed(&.{ "product", "version", "kernel" });
     const kernel = try fields.text("kernel", limits.id_bytes_max, true);
     if (!std.mem.eql(u8, kernel, assess.kernel)) {
         return fields.reject(.unsupported_schema, "kernel", "expected {s}", .{assess.kernel});
     }
+    try fields.closed(&.{ "product", "version", "kernel" });
     const product = try fields.text("product", limits.id_bytes_max, true);
     if (!std.mem.eql(u8, product, "assay")) {
         return fields.reject(.invalid_document, "product", "expected assay", .{});

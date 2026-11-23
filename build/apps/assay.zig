@@ -1,9 +1,15 @@
+const std = @import("std");
 const support = @import("../support.zig");
 const BuildContext = support.BuildContext;
 const SharedModules = support.SharedModules;
 const AppSurface = support.AppSurface;
 
-pub fn build(ctx: BuildContext, shared: SharedModules) AppSurface {
+pub const Assay = struct {
+    surface: AppSurface,
+    acceptance: *std.Build.Step,
+};
+
+pub fn build(ctx: BuildContext, shared: SharedModules) Assay {
     const b = ctx.b;
     const exact_number = ctx.module("libs/definition_core/src/exact_number.zig", &.{});
     const core = ctx.module("apps/assay/src/root.zig", &.{
@@ -41,12 +47,12 @@ pub fn build(ctx: BuildContext, shared: SharedModules) AppSurface {
     tests.dependOn(&core_tests.step);
     tests.dependOn(&cli_tests.step);
     tests.dependOn(smoke_step);
-    tests.dependOn(acceptance_step);
-    return support.appSurface(b, .{
+    const surface = support.appSurface(b, .{
         .path = b.path("apps/assay"),
         .build_step_name = "build-assay",
         .build_description = "Build Assay CLI",
         .build_deps = &.{&executable.install.step},
         .test_deps = &.{tests},
     });
+    return .{ .surface = surface, .acceptance = acceptance_step };
 }

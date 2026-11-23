@@ -560,7 +560,108 @@ const alterations = [_]Alteration{
         .code = .duplicate_key,
         .at = "/schema",
     },
+    .{
+        .old = "\"schema\":\"assay-assessment/v1\"",
+        .new = "\"schema\":\"assay-assessment/v2\",\"signature\":\"x\"",
+        .code = .unsupported_schema,
+        .at = "/schema",
+    },
+    .{
+        .old = "\"kernel\":\"assay-kernel/v1\"}",
+        .new = "\"kernel\":\"assay-kernel/v2\",\"build\":1}",
+        .code = .unsupported_schema,
+        .at = "/producer/kernel",
+    },
+    .{
+        .old = "\"files_checked\":0",
+        .new = "\"files_checked\":-1",
+        .code = .invalid_document,
+        .at = "/verification/files_checked",
+    },
+    .{
+        .old = "\"bytes_read\":0",
+        .new = "\"bytes_read\":99999999999999999999",
+        .code = .resource_limit,
+        .at = "/verification/bytes_read",
+    },
 };
+
+test "receipt envelopes accept equivalent number spellings in every count" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const result = try derive(arena, sources(arena, single(arena, witness, "complete", "null")));
+    const declared = result.loaded.subject.bytesDeclared();
+    const claimed = receiptBytes(arena, &result, .{
+        .status = .matched_manifest_during_this_invocation,
+        .files_checked = 4,
+        .bytes_read = declared,
+    });
+    const spelled = replace(arena, claimed, "\"files_checked\":4", "\"files_checked\":4.0e0");
+    const supported = "\"required_supported\":1";
+    const counted = replace(arena, spelled, supported, "\"required_supported\":10e-1");
+    var d: diag.Diagnostic = .{};
+    const checked = try receipt.check(arena, &d, counted, "assessment");
+    try testing.expectEqual(@as(u64, 4), checked.recorded.files_checked);
+}
+
+test "documents reject newer schemas before their unknown fields" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const valid = sources(arena, single(arena, witness, "complete", "null"));
+    const Case = struct { which: enum { contract, subject, evidence }, old: []const u8 };
+    const cases = [_]Case{
+        .{ .which = .contract, .old = "assay-contract/v1\"" },
+        .{ .which = .subject, .old = "assay-subject/v1\"" },
+        .{ .which = .evidence, .old = "assay-evidence/v1\"" },
+    };
+    for (cases) |case| {
+        var input = valid;
+        const slot = switch (case.which) {
+            .contract => &input.contract,
+            .subject => &input.subject,
+            .evidence => &input.evidence,
+        };
+        const newer = print(arena, "{s}2\",\"priority\":1", .{case.old[0 .. case.old.len - 2]});
+        slot.* = replace(arena, slot.*, case.old, newer);
+        try expectRejected(arena, input, .unsupported_schema, "/schema");
+    }
+}
+
+test "byte counts accept exact integer spellings and reject overflow" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var parts = single(arena, witness, "complete", "null");
+    const valid = sources(arena, parts);
+    var input = valid;
+    const size = print(arena, "\"size_bytes\":{d}}}", .{"target bytes".len});
+    const respelled = print(arena, "\"size_bytes\":{d}.0e0}}", .{"target bytes".len});
+    input.subject = replace(arena, valid.subject, size, respelled);
+    input.evidence = evidenceBytes(arena, parts, input.contract, input.subject);
+    const loaded = try derive(arena, input);
+    try testing.expectEqual(valid.subject.len + 4, loaded.loaded.sources.subject.len);
+    parts.records = "[]";
+    const artifact_template = "[{{\"id\":\"log\",\"sha256\":\"{s}\",\"size_bytes\":{s}," ++
+        "\"locator\":\"logs/run.txt\",\"description\":\"Raw log.\"}}]";
+    const Case = struct { size: []const u8, code: ?diag.Code };
+    const cases = [_]Case{
+        .{ .size = "18446744073709551615", .code = null },
+        .{ .size = "18446744073709551616", .code = .resource_limit },
+        .{ .size = "99999999999999999999", .code = .resource_limit },
+        .{ .size = "1.5", .code = .invalid_document },
+        .{ .size = "-3", .code = .invalid_document },
+    };
+    for (cases) |case| {
+        parts.artifacts = print(arena, artifact_template, .{ &digest("log"), case.size });
+        const code = case.code orelse {
+            _ = try derive(arena, sources(arena, parts));
+            continue;
+        };
+        try rejects(arena, parts, code, "/artifacts/0/size_bytes");
+    }
+}
 
 test "receipts recover exact inputs and reject altered derivations" {
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);

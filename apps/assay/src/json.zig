@@ -29,7 +29,8 @@ pub fn parse(
     var result: ?Value = null;
     var tokens: usize = 0;
     while (tokens <= bytes.len + 1) : (tokens += 1) {
-        const token = scanner.nextAlloc(arena, .alloc_always) catch |err| switch (err) {
+        const next = scanner.nextAllocMax(arena, .alloc_always, bytes.len);
+        const token = next catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
             else => return parser.fail(.invalid_json, "{s}: malformed JSON", .{role}),
         };
@@ -192,6 +193,19 @@ pub const Fields = struct {
         return .{ .map = &value.object, .loc = loc, .d = d, .role = role };
     }
 
+    pub fn document(
+        d: *Diagnostic,
+        role: []const u8,
+        value: *const Value,
+        expected_schema: []const u8,
+        required: []const []const u8,
+    ) error{Rejected}!Fields {
+        const fields = try of(d, role, &Loc.root, value);
+        try fields.schema(expected_schema);
+        try fields.closed(required);
+        return fields;
+    }
+
     pub fn closed(self: Fields, required: []const []const u8) error{Rejected}!void {
         for (self.map.keys()) |name| {
             if (!contains(required, name)) {
@@ -262,14 +276,24 @@ pub const Fields = struct {
 
     pub fn count(self: Fields, name: []const u8, maximum: u64) !u64 {
         const value = try self.field(name);
-        if (value.* != .number_string or !isPlainUnsigned(value.number_string)) {
-            return self.reject(.invalid_document, name, "unsigned integer required", .{});
+        const decoded: Unsigned = if (value.* == .number_string)
+            decodeUnsigned(value.number_string)
+        else
+            .invalid;
+        switch (decoded) {
+            .invalid => {
+                return self.reject(.invalid_document, name, "unsigned integer required", .{});
+            },
+            .too_large => {
+                return self.reject(.resource_limit, name, "value exceeds {d}", .{maximum});
+            },
+            .value => |parsed| {
+                if (parsed > maximum) {
+                    return self.reject(.resource_limit, name, "value exceeds {d}", .{maximum});
+                }
+                return parsed;
+            },
         }
-        const parsed = std.fmt.parseInt(u64, value.number_string, 10) catch maximum +| 1;
-        if (parsed > maximum) {
-            return self.reject(.resource_limit, name, "value exceeds {d}", .{maximum});
-        }
-        return parsed;
     }
 
     pub fn enumeration(self: Fields, comptime E: type, name: []const u8) !E {
@@ -346,13 +370,27 @@ pub fn isDigest(text: []const u8) bool {
     return true;
 }
 
-fn isPlainUnsigned(token: []const u8) bool {
-    if (token.len == 0) return false;
-    if (token[0] == '0') return token.len == 1;
-    for (token) |byte| {
-        if (!std.ascii.isDigit(byte)) return false;
+pub const Unsigned = union(enum) {
+    value: u64,
+    invalid,
+    too_large,
+};
+
+pub fn decodeUnsigned(token: []const u8) Unsigned {
+    const number = exact_number.parse(token) orelse return .invalid;
+    if (number.significant_len == 0) return .{ .value = 0 };
+    if (number.negative or number.scale < 0) return .invalid;
+    const digits_max = std.math.log10_int(@as(u64, std.math.maxInt(u64))) + 1;
+    if (number.scale > digits_max or number.significant_len > digits_max) return .too_large;
+    var result: u64 = 0;
+    for (0..number.significant_len) |index| {
+        result = std.math.mul(u64, result, 10) catch return .too_large;
+        result = std.math.add(u64, result, number.digit(index) - '0') catch return .too_large;
     }
-    return true;
+    for (0..@intCast(number.scale)) |_| {
+        result = std.math.mul(u64, result, 10) catch return .too_large;
+    }
+    return .{ .value = result };
 }
 
 pub fn writeString(writer: *std.Io.Writer, text: []const u8) !void {
@@ -440,7 +478,39 @@ test "identifier and digest grammars" {
     try testing.expect(isDigest(&repeat('0', 64)));
     try testing.expect(!isDigest(&repeat('A', 64)));
     try testing.expect(!isDigest(&repeat('0', 63)));
-    try testing.expect(isPlainUnsigned("0") and isPlainUnsigned("224"));
-    try testing.expect(!isPlainUnsigned("01") and !isPlainUnsigned("1.0"));
-    try testing.expect(!isPlainUnsigned("-1") and !isPlainUnsigned("1e3"));
+}
+
+test "unsigned integers accept every exact spelling and reject overflow" {
+    const accepted = [_]struct { []const u8, u64 }{
+        .{ "0", 0 },
+        .{ "-0", 0 },
+        .{ "0.0e5", 0 },
+        .{ "224", 224 },
+        .{ "224.0", 224 },
+        .{ "2.24e2", 224 },
+        .{ "1e3", 1000 },
+        .{ "18446744073709551615", std.math.maxInt(u64) },
+        .{ "1.8446744073709551615e19", std.math.maxInt(u64) },
+    };
+    for (accepted) |case| {
+        try testing.expectEqual(Unsigned{ .value = case[1] }, decodeUnsigned(case[0]));
+    }
+    for ([_][]const u8{ "-1", "1.5", "2.245e2", "1e-1" }) |token| {
+        try testing.expectEqual(Unsigned.invalid, decodeUnsigned(token));
+    }
+    for ([_][]const u8{ "18446744073709551616", "99999999999999999999", "1e20", "1e999" }) |token| {
+        try testing.expectEqual(Unsigned.too_large, decodeUnsigned(token));
+    }
+}
+
+test "string tokens beyond the scanner default are retained whole" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const body = try allocator.alloc(u8, 5 * 1024 * 1024);
+    @memset(body, 'x');
+    const document = try std.mem.concat(allocator, u8, &.{ "{\"s\":\"", body, "\"}" });
+    var d: Diagnostic = .{};
+    const value = try parse(allocator, document, &d, "test");
+    try testing.expectEqual(body.len, value.object.get("s").?.string.len);
 }
