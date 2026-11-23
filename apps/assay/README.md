@@ -31,8 +31,11 @@ JSON is the default format. `capabilities` always emits JSON. Output is rendered
 completely, bounded, and then written to stdout in one write; redirect stdout to
 keep a receipt. A failed stdout write is an `io_error` with exit 2, reported on
 stderr. Flags take separate values (`--flag VALUE`); repeated, unknown, or
-misplaced flags and positional arguments are `invalid_usage`. `--help` after a
-command prints help.
+misplaced flags and positional arguments are `invalid_usage`. Following the shared
+CLI convention, help and version are recognized only as the first argument, so a
+stray `--help` or `-h` later is `invalid_usage`, never a success exit. A flag value
+may not begin with `--`. Errors render as text only for commands that accept
+`--format`.
 
 | Exit | `assess` | `compare` / `explain` |
 |---:|---|---|

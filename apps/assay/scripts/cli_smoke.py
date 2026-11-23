@@ -57,7 +57,7 @@ def command_error(arguments, code, cwd=None):
 
 
 def test_help_version_capabilities():
-    for arguments in ([], ["--help"], ["-h"], ["assess", "--help"], ["compare", "-h"]):
+    for arguments in ([], ["--help"], ["-h"]):
         result = execute(arguments, 0)
         assert result.stderr == b""
         text = result.stdout.decode()
@@ -94,6 +94,8 @@ def test_usage_errors(workspace):
         ["explain", "--assessment", "a", "positional"],
         ["explain", "--assessment", "a", "--format", "yaml"],
         ["compare", "--baseline", "a"], ["explain", "--bogus", "x"],
+        ["assess", "--help"], ["compare", "-h"],
+        ["explain", "--assessment", "a.json", "--help"],
     ):
         command_error(arguments, "invalid_usage")
     text = execute(["explain", "--format", "text"], 2)

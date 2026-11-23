@@ -29,7 +29,8 @@ const help: core_cli.HelpSurface = .{
     \\
     \\Assay reads only the named local documents and, with --subject-root, the files
     \\the subject manifest lists. It runs no evaluator, uses no network, grants no
-    \\authority, and writes only to stdout. See apps/assay/README.md.
+    \\authority, and writes results and JSON errors to stdout; text-mode errors and
+    \\output-failure notices go to stderr. See apps/assay/README.md.
     ,
 };
 
@@ -99,10 +100,6 @@ fn execute(
 ) ExecuteError!u8 {
     if (try core_cli.handleDefaultHelpAndVersionSurface(w, argv, help, app_meta.version)) return 0;
     const options = try cli.parse(argv[1..], d);
-    if (options.help) {
-        try core_cli.printHelpSurface(w, help, app_meta.version);
-        return 0;
-    }
     switch (options.command) {
         .capabilities => {
             try render.capabilities(w, producer);

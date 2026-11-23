@@ -128,7 +128,9 @@ fn findIncompatibilities(
             .artifact_ids = &.{},
         });
     }
-    if (!std.mem.eql(u8, left.contract.context_sha256, right.contract.context_sha256)) {
+    const left_context = left.subject.artifacts[left.subject.context].sha256;
+    const right_context = right.subject.artifacts[right.subject.context].sha256;
+    if (!std.mem.eql(u8, left_context, right_context)) {
         try result.append(arena, .{
             .code = .context_changed,
             .detail = "The context artifact digests differ.",
