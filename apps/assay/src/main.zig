@@ -81,7 +81,10 @@ fn emitError(io: std.Io, d: *const Diagnostic, format: cli.Format) u8 {
     };
     rendered catch return 2;
     const file = if (format == .json) std.Io.File.stdout() else std.Io.File.stderr();
-    file.writeStreamingAll(io, writer.buffered()) catch return 2;
+    file.writeStreamingAll(io, writer.buffered()) catch {
+        const notice = "assay: io_error: error output write failed\n";
+        std.Io.File.stderr().writeStreamingAll(io, notice) catch return 2;
+    };
     return 2;
 }
 

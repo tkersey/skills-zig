@@ -50,10 +50,6 @@ fn openRoot(io: Io, d: *Diagnostic, root_path: []const u8) diag.Error!Io.Dir {
     var components = std.mem.splitScalar(u8, root_path, '/');
     while (components.next()) |component| {
         if (component.len == 0 or std.mem.eql(u8, component, ".")) continue;
-        if (std.mem.eql(u8, component, "..")) {
-            const message = "--subject-root must not contain .. components";
-            return d.fail(.invalid_usage, null, message, .{});
-        }
         const next = current.openDir(io, component, .{ .follow_symlinks = false }) catch |err| {
             return mapError(d, null, "subject root component", err);
         };
@@ -282,7 +278,8 @@ test "subject roots reject symbolic links in every spelling" {
         .{ .suffix = "/alias", .code = .identity_mismatch },
         .{ .suffix = "/alias/", .code = .identity_mismatch },
         .{ .suffix = "/alias/.", .code = .identity_mismatch },
-        .{ .suffix = "/dir/../dir", .code = .invalid_usage },
+        .{ .suffix = "/dir/../dir", .code = null },
+        .{ .suffix = "/dir/../alias", .code = .identity_mismatch },
         .{ .suffix = "/absent", .code = .missing_input },
     };
     var d: Diagnostic = .{};

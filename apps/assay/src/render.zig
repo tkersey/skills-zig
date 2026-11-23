@@ -303,16 +303,17 @@ pub fn commandErrorText(w: *Writer, d: *const diag.Diagnostic) Error!void {
     try w.print("assay: error {s}: {s}", .{ @tagName(d.code), d.message() });
     if (d.location()) |location| {
         try w.writeAll(" at ");
-        try Stringify.encodeJsonString(location, .{}, w);
+        try quoted(w, location);
     }
     try w.writeAll("\nauthority granted: false; storage mutated: false\n");
 }
 
 fn quoted(w: *Writer, text: []const u8) Error!void {
-    try Stringify.encodeJsonString(text, .{}, w);
+    try Stringify.encodeJsonString(text, .{ .escape_unicode = true }, w);
 }
 
 fn scalarText(w: *Writer, value: documents.Scalar) Error!void {
+    if (value == .string) return quoted(w, value.string);
     var s: Stringify = .{ .writer = w };
     try scalar(&s, value);
 }

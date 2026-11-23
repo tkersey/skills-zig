@@ -1000,3 +1000,26 @@ test "maximally escaped inputs survive a receipt round trip" {
     const first = checked.loaded.contract.obligations[0].statement;
     try testing.expectEqual(@as(usize, 2 + 8000), first.len);
 }
+
+test "empty qualifications are admitted and text output keeps control text inert" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var parts = single(arena, witness, "complete", "null");
+    const empty = "{\"kind\":\"domain_judgment\",\"qualification\":\"\"}";
+    parts.obligations = obligation(arena, "case", true, witness, empty);
+    parts.records = list1(arena, observed(arena, "case", "r1", judgment(arena, "supported")));
+    try expectOne(parts, .supported, .qualified_judgment);
+    parts = single(arena, witness, "complete", "\"\u{202e}x\u{85}\"");
+    const sneaky = replace(arena, parts.obligations, "\"Holds.\"", "\"Holds\u{202e}\u{9b}31m.\"");
+    parts.obligations = sneaky;
+    const result = try derive(arena, sources(arena, parts));
+    var output: std.Io.Writer.Allocating = .init(arena);
+    try render.assessmentText(&output.writer, &result.loaded, result.derivation, .{});
+    const text = output.written();
+    for ([_][]const u8{ "\u{202e}", "\u{85}", "\u{9b}" }) |raw| {
+        try testing.expect(std.mem.indexOf(u8, text, raw) == null);
+    }
+    try testing.expect(std.mem.indexOf(u8, text, "\\u202e") != null);
+    try testing.expect(std.mem.indexOf(u8, text, "\\u009b31m") != null);
+}

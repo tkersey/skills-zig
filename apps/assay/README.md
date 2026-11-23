@@ -43,7 +43,10 @@ command prints help.
 
 In JSON mode an error is one `assay-command-error/v1` object on stdout with a
 stable `code`, a bounded `message`, and a JSON Pointer `location` (or null). In
-text mode the same code and message go to stderr and stdout stays empty.
+text mode the same code and message go to stderr and stdout stays empty. If the
+error itself cannot be written to stdout, an `io_error` notice goes to stderr.
+Text output quotes all document text as JSON strings with non-ASCII escaped, so
+control and bidirectional-override characters stay inert in a terminal.
 Messages name the document and never echo input bodies or environment values.
 A location stops at the nearest enclosing value when a key on its path exceeds
 128 bytes, so oversized keys are never echoed.
@@ -71,7 +74,12 @@ are `resource_limit`.
 - `assay-subject/v1`: `schema`, `id`, `context_artifact`, `artifacts`. Each
   artifact has `id`, `role` (`target`, `context`, `evaluator`, `support`),
   relative POSIX `path`, `sha256`, and `size_bytes`. At least one target and
-  exactly one context are required; IDs and paths are unique.
+  exactly one context are required; IDs and paths are unique. Paths reject
+  absolute forms, empty, `.`, and `..` components, backslashes, NUL, trailing
+  slashes, and drive prefixes (a letter then `:`), as the spec requires. Path
+  uniqueness is byte-exact; on case-insensitive filesystems two spellings can
+  name one file, so keeping the manifest adequate stays the producer's
+  responsibility.
 - `assay-evidence/v1`: `schema`, the raw `contract_sha256`, `subject_sha256`,
   and `context_sha256` bindings, `runs`, `records`, and `artifacts`. A run
   reports `complete`, `interrupted`, `timed_out`, or `error` with a reason
@@ -138,8 +146,8 @@ baseline supported. Neither exit 0 nor any field is an adoption recommendation.
 Without `--subject-root` the manifest is an assertion (`not_checked`). With it,
 Assay opens the root one component at a time from `/` or the working directory
 without following links, so a symbolic link anywhere in the root path is an
-`identity_mismatch` (pass a physical path, for example from `realpath`) and a
-`..` component is `invalid_usage`. It opens each artifact path component without
+`identity_mismatch` (pass a physical path, for example from `realpath`). A `..`
+component opens the real parent of the already verified directory. It opens each artifact path component without
 following links, then opens the file once with `O_NOFOLLOW | O_NONBLOCK`, so a
 substituted FIFO or device cannot block it. It decides file kind and size from
 that open descriptor (a regular file of the manifest size), streams SHA-256

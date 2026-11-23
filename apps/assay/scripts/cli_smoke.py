@@ -246,8 +246,10 @@ def test_subject_root(workspace):
     for spelling in ("linked", "linked/", "linked/."):
         command_error(documents.arguments("--subject-root", str(documents.root / "linked") +
                                           spelling[len("linked"):]), "identity_mismatch")
-    command_error(documents.arguments("--subject-root", str(files / ".." / "files")),
-                  "invalid_usage")
+    dotted = execute(documents.arguments("--subject-root", str(files / ".." / "files")), 0)
+    assert json.loads(dotted.stdout)["verification"]["files_checked"] == 3
+    command_error(documents.arguments("--subject-root", str(files / ".." / "linked")),
+                  "identity_mismatch")
     command_error(documents.arguments("--subject-root", str(documents.root / "absent")),
                   "missing_input")
     original = (files / "candidate.mjs").read_bytes()
@@ -279,6 +281,10 @@ def test_bounds_and_output(workspace):
         with open("/dev/full", "wb") as full:
             result = subprocess.run([BINARY, *documents.arguments()], stdout=full,
                                     stderr=subprocess.PIPE, timeout=30)
+        assert result.returncode == 2 and b"io_error" in result.stderr, result
+        with open("/dev/full", "wb") as full:
+            result = subprocess.run([BINARY, "explain", "--assessment", str(workspace / "nope")],
+                                    stdout=full, stderr=subprocess.PIPE, timeout=30)
         assert result.returncode == 2 and b"io_error" in result.stderr, result
     read_end, write_end = os.pipe()
     os.close(read_end)

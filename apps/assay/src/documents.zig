@@ -242,7 +242,7 @@ fn decodeCheck(parent: Fields) diag.Error!Check {
         .domain_judgment => {
             try fields.closed(&.{ "kind", "qualification" });
             return .{
-                .domain_judgment = try fields.text("qualification", limits.text_bytes_max, true),
+                .domain_judgment = try fields.text("qualification", limits.text_bytes_max, false),
             };
         },
     }
