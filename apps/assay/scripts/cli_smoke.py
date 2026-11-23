@@ -203,6 +203,7 @@ def test_explain_and_compare(receipts):
     assert_no_authority(explanation)
     text = execute(["explain", "--assessment", str(receipts["refuted"]), "--format", "text"], 0)
     assert b"receipt consistency: verified" in text.stdout
+    assert b'runs:\n- codec-run-1 (interrupted): "Runner was interrupted' in text.stdout
     for fragment in (b'scope: "Input timeout=null; inherited timeout=7."', b"basis: empirical",
                      b"evaluator: codec-observer/v1", b"check: scalar_equal, expected null"):
         assert fragment in text.stdout, fragment
@@ -313,6 +314,10 @@ def test_receipt_and_output_bounds(workspace):
     path = documents.write_raw("receipt.json", receipt.decode())
     error = command_error(["explain", "--assessment", str(path)], "resource_limit")
     assert "output exceeds" in error["message"], error
+    text = execute(documents.arguments("--format", "text"), 3).stdout
+    assert text.count(reason.encode()) == 1 and b"runs:\n- run (interrupted)" in text
+    explained = execute(["explain", "--assessment", str(path), "--format", "text"], 0).stdout
+    assert explained.count(reason.encode()) == 1
 
 
 def main():

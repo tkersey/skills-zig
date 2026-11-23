@@ -52,13 +52,46 @@ fn mandatory(command: Command) []const Flag {
     };
 }
 
-pub fn requestedFormat(arguments: []const []const u8) Format {
-    var index: usize = 0;
-    while (index + 1 < arguments.len) : (index += 1) {
-        if (std.mem.eql(u8, arguments[index], "--format") and
-            std.mem.eql(u8, arguments[index + 1], "text")) return .text;
+const Token = union(enum) {
+    help,
+    positional: []const u8,
+    flag: struct { name: []const u8, value: ?[]const u8 },
+};
+
+fn isValue(argument: []const u8) bool {
+    return !std.mem.startsWith(u8, argument, "--") and !core_cli.isHelpArg(argument);
+}
+
+const Tokens = struct {
+    arguments: []const []const u8,
+    index: usize = 1,
+
+    fn next(self: *Tokens) ?Token {
+        if (self.index >= self.arguments.len) return null;
+        const argument = self.arguments[self.index];
+        self.index += 1;
+        if (core_cli.isHelpArg(argument)) return .help;
+        if (!std.mem.startsWith(u8, argument, "--")) return .{ .positional = argument };
+        var value: ?[]const u8 = null;
+        if (self.index < self.arguments.len and isValue(self.arguments[self.index])) {
+            value = self.arguments[self.index];
+            self.index += 1;
+        }
+        return .{ .flag = .{ .name = argument[2..], .value = value } };
     }
-    return .json;
+};
+
+pub fn requestedFormat(arguments: []const []const u8) Format {
+    var tokens: Tokens = .{ .arguments = arguments };
+    var format: Format = .json;
+    while (tokens.next()) |token| switch (token) {
+        .flag => |flag| if (std.mem.eql(u8, flag.name, "format")) {
+            const value = flag.value orelse continue;
+            format = std.meta.stringToEnum(Format, value) orelse format;
+        },
+        else => {},
+    };
+    return format;
 }
 
 pub fn parse(arguments: []const []const u8, d: *diag.Diagnostic) error{Rejected}!Options {
@@ -67,34 +100,18 @@ pub fn parse(arguments: []const []const u8, d: *diag.Diagnostic) error{Rejected}
         return d.fail(.invalid_usage, null, "unknown command; run assay --help", .{});
     };
     var options: Options = .{ .command = command };
-    var index: usize = 1;
-    while (index < arguments.len) : (index += 1) {
-        const argument = arguments[index];
+    for (arguments[1..]) |argument| {
         if (core_cli.isHelpArg(argument)) {
             options.help = true;
-            continue;
+            return options;
         }
-        if (!std.mem.startsWith(u8, argument, "--")) {
-            return d.fail(.invalid_usage, null, "unexpected positional argument", .{});
-        }
-        const flag = std.meta.stringToEnum(Flag, argument[2..]) orelse {
-            return d.fail(.invalid_usage, null, "unknown flag for {s}", .{@tagName(command)});
-        };
-        if (!allowed(command, flag)) {
-            return d.fail(.invalid_usage, null, "--{s} is not accepted by {s}", .{
-                @tagName(flag), @tagName(command),
-            });
-        }
-        if (options.values.get(flag) != null) {
-            return d.fail(.invalid_usage, null, "--{s} was repeated", .{@tagName(flag)});
-        }
-        if (index + 1 == arguments.len) {
-            return d.fail(.invalid_usage, null, "--{s} requires a value", .{@tagName(flag)});
-        }
-        index += 1;
-        options.values.set(flag, arguments[index]);
     }
-    if (options.help) return options;
+    var tokens: Tokens = .{ .arguments = arguments };
+    while (tokens.next()) |token| switch (token) {
+        .help => unreachable,
+        .positional => return d.fail(.invalid_usage, null, "unexpected positional argument", .{}),
+        .flag => |entry| try admitFlag(&options, entry.name, entry.value, d),
+    };
     if (options.get(.format)) |format| {
         options.format = std.meta.stringToEnum(Format, format) orelse {
             return d.fail(.invalid_usage, null, "--format must be json or text", .{});
@@ -106,6 +123,30 @@ pub fn parse(arguments: []const []const u8, d: *diag.Diagnostic) error{Rejected}
         }
     }
     return options;
+}
+
+fn admitFlag(
+    options: *Options,
+    name: []const u8,
+    value: ?[]const u8,
+    d: *diag.Diagnostic,
+) error{Rejected}!void {
+    const command = options.command;
+    const flag = std.meta.stringToEnum(Flag, name) orelse {
+        return d.fail(.invalid_usage, null, "unknown flag for {s}", .{@tagName(command)});
+    };
+    if (!allowed(command, flag)) {
+        return d.fail(.invalid_usage, null, "--{s} is not accepted by {s}", .{
+            @tagName(flag), @tagName(command),
+        });
+    }
+    if (options.values.get(flag) != null) {
+        return d.fail(.invalid_usage, null, "--{s} was repeated", .{@tagName(flag)});
+    }
+    const present = value orelse {
+        return d.fail(.invalid_usage, null, "--{s} requires a value", .{@tagName(flag)});
+    };
+    options.values.set(flag, present);
 }
 
 const testing = std.testing;
@@ -137,6 +178,15 @@ test "command admission accepts exact flags and rejects ambiguity" {
         try testing.expectEqual(diag.Code.invalid_usage, d.code);
     }
     try testing.expect((try parse(&.{ "compare", "--help" }, &d)).help);
+    try testing.expect((try parse(&.{ "assess", "--contract", "--help" }, &d)).help);
+    try testing.expectError(error.Rejected, parse(&.{
+        "assess", "--contract", "--subject", "s", "--evidence", "e",
+    }, &d));
+    try testing.expectEqualStrings("--contract requires a value", d.message());
     try testing.expectEqual(Format.text, requestedFormat(&.{ "x", "--format", "text" }));
     try testing.expectEqual(Format.json, requestedFormat(&.{ "x", "--format" }));
+    const dangling = [_][]const u8{ "explain", "--assessment", "--format" };
+    try testing.expectEqual(Format.json, requestedFormat(&dangling));
+    const shifted = [_][]const u8{ "x", "--a", "--format", "--b", "text" };
+    try testing.expectEqual(Format.json, requestedFormat(&shifted));
 }

@@ -166,6 +166,10 @@ test "locations escape pointer tokens and omit oversized keys" {
     const oversized = first.key(&long);
     diagnostic.set(.invalid_document, &oversized, "unknown", .{});
     try std.testing.expectEqualStrings("/records/0", diagnostic.location().?);
+    const below = oversized.key("a");
+    const deeper = below.index(3);
+    diagnostic.set(.duplicate_key, &deeper, "nested", .{});
+    try std.testing.expectEqualStrings("/records/0", diagnostic.location().?);
     diagnostic.set(.io_error, null, "plain", .{});
     try std.testing.expect(diagnostic.location() == null);
     diagnostic.set(.invalid_document, &Loc.root, "root", .{});

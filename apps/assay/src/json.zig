@@ -111,6 +111,11 @@ const Parser = struct {
                 self.role, limits.number_bytes_max,
             });
         }
+        if (exact_number.parse(text) == null) {
+            return self.fail(.resource_limit, "{s}: number exceeds exact-number limits", .{
+                self.role,
+            });
+        }
         return .{ .number_string = text };
     }
 
@@ -323,10 +328,7 @@ pub const Fields = struct {
         return switch (value.*) {
             .null => .null,
             .bool => |flag| .{ .boolean = flag },
-            .number_string => |token| if (exact_number.parse(token) != null)
-                .{ .number = token }
-            else
-                self.reject(.invalid_document, name, "number exceeds exact-number limits", .{}),
+            .number_string => |token| .{ .number = token },
             .string => |bytes| if (bytes.len <= limits.text_bytes_max)
                 .{ .string = bytes }
             else
@@ -376,19 +378,8 @@ pub const Unsigned = union(enum) {
     too_large,
 };
 
-fn classifyUnparsed(token: []const u8) Unsigned {
-    const exponent_at = std.mem.indexOfAny(u8, token, "eE") orelse return .invalid;
-    const mantissa = token[0..exponent_at];
-    const nonzero = std.mem.indexOfNone(u8, mantissa, "-0.") != null;
-    if (!nonzero) return .{ .value = 0 };
-    if (mantissa[0] == '-') return .invalid;
-    const exponent = token[exponent_at + 1 ..];
-    if (exponent.len > 0 and exponent[0] == '-') return .invalid;
-    return .too_large;
-}
-
 pub fn decodeUnsigned(token: []const u8) Unsigned {
-    const number = exact_number.parse(token) orelse return classifyUnparsed(token);
+    const number = exact_number.parse(token) orelse return .too_large;
     if (number.significant_len == 0) return .{ .value = 0 };
     if (number.negative or number.scale < 0) return .invalid;
     const digits_max = std.math.log10_int(@as(u64, std.math.maxInt(u64))) + 1;
@@ -448,6 +439,8 @@ test "depth and number bounds apply at and above their limits" {
     const digits = repeat('1', limits.number_bytes_max);
     _ = try parse(allocator, "[" ++ digits ++ "]", &d, "test");
     try expectRejected("[" ++ digits ++ "1]", .resource_limit, "/0");
+    try expectRejected("{\"n\":[1,1e99999999999999999999]}", .resource_limit, "/n/1");
+    try expectRejected("[-1e-99999999999999999999]", .resource_limit, "/0");
 }
 
 test "parsing preserves decoded strings, number tokens, and key order" {
@@ -498,21 +491,26 @@ test "unsigned integers accept every exact spelling and reject overflow" {
         .{ "1e3", 1000 },
         .{ "18446744073709551615", std.math.maxInt(u64) },
         .{ "1.8446744073709551615e19", std.math.maxInt(u64) },
-        .{ "0e99999999999999999999", 0 },
-        .{ "-0.0e-99999999999999999999", 0 },
     };
     for (accepted) |case| {
         try testing.expectEqual(Unsigned{ .value = case[1] }, decodeUnsigned(case[0]));
     }
     const invalid = [_][]const u8{
-        "-1", "1.5", "2.245e2", "1e-1", "1e-99999999999999999999", "-1e99999999999999999999",
+        "-1", "1.5", "2.245e2", "1e-1",
     };
     for (invalid) |token| {
         try testing.expectEqual(Unsigned.invalid, decodeUnsigned(token));
     }
     const huge = [_][]const u8{
-        "18446744073709551616",   "99999999999999999999",    "1e20", "1e999",
-        "1e99999999999999999999", "2E+99999999999999999999",
+        "18446744073709551616",
+        "99999999999999999999",
+        "1e20",
+        "1e999",
+        "1e99999999999999999999",
+        "2E+99999999999999999999",
+        "-1e99999999999999999999",
+        "0e99999999999999999999",
+        "1e-99999999999999999999",
     };
     for (huge) |token| {
         try testing.expectEqual(Unsigned.too_large, decodeUnsigned(token));

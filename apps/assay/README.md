@@ -45,6 +45,8 @@ In JSON mode an error is one `assay-command-error/v1` object on stdout with a
 stable `code`, a bounded `message`, and a JSON Pointer `location` (or null). In
 text mode the same code and message go to stderr and stdout stays empty.
 Messages name the document and never echo input bodies or environment values.
+A location stops at the nearest enclosing value when a key on its path exceeds
+128 bytes, so oversized keys are never echoed.
 
 ## Documents
 
@@ -155,9 +157,11 @@ combined, 64 MiB per receipt input or result, JSON depth 32, 4,096 obligations,
 runs, records, subject artifacts, and evidence artifacts, 256 evaluators, 16 KiB
 per text field or scalar string, 1,024-byte number tokens, 4,096-byte paths and
 locators, 4 GiB per verified artifact, 16 GiB in total, 4 KiB error messages, and
-a 512 MiB allocation budget enforced by a bounded allocator. `explain` repeats
-each obligation's run reason, so a maximal receipt can produce an explanation
-above 64 MiB; that is a clean `resource_limit` error.
+a 512 MiB allocation budget enforced by a bounded allocator. Number tokens must
+also fit the exact-number exponent range; larger ones are `resource_limit`. JSON
+`explain` output repeats each obligation's run reason, as its schema requires, so
+a maximal receipt can produce an explanation above 64 MiB; that is a clean
+`resource_limit` error. Text output lists each run's reason once.
 
 ## Tests
 

@@ -384,11 +384,6 @@ fn obligationText(w: *Writer, loaded: *const assess.Loaded, item: assess.Derived
         try quoted(w, reason);
         try w.writeByte('\n');
     };
-    if (run) |value| if (value.reason.len > 0) {
-        try w.writeAll("  run reason: ");
-        try quoted(w, value.reason);
-        try w.writeByte('\n');
-    };
 }
 
 fn derivationText(w: *Writer, loaded: *const assess.Loaded, value: assess.Derivation) Error!void {
@@ -400,6 +395,15 @@ fn derivationText(w: *Writer, loaded: *const assess.Loaded, value: assess.Deriva
     try countsText(w, value.counts);
     try w.writeAll("obligations:\n");
     for (value.items) |item| try obligationText(w, loaded, item);
+    if (loaded.evidence.runs.len > 0) try w.writeAll("runs:\n");
+    for (loaded.evidence.runs) |run| {
+        try w.print("- {s} ({s})", .{ run.id, @tagName(run.outcome) });
+        if (run.reason.len > 0) {
+            try w.writeAll(": ");
+            try quoted(w, run.reason);
+        }
+        try w.writeByte('\n');
+    }
     for (loaded.evidence.artifacts) |artifact| {
         try w.print("evidence artifact {s}: availability not_checked\n", .{artifact.id});
     }

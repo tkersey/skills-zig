@@ -255,7 +255,7 @@ test "scalar checks reject structured, malformed, and oversized values" {
     const above = print(arena, "\"{s}\"", .{&repeat('x', 16 * 1024 + 1)});
     try rejects(arena, single(arena, witness, "complete", above), .resource_limit, null);
     const huge = "1e99999999999999999999";
-    try rejects(arena, single(arena, witness, "complete", huge), .invalid_document, null);
+    try rejects(arena, single(arena, witness, "complete", huge), .resource_limit, value_at);
 }
 
 test "completion gates separate execution from judgment" {
