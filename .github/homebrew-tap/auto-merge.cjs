@@ -2,13 +2,13 @@ const assert = require('node:assert/strict');
 const { execFileSync, spawnSync } = require('node:child_process');
 const { readFileSync } = require('node:fs');
 const { setTimeout } = require('node:timers/promises');
+const { tapApps } = require('./apps.cjs');
 
 const repository = 'tkersey/homebrew-tap';
 const contexts = ['test-bot (macos-latest)', 'test-bot (ubuntu-latest)'];
-const apps = ['ledger', 'seq'];
 
 function validateAutoMerge({ app, pr, files, content, expectedContent, head, version, rules, repo, review }) {
-  assert.ok(apps.includes(app), 'Unsupported tap product');
+  assert.ok(tapApps.includes(app), 'Unsupported tap product');
   assert.match(head, /^[0-9a-f]{40}$/);
   assert.match(version, /^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$/);
   assert.equal(pr.state, 'open');
@@ -41,7 +41,7 @@ function checksReady(checks) {
     const matches = checks.filter(check => check.name === context);
     if (matches.length === 0) { ready = false; continue; }
     assert.equal(matches.length, 1, `Ambiguous check: ${context}`);
-    if (matches[0].bucket === 'pending') { ready = false; continue; }
+    if (matches[0].bucket === 'pending' || matches[0].bucket === 'cancel') { ready = false; continue; }
     assert.equal(matches[0].bucket, 'pass', `Required check did not pass: ${context}`);
   }
   return ready;
@@ -49,7 +49,7 @@ function checksReady(checks) {
 
 async function main() {
   const app = process.env.TAP_APP;
-  assert.ok(apps.includes(app), 'TAP_APP must name a tap product');
+  assert.ok(tapApps.includes(app), 'TAP_APP must name a tap product');
   const number = process.env.TAP_PR;
   const head = process.env.TAP_HEAD;
   const version = process.env.TAP_VERSION;
@@ -74,8 +74,7 @@ async function main() {
     });
   }
   validate();
-  // macOS test-bot runners can queue for several minutes before a ~5 minute formula test.
-  const deadline = Date.now() + 30 * 60 * 1000;
+  const deadline = Date.now() + 60 * 60 * 1000;
   while (true) {
     assert.equal(api(`pulls/${number}`).head.sha, head, 'Tap PR head changed while waiting');
     const observed = spawnSync('gh', ['pr', 'checks', number, '--repo', repository,

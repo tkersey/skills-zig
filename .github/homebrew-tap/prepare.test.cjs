@@ -2,8 +2,9 @@ const assert = require('node:assert/strict');
 const { createHash } = require('node:crypto');
 const { test } = require('node:test');
 const { prepareFormula, releaseTagFromVersion } = require('./prepare.cjs');
+const { tapApps } = require('./apps.cjs');
 
-for (const app of ['ledger', 'seq']) {
+for (const app of tapApps) {
   function fixture(version = '1.7.0', current = '1.6.0') {
     const archives = {
       'darwin-arm64': Buffer.from('macOS release archive'),
@@ -16,7 +17,7 @@ for (const app of ['ledger', 'seq']) {
       digest: `sha256:${createHash('sha256').update(data).digest('hex')}`,
       browser_download_url: `https://github.com/tkersey/skills-zig/releases/download/${tag}/${tag}-${platform}.tar.gz`,
     }));
-    const formula = `class ${app === 'ledger' ? 'Ledger' : 'Seq'} < Formula
+    const formula = `class Product < Formula
   desc "Native artifact validation and durable protocol runtime"
   version "${current}"
 
@@ -68,7 +69,7 @@ end
 
   test(app + ': drafts, prereleases, malformed versions and wrong product tags fail', () => {
     for (const patch of [
-      { draft: true }, { prerelease: true }, { tag_name: 'lift-v1.7.0' },
+      { draft: true }, { prerelease: true }, { tag_name: `${app === 'seq' ? 'ledger' : 'seq'}-v1.7.0` },
       { tag_name: `${app}-v1.7.0-rc1` }, { tag_name: `${app}-v01.7.0` },
       { tag_name: `${app}-v1.7.0\nchanged=true` },
     ]) {

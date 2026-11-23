@@ -167,3 +167,12 @@ jobs:
             "release-${{ matrix.app }}.yml" "${{ steps.dispatch.outputs.since }}" "$RUNNER_TEMP/dispatch.out")"
           echo "Supervising release-${{ matrix.app }}.yml run $run_id"
           .github/scripts/runner_retry.sh supervise "$GITHUB_REPOSITORY" "$run_id" 4 120
+      - name: Hand off to the Homebrew tap
+        if: >-
+          steps.release.outputs.dispatch == 'true' &&
+          matrix.app != 'seq' && matrix.app != 'ledger'
+        run: |
+          set -euo pipefail
+          gh workflow run tap-handoff.yml --repo "$GITHUB_REPOSITORY" --ref main \
+            -f "app=${{ matrix.app }}" -f "tag_name=${{ steps.release.outputs.tag }}" \
+            -f "commit_sha=${GITHUB_SHA}"
