@@ -443,6 +443,23 @@ test "depth and number bounds apply at and above their limits" {
     try expectRejected("[-1e-99999999999999999999]", .resource_limit, "/0");
 }
 
+test "deep locations under long keys are reported whole" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const key = repeat('k', 127);
+    var document: std.ArrayList(u8) = .empty;
+    var expected: std.ArrayList(u8) = .empty;
+    for (0..limits.json_depth_max - 1) |_| {
+        try document.appendSlice(allocator, "{\"" ++ key ++ "\":");
+        try expected.appendSlice(allocator, "/" ++ key);
+    }
+    try document.appendSlice(allocator, "{\"z\":1,\"z\":2}");
+    for (0..limits.json_depth_max - 1) |_| try document.append(allocator, '}');
+    try expected.appendSlice(allocator, "/z");
+    try expectRejected(document.items, .duplicate_key, expected.items);
+}
+
 test "parsing preserves decoded strings, number tokens, and key order" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();

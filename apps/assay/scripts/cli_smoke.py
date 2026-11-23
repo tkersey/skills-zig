@@ -101,6 +101,10 @@ def test_usage_errors(workspace):
     text = execute(["explain", "--format", "text"], 2)
     assert text.stdout == b"" and b"invalid_usage" in text.stderr
     missing = command_error(["explain", "--assessment", str(workspace / "absent.json")], "missing_input")
+    (workspace / "plain-file").write_text("x")
+    command_error(["explain", "--assessment", str(workspace / "plain-file" / "x.json")],
+                  "missing_input")
+    command_error(["explain", "--assessment", str(workspace)], "missing_input")
     assert "absent" not in missing["message"]
 
 
@@ -221,6 +225,14 @@ def test_explain_and_compare(receipts):
     tampered.write_text(original.replace('"overall":"refuted"', '"overall":"supported"', 1))
     error = command_error(["explain", "--assessment", str(tampered)], "receipt_mismatch")
     assert error["location"] == "/derivation/overall"
+    receipt = json.loads(original)
+    receipt["inputs"]["contract_utf8"] = receipt["inputs"]["contract_utf8"].replace(
+        '"basis": "empirical"', '"basis": "anecdotal"', 1)
+    broken = receipts["refuted"].with_name("broken.json")
+    broken.write_text(json.dumps(receipt))
+    inner = command_error(["explain", "--assessment", str(broken)], "receipt_mismatch")
+    assert inner["location"] == "/inputs", inner
+    assert 'invalid_document at "/obligations/0/basis"' in inner["message"], inner
     baseline_error = command_error(
         ["compare", "--baseline", str(tampered), "--candidate", str(receipts["refuted"])],
         "receipt_mismatch")

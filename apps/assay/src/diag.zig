@@ -20,7 +20,7 @@ pub const Code = enum {
 pub const Error = error{ Rejected, OutOfMemory };
 
 const segments_max = 2 * limits.json_depth_max;
-const location_bytes_max = 4096;
+pub const location_bytes_max = segments_max * (2 * segment_key_bytes_max + 1);
 const segment_key_bytes_max = limits.id_bytes_max;
 
 pub const Loc = struct {
@@ -139,10 +139,15 @@ pub const Diagnostic = struct {
         var inner: [limits.error_message_bytes_max]u8 = undefined;
         const inner_message = inner[0..self.message_len];
         @memcpy(inner_message, self.message());
+        var inner_where: [location_bytes_max]u8 = undefined;
+        const where = self.location() orelse "";
+        const inner_location = inner_where[0..where.len];
+        @memcpy(inner_location, where);
         const inner_code = self.code;
-        return self.fail(code, loc, "{s}: " ++ summary ++ " ({s}: {s})", .{
+        return self.fail(code, loc, "{s}: " ++ summary ++ " ({s} at \"{s}\": {s})", .{
             role,
             @tagName(inner_code),
+            inner_location,
             inner_message,
         });
     }

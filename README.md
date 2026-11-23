@@ -88,6 +88,9 @@ zig build -Doptimize=fast
 ```
 
 SIWC's offline authentication and command tests run with `zig build test-siwc`.
+Assay's process smoke lane (part of routine `zig build test`) needs `python3`;
+its codec acceptance lane (`zig build test-assay-acceptance`, included in
+`test-full`) also needs `node`.
 Its PR and release qualification run both Debug and ReleaseSafe on Linux and
 macOS; qualification uses synthetic credentials and does not sign in to an account.
 

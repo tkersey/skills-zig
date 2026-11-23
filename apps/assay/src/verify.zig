@@ -88,7 +88,16 @@ fn verifyArtifact(
         return mapError(d, loc, "subject artifact", err);
     };
     defer file.close(io);
-    return hashFile(io, d, file, artifact, loc, buffer);
+    const bytes = try hashFile(io, d, file, artifact, loc, buffer);
+    const opened = file.stat(io) catch |err| return mapError(d, loc, "subject artifact", err);
+    const named = dir.statFile(io, name, .{ .follow_symlinks = false }) catch |err| {
+        return mapError(d, loc, "subject artifact", err);
+    };
+    if (named.kind != .file or named.inode != opened.inode) {
+        const message = "subject: artifact path was replaced during verification";
+        return d.fail(.identity_mismatch, loc, message, .{});
+    }
+    return bytes;
 }
 
 fn openArtifact(dir: Io.Dir, name: []const u8) std.posix.OpenError!Io.File {
@@ -345,6 +354,62 @@ test "short positional reads still verify every byte" {
     const result = try verify(io, &d, root_buffer[0..root_len], subject, &buffer);
     try testing.expectEqual(@as(u64, data.len), result.bytes_read);
     try testing.expect(ShortReads.calls > data.len / 3);
+}
+
+const SwapDuringRead = struct {
+    var delegate: *const @TypeOf(std.testing.io.vtable.fileReadPositional) = undefined;
+    var dir: Io.Dir = undefined;
+    var swapped = false;
+
+    fn read(
+        userdata: ?*anyopaque,
+        file: Io.File,
+        buffers: []const []u8,
+        offset: u64,
+    ) Io.File.ReadPositionalError!usize {
+        if (!swapped) {
+            swapped = true;
+            dir.rename("other", dir, "target", testing.io) catch |err| {
+                std.debug.panic("swap rename failed: {s}", .{@errorName(err)});
+            };
+        }
+        return delegate.*(userdata, file, buffers, offset);
+    }
+};
+
+test "a path replaced while its bytes are hashed is rejected" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = "target", .data = "payload" });
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = "other", .data = "imposter" });
+    var vtable = testing.io.vtable.*;
+    SwapDuringRead.delegate = &testing.io.vtable.fileReadPositional;
+    SwapDuringRead.dir = tmp.dir;
+    SwapDuringRead.swapped = false;
+    vtable.fileReadPositional = SwapDuringRead.read;
+    const io: Io = .{ .userdata = testing.io.userdata, .vtable = &vtable };
+    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(testing.io, &root_buffer);
+    const hex = assess.sha256Hex("payload");
+    var storage = [1]documents.Artifact{.{
+        .id = "a",
+        .role = .context,
+        .path = "target",
+        .sha256 = &hex,
+        .size_bytes = 7,
+    }};
+    const subject: documents.Subject = .{
+        .id = "s",
+        .context = 0,
+        .artifacts = &storage,
+        .artifact_ids = .empty,
+    };
+    var buffer: [limits.hash_buffer_bytes]u8 = undefined;
+    var d: Diagnostic = .{};
+    const root = root_buffer[0..root_len];
+    try testing.expectError(error.Rejected, verify(io, &d, root, subject, &buffer));
+    try testing.expectEqual(diag.Code.identity_mismatch, d.code);
+    try testing.expect(SwapDuringRead.swapped);
 }
 
 test "visible metadata changes are detected" {

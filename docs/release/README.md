@@ -91,8 +91,9 @@ contains only `siwc`, and qualification verifies its version and help surface.
 No release or CI job uses a real ChatGPT account or performs paid inference.
 The initial Homebrew formula is a separate tap handoff after the first release.
 
-Assay qualifies `test-assay` in Debug and ReleaseSafe on both platforms before
-producing release archives, with the same Linux and macOS targets as SIWC. Each
+Assay qualifies `test-assay` in Debug and ReleaseSafe and its retained codec
+acceptance controls (`test-assay-acceptance`, which needs `python3` and `node`) on
+both platforms before producing release archives, with the same Linux and macOS targets as SIWC. Each
 archive contains only `assay`, and qualification verifies its version, help, and
 `assay capabilities` output. Registering Assay in the root build is a shared
 root-build change, so all five existing CLIs received VERSION bumps with it.

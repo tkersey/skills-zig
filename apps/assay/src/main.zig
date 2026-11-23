@@ -74,7 +74,8 @@ fn run(io: std.Io, gpa: std.mem.Allocator, argv: []const []const u8) u8 {
 }
 
 fn emitError(io: std.Io, d: *const Diagnostic, format: cli.Format) u8 {
-    var buffer: [64 * 1024]u8 = undefined;
+    const escaped_bytes_max = 6 * (limits.error_message_bytes_max + assay.diag.location_bytes_max);
+    var buffer: [escaped_bytes_max + 1024]u8 = undefined;
     var writer = Writer.fixed(&buffer);
     const rendered = switch (format) {
         .json => render.commandError(&writer, d),
@@ -122,7 +123,12 @@ fn readInput(
     const limit: std.Io.Limit = .limited(@intCast(bytes_max + 1));
     return std.Io.Dir.cwd().readFileAlloc(io, path, arena, limit) catch |err| switch (err) {
         error.OutOfMemory => error.OutOfMemory,
-        error.FileNotFound => d.fail(.missing_input, null, "{s} document not found", .{label}),
+        error.FileNotFound, error.NotDir, error.IsDir => d.fail(
+            .missing_input,
+            null,
+            "{s} document not found as a file",
+            .{label},
+        ),
         error.StreamTooLong => d.fail(.resource_limit, null, "{s} document exceeds {d} bytes", .{
             label, bytes_max,
         }),

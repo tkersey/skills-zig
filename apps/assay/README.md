@@ -52,7 +52,9 @@ Text output quotes all document text as JSON strings with non-ASCII escaped, so
 control and bidirectional-override characters stay inert in a terminal.
 Messages name the document and never echo input bodies or environment values.
 A location stops at the nearest enclosing value when a key on its path exceeds
-128 bytes, so oversized keys are never echoed.
+128 bytes, so oversized keys are never echoed; otherwise it is reported whole. When
+a receipt's embedded documents are invalid, the error is `receipt_mismatch` at
+`/inputs`, and its message names the inner code and location.
 
 ## Documents
 
@@ -155,7 +157,9 @@ following links, then opens the file once with `O_NOFOLLOW | O_NONBLOCK`, so a
 substituted FIFO or device cannot block it. It decides file kind and size from
 that open descriptor (a regular file of the manifest size), streams SHA-256
 through a 64 KiB buffer until end of file whatever the read sizes, and rejects
-visible changes in inode, size, or timestamps during the read. Any failure is exit 2; a
+changes in size or timestamps of the opened file during the read. After hashing it
+re-reads the path without following links and requires the same inode, so a path
+replaced during the read is rejected. Any failure is exit 2; a
 requested verification is never downgraded. Success proves which bytes Assay read
 during this invocation, not that they were executed or that the manifest omits
 nothing.
@@ -175,6 +179,9 @@ a maximal receipt can produce an explanation above 64 MiB; that is a clean
 `resource_limit` error. Text output lists each run's reason once.
 
 ## Tests
+
+The process smoke lane needs `python3`; the acceptance lane needs `python3` and
+`node`.
 
 ```bash
 zig build test-assay              # routine: core, entry point, and process smoke
