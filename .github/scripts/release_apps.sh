@@ -9,7 +9,7 @@ fi
 mode=$1
 base_ref=$2
 head_ref=$3
-apps=(seq lift ledger memory-note siwc)
+apps=(seq lift ledger memory-note siwc assay)
 
 resolve_ref() {
   local ref=$1
@@ -44,6 +44,7 @@ case "$mode" in
     mark_definition_consumers() {
       mark_app seq
       mark_app ledger
+      mark_app assay
     }
 
     mark_trace_consumers() {
@@ -134,6 +135,9 @@ case "$mode" in
           ;;
         .github/workflows/release-siwc.yml)
           mark_app siwc
+          ;;
+        .github/workflows/release-assay.yml)
+          mark_app assay
           ;;
         apps/*)
           matched=0

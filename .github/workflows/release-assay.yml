@@ -1,0 +1,116 @@
+name: Release Assay
+
+on:
+  push:
+    tags:
+      - "assay-v*"
+  workflow_dispatch:
+    inputs:
+      tag_name:
+        description: Release tag to publish
+        required: true
+        type: string
+
+env:
+  RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag_name || github.ref_name }}
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+
+permissions:
+  actions: read
+  contents: write
+
+concurrency:
+  group: release-assay-${{ github.event_name == 'workflow_dispatch' && inputs.tag_name || github.ref_name }}
+  cancel-in-progress: false
+
+jobs:
+  qualify:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux-x86_64
+            target: x86_64-linux-musl
+            os: ubuntu-latest
+          - platform: darwin-arm64
+            target: aarch64-macos.15.0
+            os: macos-15
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: refs/tags/${{ env.RELEASE_TAG }}
+      - name: Validate Assay tag
+        shell: bash
+        run: |
+          set -euo pipefail
+          expected="assay-v$(tr -d '[:space:]' < apps/assay/VERSION)"
+          test "$RELEASE_TAG" = "$expected"
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.17.1
+      - name: Test Assay in Debug
+        run: zig build test-assay -Dtarget=${{ matrix.target }} -Dcpu=baseline -Doptimize=debug
+      - name: Test Assay in ReleaseSafe
+        run: zig build test-assay -Dtarget=${{ matrix.target }} -Dcpu=baseline -Doptimize=safe
+      - name: Build Assay release executable
+        run: zig build build-assay -Dtarget=${{ matrix.target }} -Dcpu=baseline -Doptimize=fast
+      - name: Package and verify Assay archive
+        shell: bash
+        run: |
+          set -euo pipefail
+          expected="$(tr -d '[:space:]' < apps/assay/VERSION)"
+          test "$(zig-out/bin/assay --version)" = "$expected"
+          zig-out/bin/assay --help
+          zig-out/bin/assay capabilities |
+            jq -e '.schema == "assay-capabilities/v1" and .product == "assay"' >/dev/null
+          staging="$(mktemp -d "${RUNNER_TEMP}/assay-release.XXXXXX")"
+          trap 'rm -rf "$staging"' EXIT
+          cp zig-out/bin/assay "$staging/assay"
+          archive="${RELEASE_TAG}-${{ matrix.platform }}.tar.gz"
+          tar -czf "$archive" -C "$staging" assay
+          test "$(tar -tzf "$archive")" = assay
+          echo "RELEASE_ARCHIVE=$archive" >> "$GITHUB_ENV"
+      - uses: actions/upload-artifact@v6
+        with:
+          name: ${{ env.RELEASE_ARCHIVE }}
+          path: ${{ env.RELEASE_ARCHIVE }}
+          if-no-files-found: error
+          overwrite: false
+
+  publish:
+    needs: qualify
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Download qualified archives
+        shell: bash
+        run: |
+          set -euo pipefail
+          gh run download "${{ github.run_id }}" \
+            --repo "$GITHUB_REPOSITORY" \
+            --dir release-assets \
+            --pattern "${RELEASE_TAG}-*.tar.gz"
+      - name: Verify exact Assay artifact set and publish
+        shell: bash
+        run: |
+          set -euo pipefail
+          assets=()
+          for platform in linux-x86_64 darwin-arm64; do
+            name="${RELEASE_TAG}-${platform}.tar.gz"
+            asset="release-assets/$name/$name"
+            test -f "$asset"
+            test "$(tar -tzf "$asset")" = assay
+            assets+=("$asset")
+          done
+          count="$(find release-assets -type f | wc -l | tr -d '[:space:]')"
+          test "$count" -eq 2
+          if gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release upload "$RELEASE_TAG" "${assets[@]}" --repo "$GITHUB_REPOSITORY" --clobber
+          else
+            gh release create "$RELEASE_TAG" "${assets[@]}" \
+              --repo "$GITHUB_REPOSITORY" --verify-tag --title "$RELEASE_TAG"
+          fi
