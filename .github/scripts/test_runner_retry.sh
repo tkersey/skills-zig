@@ -109,6 +109,12 @@ unacquired_job 16 | jq -c '.jobs += [{"id":17,"conclusion":"failure","steps":[{}
 not_acquired_annotation 16
 expect_not "a mix of unacquired and real failures is not retryable" "$script" unacquired o/r 106
 
+unacquired_job 18 >"$FAKE_DIR/jobs-107-1.json"
+jq -n '[{"message":"The job was not acquired by Runner of type hosted even after multiple attempts"}]
+  + [range(20000) | {"message":"Due to capacity constraints, jobs targeting macOS arm64 runners may experience longer queue times."}]' \
+  >"$FAKE_DIR/annotations-18.json"
+expect "a match followed by long annotation output is still retryable" "$script" unacquired o/r 107
+
 reset_state supervise-success
 echo success >"$FAKE_DIR/conclusion-200-1"
 expect "a successful run needs no retry" "$script" supervise o/r 200 4 60

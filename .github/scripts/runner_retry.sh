@@ -16,7 +16,7 @@ EOF
 }
 
 only_unacquired_failures() {
-  local repo=$1 run=$2 jobs id conclusion steps runner count=0
+  local repo=$1 run=$2 jobs id conclusion steps runner messages count=0
   jobs=$("$GH" api "repos/$repo/actions/runs/$run/jobs?per_page=100" --jq \
     '.jobs[] | select(.conclusion != null and .conclusion != "success" and .conclusion != "skipped")
       | "\(.id)\t\(.conclusion)\t\(.steps | length)\t\(.runner_name // "")"')
@@ -24,8 +24,8 @@ only_unacquired_failures() {
   while IFS=$'\t' read -r id conclusion steps runner; do
     count=$((count + 1))
     [[ "$conclusion" == cancelled && "$steps" == 0 && -z "$runner" ]] || return 1
-    "$GH" api "repos/$repo/check-runs/$id/annotations" --jq '.[].message' |
-      grep -Fq "$not_acquired_marker" || return 1
+    messages=$("$GH" api "repos/$repo/check-runs/$id/annotations" --jq '.[].message') || return 1
+    grep -Fq "$not_acquired_marker" <<<"$messages" || return 1
   done <<<"$jobs"
   [[ $count -gt 0 ]]
 }
