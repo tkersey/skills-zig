@@ -1,0 +1,28 @@
+name: Retry unacquired runners
+
+on:
+  schedule:
+    - cron: "7,27,47 * * * *"
+  workflow_dispatch:
+
+permissions:
+  actions: write
+  contents: read
+
+concurrency:
+  group: retry-unacquired-runners
+  cancel-in-progress: false
+
+jobs:
+  sweep:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v5
+      - name: Re-run current jobs that no hosted runner acquired
+        run: |
+          set -euo pipefail
+          since="$(date -u -d '6 hours ago' +%Y-%m-%dT%H:%M:%SZ)"
+          .github/scripts/runner_retry.sh sweep "$GITHUB_REPOSITORY" "$since" 4

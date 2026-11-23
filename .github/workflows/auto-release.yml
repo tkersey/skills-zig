@@ -90,8 +90,10 @@ jobs:
       (needs.contract.result == 'success' || needs.contract.result == 'skipped') &&
       needs.detect.outputs.version_changed_json != '[]'
     runs-on: ubuntu-latest
+    timeout-minutes: 240
     strategy:
       fail-fast: false
+      max-parallel: 1
       matrix:
         app: ${{ fromJson(needs.detect.outputs.version_changed_json) }}
     env:
@@ -135,10 +137,12 @@ jobs:
             git tag "$tag" "${GITHUB_SHA}"
             git push origin "refs/tags/$tag"
           fi
-      - name: Dispatch release workflow
+      - id: dispatch
+        name: Dispatch release workflow
         if: steps.release.outputs.dispatch == 'true'
         run: |
           set -euo pipefail
+          echo "since=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_OUTPUT"
           if [ "${{ matrix.app }}" = "seq" ]; then
             echo "Seq tag creation is deferred until qualification succeeds."
             workflow_args=(
@@ -154,4 +158,12 @@ jobs:
               -f "tag_name=${{ steps.release.outputs.tag }}"
             )
           fi
-          gh workflow run "release-${{ matrix.app }}.yml" "${workflow_args[@]}"
+          gh workflow run "release-${{ matrix.app }}.yml" "${workflow_args[@]}" | tee "$RUNNER_TEMP/dispatch.out"
+      - name: Wait for the release, re-running jobs no hosted runner acquired
+        if: steps.release.outputs.dispatch == 'true'
+        run: |
+          set -euo pipefail
+          run_id="$(.github/scripts/runner_retry.sh resolve "$GITHUB_REPOSITORY" \
+            "release-${{ matrix.app }}.yml" "${{ steps.dispatch.outputs.since }}" "$RUNNER_TEMP/dispatch.out")"
+          echo "Supervising release-${{ matrix.app }}.yml run $run_id"
+          .github/scripts/runner_retry.sh supervise "$GITHUB_REPOSITORY" "$run_id" 4 120

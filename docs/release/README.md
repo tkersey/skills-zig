@@ -99,6 +99,31 @@ archive contains only `assay`, and qualification verifies its version, help, and
 root-build change, so all five existing CLIs received VERSION bumps with it.
 The Homebrew formula is a separate manual tap handoff after the first release.
 
+## Hosted macOS runner capacity
+
+GitHub-hosted macOS arm64 runners can be capacity-constrained. A job that no runner
+acquires is cancelled after about 15 minutes with zero steps, the annotation "The
+job was not acquired by Runner of type hosted even after multiple attempts", and a
+"capacity constraints" notice. On 2026-11-23 this hit both `macos-15` and
+`macos-latest` (macOS 26), so changing the label does not avoid it.
+
+Two mechanisms absorb it without masking real failures:
+
+- Auto Release dispatches version-bumped releases one at a time
+  (`max-parallel: 1`). Each dispatch step then supervises its own run with
+  `.github/scripts/runner_retry.sh supervise`. Releases no longer start a burst of
+  macOS jobs at once.
+- `.github/workflows/retry-unacquired-runners.yml` sweeps completed runs from the
+  last six hours every 20 minutes. It skips runs whose branch or tag has moved
+  since they ran.
+
+Both re-run a run's failed jobs (`gh run rerun --failed`) only when every
+failed job is a zero-step cancellation that never had a runner and carries the
+not-acquired annotation. Retries are capped at four attempts per run and back
+off between attempts. Any real test, build, or timeout failure is reported
+unchanged and never retried. `.github/scripts/test_runner_retry.sh` covers these
+rules in PR CI.
+
 ## Homebrew Tap Handoff
 
 Homebrew formula updates are intentionally handled in a separate tap repository.
