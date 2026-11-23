@@ -300,7 +300,8 @@ pub fn commandError(w: *Writer, d: *const diag.Diagnostic) Error!void {
 }
 
 pub fn commandErrorText(w: *Writer, d: *const diag.Diagnostic) Error!void {
-    try w.print("assay: error {s}: {s}", .{ @tagName(d.code), d.message() });
+    try w.print("assay: error {s}: ", .{@tagName(d.code)});
+    try quoted(w, d.message());
     if (d.location()) |location| {
         try w.writeAll(" at ");
         try quoted(w, location);

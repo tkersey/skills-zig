@@ -139,12 +139,10 @@ pub const Diagnostic = struct {
         var inner: [limits.error_message_bytes_max]u8 = undefined;
         const inner_message = inner[0..self.message_len];
         @memcpy(inner_message, self.message());
-        var inner_where: [location_bytes_max]u8 = undefined;
-        const where = self.location() orelse "";
-        const inner_location = inner_where[0..where.len];
-        @memcpy(inner_location, where);
+        var inner_where: [nested_location_bytes_max]u8 = undefined;
+        const inner_location = quoteLocation(&inner_where, self.location());
         const inner_code = self.code;
-        return self.fail(code, loc, "{s}: " ++ summary ++ " ({s} at \"{s}\": {s})", .{
+        return self.fail(code, loc, "{s}: " ++ summary ++ " ({s} at {s}: {s})", .{
             role,
             @tagName(inner_code),
             inner_location,
@@ -152,6 +150,31 @@ pub const Diagnostic = struct {
         });
     }
 };
+
+const nested_location_bytes_max = 1024;
+
+fn quoteLocation(buffer: *[nested_location_bytes_max]u8, location: ?[]const u8) []const u8 {
+    const full = location orelse return "none";
+    var prefix = full;
+    var attempts: usize = 0;
+    while (attempts <= segments_max) : (attempts += 1) {
+        var writer = std.Io.Writer.fixed(buffer);
+        const options: std.json.Stringify.Options = .{ .escape_unicode = true };
+        const fits = if (std.json.Stringify.encodeJsonString(prefix, options, &writer)) |_|
+            writer.unusedCapacityLen() >= " (abbreviated)".len
+        else |_|
+            false;
+        if (fits) {
+            if (prefix.len < full.len) {
+                writer.writeAll(" (abbreviated)") catch return writer.buffered();
+            }
+            return writer.buffered();
+        }
+        const cut = std.mem.lastIndexOfScalar(u8, prefix, '/') orelse break;
+        prefix = prefix[0..cut];
+    }
+    return "\"\" (abbreviated)";
+}
 
 fn utf8Prefix(bytes: []const u8) usize {
     var len = bytes.len;
@@ -179,6 +202,24 @@ test "locations escape pointer tokens and omit oversized keys" {
     try std.testing.expect(diagnostic.location() == null);
     diagnostic.set(.invalid_document, &Loc.root, "root", .{});
     try std.testing.expectEqualStrings("", diagnostic.location().?);
+}
+
+test "nested locations are escaped, bounded at segments, and explicit when absent" {
+    var buffer: [nested_location_bytes_max]u8 = undefined;
+    try std.testing.expectEqualStrings("none", quoteLocation(&buffer, null));
+    try std.testing.expectEqualStrings(
+        "\"/a/\\u001b]0;x\\u0007\\u202e\"",
+        quoteLocation(&buffer, "/a/\x1b]0;x\x07\u{202e}"),
+    );
+    var long: [64 * 33]u8 = undefined;
+    for (0..64) |index| {
+        long[index * 33] = '/';
+        @memset(long[index * 33 + 1 ..][0..32], 'k');
+    }
+    const quoted = quoteLocation(&buffer, &long);
+    try std.testing.expect(quoted.len <= nested_location_bytes_max);
+    try std.testing.expect(std.mem.endsWith(u8, quoted, "\" (abbreviated)"));
+    try std.testing.expectEqual(@as(usize, 0), (quoted.len - 2 - " (abbreviated)".len) % 33);
 }
 
 test "messages are bounded at a UTF-8 boundary" {

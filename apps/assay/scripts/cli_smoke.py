@@ -233,6 +233,19 @@ def test_explain_and_compare(receipts):
     inner = command_error(["explain", "--assessment", str(broken)], "receipt_mismatch")
     assert inner["location"] == "/inputs", inner
     assert 'invalid_document at "/obligations/0/basis"' in inner["message"], inner
+    hostile = json.loads(original)
+    hostile["inputs"]["contract_utf8"] = hostile["inputs"]["contract_utf8"].replace(
+        '"basis": "empirical"', '"basis": "empirical", "\\u001b]0;pwned\\u0007\\u202e": 1', 1)
+    hostile_path = receipts["refuted"].with_name("hostile.json")
+    hostile_path.write_text(json.dumps(hostile))
+    for format_args, stream in (([], "stdout"), (["--format", "text"], "stderr")):
+        result = execute(["explain", "--assessment", str(hostile_path), *format_args], 2)
+        output = getattr(result, stream)
+        assert b"receipt_mismatch" in output, output
+        if stream == "stderr":
+            for raw in (b"\x1b", b"\x07", "\u202e".encode()):
+                assert raw not in output, output
+            assert b"\\u001b" in output, output
     baseline_error = command_error(
         ["compare", "--baseline", str(tampered), "--candidate", str(receipts["refuted"])],
         "receipt_mismatch")

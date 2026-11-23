@@ -48,13 +48,15 @@ In JSON mode an error is one `assay-command-error/v1` object on stdout with a
 stable `code`, a bounded `message`, and a JSON Pointer `location` (or null). In
 text mode the same code and message go to stderr and stdout stays empty. If the
 error itself cannot be written to stdout, an `io_error` notice goes to stderr.
-Text output quotes all document text as JSON strings with non-ASCII escaped, so
-control and bidirectional-override characters stay inert in a terminal.
+Text output, including text-mode error messages and locations, quotes all
+document-derived text as JSON strings with non-ASCII escaped, so control and
+bidirectional-override characters stay inert in a terminal.
 Messages name the document and never echo input bodies or environment values.
 A location stops at the nearest enclosing value when a key on its path exceeds
 128 bytes, so oversized keys are never echoed; otherwise it is reported whole. When
 a receipt's embedded documents are invalid, the error is `receipt_mismatch` at
-`/inputs`, and its message names the inner code and location.
+`/inputs`, and its message names the inner code and the JSON-escaped inner
+location (abbreviated at a segment boundary beyond 1 KiB, or `none`).
 
 ## Documents
 
@@ -158,8 +160,9 @@ substituted FIFO or device cannot block it. It decides file kind and size from
 that open descriptor (a regular file of the manifest size), streams SHA-256
 through a 64 KiB buffer until end of file whatever the read sizes, and rejects
 changes in size or timestamps of the opened file during the read. After hashing it
-re-reads the path without following links and requires the same inode, so a path
-replaced during the read is rejected. Any failure is exit 2; a
+walks the whole path again from the root without following links and requires
+the file it names to have the opened file's inode, size, and timestamps, so a
+replaced file or ancestor directory is rejected. Any failure is exit 2; a
 requested verification is never downgraded. Success proves which bytes Assay read
 during this invocation, not that they were executed or that the manifest omits
 nothing.

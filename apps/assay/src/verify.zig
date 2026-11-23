@@ -59,6 +59,45 @@ fn openRoot(io: Io, d: *Diagnostic, root_path: []const u8) diag.Error!Io.Dir {
     return current;
 }
 
+const Walk = struct {
+    parent: ?Io.Dir,
+    name: []const u8,
+
+    fn dir(self: Walk, root: Io.Dir) Io.Dir {
+        return self.parent orelse root;
+    }
+
+    fn close(self: Walk, io: Io) void {
+        if (self.parent) |parent| parent.close(io);
+    }
+};
+
+fn walkParent(
+    io: Io,
+    d: *Diagnostic,
+    root: Io.Dir,
+    path: []const u8,
+    loc: *const Loc,
+) diag.Error!Walk {
+    std.debug.assert(documents.isRelativePath(path));
+    const split = std.mem.lastIndexOfScalar(u8, path, '/');
+    var walk: Walk = .{
+        .parent = null,
+        .name = if (split) |position| path[position + 1 ..] else path,
+    };
+    errdefer walk.close(io);
+    const position = split orelse return walk;
+    var components = std.mem.splitScalar(u8, path[0..position], '/');
+    while (components.next()) |component| {
+        const next = walk.dir(root).openDir(io, component, .{
+            .follow_symlinks = false,
+        }) catch |err| return mapError(d, loc, "subject artifact directory", err);
+        walk.close(io);
+        walk.parent = next;
+    }
+    return walk;
+}
+
 fn verifyArtifact(
     io: Io,
     d: *Diagnostic,
@@ -67,37 +106,34 @@ fn verifyArtifact(
     loc: *const Loc,
     buffer: *[limits.hash_buffer_bytes]u8,
 ) diag.Error!u64 {
-    std.debug.assert(documents.isRelativePath(artifact.path));
-    const split = std.mem.lastIndexOfScalar(u8, artifact.path, '/');
-    const name = if (split) |position| artifact.path[position + 1 ..] else artifact.path;
-    var parent: ?Io.Dir = null;
-    defer if (parent) |dir| dir.close(io);
-    if (split) |position| {
-        var components = std.mem.splitScalar(u8, artifact.path[0..position], '/');
-        while (components.next()) |component| {
-            const base = parent orelse root;
-            const next = base.openDir(io, component, .{ .follow_symlinks = false }) catch |err| {
-                return mapError(d, loc, "subject artifact directory", err);
-            };
-            if (parent) |previous| previous.close(io);
-            parent = next;
-        }
-    }
-    const dir = parent orelse root;
-    const file = openArtifact(dir, name) catch |err| {
+    const walk = try walkParent(io, d, root, artifact.path, loc);
+    defer walk.close(io);
+    const file = openArtifact(walk.dir(root), walk.name) catch |err| {
         return mapError(d, loc, "subject artifact", err);
     };
     defer file.close(io);
     const bytes = try hashFile(io, d, file, artifact, loc, buffer);
     const opened = file.stat(io) catch |err| return mapError(d, loc, "subject artifact", err);
-    const named = dir.statFile(io, name, .{ .follow_symlinks = false }) catch |err| {
-        return mapError(d, loc, "subject artifact", err);
-    };
-    if (named.kind != .file or named.inode != opened.inode) {
+    const named = try restatPath(io, d, root, artifact.path, loc);
+    if (named.kind != .file or changed(opened, named)) {
         const message = "subject: artifact path was replaced during verification";
         return d.fail(.identity_mismatch, loc, message, .{});
     }
     return bytes;
+}
+
+fn restatPath(
+    io: Io,
+    d: *Diagnostic,
+    root: Io.Dir,
+    path: []const u8,
+    loc: *const Loc,
+) diag.Error!Io.File.Stat {
+    const walk = try walkParent(io, d, root, path, loc);
+    defer walk.close(io);
+    return walk.dir(root).statFile(io, walk.name, .{ .follow_symlinks = false }) catch |err| {
+        return mapError(d, loc, "subject artifact", err);
+    };
 }
 
 fn openArtifact(dir: Io.Dir, name: []const u8) std.posix.OpenError!Io.File {
@@ -360,6 +396,7 @@ const SwapDuringRead = struct {
     var delegate: *const @TypeOf(std.testing.io.vtable.fileReadPositional) = undefined;
     var dir: Io.Dir = undefined;
     var swapped = false;
+    var renames: []const [2][]const u8 = &.{};
 
     fn read(
         userdata: ?*anyopaque,
@@ -369,23 +406,37 @@ const SwapDuringRead = struct {
     ) Io.File.ReadPositionalError!usize {
         if (!swapped) {
             swapped = true;
-            dir.rename("other", dir, "target", testing.io) catch |err| {
-                std.debug.panic("swap rename failed: {s}", .{@errorName(err)});
-            };
+            for (renames) |rename| {
+                dir.rename(rename[0], dir, rename[1], testing.io) catch |err| {
+                    std.debug.panic("swap rename failed: {s}", .{@errorName(err)});
+                };
+            }
         }
         return delegate.*(userdata, file, buffers, offset);
     }
 };
 
-test "a path replaced while its bytes are hashed is rejected" {
+fn expectSwapRejected(
+    path: []const u8,
+    setup: []const [2][]const u8,
+    renames: []const [2][]const u8,
+) !void {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
-    try tmp.dir.writeFile(testing.io, .{ .sub_path = "target", .data = "payload" });
-    try tmp.dir.writeFile(testing.io, .{ .sub_path = "other", .data = "imposter" });
+    for (setup) |entry| {
+        if (std.fs.path.dirname(entry[0])) |parent| {
+            tmp.dir.createDirPath(testing.io, parent) catch |err| switch (err) {
+                error.PathAlreadyExists => {},
+                else => return err,
+            };
+        }
+        try tmp.dir.writeFile(testing.io, .{ .sub_path = entry[0], .data = entry[1] });
+    }
     var vtable = testing.io.vtable.*;
     SwapDuringRead.delegate = &testing.io.vtable.fileReadPositional;
     SwapDuringRead.dir = tmp.dir;
     SwapDuringRead.swapped = false;
+    SwapDuringRead.renames = renames;
     vtable.fileReadPositional = SwapDuringRead.read;
     const io: Io = .{ .userdata = testing.io.userdata, .vtable = &vtable };
     var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
@@ -394,7 +445,7 @@ test "a path replaced while its bytes are hashed is rejected" {
     var storage = [1]documents.Artifact{.{
         .id = "a",
         .role = .context,
-        .path = "target",
+        .path = path,
         .sha256 = &hex,
         .size_bytes = 7,
     }};
@@ -410,6 +461,19 @@ test "a path replaced while its bytes are hashed is rejected" {
     try testing.expectError(error.Rejected, verify(io, &d, root, subject, &buffer));
     try testing.expectEqual(diag.Code.identity_mismatch, d.code);
     try testing.expect(SwapDuringRead.swapped);
+}
+
+test "a path or ancestor replaced while its bytes are hashed is rejected" {
+    try expectSwapRejected(
+        "target",
+        &.{ .{ "target", "payload" }, .{ "other", "imposter" } },
+        &.{.{ "other", "target" }},
+    );
+    try expectSwapRejected(
+        "task/codec",
+        &.{ .{ "task/codec", "payload" }, .{ "fresh/codec", "imposter" } },
+        &.{ .{ "task", "stale" }, .{ "fresh", "task" } },
+    );
 }
 
 test "visible metadata changes are detected" {
