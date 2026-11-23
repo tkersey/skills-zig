@@ -181,22 +181,37 @@ fn explanationItem(s: *Stringify, loaded: *const assess.Loaded, item: assess.Der
     try s.objectField("observation");
     try observation(s, if (record) |value| value.observation else null);
     try field(s, "reason_code", item.reason_code);
+    try field(s, "run_id", if (run) |value| value.id else null);
     try field(s, "run_outcome", if (run) |value| value.outcome else null);
     try field(s, "completion_gate", item.completion_gate);
     try field(s, "record_reason", if (record) |value| value.reason else null);
-    try field(s, "run_reason", if (run) |value| value.reason else null);
     try s.endObject();
+}
+
+fn explanationRuns(s: *Stringify, loaded: *const assess.Loaded) Error!void {
+    try s.beginArray();
+    for (loaded.evidence.runs) |run| {
+        try s.beginObject();
+        try field(s, "id", run.id);
+        try field(s, "evaluator_id", run.evaluator_id);
+        try field(s, "outcome", run.outcome);
+        try field(s, "reason", run.reason);
+        try s.endObject();
+    }
+    try s.endArray();
 }
 
 pub fn explanation(w: *Writer, verified: *const receipt.Verified) Error!void {
     var s: Stringify = .{ .writer = w };
     const loaded = &verified.loaded;
     try s.beginObject();
-    try field(&s, "schema", "assay-explanation/v1");
+    try field(&s, "schema", "assay-explanation/v2");
     try field(&s, "assessment_id", &loaded.assessment_id);
     try field(&s, "receipt_consistency", "verified");
     try s.objectField("derivation");
     try derivation(&s, loaded, verified.derivation);
+    try s.objectField("runs");
+    try explanationRuns(&s, loaded);
     try s.objectField("explanations");
     try s.beginArray();
     for (verified.derivation.items) |item| try explanationItem(&s, loaded, item);
@@ -248,7 +263,7 @@ const input_schemas = [_][]const u8{
 };
 const output_schemas = [_][]const u8{
     "assay-capabilities/v1", "assay-assessment/v1",    "assay-comparison/v1",
-    "assay-explanation/v1",  "assay-command-error/v1",
+    "assay-explanation/v2",  "assay-command-error/v1",
 };
 
 pub fn capabilities(w: *Writer, producer: Producer) Error!void {

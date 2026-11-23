@@ -74,6 +74,13 @@ def test_help_version_capabilities():
     assert capabilities["kernel"] == "assay-kernel/v1"
     assert capabilities["commands"] == list(COMMANDS)
     assert capabilities["check_kinds"] == ["scalar_equal", "domain_judgment"]
+    assert capabilities["input_schemas"] == [
+        "assay-contract/v1", "assay-subject/v1", "assay-evidence/v1", "assay-assessment/v1",
+    ]
+    assert capabilities["output_schemas"] == [
+        "assay-capabilities/v1", "assay-assessment/v1", "assay-comparison/v1",
+        "assay-explanation/v2", "assay-command-error/v1",
+    ]
     assert capabilities["exit_codes"] == {
         "supported": 0, "refuted": 1, "command_error": 2, "unresolved": 3,
         "processing_complete": 0,
@@ -204,7 +211,20 @@ def test_explain_and_compare(receipts):
     item = explanation["explanations"][0]
     assert item["check"] == {"kind": "scalar_equal", "expected": None}
     assert item["observation"] == {"kind": "scalar", "value": 7}
-    assert item["run_reason"] == "Runner was interrupted after recording this case."
+    assert list(explanation) == [
+        "schema", "assessment_id", "receipt_consistency", "derivation", "runs", "explanations",
+        "subject_bytes", "recorded_verification", "authority_granted", "storage_mutated",
+    ]
+    assert explanation["schema"] == "assay-explanation/v2"
+    assert list(item) == [
+        "obligation_id", "statement", "scope", "check", "observation", "reason_code", "run_id",
+        "run_outcome", "completion_gate", "record_reason",
+    ]
+    assert item["run_id"] == "codec-run-1" and item["run_outcome"] == "interrupted"
+    assert explanation["runs"] == [{
+        "id": "codec-run-1", "evaluator_id": "codec-observer/v1", "outcome": "interrupted",
+        "reason": "Runner was interrupted after recording this case.",
+    }]
     assert explanation["receipt_consistency"] == "verified"
     assert_no_authority(explanation)
     text = execute(["explain", "--assessment", str(receipts["refuted"]), "--format", "text"], 0)
@@ -345,8 +365,12 @@ def test_receipt_and_output_bounds(workspace):
     documents.evidence = documents.write("evidence.json", evidence)
     receipt = execute(documents.arguments(), 3).stdout
     path = documents.write_raw("receipt.json", receipt.decode())
-    error = command_error(["explain", "--assessment", str(path)], "resource_limit")
-    assert "output exceeds" in error["message"], error
+    explained_json = execute(["explain", "--assessment", str(path)], 0).stdout
+    assert len(explained_json) < 16 * 1024 * 1024, len(explained_json)
+    assert explained_json.count(reason.encode()) == 1
+    explanation = json.loads(explained_json)
+    assert [run["id"] for run in explanation["runs"]] == ["run"]
+    assert {item["run_id"] for item in explanation["explanations"]} == {"run"}
     text = execute(documents.arguments("--format", "text"), 3).stdout
     assert text.count(reason.encode()) == 1 and b"runs:\n- run (interrupted)" in text
     explained = execute(["explain", "--assessment", str(path), "--format", "text"], 0).stdout

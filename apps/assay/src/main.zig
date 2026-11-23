@@ -61,16 +61,21 @@ fn run(io: std.Io, gpa: std.mem.Allocator, argv: []const []const u8) u8 {
         }
         return emitError(io, &d, format);
     };
-    if (output.written().len > limits.receipt_bytes_max) {
-        d.set(.resource_limit, null, "output exceeds {d} bytes", .{limits.receipt_bytes_max});
-        return emitError(io, &d, format);
-    }
-    std.Io.File.stdout().writeStreamingAll(io, output.written()) catch {
+    const admitted = admitOutput(&d, output.written()) catch return emitError(io, &d, format);
+    std.Io.File.stdout().writeStreamingAll(io, admitted) catch {
         const message = "assay: io_error: stdout write failed\n";
         std.Io.File.stderr().writeStreamingAll(io, message) catch return 2;
         return 2;
     };
     return status;
+}
+
+fn admitOutput(d: *Diagnostic, bytes: []const u8) error{Rejected}![]const u8 {
+    if (bytes.len > limits.receipt_bytes_max) {
+        const bound = limits.receipt_bytes_max;
+        return d.fail(.resource_limit, null, "output exceeds {d} bytes", .{bound});
+    }
+    return bytes;
 }
 
 fn emitError(io: std.Io, d: *const Diagnostic, format: cli.Format) u8 {
@@ -210,6 +215,19 @@ fn explainCommand(
         .text => try render.explanationText(w, &verified),
     }
     return 0;
+}
+
+test "output beyond the receipt bound is a clean resource error" {
+    const allocator = std.testing.allocator;
+    const at_limit = try allocator.alloc(u8, limits.receipt_bytes_max);
+    defer allocator.free(at_limit);
+    var d: Diagnostic = .{};
+    try std.testing.expectEqual(at_limit.len, (try admitOutput(&d, at_limit)).len);
+    const above = try allocator.alloc(u8, limits.receipt_bytes_max + 1);
+    defer allocator.free(above);
+    try std.testing.expectError(error.Rejected, admitOutput(&d, above));
+    try std.testing.expectEqual(assay.diag.Code.resource_limit, d.code);
+    try std.testing.expectEqualStrings("output exceeds 67108864 bytes", d.message());
 }
 
 test "help names every command and the authority boundary" {

@@ -13,7 +13,9 @@ repair, or close out work. Every result carries `authority_granted: false` and
 
 The implemented contract is the Assay CLI v1 specification
 ([gist](https://gist.github.com/tkersey/ce1d7d3c15b3b27d467c2e3a20bb4407),
-revision `631d061bfb6a0dc260548c4c386be1848c85675c`).
+revision `631d061bfb6a0dc260548c4c386be1848c85675c`), with one owner-approved
+revision: `explain` emits `assay-explanation/v2`, described under
+[Receipts, explain, and compare](#receipts-explain-and-compare).
 
 ## Commands
 
@@ -136,7 +138,26 @@ validation and derivation rule, and compare each stored derivation field with
 the recomputed one; object key order and equivalent number spellings in the
 envelope do not matter. A mismatch is `receipt_mismatch`. Recorded verification
 is returned only as an `unauthenticated_receipt_claim`; `explain` reports
-`subject_bytes: "not_reverified"`. Receipts are integrity-checked, not
+`subject_bytes: "not_reverified"`.
+
+`explain` emits `assay-explanation/v2`:
+
+- **Top-level fields:** `schema`, `assessment_id`, `receipt_consistency`,
+  `derivation`, `runs`, `explanations`, `subject_bytes`, `recorded_verification`,
+  `authority_granted`, and `storage_mutated`.
+- **`runs`:** lists each evidence run once, with `id`, `evaluator_id`, `outcome`,
+  and `reason`.
+- **Each explanation item:** has `obligation_id`, `statement`, `scope`, `check`,
+  `observation`, `reason_code`, `run_id`, `run_outcome`, `completion_gate`, and
+  `record_reason`. It references its run by `run_id` and does not repeat the run's
+  reason.
+
+This revises the specification's per-item `run_reason` field (the v1 shape) by
+owner decision on 2026-11-23. With it, explanation output stays proportional to
+the receipt, rather than repeating a run's reason for every obligation recorded
+against it.
+
+Receipts are integrity-checked, not
 authenticated: a consistently rewritten receipt has a different identity, and
 telling it from the intended one needs an external trusted digest.
 
@@ -176,10 +197,8 @@ runs, records, subject artifacts, and evidence artifacts, 256 evaluators, 16 KiB
 per text field or scalar string, 1,024-byte number tokens, 4,096-byte paths and
 locators, 4 GiB per verified artifact, 16 GiB in total, 4 KiB error messages, and
 a 512 MiB allocation budget enforced by a bounded allocator. Number tokens must
-also fit the exact-number exponent range; larger ones are `resource_limit`. JSON
-`explain` output repeats each obligation's run reason, as its schema requires, so
-a maximal receipt can produce an explanation above 64 MiB; that is a clean
-`resource_limit` error. Text output lists each run's reason once.
+also fit the exact-number exponent range; larger ones are `resource_limit`. Both
+JSON and text output list each run's reason once.
 
 ## Tests
 

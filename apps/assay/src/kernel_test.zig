@@ -719,6 +719,14 @@ test "recorded verification is retained only as an unauthenticated claim" {
     var output: std.Io.Writer.Allocating = .init(arena);
     try render.explanation(&output.writer, &checked);
     const explanation = try json.parse(arena, output.written(), &d, "explanation");
+    const schema = explanation.object.get("schema").?.string;
+    try testing.expectEqualStrings("assay-explanation/v2", schema);
+    const runs = explanation.object.get("runs").?.array.items;
+    try testing.expectEqual(@as(usize, 1), runs.len);
+    try testing.expectEqualStrings("r1", runs[0].object.get("id").?.string);
+    const first = explanation.object.get("explanations").?.array.items[0].object;
+    try testing.expectEqualStrings("r1", first.get("run_id").?.string);
+    try testing.expect(first.get("run_reason") == null);
     const subject_bytes = explanation.object.get("subject_bytes").?.string;
     try testing.expectEqualStrings("not_reverified", subject_bytes);
     const recorded = explanation.object.get("recorded_verification").?.object;
