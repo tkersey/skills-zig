@@ -1386,7 +1386,7 @@ preparation_noncanonical="$preparation_dir/flat-archive/legacy-archive/worktree-
 cp -R "$preparation_flat_archive" "$preparation_noncanonical"
 "$json_cli" '.worktrees += [.worktrees[0] | .directory = "worktree-1_0"]' \
   "$preparation_dir/flat-manifest-before.json" >"$preparation_flat_manifest"
-preparation_expect_failure InvalidPreparationArchive "$preparation_dir/flat-noncanonical.json" \
+preparation_expect_failure InvalidArchiveWorktreeIndex "$preparation_dir/flat-noncanonical.json" \
   prepare --definition "$event_definition" --store-root "$preparation_empty" \
   --store-id preparation-smoke --source-archive "$preparation_noncanonical" --apply --format json
 rm -r "$preparation_noncanonical"
@@ -1409,6 +1409,22 @@ cp -R "$preparation_dir/legacy-archive/fixture" "$preparation_named_generation"
   --format json >"$preparation_dir/named-generation.json"
 "$json_cli" -e '.outcome == "ready" and .records == 2' "$preparation_dir/named-generation.json" >/dev/null
 rm -r "$preparation_named_generation"
+preparation_named_store="$preparation_dir/named-store/legacy-archive/legacy-archive"
+mkdir -p "$preparation_named_store"
+cp -R "$preparation_flat_archive" "$preparation_named_store/worktree-0"
+cp "$preparation_dir/flat-manifest-before.json" "$preparation_named_store/manifest.json"
+"$binary" prepare --definition "$event_definition" --store-root "$preparation_empty" \
+  --store-id preparation-smoke --source-archive "$preparation_named_store/worktree-0" \
+  --format json >"$preparation_dir/named-store.json"
+"$json_cli" -e '.outcome == "ready" and .records == 2' "$preparation_dir/named-store.json" >/dev/null
+mkdir -p "$preparation_dir/flat-archive/legacy-archive/worktree-9"
+printf '%s\n' '{"schema":"ledger-legacy-archive/v1"}' >"$preparation_flat_manifest"
+preparation_expect_failure InvalidArchiveManifest "$preparation_dir/flat-empty-tree.json" \
+  prepare --definition "$event_definition" --store-root "$preparation_empty" \
+  --store-id preparation-smoke --source-archive "$preparation_dir/flat-archive/legacy-archive/worktree-9" \
+  --format json
+rmdir "$preparation_dir/flat-archive/legacy-archive/worktree-9"
+cp "$preparation_dir/flat-manifest-before.json" "$preparation_flat_manifest"
 test ! -e "$preparation_empty/.ledger/example/events.jsonl"
 
 # An explicit candidate can restore only the exact surviving native binding.

@@ -1235,6 +1235,10 @@ test "host archive discovery rejects unlisted and malformed flat inventory" {
                 "\"entries\":{\".ledger/other\":42}}]}",
             .expected = error.InvalidArchiveEntry,
         },
+        .{
+            .manifest = prefix ++ tree ++ "],\"sources\":{}}",
+            .expected = error.InvalidArchiveManifest,
+        },
         .{ .manifest = "[]", .expected = error.InvalidArchiveManifest },
     };
     for (invalid) |case| {

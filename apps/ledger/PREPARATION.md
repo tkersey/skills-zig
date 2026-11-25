@@ -163,9 +163,10 @@ an `entries` object of at most 100,000 entries whose values are objects or
 `null`, which reads as absent. Discovery also reads every other published
 directory in `legacy-archive/` as a generation (unpublished `.archiving-*`
 stages are skipped), so a directory beside a flat manifest that the manifest
-does not list must hold a valid generation manifest. An explicit
-`--source-archive` tree is a generation tree when its grandparent is
-`legacy-archive` and a flat tree when only its parent is. Within an
+does not list must hold a valid generation manifest. A manifest's layout is
+fixed by its inventory key (`sources` or `worktrees`, never both), so an explicit
+`--source-archive` tree reads the manifest beside it and must sit directly under
+`legacy-archive` (flat) or one generation directory below it. Within an
 admissible manifest, both layouts select a tree only when its entries contain
 the owner's slot or binding, and both verify each imported file's kind and
 SHA-256 digest; generation entries must also attest the size, which flat entries
