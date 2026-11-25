@@ -160,9 +160,12 @@ error, whichever owner is being prepared. An admissible manifest is an object
 with schema `ledger-legacy-archive/v1` and its layout's inventory, holding at
 most 128 trees; each tree has a decimal-digit index, no duplicate directory, and
 an `entries` object of at most 100,000 entries whose values are objects or
-`null`, which reads as absent. Discovery also reads every other directory in
-`legacy-archive/` as a generation, so a directory beside a flat manifest that
-the manifest does not list must hold a valid generation manifest. Within an
+`null`, which reads as absent. Discovery also reads every other published
+directory in `legacy-archive/` as a generation (unpublished `.archiving-*`
+stages are skipped), so a directory beside a flat manifest that the manifest
+does not list must hold a valid generation manifest. An explicit
+`--source-archive` tree is a generation tree when its grandparent is
+`legacy-archive` and a flat tree when only its parent is. Within an
 admissible manifest, both layouts select a tree only when its entries contain
 the owner's slot or binding, and both verify each imported file's kind and
 SHA-256 digest; generation entries must also attest the size, which flat entries

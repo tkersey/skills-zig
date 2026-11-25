@@ -460,7 +460,7 @@ fn selectArchiveTrees(
 ) ![]const preparation.ArchiveTree {
     const inventory = try preparation.archiveTrees(allocator, value, layout);
     for (inventory) |tree| {
-        if (!archiveSelects(tree.entries, selected_slot, binding)) continue;
+        if (!archiveSelects(tree, selected_slot, binding)) continue;
         const original = try std.fmt.allocPrint(
             allocator,
             "{s}/worktree-{s}",
@@ -472,13 +472,11 @@ fn selectArchiveTrees(
 }
 
 fn archiveSelects(
-    entries: std.json.ObjectMap,
+    tree: preparation.ArchiveTree,
     selected_slot: []const u8,
     binding: []const u8,
 ) bool {
-    const entry = entries.get(selected_slot) orelse .null;
-    if (entry == .null) return entries.contains(binding);
-    return true;
+    return tree.entry(selected_slot) != null or tree.entry(binding) != null;
 }
 
 fn admitArchiveTree(
@@ -1161,6 +1159,39 @@ test "host archive discovery selects flat inventory trees beside generations" {
     var skipped = try archive.discover(false);
     defer skipped.deinit();
     try std.testing.expectEqual(@as(usize, 0), skipped.sources.len);
+}
+
+test "host archive discovery reads null entries as absent" {
+    const allocator = std.testing.allocator;
+    var archive: TestArchive = undefined;
+    try archive.init();
+    defer archive.deinit();
+    var hash: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(TestArchive.slot, &hash, .{});
+    const binding = try std.fmt.allocPrint(
+        allocator,
+        ".ledger/.bindings/{s}.jsonl",
+        .{std.fmt.bytesToHex(hash, .lower)},
+    );
+    defer allocator.free(binding);
+    const tree = "{{\"schema\":\"ledger-legacy-archive/v1\",\"worktrees\":[" ++
+        "{{\"directory\":\"worktree-0\",\"entries\":{{\".ledger/owner/events.jsonl\":null,";
+    const absent = try std.fmt.allocPrint(allocator, tree ++ "\"{s}\":null}}}}]}}", .{binding});
+    defer allocator.free(absent);
+    try archive.manifest(absent);
+    var unselected = try archive.discover(true);
+    defer unselected.deinit();
+    try std.testing.expectEqual(@as(usize, 2), unselected.sources.len);
+    const present = try std.fmt.allocPrint(
+        allocator,
+        tree ++ "\"{s}\":{{\"kind\":\"file\"}}}}}}]}}",
+        .{binding},
+    );
+    defer allocator.free(present);
+    try archive.manifest(present);
+    var selected = try archive.discover(true);
+    defer selected.deinit();
+    try std.testing.expectEqual(@as(usize, 3), selected.sources.len);
 }
 
 test "host archive discovery rejects unlisted and malformed flat inventory" {

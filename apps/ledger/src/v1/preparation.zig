@@ -845,15 +845,15 @@ pub fn validateArchive(
     const index = archiveIndex(basename[prefix.len..]) catch
         return error.InvalidPreparationArchive;
     const parent = std.fs.path.dirname(source.root) orelse return error.InvalidPreparationArchive;
-    const flat = std.mem.eql(u8, std.fs.path.basename(parent), "legacy-archive");
-    const layout: ArchiveLayout = if (flat) .flat else .generation;
     const archive_parent = std.fs.path.dirname(parent) orelse
         return error.InvalidPreparationArchive;
-    if (layout == .generation and
-        !std.mem.eql(u8, std.fs.path.basename(archive_parent), "legacy-archive"))
-    {
-        return error.InvalidPreparationArchive;
-    }
+    const layout: ArchiveLayout =
+        if (std.mem.eql(u8, std.fs.path.basename(archive_parent), "legacy-archive"))
+            .generation
+        else if (std.mem.eql(u8, std.fs.path.basename(parent), "legacy-archive"))
+            .flat
+        else
+            return error.InvalidPreparationArchive;
     var directory = try storage_root.openRoot(io, parent);
     defer directory.close(io);
     var scope: storage_root.Scope = .{ .fs = .{
@@ -869,15 +869,13 @@ pub fn validateArchive(
     defer parsed.deinit();
     const trees = try archiveTrees(allocator, parsed.value, layout);
     defer allocator.free(trees);
-    const entries = for (trees) |tree| {
-        if (std.mem.eql(u8, tree.index, index)) break tree.entries;
+    const selected = for (trees) |tree| {
+        if (std.mem.eql(u8, tree.index, index)) break tree;
     } else return error.InvalidPreparationArchive;
     for (history.files.items) |file| {
         const path = try allocator.print(".ledger/{s}", .{file.path});
         defer allocator.free(path);
-        const value = entries.get(path) orelse .null;
-        if (value == .null) return error.PreparationArchiveEvidenceMissing;
-        const entry = value.object;
+        const entry = selected.entry(path) orelse return error.PreparationArchiveEvidenceMissing;
         if (!std.mem.eql(u8, try definition_core.json.requiredString(entry, "kind"), "file") or
             !std.mem.eql(
                 u8,
@@ -900,6 +898,14 @@ pub const ArchiveLayout = enum { generation, flat };
 pub const ArchiveTree = struct {
     index: []const u8,
     entries: std.json.ObjectMap,
+
+    pub fn entry(self: ArchiveTree, path: []const u8) ?std.json.ObjectMap {
+        const value = self.entries.get(path) orelse return null;
+        return switch (value) {
+            .object => |object| object,
+            else => null,
+        };
+    }
 };
 
 const archive_trees_max = 128;

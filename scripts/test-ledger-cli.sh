@@ -1402,6 +1402,13 @@ InvalidArchiveWorktreeIndex|.sources["../escape"] = {entries: {}}
 InvalidArchiveEntry|.sources["1"] = {entries: {".ledger/example/events.jsonl": 42}}
 GENERATION_INVENTORIES
 cp "$preparation_dir/archive-manifest-before.json" "$preparation_dir/legacy-archive/fixture/manifest.json"
+preparation_named_generation="$preparation_dir/legacy-archive/legacy-archive"
+cp -R "$preparation_dir/legacy-archive/fixture" "$preparation_named_generation"
+"$binary" prepare --definition "$event_definition" --store-root "$preparation_empty" \
+  --store-id preparation-smoke --source-archive "$preparation_named_generation/worktree-0" \
+  --format json >"$preparation_dir/named-generation.json"
+"$json_cli" -e '.outcome == "ready" and .records == 2' "$preparation_dir/named-generation.json" >/dev/null
+rm -r "$preparation_named_generation"
 test ! -e "$preparation_empty/.ledger/example/events.jsonl"
 
 # An explicit candidate can restore only the exact surviving native binding.
