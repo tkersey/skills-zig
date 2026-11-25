@@ -838,16 +838,17 @@ pub fn validateArchive(
     history: *const History,
     budget: *storage_root.ReadBudget,
 ) !void {
-    if (!history.exists) return error.PreparationArchiveEvidenceMissing;
     const basename = std.fs.path.basename(source.root);
-    if (!std.mem.startsWith(u8, basename, "worktree-")) return error.InvalidPreparationArchive;
-    const index = basename[9..];
-    _ = std.fmt.parseInt(usize, index, 10) catch return error.InvalidPreparationArchive;
+    const prefix = "worktree-";
+    if (!std.mem.startsWith(u8, basename, prefix)) return error.InvalidPreparationArchive;
+    const index = archiveIndex(basename[prefix.len..]) catch
+        return error.InvalidPreparationArchive;
     const parent = std.fs.path.dirname(source.root) orelse return error.InvalidPreparationArchive;
-    const flat_layout = std.mem.eql(u8, std.fs.path.basename(parent), "legacy-archive");
     const archive_parent = std.fs.path.dirname(parent) orelse
         return error.InvalidPreparationArchive;
-    if (!flat_layout and !std.mem.eql(u8, std.fs.path.basename(archive_parent), "legacy-archive")) {
+    if (!std.mem.eql(u8, std.fs.path.basename(parent), "legacy-archive") and
+        !std.mem.eql(u8, std.fs.path.basename(archive_parent), "legacy-archive"))
+    {
         return error.InvalidPreparationArchive;
     }
     var directory = try storage_root.openRoot(io, parent);
@@ -863,27 +864,24 @@ pub fn validateArchive(
         .duplicate_field_behavior = .@"error",
     });
     defer parsed.deinit();
-    const object = try definition_core.json.object(parsed.value);
-    const schema = try definition_core.json.requiredString(object, "schema");
-    if (!std.mem.eql(u8, schema, "ledger-legacy-archive/v1")) {
+    const layout = try archiveLayout(parsed.value);
+    const archive_root = switch (layout) {
+        .flat => parent,
+        .generation => archive_parent,
+    };
+    if (!std.mem.eql(u8, std.fs.path.basename(archive_root), "legacy-archive")) {
         return error.InvalidPreparationArchive;
     }
-    if (flat_layout) return error.UnsupportedLegacyArchiveLayout;
-    const sources = try definition_core.json.object(
-        object.get("sources") orelse return error.InvalidPreparationArchive,
-    );
-    const selected = try definition_core.json.object(
-        sources.get(index) orelse return error.InvalidPreparationArchive,
-    );
-    const entries = try definition_core.json.object(
-        selected.get("entries") orelse return error.InvalidPreparationArchive,
-    );
+    const trees = try archiveTrees(allocator, parsed.value, layout);
+    defer allocator.free(trees);
+    const selected = for (trees) |tree| {
+        if (std.mem.eql(u8, tree.index, index)) break tree;
+    } else return error.InvalidPreparationArchive;
+    if (!history.exists) return error.PreparationArchiveEvidenceMissing;
     for (history.files.items) |file| {
         const path = try allocator.print(".ledger/{s}", .{file.path});
         defer allocator.free(path);
-        const entry = try definition_core.json.object(
-            entries.get(path) orelse return error.PreparationArchiveEvidenceMissing,
-        );
+        const entry = selected.entry(path) orelse return error.PreparationArchiveEvidenceMissing;
         if (!std.mem.eql(u8, try definition_core.json.requiredString(entry, "kind"), "file") or
             !std.mem.eql(
                 u8,
@@ -893,11 +891,102 @@ pub fn validateArchive(
         {
             return error.PreparationArchiveEvidenceMismatch;
         }
-        const size = entry.get("size") orelse return error.PreparationArchiveEvidenceMissing;
-        if (size != .integer or size.integer < 0 or size.integer != file.bytes.len) {
-            return error.PreparationArchiveEvidenceMismatch;
-        }
+        if (entry.get("size")) |size| {
+            if (size != .integer or size.integer < 0 or size.integer != file.bytes.len) {
+                return error.PreparationArchiveEvidenceMismatch;
+            }
+        } else if (layout == .generation) return error.PreparationArchiveEvidenceMissing;
     }
+}
+
+pub const ArchiveLayout = enum { generation, flat };
+
+pub const ArchiveTree = struct {
+    index: []const u8,
+    entries: std.json.ObjectMap,
+
+    pub fn entry(self: ArchiveTree, path: []const u8) ?std.json.ObjectMap {
+        const value = self.entries.get(path) orelse return null;
+        return switch (value) {
+            .object => |object| object,
+            else => null,
+        };
+    }
+};
+
+const archive_trees_max = 128;
+const archive_entries_max = 100000;
+
+pub fn archiveLayout(value: std.json.Value) !ArchiveLayout {
+    if (value != .object) return error.InvalidArchiveManifest;
+    const schema = value.object.get("schema") orelse return error.InvalidArchiveManifest;
+    if (schema != .string or !std.mem.eql(u8, schema.string, "ledger-legacy-archive/v1"))
+        return error.InvalidArchiveManifest;
+    const sources = value.object.contains("sources");
+    if (sources == value.object.contains("worktrees")) return error.InvalidArchiveManifest;
+    return if (sources) .generation else .flat;
+}
+
+pub fn archiveTrees(
+    allocator: std.mem.Allocator,
+    value: std.json.Value,
+    layout: ArchiveLayout,
+) ![]ArchiveTree {
+    if (try archiveLayout(value) != layout) return error.InvalidArchiveManifest;
+    return switch (layout) {
+        .generation => generationTrees(allocator, value.object.get("sources").?),
+        .flat => flatTrees(allocator, value.object.get("worktrees").?),
+    };
+}
+
+fn generationTrees(allocator: std.mem.Allocator, sources: std.json.Value) ![]ArchiveTree {
+    if (sources != .object or sources.object.count() > archive_trees_max)
+        return error.InvalidArchiveManifest;
+    const trees = try allocator.alloc(ArchiveTree, sources.object.count());
+    errdefer allocator.free(trees);
+    for (sources.object.keys(), sources.object.values(), trees) |index, tree, *slot| {
+        slot.* = .{ .index = try archiveIndex(index), .entries = try archiveEntries(tree) };
+    }
+    return trees;
+}
+
+fn flatTrees(allocator: std.mem.Allocator, worktrees: std.json.Value) ![]ArchiveTree {
+    if (worktrees != .array or worktrees.array.items.len > archive_trees_max)
+        return error.InvalidArchiveManifest;
+    const trees = try allocator.alloc(ArchiveTree, worktrees.array.items.len);
+    errdefer allocator.free(trees);
+    for (worktrees.array.items, trees, 0..) |tree, *slot, position| {
+        if (tree != .object) return error.InvalidArchiveSourceInventory;
+        const directory = tree.object.get("directory") orelse
+            return error.InvalidArchiveSourceInventory;
+        if (directory != .string) return error.InvalidArchiveSourceInventory;
+        const prefix = "worktree-";
+        if (!std.mem.startsWith(u8, directory.string, prefix))
+            return error.InvalidArchiveWorktreeIndex;
+        const index = try archiveIndex(directory.string[prefix.len..]);
+        for (trees[0..position]) |earlier| {
+            if (std.mem.eql(u8, earlier.index, index)) return error.InvalidArchiveManifest;
+        }
+        slot.* = .{ .index = index, .entries = try archiveEntries(tree) };
+    }
+    return trees;
+}
+
+fn archiveIndex(index: []const u8) ![]const u8 {
+    if (index.len == 0) return error.InvalidArchiveWorktreeIndex;
+    for (index) |byte| if (!std.ascii.isDigit(byte)) return error.InvalidArchiveWorktreeIndex;
+    return index;
+}
+
+fn archiveEntries(tree: std.json.Value) !std.json.ObjectMap {
+    if (tree != .object) return error.InvalidArchiveSourceInventory;
+    const entries = tree.object.get("entries") orelse return error.InvalidArchiveSourceInventory;
+    if (entries != .object or entries.object.count() > archive_entries_max)
+        return error.InvalidArchiveSourceInventory;
+    for (entries.object.values()) |entry| {
+        if (entry != .object and entry != .null) return error.InvalidArchiveEntry;
+    }
+    return entries.object;
 }
 
 pub const File = struct {

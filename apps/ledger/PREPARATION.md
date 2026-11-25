@@ -149,11 +149,42 @@ metadata. Sources and unrelated payload are never destinations. `--param NAME=VA
 uses the existing definition parameter contract. At most 32 sources are admitted.
 
 Published archive generations have a manifest at
-`legacy-archive/<generation>/manifest.json`. A manifest directly at
-`legacy-archive/manifest.json` identifies an earlier, unsupported inventory layout
-and returns `UnsupportedLegacyArchiveLayout`. Its shared schema name does not
-prove compatibility. The archive and any neighboring generations remain intact;
-general historical import requires a verified adapter for that manifest shape.
+`legacy-archive/<generation>/manifest.json` whose `sources` map each worktree
+index to its `entries`, and select `legacy-archive/<generation>/worktree-<index>`.
+An earlier flat layout has one manifest at `legacy-archive/manifest.json` whose
+`worktrees` array names each retained `directory` (`worktree-<index>`) with its
+`entries`, and selects `legacy-archive/worktree-<index>`.
+
+One reader, `archiveTrees`, decides whether a manifest is admissible, for both
+discovery and explicit `--source-archive` validation. An admissible manifest is
+an object with schema `ledger-legacy-archive/v1` and exactly one inventory key,
+`sources` (generation) or `worktrees` (flat), which fixes its layout. It holds
+at most 128 trees; each tree has a decimal-digit index, no duplicate directory,
+and an `entries` object of at most 100,000 entries whose values are objects or
+`null`. A missing or `null` entry reads as absent everywhere.
+
+Discovery reads `legacy-archive/manifest.json`, which must be flat, and each
+other published directory in `legacy-archive/` as a generation; unpublished
+`.archiving-*` stages are skipped, and a directory beside a flat manifest that
+the manifest does not list must hold a valid generation manifest. It selects a
+tree only when its entries list the owner's slot or binding, and every selected
+tree is then verified like an explicit one.
+
+An explicit `--source-archive` tree must be named `worktree-<digits>` and sit
+directly under a directory named `legacy-archive`, or one directory below it;
+otherwise it is rejected before any manifest is read. Its layout comes from the manifest beside it: flat requires
+the parent to be named `legacy-archive`, generation the grandparent. Without
+the store root, the path cannot show which interpretation discovery would use
+when both directories are named `legacy-archive`, so such a tree is accepted
+when its manifest fits either one, even where discovery for a particular store
+rejects the manifest's position. An explicit tree inside an unpublished stage is
+not refused, and an explicit tree whose entries do not list the owner fails
+verification. The source's history is captured before the manifest is verified,
+so a history error can surface before a manifest error.
+
+Verification requires each imported file's entry to exist with kind `file` and
+a matching SHA-256 digest; generation entries must also attest the size, which
+flat entries may omit. Archives and neighboring generations are never modified.
 
 Exact restoration of an already bound, missing canonical slot has a separate
 proof available through
@@ -163,7 +194,7 @@ returns `PreparationRequiresBoundHistory`. The candidate must contain a complete
 native history whose binding bytes equal the surviving target binding, whose event
 digest equals that binding's last revision, and whose required definition and
 revision archives pass native replay. This can use an explicitly selected retained
-tree even when its enclosing archive inventory is unsupported. Inspect preparation
+tree even when its enclosing archive inventory cannot attest it. Inspect preparation
 without `--apply`, then apply a `ready` exact candidate while retaining
 `--restore-bound-history` and satisfying the existing writer-coordination
 requirement. Missing candidate bindings, incomplete native metadata, mismatched
