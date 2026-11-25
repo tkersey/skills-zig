@@ -1365,14 +1365,34 @@ preparation_expect_failure PreparationArchiveEvidenceMismatch "$preparation_dir/
 preparation_expect_failure PreparationArchiveEvidenceMismatch "$preparation_dir/flat-size-mismatch.json" \
   prepare --definition "$event_definition" --store-root "$preparation_empty" \
   --store-id preparation-smoke --source-archive "$preparation_flat_archive" --apply --format json
-for preparation_flat_inventory in '.worktrees[0].directory = "worktree-1"' '.worktrees += .worktrees' 'del(.worktrees)'; do
+while IFS='|' read -r preparation_expected preparation_flat_inventory; do
   "$json_cli" "$preparation_flat_inventory" \
     "$preparation_dir/flat-manifest-before.json" >"$preparation_flat_manifest"
-  preparation_expect_failure InvalidPreparationArchive "$preparation_dir/flat-inventory-invalid.json" \
+  preparation_expect_failure "$preparation_expected" "$preparation_dir/flat-inventory-invalid.json" \
     prepare --definition "$event_definition" --store-root "$preparation_empty" \
     --store-id preparation-smoke --source-archive "$preparation_flat_archive" --apply --format json
-done
+done <<'FLAT_INVENTORIES'
+InvalidPreparationArchive|.worktrees[0].directory = "worktree-1"
+InvalidArchiveManifest|.worktrees += .worktrees
+InvalidArchiveManifest|del(.worktrees)
+InvalidArchiveWorktreeIndex|.worktrees += [{directory: "../escape", entries: {}}]
+InvalidArchiveSourceInventory|.worktrees += [{directory: "worktree-7"}]
+FLAT_INVENTORIES
+preparation_noncanonical="$preparation_dir/flat-archive/legacy-archive/worktree-1_0"
+cp -R "$preparation_flat_archive" "$preparation_noncanonical"
+"$json_cli" '.worktrees += [.worktrees[0] | .directory = "worktree-1_0"]' \
+  "$preparation_dir/flat-manifest-before.json" >"$preparation_flat_manifest"
+preparation_expect_failure InvalidPreparationArchive "$preparation_dir/flat-noncanonical.json" \
+  prepare --definition "$event_definition" --store-root "$preparation_empty" \
+  --store-id preparation-smoke --source-archive "$preparation_noncanonical" --apply --format json
+rm -r "$preparation_noncanonical"
 cp "$preparation_dir/flat-manifest-before.json" "$preparation_flat_manifest"
+"$json_cli" '.sources["../escape"] = {entries: {}}' \
+  "$preparation_dir/archive-manifest-before.json" >"$preparation_dir/legacy-archive/fixture/manifest.json"
+preparation_expect_failure InvalidArchiveWorktreeIndex "$preparation_dir/generation-inventory-invalid.json" \
+  prepare --definition "$event_definition" --store-root "$preparation_empty" \
+  --store-id preparation-smoke --source-archive "$preparation_archive" --apply --format json
+cp "$preparation_dir/archive-manifest-before.json" "$preparation_dir/legacy-archive/fixture/manifest.json"
 test ! -e "$preparation_empty/.ledger/example/events.jsonl"
 
 # An explicit candidate can restore only the exact surviving native binding.
@@ -1405,7 +1425,7 @@ preparation_fingerprint "$preparation_flat_target" >"$preparation_dir/flat-unbou
 cmp -s "$preparation_dir/flat-unbound-before" "$preparation_dir/flat-unbound-after"
 mv "$preparation_dir/flat-target-bindings-retained" "$preparation_flat_target/.ledger/.bindings"
 preparation_fingerprint "$preparation_flat_target" >"$preparation_dir/flat-target-before"
-preparation_expect_failure InvalidPreparationArchive "$preparation_dir/flat-archive-blocked.json" \
+preparation_expect_failure InvalidArchiveManifest "$preparation_dir/flat-archive-blocked.json" \
   prepare --definition "$event_definition" --store-root "$preparation_flat_target" \
   --store-id preparation-smoke --restore-bound-history --source-archive "$preparation_flat" --apply --format json
 preparation_fingerprint "$preparation_flat_target" >"$preparation_dir/flat-target-after"

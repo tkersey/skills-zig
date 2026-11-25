@@ -351,14 +351,16 @@ fn appendArchives(
     );
     var selected: std.StringHashMapUnmanaged(void) = .empty;
     var total: u64 = 0;
-    var flat: ?[]const []const u8 = null;
+    var flat_manifest: ?std.json.Parsed(std.json.Value) = null;
+    defer if (flat_manifest) |parsed| parsed.deinit();
+    var flat: ?[]const preparation.ArchiveTree = null;
     if (try catalog.existsAt(io, archive_dir, "manifest.json")) {
-        const parsed = try readArchiveManifest(scratch, io, archive_dir, &total);
-        defer parsed.deinit();
-        flat = try selectFlatArchiveTrees(
+        flat_manifest = try readArchiveManifest(scratch, io, archive_dir, &total);
+        flat = try selectArchiveTrees(
             allocator,
             io,
-            parsed.value,
+            flat_manifest.?.value,
+            .flat,
             selected_slot,
             binding,
             path,
@@ -372,14 +374,15 @@ fn appendArchives(
         defer generation.close(io);
         const parsed = try readArchiveManifest(scratch, io, generation, &total);
         defer parsed.deinit();
-        try selectArchiveTrees(
+        const trees_root = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ path, name });
+        _ = try selectArchiveTrees(
             allocator,
             io,
             parsed.value,
+            .generation,
             selected_slot,
             binding,
-            path,
-            name,
+            trees_root,
             tree_count,
             &selected,
         );
@@ -448,79 +451,33 @@ fn selectArchiveTrees(
     allocator: std.mem.Allocator,
     io: std.Io,
     value: std.json.Value,
+    layout: preparation.ArchiveLayout,
     selected_slot: []const u8,
     binding: []const u8,
-    path: []const u8,
-    name: []const u8,
+    trees_root: []const u8,
     tree_count: usize,
     selected: *std.StringHashMapUnmanaged(void),
-) !void {
-    const all = try archiveInventory(value, "sources");
-    if (all != .object or all.object.count() > max_sources) return error.InvalidArchiveManifest;
-    for (all.object.keys(), all.object.values()) |index, tree| {
-        try archiveWorktreeIndex(index);
-        if (!try archiveSelects(tree, selected_slot, binding)) continue;
+) ![]const preparation.ArchiveTree {
+    const inventory = try preparation.archiveTrees(allocator, value, layout);
+    for (inventory) |tree| {
+        if (!try archiveSelects(tree.entries, selected_slot, binding)) continue;
         const original = try std.fmt.allocPrint(
             allocator,
-            "{s}/{s}/worktree-{s}",
-            .{ path, name, index },
+            "{s}/worktree-{s}",
+            .{ trees_root, tree.index },
         );
         try admitArchiveTree(allocator, io, original, tree_count, selected);
     }
+    return inventory;
 }
 
-fn selectFlatArchiveTrees(
-    allocator: std.mem.Allocator,
-    io: std.Io,
-    value: std.json.Value,
+fn archiveSelects(
+    entries: std.json.ObjectMap,
     selected_slot: []const u8,
     binding: []const u8,
-    path: []const u8,
-    tree_count: usize,
-    selected: *std.StringHashMapUnmanaged(void),
-) ![]const []const u8 {
-    const all = try archiveInventory(value, "worktrees");
-    if (all != .array or all.array.items.len > max_sources) return error.InvalidArchiveManifest;
-    const directories = try allocator.alloc([]const u8, all.array.items.len);
-    for (all.array.items, directories, 0..) |tree, *directory, position| {
-        if (tree != .object) return error.InvalidArchiveSourceInventory;
-        const name = tree.object.get("directory") orelse
-            return error.InvalidArchiveSourceInventory;
-        if (name != .string) return error.InvalidArchiveSourceInventory;
-        const prefix = "worktree-";
-        if (!std.mem.startsWith(u8, name.string, prefix)) return error.InvalidArchiveWorktreeIndex;
-        try archiveWorktreeIndex(name.string[prefix.len..]);
-        for (directories[0..position]) |earlier| {
-            if (std.mem.eql(u8, earlier, name.string)) return error.InvalidArchiveManifest;
-        }
-        directory.* = try allocator.dupe(u8, name.string);
-        if (!try archiveSelects(tree, selected_slot, binding)) continue;
-        const original = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ path, name.string });
-        try admitArchiveTree(allocator, io, original, tree_count, selected);
-    }
-    return directories;
-}
-
-fn archiveInventory(value: std.json.Value, field: []const u8) !std.json.Value {
-    if (value != .object) return error.InvalidArchiveManifest;
-    const schema = value.object.get("schema") orelse return error.InvalidArchiveManifest;
-    if (schema != .string or !std.mem.eql(u8, schema.string, "ledger-legacy-archive/v1"))
-        return error.InvalidArchiveManifest;
-    return value.object.get(field) orelse error.InvalidArchiveManifest;
-}
-
-fn archiveWorktreeIndex(index: []const u8) !void {
-    if (index.len == 0) return error.InvalidArchiveWorktreeIndex;
-    for (index) |byte| if (!std.ascii.isDigit(byte)) return error.InvalidArchiveWorktreeIndex;
-}
-
-fn archiveSelects(tree: std.json.Value, selected_slot: []const u8, binding: []const u8) !bool {
-    if (tree != .object) return error.InvalidArchiveSourceInventory;
-    const entries = tree.object.get("entries") orelse return error.InvalidArchiveSourceInventory;
-    if (entries != .object or entries.object.count() > 100000)
-        return error.InvalidArchiveSourceInventory;
-    const entry = entries.object.get(selected_slot) orelse .null;
-    if (entry == .null) return entries.object.contains(binding);
+) !bool {
+    const entry = entries.get(selected_slot) orelse .null;
+    if (entry == .null) return entries.contains(binding);
     if (entry != .object) return error.InvalidArchivedSlotEntry;
     return true;
 }
@@ -1021,7 +978,7 @@ fn archiveGenerations(
     allocator: std.mem.Allocator,
     io: std.Io,
     archive_dir: std.Io.Dir,
-    flat: ?[]const []const u8,
+    flat: ?[]const preparation.ArchiveTree,
 ) ![]const []const u8 {
     var generations: std.ArrayList([]const u8) = .empty;
     var iterator = archive_dir.iterate();
@@ -1030,8 +987,8 @@ fn archiveGenerations(
         observed += 1;
         if (observed > 100000) return error.ArchiveManifestBoundExceeded;
         if (unpublishedArchive(entry.name)) continue;
-        if (flat) |directories| {
-            if (flatArchiveMember(directories, entry.name)) continue;
+        if (flat) |inventory| {
+            if (flatArchiveMember(inventory, entry.name)) continue;
         }
         if (generations.items.len == max_sources) return error.ArchiveManifestBoundExceeded;
         const generation = try archive_dir.openDir(io, entry.name, .{ .follow_symlinks = false });
@@ -1042,10 +999,12 @@ fn archiveGenerations(
     return generations.toOwnedSlice(allocator);
 }
 
-fn flatArchiveMember(directories: []const []const u8, name: []const u8) bool {
+fn flatArchiveMember(inventory: []const preparation.ArchiveTree, name: []const u8) bool {
     if (std.mem.eql(u8, name, "manifest.json")) return true;
-    for (directories) |directory| {
-        if (std.mem.eql(u8, directory, name)) return true;
+    const prefix = "worktree-";
+    if (!std.mem.startsWith(u8, name, prefix)) return false;
+    for (inventory) |tree| {
+        if (std.mem.eql(u8, tree.index, name[prefix.len..])) return true;
     }
     return false;
 }

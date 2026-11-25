@@ -153,12 +153,16 @@ Published archive generations have a manifest at
 index to its `entries`, and select `legacy-archive/<generation>/worktree-<index>`.
 An earlier flat layout has one manifest at `legacy-archive/manifest.json` whose
 `worktrees` array names each retained `directory` (`worktree-<index>`) with its
-`entries`, and selects `legacy-archive/worktree-<index>`. Both layouts select a
-tree only when its entries contain the owner's slot or binding, and both verify
-each imported file's kind and SHA-256 digest; generation entries must also attest
-the size, which flat entries may omit. A schema name without either inventory,
-a duplicate or malformed directory, and an unlisted directory beside a flat
-manifest remain errors. Archives and neighboring generations are never modified.
+`entries`, and selects `legacy-archive/worktree-<index>`. Discovery and an
+explicit `--source-archive` read the same inventory, so they accept and reject
+the same manifests: a schema name without the layout's inventory, a worktree
+index that is not decimal digits, a duplicate directory, a tree without
+`entries`, or more than 128 trees is an error for every tree in that archive.
+Discovery also rejects a directory beside a flat manifest that the manifest does
+not list. Both layouts select a tree only when its entries contain the owner's
+slot or binding, and both verify each imported file's kind and SHA-256 digest;
+generation entries must also attest the size, which flat entries may omit.
+Archives and neighboring generations are never modified.
 
 Exact restoration of an already bound, missing canonical slot has a separate
 proof available through
