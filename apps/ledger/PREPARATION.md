@@ -154,15 +154,19 @@ index to its `entries`, and select `legacy-archive/<generation>/worktree-<index>
 An earlier flat layout has one manifest at `legacy-archive/manifest.json` whose
 `worktrees` array names each retained `directory` (`worktree-<index>`) with its
 `entries`, and selects `legacy-archive/worktree-<index>`. Discovery and an
-explicit `--source-archive` read the same inventory, so they accept and reject
-the same manifests: a schema name without the layout's inventory, a worktree
-index that is not decimal digits, a duplicate directory, a tree without
-`entries`, or more than 128 trees is an error for every tree in that archive.
-Discovery also rejects a directory beside a flat manifest that the manifest does
-not list. Both layouts select a tree only when its entries contain the owner's
-slot or binding, and both verify each imported file's kind and SHA-256 digest;
-generation entries must also attest the size, which flat entries may omit.
-Archives and neighboring generations are never modified.
+explicit `--source-archive` validate each manifest with the same reader, so a
+manifest's content is admissible on both or on neither, with the same validation
+error, whichever owner is being prepared. An admissible manifest is an object
+with schema `ledger-legacy-archive/v1` and its layout's inventory, holding at
+most 128 trees; each tree has a decimal-digit index, no duplicate directory, and
+an `entries` object of at most 100,000 entries whose values are objects or
+`null`, which reads as absent. Discovery also reads every other directory in
+`legacy-archive/` as a generation, so a directory beside a flat manifest that
+the manifest does not list must hold a valid generation manifest. Within an
+admissible manifest, both layouts select a tree only when its entries contain
+the owner's slot or binding, and both verify each imported file's kind and
+SHA-256 digest; generation entries must also attest the size, which flat entries
+may omit. Archives and neighboring generations are never modified.
 
 Exact restoration of an already bound, missing canonical slot has a separate
 proof available through

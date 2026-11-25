@@ -867,11 +867,6 @@ pub fn validateArchive(
         .duplicate_field_behavior = .@"error",
     });
     defer parsed.deinit();
-    const object = try definition_core.json.object(parsed.value);
-    const schema = try definition_core.json.requiredString(object, "schema");
-    if (!std.mem.eql(u8, schema, "ledger-legacy-archive/v1")) {
-        return error.InvalidPreparationArchive;
-    }
     const trees = try archiveTrees(allocator, parsed.value, layout);
     defer allocator.free(trees);
     const entries = for (trees) |tree| {
@@ -880,9 +875,9 @@ pub fn validateArchive(
     for (history.files.items) |file| {
         const path = try allocator.print(".ledger/{s}", .{file.path});
         defer allocator.free(path);
-        const entry = try definition_core.json.object(
-            entries.get(path) orelse return error.PreparationArchiveEvidenceMissing,
-        );
+        const value = entries.get(path) orelse .null;
+        if (value == .null) return error.PreparationArchiveEvidenceMissing;
+        const entry = value.object;
         if (!std.mem.eql(u8, try definition_core.json.requiredString(entry, "kind"), "file") or
             !std.mem.eql(
                 u8,
@@ -975,6 +970,9 @@ fn archiveEntries(tree: std.json.Value) !std.json.ObjectMap {
     const entries = tree.object.get("entries") orelse return error.InvalidArchiveSourceInventory;
     if (entries != .object or entries.object.count() > archive_entries_max)
         return error.InvalidArchiveSourceInventory;
+    for (entries.object.values()) |entry| {
+        if (entry != .object and entry != .null) return error.InvalidArchiveEntry;
+    }
     return entries.object;
 }
 

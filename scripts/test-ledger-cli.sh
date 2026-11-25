@@ -1377,6 +1377,10 @@ InvalidArchiveManifest|.worktrees += .worktrees
 InvalidArchiveManifest|del(.worktrees)
 InvalidArchiveWorktreeIndex|.worktrees += [{directory: "../escape", entries: {}}]
 InvalidArchiveSourceInventory|.worktrees += [{directory: "worktree-7"}]
+InvalidArchiveEntry|.worktrees += [{directory: "worktree-7", entries: {".ledger/example/events.jsonl": 42}}]
+PreparationArchiveEvidenceMissing|.worktrees[0].entries[".ledger/example/events.jsonl"] = null
+InvalidArchiveManifest|[]
+InvalidArchiveManifest|{schema: 1, worktrees: .worktrees}
 FLAT_INVENTORIES
 preparation_noncanonical="$preparation_dir/flat-archive/legacy-archive/worktree-1_0"
 cp -R "$preparation_flat_archive" "$preparation_noncanonical"
@@ -1387,11 +1391,16 @@ preparation_expect_failure InvalidPreparationArchive "$preparation_dir/flat-nonc
   --store-id preparation-smoke --source-archive "$preparation_noncanonical" --apply --format json
 rm -r "$preparation_noncanonical"
 cp "$preparation_dir/flat-manifest-before.json" "$preparation_flat_manifest"
-"$json_cli" '.sources["../escape"] = {entries: {}}' \
-  "$preparation_dir/archive-manifest-before.json" >"$preparation_dir/legacy-archive/fixture/manifest.json"
-preparation_expect_failure InvalidArchiveWorktreeIndex "$preparation_dir/generation-inventory-invalid.json" \
-  prepare --definition "$event_definition" --store-root "$preparation_empty" \
-  --store-id preparation-smoke --source-archive "$preparation_archive" --apply --format json
+while IFS='|' read -r preparation_expected preparation_generation_inventory; do
+  "$json_cli" "$preparation_generation_inventory" \
+    "$preparation_dir/archive-manifest-before.json" >"$preparation_dir/legacy-archive/fixture/manifest.json"
+  preparation_expect_failure "$preparation_expected" "$preparation_dir/generation-inventory-invalid.json" \
+    prepare --definition "$event_definition" --store-root "$preparation_empty" \
+    --store-id preparation-smoke --source-archive "$preparation_archive" --apply --format json
+done <<'GENERATION_INVENTORIES'
+InvalidArchiveWorktreeIndex|.sources["../escape"] = {entries: {}}
+InvalidArchiveEntry|.sources["1"] = {entries: {".ledger/example/events.jsonl": 42}}
+GENERATION_INVENTORIES
 cp "$preparation_dir/archive-manifest-before.json" "$preparation_dir/legacy-archive/fixture/manifest.json"
 test ! -e "$preparation_empty/.ledger/example/events.jsonl"
 
@@ -1484,7 +1493,7 @@ test "$preparation_status" -eq 2
 test ! -e "$preparation_empty/.ledger/example/events.jsonl"
 cp "$preparation_dir/required-before.json" "$preparation_required"
 printf '%s\n' '{}' >"$preparation_dir/legacy-archive/fixture/manifest.json"
-preparation_expect_failure MissingField "$preparation_dir/manifest-corrupt.json" \
+preparation_expect_failure InvalidArchiveManifest "$preparation_dir/manifest-corrupt.json" \
   prepare --definition "$event_definition" --store-root "$preparation_empty" \
   --store-id preparation-smoke --source-archive "$preparation_archive" --format json
 

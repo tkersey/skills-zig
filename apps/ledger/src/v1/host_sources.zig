@@ -460,7 +460,7 @@ fn selectArchiveTrees(
 ) ![]const preparation.ArchiveTree {
     const inventory = try preparation.archiveTrees(allocator, value, layout);
     for (inventory) |tree| {
-        if (!try archiveSelects(tree.entries, selected_slot, binding)) continue;
+        if (!archiveSelects(tree.entries, selected_slot, binding)) continue;
         const original = try std.fmt.allocPrint(
             allocator,
             "{s}/worktree-{s}",
@@ -475,10 +475,9 @@ fn archiveSelects(
     entries: std.json.ObjectMap,
     selected_slot: []const u8,
     binding: []const u8,
-) !bool {
+) bool {
     const entry = entries.get(selected_slot) orelse .null;
     if (entry == .null) return entries.contains(binding);
-    if (entry != .object) return error.InvalidArchivedSlotEntry;
     return true;
 }
 
@@ -903,7 +902,7 @@ test "host sources select archived events and bindings without unrelated reads" 
             "\"sources\":{\"0\":{\"entries\":{\".ledger/owner/events.jsonl\":42}}}}",
     );
     try std.testing.expectError(
-        error.InvalidArchivedSlotEntry,
+        error.InvalidArchiveEntry,
         discover(allocator, io, &environment, null, target.value, slot, &.{}, true),
     );
     var arena = std.heap.ArenaAllocator.init(allocator);
@@ -1198,7 +1197,12 @@ test "host archive discovery rejects unlisted and malformed flat inventory" {
         .{
             .manifest = prefix ++ "{\"directory\":\"worktree-0\"," ++
                 "\"entries\":{\".ledger/owner/events.jsonl\":42}}]}",
-            .expected = error.InvalidArchivedSlotEntry,
+            .expected = error.InvalidArchiveEntry,
+        },
+        .{
+            .manifest = prefix ++ tree ++ ",{\"directory\":\"worktree-1\"," ++
+                "\"entries\":{\".ledger/other\":42}}]}",
+            .expected = error.InvalidArchiveEntry,
         },
         .{ .manifest = "[]", .expected = error.InvalidArchiveManifest },
     };
