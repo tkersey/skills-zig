@@ -841,6 +841,8 @@ pub fn validateArchive(
     const basename = std.fs.path.basename(source.root);
     const prefix = "worktree-";
     if (!std.mem.startsWith(u8, basename, prefix)) return error.InvalidPreparationArchive;
+    const index = archiveIndex(basename[prefix.len..]) catch
+        return error.InvalidPreparationArchive;
     const parent = std.fs.path.dirname(source.root) orelse return error.InvalidPreparationArchive;
     const archive_parent = std.fs.path.dirname(parent) orelse
         return error.InvalidPreparationArchive;
@@ -872,8 +874,6 @@ pub fn validateArchive(
     }
     const trees = try archiveTrees(allocator, parsed.value, layout);
     defer allocator.free(trees);
-    const index = archiveIndex(basename[prefix.len..]) catch
-        return error.InvalidPreparationArchive;
     const selected = for (trees) |tree| {
         if (std.mem.eql(u8, tree.index, index)) break tree;
     } else return error.InvalidPreparationArchive;

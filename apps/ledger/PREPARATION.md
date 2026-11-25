@@ -170,9 +170,9 @@ the manifest does not list must hold a valid generation manifest. It selects a
 tree only when its entries list the owner's slot or binding, and every selected
 tree is then verified like an explicit one.
 
-An explicit `--source-archive` tree must sit directly under a directory named
-`legacy-archive`, or one directory below it; otherwise it is rejected before any
-manifest is read. Its layout comes from the manifest beside it: flat requires
+An explicit `--source-archive` tree must be named `worktree-<digits>` and sit
+directly under a directory named `legacy-archive`, or one directory below it;
+otherwise it is rejected before any manifest is read. Its layout comes from the manifest beside it: flat requires
 the parent to be named `legacy-archive`, generation the grandparent. Without
 the store root, the path cannot show which interpretation discovery would use
 when both directories are named `legacy-archive`, so such a tree is accepted

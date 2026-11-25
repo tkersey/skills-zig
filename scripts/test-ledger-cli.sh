@@ -1386,7 +1386,7 @@ preparation_noncanonical="$preparation_dir/flat-archive/legacy-archive/worktree-
 cp -R "$preparation_flat_archive" "$preparation_noncanonical"
 "$json_cli" '.worktrees += [.worktrees[0] | .directory = "worktree-1_0"]' \
   "$preparation_dir/flat-manifest-before.json" >"$preparation_flat_manifest"
-preparation_expect_failure InvalidArchiveWorktreeIndex "$preparation_dir/flat-noncanonical.json" \
+preparation_expect_failure InvalidPreparationArchive "$preparation_dir/flat-noncanonical.json" \
   prepare --definition "$event_definition" --store-root "$preparation_empty" \
   --store-id preparation-smoke --source-archive "$preparation_noncanonical" --apply --format json
 rm -r "$preparation_noncanonical"
