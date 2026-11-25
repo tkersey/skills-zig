@@ -341,8 +341,6 @@ fn appendArchives(
         else => return err,
     };
     defer archive_dir.close(io);
-    try rejectFlatArchive(scratch, io, archive_dir);
-    const generations = try archiveGenerations(allocator, io, archive_dir);
     const selected_slot = try std.fmt.allocPrint(allocator, ".ledger/{s}", .{slot});
     var hash: [32]u8 = undefined;
     std.crypto.hash.sha2.Sha256.hash(slot, &hash, .{});
@@ -353,25 +351,26 @@ fn appendArchives(
     );
     var selected: std.StringHashMapUnmanaged(void) = .empty;
     var total: u64 = 0;
+    var flat: ?[]const []const u8 = null;
+    if (try catalog.existsAt(io, archive_dir, "manifest.json")) {
+        const parsed = try readArchiveManifest(scratch, io, archive_dir, &total);
+        defer parsed.deinit();
+        flat = try selectFlatArchiveTrees(
+            allocator,
+            io,
+            parsed.value,
+            selected_slot,
+            binding,
+            path,
+            tree_count,
+            &selected,
+        );
+    }
+    const generations = try archiveGenerations(allocator, io, archive_dir, flat);
     for (generations) |name| {
         const generation = try archive_dir.openDir(io, name, .{ .follow_symlinks = false });
         defer generation.close(io);
-        const bytes = try catalog.readBytes(
-            scratch,
-            io,
-            generation,
-            "manifest.json",
-            32 * 1024 * 1024,
-        );
-        defer scratch.free(bytes);
-        total += bytes.len;
-        if (total > 2 * 1024 * 1024 * 1024) return error.ArchiveManifestByteBoundExceeded;
-        const parsed = try std.json.parseFromSlice(
-            std.json.Value,
-            scratch,
-            bytes,
-            .{ .duplicate_field_behavior = .@"error" },
-        );
+        const parsed = try readArchiveManifest(scratch, io, generation, &total);
         defer parsed.deinit();
         try selectArchiveTrees(
             allocator,
@@ -393,28 +392,20 @@ fn appendArchives(
     for (ordered) |original| try sources.append(allocator, .{ .root = original, .archive = true });
 }
 
-fn rejectFlatArchive(allocator: std.mem.Allocator, io: std.Io, directory: std.Io.Dir) !void {
-    if (!try catalog.existsAt(io, directory, "manifest.json")) return;
-    // The earlier flat archive reused this schema name with a different
-    // inventory shape. Do not interpret its worktrees as generations or
-    // silently skip historical evidence that needs a verified importer.
-    const bytes = try catalog.readBytes(
-        allocator,
-        io,
-        directory,
-        "manifest.json",
-        32 * 1024 * 1024,
-    );
-    defer allocator.free(bytes);
-    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, bytes, .{
+fn readArchiveManifest(
+    scratch: std.mem.Allocator,
+    io: std.Io,
+    directory: std.Io.Dir,
+    total: *u64,
+) !std.json.Parsed(std.json.Value) {
+    const bytes = try catalog.readBytes(scratch, io, directory, "manifest.json", 32 * 1024 * 1024);
+    defer scratch.free(bytes);
+    total.* += bytes.len;
+    if (total.* > 2 * 1024 * 1024 * 1024) return error.ArchiveManifestByteBoundExceeded;
+    return std.json.parseFromSlice(std.json.Value, scratch, bytes, .{
         .duplicate_field_behavior = .@"error",
+        .allocate = .alloc_always,
     });
-    defer parsed.deinit();
-    if (parsed.value != .object) return error.InvalidArchiveManifest;
-    const schema = parsed.value.object.get("schema") orelse return error.InvalidArchiveManifest;
-    if (schema != .string or !std.mem.eql(u8, schema.string, "ledger-legacy-archive/v1"))
-        return error.InvalidArchiveManifest;
-    return error.UnsupportedLegacyArchiveLayout;
 }
 
 fn noSymlinks(io: std.Io, path: []const u8) !bool {
@@ -464,38 +455,86 @@ fn selectArchiveTrees(
     tree_count: usize,
     selected: *std.StringHashMapUnmanaged(void),
 ) !void {
-    if (value != .object) return error.InvalidArchiveManifest;
-    const schema = value.object.get("schema") orelse return error.InvalidArchiveManifest;
-    const all = value.object.get("sources") orelse return error.InvalidArchiveManifest;
-    if (schema != .string or
-        !std.mem.eql(u8, schema.string, "ledger-legacy-archive/v1") or
-        all != .object or
-        all.object.count() > max_sources)
-        return error.InvalidArchiveManifest;
+    const all = try archiveInventory(value, "sources");
+    if (all != .object or all.object.count() > max_sources) return error.InvalidArchiveManifest;
     for (all.object.keys(), all.object.values()) |index, tree| {
-        if (index.len == 0) return error.InvalidArchiveWorktreeIndex;
-        for (index) |byte| if (!std.ascii.isDigit(byte))
-            return error.InvalidArchiveWorktreeIndex;
-        if (tree != .object) return error.InvalidArchiveSourceInventory;
-        const entries = tree.object.get("entries") orelse
-            return error.InvalidArchiveSourceInventory;
-        if (entries != .object or
-            entries.object.count() > 100000)
-            return error.InvalidArchiveSourceInventory;
-        const entry = entries.object.get(selected_slot);
-        if (entry == null or entry.? == .null) {
-            if (!entries.object.contains(binding)) continue;
-        } else if (entry.? != .object) return error.InvalidArchivedSlotEntry;
+        try archiveWorktreeIndex(index);
+        if (!try archiveSelects(tree, selected_slot, binding)) continue;
         const original = try std.fmt.allocPrint(
             allocator,
             "{s}/{s}/worktree-{s}",
             .{ path, name, index },
         );
-        _ = try noSymlinks(io, original);
-        try selected.put(allocator, original, {});
-        if (selected.count() + tree_count > max_sources)
-            return error.PreparationSourceBoundExceeded;
+        try admitArchiveTree(allocator, io, original, tree_count, selected);
     }
+}
+
+fn selectFlatArchiveTrees(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    value: std.json.Value,
+    selected_slot: []const u8,
+    binding: []const u8,
+    path: []const u8,
+    tree_count: usize,
+    selected: *std.StringHashMapUnmanaged(void),
+) ![]const []const u8 {
+    const all = try archiveInventory(value, "worktrees");
+    if (all != .array or all.array.items.len > max_sources) return error.InvalidArchiveManifest;
+    const directories = try allocator.alloc([]const u8, all.array.items.len);
+    for (all.array.items, directories, 0..) |tree, *directory, position| {
+        if (tree != .object) return error.InvalidArchiveSourceInventory;
+        const name = tree.object.get("directory") orelse
+            return error.InvalidArchiveSourceInventory;
+        if (name != .string) return error.InvalidArchiveSourceInventory;
+        const prefix = "worktree-";
+        if (!std.mem.startsWith(u8, name.string, prefix)) return error.InvalidArchiveWorktreeIndex;
+        try archiveWorktreeIndex(name.string[prefix.len..]);
+        for (directories[0..position]) |earlier| {
+            if (std.mem.eql(u8, earlier, name.string)) return error.InvalidArchiveManifest;
+        }
+        directory.* = try allocator.dupe(u8, name.string);
+        if (!try archiveSelects(tree, selected_slot, binding)) continue;
+        const original = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ path, name.string });
+        try admitArchiveTree(allocator, io, original, tree_count, selected);
+    }
+    return directories;
+}
+
+fn archiveInventory(value: std.json.Value, field: []const u8) !std.json.Value {
+    if (value != .object) return error.InvalidArchiveManifest;
+    const schema = value.object.get("schema") orelse return error.InvalidArchiveManifest;
+    if (schema != .string or !std.mem.eql(u8, schema.string, "ledger-legacy-archive/v1"))
+        return error.InvalidArchiveManifest;
+    return value.object.get(field) orelse error.InvalidArchiveManifest;
+}
+
+fn archiveWorktreeIndex(index: []const u8) !void {
+    if (index.len == 0) return error.InvalidArchiveWorktreeIndex;
+    for (index) |byte| if (!std.ascii.isDigit(byte)) return error.InvalidArchiveWorktreeIndex;
+}
+
+fn archiveSelects(tree: std.json.Value, selected_slot: []const u8, binding: []const u8) !bool {
+    if (tree != .object) return error.InvalidArchiveSourceInventory;
+    const entries = tree.object.get("entries") orelse return error.InvalidArchiveSourceInventory;
+    if (entries != .object or entries.object.count() > 100000)
+        return error.InvalidArchiveSourceInventory;
+    const entry = entries.object.get(selected_slot) orelse .null;
+    if (entry == .null) return entries.object.contains(binding);
+    if (entry != .object) return error.InvalidArchivedSlotEntry;
+    return true;
+}
+
+fn admitArchiveTree(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    original: []const u8,
+    tree_count: usize,
+    selected: *std.StringHashMapUnmanaged(void),
+) !void {
+    _ = try noSymlinks(io, original);
+    try selected.put(allocator, original, {});
+    if (selected.count() + tree_count > max_sources) return error.PreparationSourceBoundExceeded;
 }
 
 fn lessString(_: void, left: []const u8, right: []const u8) bool {
@@ -982,6 +1021,7 @@ fn archiveGenerations(
     allocator: std.mem.Allocator,
     io: std.Io,
     archive_dir: std.Io.Dir,
+    flat: ?[]const []const u8,
 ) ![]const []const u8 {
     var generations: std.ArrayList([]const u8) = .empty;
     var iterator = archive_dir.iterate();
@@ -990,6 +1030,9 @@ fn archiveGenerations(
         observed += 1;
         if (observed > 100000) return error.ArchiveManifestBoundExceeded;
         if (unpublishedArchive(entry.name)) continue;
+        if (flat) |directories| {
+            if (flatArchiveMember(directories, entry.name)) continue;
+        }
         if (generations.items.len == max_sources) return error.ArchiveManifestBoundExceeded;
         const generation = try archive_dir.openDir(io, entry.name, .{ .follow_symlinks = false });
         generation.close(io);
@@ -997,6 +1040,14 @@ fn archiveGenerations(
     }
     std.mem.sort([]const u8, generations.items, {}, lessString);
     return generations.toOwnedSlice(allocator);
+}
+
+fn flatArchiveMember(directories: []const []const u8, name: []const u8) bool {
+    if (std.mem.eql(u8, name, "manifest.json")) return true;
+    for (directories) |directory| {
+        if (std.mem.eql(u8, directory, name)) return true;
+    }
+    return false;
 }
 
 fn unpublishedArchive(name: []const u8) bool {
@@ -1057,57 +1108,146 @@ test "host archive discovery retains old stages beside valid generations" {
     );
 }
 
-test "host archive discovery identifies unsupported flat evidence without skipping it" {
+const TestArchive = struct {
+    const slot = "owner/events.jsonl";
+    const manifest_path = "legacy-archive/manifest.json";
+    const retained_path = "legacy-archive/worktree-0/.ledger/owner/events.jsonl";
+
+    tmp: std.testing.TmpDir,
+    root: [:0]const u8,
+    environment: std.process.Environ.Map,
+    target: host.Context,
+
+    fn init(self: *TestArchive) !void {
+        const allocator = std.testing.allocator;
+        self.tmp = std.testing.tmpDir(.{});
+        errdefer self.tmp.cleanup();
+        self.root = try self.tmp.dir.realPathFileAlloc(std.testing.io, ".", allocator);
+        errdefer allocator.free(self.root);
+        self.environment = std.process.Environ.Map.init(allocator);
+        errdefer self.environment.deinit();
+        const id = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        self.target = try host.context(allocator, self.root, id, null, null, false, false);
+        errdefer self.target.deinit();
+        try testArchiveManifest(self.root, slot);
+        try testWrite(self.root, retained_path, "retain original evidence\n");
+    }
+
+    fn deinit(self: *TestArchive) void {
+        self.target.deinit();
+        self.environment.deinit();
+        std.testing.allocator.free(self.root);
+        self.tmp.cleanup();
+    }
+
+    fn manifest(self: *TestArchive, bytes: []const u8) !void {
+        try testWrite(self.root, manifest_path, bytes);
+    }
+
+    fn discover(self: *TestArchive, archives: bool) !Sources {
+        return discoverObserved(
+            std.testing.allocator,
+            std.testing.io,
+            &self.environment,
+            null,
+            self.target.value,
+            slot,
+            &.{},
+            archives,
+            null,
+        );
+    }
+};
+
+test "host archive discovery selects flat inventory trees beside generations" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const root = try tmp.dir.realPathFileAlloc(io, ".", allocator);
-    defer allocator.free(root);
-    var environment = std.process.Environ.Map.init(allocator);
-    defer environment.deinit();
-    var target = try host.context(
+    var archive: TestArchive = undefined;
+    try archive.init();
+    defer archive.deinit();
+    try archive.manifest("{\"schema\":\"ledger-legacy-archive/v1\"}");
+    try std.testing.expectError(error.InvalidArchiveManifest, archive.discover(true));
+
+    try archive.manifest("{\"schema\":\"ledger-legacy-archive/v1\",\"worktrees\":[" ++
+        "{\"directory\":\"worktree-0\",\"entries\":{\".ledger/other\":{\"kind\":\"file\"}}}]}");
+    var generations = try archive.discover(true);
+    defer generations.deinit();
+    try std.testing.expectEqual(@as(usize, 2), generations.sources.len);
+    for (generations.sources) |source| {
+        try std.testing.expect(source.archive);
+        try std.testing.expect(std.mem.indexOf(u8, source.root, "/legacy-archive/a/") != null);
+    }
+
+    const owned = "{\"schema\":\"ledger-legacy-archive/v1\",\"worktrees\":[" ++
+        "{\"directory\":\"worktree-0\",\"entries\":{" ++
+        "\".ledger/owner/events.jsonl\":{\"kind\":\"file\",\"sha256\":\"0\"}}}]}";
+    try archive.manifest(owned);
+    var found = try archive.discover(true);
+    defer found.deinit();
+    try std.testing.expectEqual(@as(usize, 3), found.sources.len);
+    const flat_root = try std.fs.path.join(
         allocator,
-        root,
-        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-        null,
-        null,
-        false,
-        false,
+        &.{ archive.root, "legacy-archive/worktree-0" },
     );
-    defer target.deinit();
-    const slot = "owner/events.jsonl";
-    try testArchiveManifest(root, slot);
-    const manifest_path = "legacy-archive/manifest.json";
-    // This reproduces the layout discriminator, not a guessed historical
-    // inventory. A schema name alone must never authorize archive recovery.
-    const manifest = "{\"schema\":\"ledger-legacy-archive/v1\"}";
-    const retained_path = "legacy-archive/worktree-0/.ledger/owner/events.jsonl";
-    try testWrite(root, manifest_path, manifest);
-    try testWrite(root, retained_path, "retain original evidence\n");
-    try std.testing.expectError(
-        error.UnsupportedLegacyArchiveLayout,
-        discover(allocator, io, &environment, null, target.value, slot, &.{}, true),
-    );
-    const saved_manifest = try catalog.readBytes(allocator, io, tmp.dir, manifest_path, 4096);
-    defer allocator.free(saved_manifest);
-    try std.testing.expectEqualStrings(manifest, saved_manifest);
-    const retained = try catalog.readBytes(allocator, io, tmp.dir, retained_path, 4096);
+    defer allocator.free(flat_root);
+    try std.testing.expectEqualStrings(flat_root, found.sources[2].root);
+    try std.testing.expect(found.sources[2].archive);
+    const directory = archive.tmp.dir;
+    const saved = try catalog.readBytes(allocator, io, directory, TestArchive.manifest_path, 4096);
+    defer allocator.free(saved);
+    try std.testing.expectEqualStrings(owned, saved);
+    const retained_path = TestArchive.retained_path;
+    const retained = try catalog.readBytes(allocator, io, directory, retained_path, 4096);
     defer allocator.free(retained);
     try std.testing.expectEqualStrings("retain original evidence\n", retained);
-    var skipped = try discover(allocator, io, &environment, null, target.value, slot, &.{}, false);
+    var skipped = try archive.discover(false);
     defer skipped.deinit();
     try std.testing.expectEqual(@as(usize, 0), skipped.sources.len);
+}
 
-    try testWrite(root, manifest_path, "[]");
-    try std.testing.expectError(
-        error.InvalidArchiveManifest,
-        discover(allocator, io, &environment, null, target.value, slot, &.{}, true),
-    );
-    try tmp.dir.deleteFile(io, manifest_path);
-    try tmp.dir.symLink(io, "a/manifest.json", manifest_path, .{});
-    try std.testing.expectError(
-        error.SymlinkComponent,
-        discover(allocator, io, &environment, null, target.value, slot, &.{}, true),
-    );
+test "host archive discovery rejects unlisted and malformed flat inventory" {
+    const io = std.testing.io;
+    var archive: TestArchive = undefined;
+    try archive.init();
+    defer archive.deinit();
+    try archive.manifest("{\"schema\":\"ledger-legacy-archive/v1\",\"worktrees\":[" ++
+        "{\"directory\":\"worktree-0\",\"entries\":{}}]}");
+    try testWrite(archive.root, "legacy-archive/worktree-1/.ledger/other", "unlisted\n");
+    try std.testing.expectError(error.FileNotFound, archive.discover(true));
+    try archive.manifest("{\"schema\":\"ledger-legacy-archive/v1\",\"worktrees\":[" ++
+        "{\"directory\":\"worktree-0\",\"entries\":{}}," ++
+        "{\"directory\":\"worktree-1\",\"entries\":{}}]}");
+    var listed = try archive.discover(true);
+    defer listed.deinit();
+    try std.testing.expectEqual(@as(usize, 2), listed.sources.len);
+
+    const prefix = "{\"schema\":\"ledger-legacy-archive/v1\",\"worktrees\":[";
+    const tree = "{\"directory\":\"worktree-0\",\"entries\":{}}";
+    const invalid = [_]struct { manifest: []const u8, expected: anyerror }{
+        .{
+            .manifest = prefix ++ "{\"directory\":\"../escape\",\"entries\":{}}]}",
+            .expected = error.InvalidArchiveWorktreeIndex,
+        },
+        .{
+            .manifest = prefix ++ tree ++ "," ++ tree ++ "]}",
+            .expected = error.InvalidArchiveManifest,
+        },
+        .{
+            .manifest = prefix ++ "{\"directory\":\"worktree-0\"}]}",
+            .expected = error.InvalidArchiveSourceInventory,
+        },
+        .{
+            .manifest = prefix ++ "{\"directory\":\"worktree-0\"," ++
+                "\"entries\":{\".ledger/owner/events.jsonl\":42}}]}",
+            .expected = error.InvalidArchivedSlotEntry,
+        },
+        .{ .manifest = "[]", .expected = error.InvalidArchiveManifest },
+    };
+    for (invalid) |case| {
+        try archive.manifest(case.manifest);
+        try std.testing.expectError(case.expected, archive.discover(true));
+    }
+    try archive.tmp.dir.deleteFile(io, TestArchive.manifest_path);
+    try archive.tmp.dir.symLink(io, "a/manifest.json", TestArchive.manifest_path, .{});
+    try std.testing.expectError(error.SymlinkComponent, archive.discover(true));
 }

@@ -1326,9 +1326,57 @@ preparation_expect_failure StoreSlotWithoutBinding "$preparation_dir/archive-bin
 mv "$preparation_dir/archive-bindings-retained" "$preparation_archive/.ledger/.bindings"
 test ! -e "$preparation_empty/.ledger/example/events.jsonl"
 
+# The flat inventory attests each archived tree by directory, kind, and digest.
+preparation_flat_archive="$preparation_dir/flat-archive/legacy-archive/worktree-0"
+preparation_flat_manifest="$preparation_dir/flat-archive/legacy-archive/manifest.json"
+preparation_flat_archive_target="$preparation_dir/flat-archive-target"
+mkdir -p "$preparation_flat_archive/.ledger"
+cp -R "$preparation_archive/.ledger/example" "$preparation_archive/.ledger/.bindings" \
+  "$preparation_archive/.ledger/.definitions" "$preparation_archive/.ledger/unrelated-evidence" \
+  "$preparation_flat_archive/.ledger/"
+"$json_cli" '{schema: .schema, selected_slots: ["example/events.jsonl"], semantic_admission: false,
+  worktrees: [{directory: "worktree-0", workspace_root: "/retired/workspace",
+    entries: (.sources["0"].entries | map_values({kind: .kind, sha256: .sha256}))}]}' \
+  "$preparation_dir/archive-manifest-before.json" >"$preparation_flat_manifest"
+cp "$preparation_flat_manifest" "$preparation_dir/flat-manifest-before.json"
+preparation_init "$preparation_flat_archive_target"
+"$binary" prepare --definition "$event_definition" --store-root "$preparation_flat_archive_target" \
+  --store-id preparation-smoke --source-archive "$preparation_flat_archive" --apply --format json \
+  >"$preparation_dir/flat-archive-applied.json"
+"$json_cli" -e '.outcome == "prepared" and .records == 2' \
+  "$preparation_dir/flat-archive-applied.json" >/dev/null
+cmp -s "$preparation_dir/expected.jsonl" "$preparation_flat_archive_target/.ledger/example/events.jsonl"
+test ! -e "$preparation_flat_archive_target/.ledger/unrelated-evidence"
+preparation_flat_binding_entry=$(find "$preparation_flat_archive/.ledger/.bindings" -name '*.jsonl' -type f -print -quit)
+for preparation_required_entry in .ledger/example/events.jsonl "${preparation_flat_binding_entry#"$preparation_flat_archive/"}"; do
+  "$json_cli" --arg path "$preparation_required_entry" 'del(.worktrees[0].entries[$path])' \
+    "$preparation_dir/flat-manifest-before.json" >"$preparation_flat_manifest"
+  preparation_expect_failure PreparationArchiveEvidenceMissing "$preparation_dir/flat-inventory-missing.json" \
+    prepare --definition "$event_definition" --store-root "$preparation_empty" \
+    --store-id preparation-smoke --source-archive "$preparation_flat_archive" --apply --format json
+done
+"$json_cli" '.worktrees[0].entries[".ledger/example/events.jsonl"].sha256 = "untrusted-digest"' \
+  "$preparation_dir/flat-manifest-before.json" >"$preparation_flat_manifest"
+preparation_expect_failure PreparationArchiveEvidenceMismatch "$preparation_dir/flat-digest-mismatch.json" \
+  prepare --definition "$event_definition" --store-root "$preparation_empty" \
+  --store-id preparation-smoke --source-archive "$preparation_flat_archive" --apply --format json
+"$json_cli" '.worktrees[0].entries[".ledger/example/events.jsonl"].size = 1' \
+  "$preparation_dir/flat-manifest-before.json" >"$preparation_flat_manifest"
+preparation_expect_failure PreparationArchiveEvidenceMismatch "$preparation_dir/flat-size-mismatch.json" \
+  prepare --definition "$event_definition" --store-root "$preparation_empty" \
+  --store-id preparation-smoke --source-archive "$preparation_flat_archive" --apply --format json
+for preparation_flat_inventory in '.worktrees[0].directory = "worktree-1"' '.worktrees += .worktrees' 'del(.worktrees)'; do
+  "$json_cli" "$preparation_flat_inventory" \
+    "$preparation_dir/flat-manifest-before.json" >"$preparation_flat_manifest"
+  preparation_expect_failure InvalidPreparationArchive "$preparation_dir/flat-inventory-invalid.json" \
+    prepare --definition "$event_definition" --store-root "$preparation_empty" \
+    --store-id preparation-smoke --source-archive "$preparation_flat_archive" --apply --format json
+done
+cp "$preparation_dir/flat-manifest-before.json" "$preparation_flat_manifest"
+test ! -e "$preparation_empty/.ledger/example/events.jsonl"
+
 # An explicit candidate can restore only the exact surviving native binding.
-# This is not a fixture for the unpublished flat archive inventory: the schema
-# marker deliberately carries no authority to admit history through that route.
+# A schema marker without a flat inventory carries no authority to admit history.
 preparation_flat="$preparation_dir/flat-evidence/legacy-archive/worktree-0"
 preparation_flat_target="$preparation_dir/flat-bound-target"
 mkdir -p "$preparation_flat/.ledger"
@@ -1357,7 +1405,7 @@ preparation_fingerprint "$preparation_flat_target" >"$preparation_dir/flat-unbou
 cmp -s "$preparation_dir/flat-unbound-before" "$preparation_dir/flat-unbound-after"
 mv "$preparation_dir/flat-target-bindings-retained" "$preparation_flat_target/.ledger/.bindings"
 preparation_fingerprint "$preparation_flat_target" >"$preparation_dir/flat-target-before"
-preparation_expect_failure UnsupportedLegacyArchiveLayout "$preparation_dir/flat-archive-blocked.json" \
+preparation_expect_failure InvalidPreparationArchive "$preparation_dir/flat-archive-blocked.json" \
   prepare --definition "$event_definition" --store-root "$preparation_flat_target" \
   --store-id preparation-smoke --restore-bound-history --source-archive "$preparation_flat" --apply --format json
 preparation_fingerprint "$preparation_flat_target" >"$preparation_dir/flat-target-after"

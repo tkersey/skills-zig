@@ -868,16 +868,10 @@ pub fn validateArchive(
     if (!std.mem.eql(u8, schema, "ledger-legacy-archive/v1")) {
         return error.InvalidPreparationArchive;
     }
-    if (flat_layout) return error.UnsupportedLegacyArchiveLayout;
-    const sources = try definition_core.json.object(
-        object.get("sources") orelse return error.InvalidPreparationArchive,
-    );
-    const selected = try definition_core.json.object(
-        sources.get(index) orelse return error.InvalidPreparationArchive,
-    );
-    const entries = try definition_core.json.object(
-        selected.get("entries") orelse return error.InvalidPreparationArchive,
-    );
+    const entries = if (flat_layout)
+        try flatArchiveEntries(object, basename)
+    else
+        try generationArchiveEntries(object, index);
     for (history.files.items) |file| {
         const path = try allocator.print(".ledger/{s}", .{file.path});
         defer allocator.free(path);
@@ -893,11 +887,47 @@ pub fn validateArchive(
         {
             return error.PreparationArchiveEvidenceMismatch;
         }
-        const size = entry.get("size") orelse return error.PreparationArchiveEvidenceMissing;
-        if (size != .integer or size.integer < 0 or size.integer != file.bytes.len) {
-            return error.PreparationArchiveEvidenceMismatch;
-        }
+        if (entry.get("size")) |size| {
+            if (size != .integer or size.integer < 0 or size.integer != file.bytes.len) {
+                return error.PreparationArchiveEvidenceMismatch;
+            }
+        } else if (!flat_layout) return error.PreparationArchiveEvidenceMissing;
     }
+}
+
+fn generationArchiveEntries(
+    object: std.json.ObjectMap,
+    index: []const u8,
+) !std.json.ObjectMap {
+    const sources = try definition_core.json.object(
+        object.get("sources") orelse return error.InvalidPreparationArchive,
+    );
+    const selected = try definition_core.json.object(
+        sources.get(index) orelse return error.InvalidPreparationArchive,
+    );
+    return definition_core.json.object(
+        selected.get("entries") orelse return error.InvalidPreparationArchive,
+    );
+}
+
+fn flatArchiveEntries(
+    object: std.json.ObjectMap,
+    directory: []const u8,
+) !std.json.ObjectMap {
+    const worktrees = try definition_core.json.array(
+        object.get("worktrees") orelse return error.InvalidPreparationArchive,
+    );
+    var found: ?std.json.ObjectMap = null;
+    for (worktrees.items) |value| {
+        const tree = try definition_core.json.object(value);
+        const name = try definition_core.json.requiredString(tree, "directory");
+        if (!std.mem.eql(u8, name, directory)) continue;
+        if (found != null) return error.InvalidPreparationArchive;
+        found = try definition_core.json.object(
+            tree.get("entries") orelse return error.InvalidPreparationArchive,
+        );
+    }
+    return found orelse error.InvalidPreparationArchive;
 }
 
 pub const File = struct {

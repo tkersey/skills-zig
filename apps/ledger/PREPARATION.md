@@ -149,11 +149,16 @@ metadata. Sources and unrelated payload are never destinations. `--param NAME=VA
 uses the existing definition parameter contract. At most 32 sources are admitted.
 
 Published archive generations have a manifest at
-`legacy-archive/<generation>/manifest.json`. A manifest directly at
-`legacy-archive/manifest.json` identifies an earlier, unsupported inventory layout
-and returns `UnsupportedLegacyArchiveLayout`. Its shared schema name does not
-prove compatibility. The archive and any neighboring generations remain intact;
-general historical import requires a verified adapter for that manifest shape.
+`legacy-archive/<generation>/manifest.json` whose `sources` map each worktree
+index to its `entries`, and select `legacy-archive/<generation>/worktree-<index>`.
+An earlier flat layout has one manifest at `legacy-archive/manifest.json` whose
+`worktrees` array names each retained `directory` (`worktree-<index>`) with its
+`entries`, and selects `legacy-archive/worktree-<index>`. Both layouts select a
+tree only when its entries contain the owner's slot or binding, and both verify
+each imported file's kind and SHA-256 digest; generation entries must also attest
+the size, which flat entries may omit. A schema name without either inventory,
+a duplicate or malformed directory, and an unlisted directory beside a flat
+manifest remain errors. Archives and neighboring generations are never modified.
 
 Exact restoration of an already bound, missing canonical slot has a separate
 proof available through
@@ -163,7 +168,7 @@ returns `PreparationRequiresBoundHistory`. The candidate must contain a complete
 native history whose binding bytes equal the surviving target binding, whose event
 digest equals that binding's last revision, and whose required definition and
 revision archives pass native replay. This can use an explicitly selected retained
-tree even when its enclosing archive inventory is unsupported. Inspect preparation
+tree even when its enclosing archive inventory cannot attest it. Inspect preparation
 without `--apply`, then apply a `ready` exact candidate while retaining
 `--restore-bound-history` and satisfying the existing writer-coordination
 requirement. Missing candidate bindings, incomplete native metadata, mismatched
