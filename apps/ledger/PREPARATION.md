@@ -153,24 +153,38 @@ Published archive generations have a manifest at
 index to its `entries`, and select `legacy-archive/<generation>/worktree-<index>`.
 An earlier flat layout has one manifest at `legacy-archive/manifest.json` whose
 `worktrees` array names each retained `directory` (`worktree-<index>`) with its
-`entries`, and selects `legacy-archive/worktree-<index>`. Discovery and an
-explicit `--source-archive` validate each manifest with the same reader, so a
-manifest's content is admissible on both or on neither, with the same validation
-error, whichever owner is being prepared. An admissible manifest is an object
-with schema `ledger-legacy-archive/v1` and its layout's inventory, holding at
-most 128 trees; each tree has a decimal-digit index, no duplicate directory, and
-an `entries` object of at most 100,000 entries whose values are objects or
-`null`, which reads as absent. Discovery also reads every other published
-directory in `legacy-archive/` as a generation (unpublished `.archiving-*`
-stages are skipped), so a directory beside a flat manifest that the manifest
-does not list must hold a valid generation manifest. A manifest's layout is
-fixed by its inventory key (`sources` or `worktrees`, never both), so an explicit
-`--source-archive` tree reads the manifest beside it and must sit directly under
-`legacy-archive` (flat) or one generation directory below it. Within an
-admissible manifest, both layouts select a tree only when its entries contain
-the owner's slot or binding, and both verify each imported file's kind and
-SHA-256 digest; generation entries must also attest the size, which flat entries
-may omit. Archives and neighboring generations are never modified.
+`entries`, and selects `legacy-archive/worktree-<index>`.
+
+One reader, `archiveTrees`, decides whether a manifest is admissible, for both
+discovery and explicit `--source-archive` validation. An admissible manifest is
+an object with schema `ledger-legacy-archive/v1` and exactly one inventory key,
+`sources` (generation) or `worktrees` (flat), which fixes its layout. It holds
+at most 128 trees; each tree has a decimal-digit index, no duplicate directory,
+and an `entries` object of at most 100,000 entries whose values are objects or
+`null`. A missing or `null` entry reads as absent everywhere.
+
+Discovery reads `legacy-archive/manifest.json`, which must be flat, and each
+other published directory in `legacy-archive/` as a generation; unpublished
+`.archiving-*` stages are skipped, and a directory beside a flat manifest that
+the manifest does not list must hold a valid generation manifest. It selects a
+tree only when its entries list the owner's slot or binding, and every selected
+tree is then verified like an explicit one.
+
+An explicit `--source-archive` tree must sit directly under a directory named
+`legacy-archive`, or one directory below it; otherwise it is rejected before any
+manifest is read. Its layout comes from the manifest beside it: flat requires
+the parent to be named `legacy-archive`, generation the grandparent. Without
+the store root, the path cannot show which interpretation discovery would use
+when both directories are named `legacy-archive`, so such a tree is accepted
+when its manifest fits either one, even where discovery for a particular store
+rejects the manifest's position. An explicit tree inside an unpublished stage is
+not refused, and an explicit tree whose entries do not list the owner fails
+verification. The source's history is captured before the manifest is verified,
+so a history error can surface before a manifest error.
+
+Verification requires each imported file's entry to exist with kind `file` and
+a matching SHA-256 digest; generation entries must also attest the size, which
+flat entries may omit. Archives and neighboring generations are never modified.
 
 Exact restoration of an already bound, missing canonical slot has a separate
 proof available through

@@ -1425,6 +1425,12 @@ preparation_expect_failure InvalidArchiveManifest "$preparation_dir/flat-empty-t
   --format json
 rmdir "$preparation_dir/flat-archive/legacy-archive/worktree-9"
 cp "$preparation_dir/flat-manifest-before.json" "$preparation_flat_manifest"
+mkdir -p "$preparation_dir/not-an-archive"
+cp -R "$preparation_flat_archive" "$preparation_dir/not-an-archive/worktree-0"
+preparation_expect_failure InvalidPreparationArchive "$preparation_dir/not-an-archive.json" \
+  prepare --definition "$event_definition" --store-root "$preparation_empty" \
+  --store-id preparation-smoke --source-archive "$preparation_dir/not-an-archive/worktree-0" \
+  --format json
 test ! -e "$preparation_empty/.ledger/example/events.jsonl"
 
 # An explicit candidate can restore only the exact surviving native binding.

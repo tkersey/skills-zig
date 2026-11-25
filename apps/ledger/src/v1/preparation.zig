@@ -842,6 +842,13 @@ pub fn validateArchive(
     const prefix = "worktree-";
     if (!std.mem.startsWith(u8, basename, prefix)) return error.InvalidPreparationArchive;
     const parent = std.fs.path.dirname(source.root) orelse return error.InvalidPreparationArchive;
+    const archive_parent = std.fs.path.dirname(parent) orelse
+        return error.InvalidPreparationArchive;
+    if (!std.mem.eql(u8, std.fs.path.basename(parent), "legacy-archive") and
+        !std.mem.eql(u8, std.fs.path.basename(archive_parent), "legacy-archive"))
+    {
+        return error.InvalidPreparationArchive;
+    }
     var directory = try storage_root.openRoot(io, parent);
     defer directory.close(io);
     var scope: storage_root.Scope = .{ .fs = .{
@@ -858,7 +865,7 @@ pub fn validateArchive(
     const layout = try archiveLayout(parsed.value);
     const archive_root = switch (layout) {
         .flat => parent,
-        .generation => std.fs.path.dirname(parent) orelse return error.InvalidPreparationArchive,
+        .generation => archive_parent,
     };
     if (!std.mem.eql(u8, std.fs.path.basename(archive_root), "legacy-archive")) {
         return error.InvalidPreparationArchive;
