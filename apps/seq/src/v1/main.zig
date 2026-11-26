@@ -444,7 +444,8 @@ fn usesRelationGraph(definition_plan: *const seq.definition.Plan) bool {
     return definition_plan.requires(.derive) or
         definition_plan.requires(.join) or
         definition_plan.requires(.ordered_fold) or
-        definition_plan.requires(.reachability);
+        definition_plan.requires(.reachability) or
+        definition_plan.requires(.union_relations);
 }
 
 fn emitGraphObservation(

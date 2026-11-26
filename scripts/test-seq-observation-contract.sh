@@ -668,6 +668,40 @@ for shape in reordered-lineage subset-lineage; do
     .[0].data.rows == .[1].data.rows and (.[0].data.rows | length) == 2' >/dev/null
 done
 
+# A union feeding the lineage join streams only when it sorts by session first;
+# then each session's rows keep the materialized union's order and multiplicity.
+jq '.requires.operators += ["union"] |
+  .pipeline |= (map(if .op == "join" then .inputs = ["both_rows", "both_rows", "session_rows"]
+    else . end) | .[0:3] + [
+    {op: "filter", input: "message_rows", as: "spoken_rows",
+     where: [{field: "role", op: "not-equal", value: "user"}]},
+    {op: "union", inputs: ["assistant_rows", "spoken_rows"], as: "both_rows",
+     order_by: [{field: "session_id"}, {field: "source_event_id"}]}] + .[3:])' \
+  "$lineage_definition" >"$work/union-lineage.json"
+jq '.relations[0].fields += ["model"]' "$work/union-lineage.json" \
+  >"$work/union-lineage-materialized.json"
+jq '(.pipeline[] | select(.op == "union")) |= del(.order_by)' "$work/union-lineage.json" \
+  >"$work/union-unordered.json"
+jq '(.pipeline[] | select(.op == "union") | .order_by) = [{field: "source_event_id"}]' \
+  "$work/union-lineage.json" >"$work/union-event-ordered.json"
+jq -e '.strategy.kind == "partition-lineage-stream"' <<<"$("$binary" explain \
+  --definition "$work/union-lineage.json" --projection rows --format json)" >/dev/null
+for shape in union-lineage-materialized union-unordered union-event-ordered; do
+  jq -e '.strategy.kind == "materialized-graph"' <<<"$("$binary" explain \
+    --definition "$work/$shape.json" --projection rows --format json)" >/dev/null
+done
+union_streamed=$("$binary" observe --definition "$work/union-lineage.json" --projection rows \
+  --root "$work/fork-root" --format json)
+union_materialized=$("$binary" observe --definition "$work/union-lineage-materialized.json" \
+  --projection rows --root "$work/fork-root" --format json)
+printf '%s\n' "$union_streamed" "$union_materialized" | jq -se '
+  .[0].data.rows == .[1].data.rows and
+  [.[0].data.rows[].session_id] ==
+    ["fixture-child", "fixture-child", "fixture-session", "fixture-session"]' >/dev/null
+"$binary" observe --definition "$work/union-lineage.json" --projection rows \
+  --path "$work/fork-root/child.jsonl" --format json |
+  jq -e '.data.rows | length == 2 and all(.session_id == "fixture-child")' >/dev/null
+
 post_limit_plan=$("$binary" explain --definition "$work/lineage-limit.json" --projection rows \
   --format json)
 jq -e '.strategy.kind == "partition-lineage-stream"' <<<"$post_limit_plan" >/dev/null

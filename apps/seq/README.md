@@ -171,8 +171,9 @@ A lineage definition streams (`partition-lineage-stream`) only when all of these
   keys are all equality keys that pair a field of that input with itself, and whose
   lineage relates rows and nodes by `session_id` and walks `parent_session_id`;
 - its local stages stay within one session: an `ordered_fold` is keyed by
-  `session_id` and its `order_by` starts with `session_id`, `distinct` and joins
-  are keyed by `session_id`, and a stage that outputs `session_id` copies it from
+  `session_id` and its `order_by` starts with `session_id`, a `union`'s
+  `order_by` starts with `session_id`, `distinct` and joins are keyed by
+  `session_id`, and a stage that outputs `session_id` copies it from
   `session_id`, a join from its left input;
 - its lineage graph input reaches the sessions scan through filters, projections,
   aliases, sorts, and input-preserving derives that do not define `session_id` or
@@ -330,6 +331,19 @@ integer byte limit, preserves null text, and stops before splitting a codepoint.
 Compare the prefix with its input to detect truncation. Capabilities advertise
 this through `derive` version 3 and `ordered-fold` version 2. Bounded excerpts
 are not automatic redaction or semantic contamination classification.
+
+`union` (capability version 1) concatenates two to sixteen relations into one,
+keeping every row: it never removes duplicates. Its inputs must carry the same
+field names with the same types; the output keeps the first input's field order
+and is nullable wherever any input is. Without `order_by`, rows follow input order
+and each input's own row order. With `order_by`, which takes the same keys as
+`ordered-fold`, rows are sorted by those keys, and equal rows keep input order and
+then each input's row order. Routing rows by `filter` into separate branches and
+merging them with `union` lets each branch handle only the rows it is written for.
+A union inside a streamed lineage prefix must sort by `session_id` first, as a local
+`ordered_fold` does; each session then keeps the order the materialized union gives
+it, so both strategies agree. Like a fold, it sorts the rows of identity-less session
+files per file when streaming, where the materialized union sorts them together.
 
 ## Native surface
 
