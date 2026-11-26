@@ -858,6 +858,86 @@ pub fn isUuid(text: []const u8) bool {
     return true;
 }
 
+// Claude Code writes one orchestration journal per workflow run beside that
+// workflow's worker transcripts. Journal records carry no transcript signature, so
+// corpus discovery recognizes them by both their layout and their first record.
+const workflow_journal_name = "journal.jsonl";
+const workflow_journal_types = [_][]const u8{ "launched", "started", "result" };
+
+/// Matches `<session-uuid>/subagents/workflows/<workflow-id>/journal.jsonl`.
+pub fn isWorkflowJournalPath(path: []const u8) bool {
+    if (!eql(std.fs.path.basename(path), workflow_journal_name)) return false;
+    const workflow = std.fs.path.dirname(path) orelse return false;
+    const workflows = std.fs.path.dirname(workflow) orelse return false;
+    if (!eql(std.fs.path.basename(workflows), "workflows")) return false;
+    const subagents = std.fs.path.dirname(workflows) orelse return false;
+    if (!eql(std.fs.path.basename(subagents), "subagents")) return false;
+    const session = std.fs.path.dirname(subagents) orelse return false;
+    return isUuid(std.fs.path.basename(session));
+}
+
+/// A journal record has a journal type and no Claude, Codex or Pi signature.
+pub fn isWorkflowJournalRecord(root: std.json.ObjectMap) bool {
+    const entry_type = stringField(root, "type") orelse return false;
+    return oneOf(entry_type, &workflow_journal_types) and signature(root, 1) == .neutral;
+}
+
+test "workflow journal paths require the session workflow layout" {
+    const session = "/p/-repo/d0000000-0000-4000-8000-000000000001";
+    const matching = [_][]const u8{
+        session ++ "/subagents/workflows/wf_1/journal.jsonl",
+        "d0000000-0000-4000-8000-000000000001/subagents/workflows/wf_1/journal.jsonl",
+    };
+    for (matching) |path| try std.testing.expect(isWorkflowJournalPath(path));
+    const other = [_][]const u8{
+        session ++ "/subagents/workflows/wf_1/agent-a1.jsonl",
+        session ++ "/subagents/workflows/wf_1/journal.jsonl.zst",
+        session ++ "/subagents/workflows/wf_1/Journal.jsonl",
+        session ++ "/subagents/workflows/journal.jsonl",
+        session ++ "/subagents/journal.jsonl",
+        session ++ "/subagents/other/wf_1/journal.jsonl",
+        session ++ "/agents/workflows/wf_1/journal.jsonl",
+        session ++ "/subagents/workflows/wf_1/nested/journal.jsonl",
+        "/p/-repo/not-a-session/subagents/workflows/wf_1/journal.jsonl",
+        "/p/-repo/d0000000-0000-4000-8000-00000000000/subagents/workflows/wf_1/journal.jsonl",
+        "subagents/workflows/wf_1/journal.jsonl",
+        "journal.jsonl",
+    };
+    for (other) |path| try std.testing.expect(!isWorkflowJournalPath(path));
+}
+
+test "workflow journal records have a journal type and no source signature" {
+    const journal = [_][]const u8{
+        \\{"type":"launched"}
+        ,
+        \\{"type":"started","agentId":"a1","key":"k","label":"l","phase":"p"}
+        ,
+        \\{"type":"result","agentId":"a1","key":"k","sessionId":"s","result":{},"toolsUsed":[]}
+        ,
+    };
+    const other = [_][]const u8{
+        \\{"type":"user","uuid":"u","sessionId":"s","message":{"role":"user","content":"x"}}
+        ,
+        \\{"type":"launched","record_type":"state"}
+        ,
+        \\{"type":"response_item","payload":{"type":"message"}}
+        ,
+        \\{"type":"paused"}
+        ,
+        \\{"type":7}
+        ,
+        \\{"kind":"launched"}
+        ,
+    };
+    for (journal ++ other, 0..) |line, index| {
+        const testing_allocator = std.testing.allocator;
+        const parsed = try std.json.parseFromSlice(std.json.Value, testing_allocator, line, .{});
+        defer parsed.deinit();
+        const root = valueObject(parsed.value).?;
+        try std.testing.expectEqual(index < journal.len, isWorkflowJournalRecord(root));
+    }
+}
+
 const Prefix = struct {
     done: bool = false,
     first_session_id: ?[]const u8 = null,

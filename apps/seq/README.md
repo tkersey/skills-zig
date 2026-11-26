@@ -482,6 +482,21 @@ source fails with `UnsupportedSessionFormat`; non-empty input with no known
 signature fails with `UnclassifiedSessionFormat` before any row is emitted.
 Empty files keep their rows and cast no adapter vote.
 
+Claude corpus discovery (the default Claude Code root, or an explicit `--root`
+other than the live Codex session root) excludes Claude Code workflow journals
+(Seq 1.6.2). A journal is a file named `journal.jsonl` directly inside
+`<session-uuid>/subagents/workflows/<workflow-id>/` whose first line, read within
+4 KiB, is a `launched`, `started` or `result` record with no transcript signature.
+Journals record workflow orchestration, not a conversation. Worker transcripts in
+the same directory are still read. Observation limitations report the count as
+`claude_workflow_journals_excluded`, and each probe counts toward the discovery
+statistics. Native commands, including `seq index`, omit journals without
+reporting a count. A file that fails either test stays in the corpus and is
+classified as above, and an explicit `--path` to a journal still fails with
+`UnclassifiedSessionFormat`. Recognition follows Claude Code's internal journal
+layout: if that layout changes, the corpus fails again instead of silently
+skipping the files.
+
 `source_events` carries nullable `native_id` and `native_parent_id` (Seq 1.6):
 each Claude record's `uuid` and physical `parentUuid`, for modeled and private
 records alike. A compaction's `logicalParentUuid` is not substituted. Other
@@ -561,8 +576,8 @@ An explicit Claude transcript path outside the default corpus admits its
 session family (the main transcript and its workers) for corpus graph
 discovery; native commands and physically selected observations read one file.
 Observation limitations report `claude_inline_sidechain_records`,
-`claude_unlocated_spawn_count`, `claude_worker_parent_unread` and
-`claude_worker_parent_missing` counts. Claude Code's transcript format is
+`claude_unlocated_spawn_count`, `claude_worker_parent_unread`,
+`claude_worker_parent_missing` and `claude_workflow_journals_excluded` counts. Claude Code's transcript format is
 internal and versioned; out-of-line tool output files are not read.
 
 `seq tail --current` reads `CLAUDE_CODE_SESSION_ID` beside the Codex and Pi

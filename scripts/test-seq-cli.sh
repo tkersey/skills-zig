@@ -376,6 +376,47 @@ if pi_mixed=$(claude_isolated observe --definition "$cache_dir/session-ids.json"
   exit 1
 fi
 jq -e '.code == "MixedPhysicalSourceAdapters"' <<<"$pi_mixed" >/dev/null
+claude_workflow="$cache_dir/claude-workflow"
+claude_workflow_id=d0000000-0000-4000-8000-000000000010
+claude_workflow_worker=$claude_workflow_id/agent-c1c2c3c4c5c600002
+claude_workflow_run="$claude_workflow/projects/-work-flow/$claude_workflow_id/subagents/workflows"
+cp -R "$claude_fixtures/workflow" "$claude_workflow"
+claude_workflow_env() {
+  HOME="$cache_dir/home" CODEX_HOME="$cache_dir/codex" CLAUDE_CONFIG_DIR="$claude_workflow" \
+    "$binary" "$@"
+}
+for claude_workflow_selection in "--source=claude-code" "--root=$claude_workflow/projects"; do
+  claude_workflow_selector=("${claude_workflow_selection%%=*}" "${claude_workflow_selection#*=}")
+  claude_workflow_sessions=$(claude_workflow_env sessions "${claude_workflow_selector[@]}" \
+    --format json)
+  jq -e --arg worker "$claude_workflow_worker" 'length == 3 and
+    any(.[]; .session_id == $worker) and all(.[]; .path | endswith("/journal.jsonl") | not)' \
+    <<<"$claude_workflow_sessions" >/dev/null
+  for claude_workflow_definition in session-exclusion session-self-join family-lineage; do
+    claude_workflow_args=(--definition "$claude_definitions/$claude_workflow_definition.json")
+    if [[ $claude_workflow_definition == session-exclusion ]]; then
+      claude_workflow_args+=(--param exclude_session_id=none)
+    fi
+    claude_workflow_observed=$(claude_workflow_env observe "${claude_workflow_args[@]}" \
+      --projection rows "${claude_workflow_selector[@]}" --format json)
+    jq -e --arg worker "$claude_workflow_worker" '.corpus.files == 3 and
+      (.data.rows | any(.[]; .session_id == $worker)) and
+      (.limitations | index("claude_workflow_journals_excluded: 1") != null)' \
+      <<<"$claude_workflow_observed" >/dev/null
+  done
+done
+if claude_journal_path=$(claude_workflow_env turns \
+  --path "$claude_workflow_run/wf_0001/journal.jsonl" --format json); then
+  exit 1
+fi
+jq -e '.code == "UnclassifiedSessionFormat"' <<<"$claude_journal_path" >/dev/null
+printf '{"type":"paused"}\n' >"$claude_workflow/projects/-work-flow/stray.jsonl"
+if claude_stray=$(claude_workflow_env observe \
+  --definition "$claude_definitions/session-self-join.json" --projection rows \
+  --root "$claude_workflow/projects" --format json); then
+  exit 1
+fi
+jq -e '.code == "UnclassifiedSessionFormat"' <<<"$claude_stray" >/dev/null
 
 external_output=$("$binary" observe \
   --definition "$external_definition" \
