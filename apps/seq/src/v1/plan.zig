@@ -558,7 +558,37 @@ fn compileGenericStage(
         source,
     );
     defer input.deinit(allocator);
-    var schema = switch (source.operator) {
+    var schema = try genericStageSchema(
+        allocator,
+        definition_plan,
+        prior_stages,
+        source,
+        &input.schema,
+        object,
+    );
+    errdefer schema.deinit(allocator);
+    return .{
+        .source = input.source,
+        .operation = .{ .generic = .{
+            .operator = source.operator,
+            .canonical_config = try allocator.dupe(
+                u8,
+                source.canonical_config,
+            ),
+        } },
+        .schema = schema,
+    };
+}
+
+fn genericStageSchema(
+    allocator: std.mem.Allocator,
+    definition_plan: *const definition.Plan,
+    prior_stages: []const Stage,
+    source: definition.Step,
+    input: *const Schema,
+    object: std.json.ObjectMap,
+) !Schema {
+    return switch (source.operator) {
         .derive => if (object.get("preserve_input")) |raw|
             if (!try definition_core.json.boolean(raw))
                 try schemaFromDeclaredColumns(
@@ -570,7 +600,7 @@ fn compileGenericStage(
             else
                 try appendDeclaredColumns(
                     allocator,
-                    &input.schema,
+                    input,
                     try definition_core.json.array(
                         try definition_core.json.field(object, "fields"),
                     ),
@@ -578,7 +608,7 @@ fn compileGenericStage(
         else
             try appendDeclaredColumns(
                 allocator,
-                &input.schema,
+                input,
                 try definition_core.json.array(
                     try definition_core.json.field(object, "fields"),
                 ),
@@ -600,22 +630,10 @@ fn compileGenericStage(
             definition_plan,
             prior_stages,
             source,
-            &input.schema,
+            input,
             object,
         ),
         else => unreachable,
-    };
-    errdefer schema.deinit(allocator);
-    return .{
-        .source = input.source,
-        .operation = .{ .generic = .{
-            .operator = source.operator,
-            .canonical_config = try allocator.dupe(
-                u8,
-                source.canonical_config,
-            ),
-        } },
-        .schema = schema,
     };
 }
 
@@ -649,7 +667,8 @@ fn compileUnionSchema(
         }
     }
     if (object.get("order_by")) |raw| {
-        allocator.free(try compileSortKeys(allocator, &schema, try definition_core.json.array(raw)));
+        const keys = try compileSortKeys(allocator, &schema, try definition_core.json.array(raw));
+        allocator.free(keys);
     }
     return schema;
 }
@@ -3160,7 +3179,8 @@ const union_plan_fields =
 
 fn expectUnionPlan(fields: []const u8, order: []const u8) !void {
     const allocator = std.testing.allocator;
-    const with_fields = try std.mem.replaceOwned(u8, allocator, union_plan_template, "@FIELDS@", fields);
+    const with_fields =
+        try std.mem.replaceOwned(u8, allocator, union_plan_template, "@FIELDS@", fields);
     defer allocator.free(with_fields);
     const source = try std.mem.replaceOwned(u8, allocator, with_fields, "@ORDER@", order);
     defer allocator.free(source);
@@ -3182,7 +3202,10 @@ fn expectUnionPlan(fields: []const u8, order: []const u8) !void {
     const first = native_plan.stages[native_plan.findStage("a").?].schema;
     const second = native_plan.stages[native_plan.findStage("u").?].schema;
     const merged = native_plan.stages[native_plan.findStage("rows").?];
-    try std.testing.expectEqual(definition.Operator.union_relations, merged.operation.generic.operator);
+    try std.testing.expectEqual(
+        definition.Operator.union_relations,
+        merged.operation.generic.operator,
+    );
     try std.testing.expectEqual(first.columns.len, merged.schema.columns.len);
     for (first.columns, merged.schema.columns) |column, output| {
         try std.testing.expectEqualStrings(column.name, output.name);
@@ -3218,7 +3241,10 @@ test "union rejects inputs whose fields differ and order keys it cannot sort by"
         ,
     };
     for (cases) |fields| {
-        try std.testing.expectError(error.ObservationUnionSchemaMismatch, expectUnionPlan(fields, ""));
+        try std.testing.expectError(
+            error.ObservationUnionSchemaMismatch,
+            expectUnionPlan(fields, ""),
+        );
     }
     try std.testing.expectError(error.UnknownObservationSortField, expectUnionPlan(
         union_plan_fields,

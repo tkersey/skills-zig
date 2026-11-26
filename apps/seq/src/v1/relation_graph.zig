@@ -510,7 +510,11 @@ fn unionSessionOrder(
     const root = try definition_core.json.object(parsed.value);
     const order_by = root.get("order_by") orelse return null;
     const session = stage.schema.find("session_id") orelse return null;
-    const order = try compileDynamicSort(allocator, &stage.schema, try definition_core.json.array(order_by));
+    const order = try compileDynamicSort(
+        allocator,
+        &stage.schema,
+        try definition_core.json.array(order_by),
+    );
     defer allocator.free(order);
     if (order.len == 0 or order[0].field_index != session) return null;
     return order[0];
@@ -586,7 +590,12 @@ fn localPartitionOrder(
             .scan => return .path,
             .generic => |generic| switch (generic.operator) {
                 .ordered_fold => {
-                    const key = try sessionFoldOrder(allocator, definition_plan, native_plan, current);
+                    const key = try sessionFoldOrder(
+                        allocator,
+                        definition_plan,
+                        native_plan,
+                        current,
+                    );
                     return .{ .session = key.? };
                 },
                 .union_relations => {
@@ -1312,7 +1321,8 @@ fn unionTable(
         }
         for (0..try table.rowCount()) |row_index| {
             const row = table.row(row_index);
-            for (columns, values[offset * width ..][0..width]) |source, *value| value.* = row[source];
+            const target = values[offset * width ..][0..width];
+            for (columns, target) |source, *value| value.* = row[source];
             offset += 1;
         }
     }
@@ -1321,7 +1331,11 @@ fn unionTable(
     defer parsed.deinit();
     const root = try definition_core.json.object(parsed.value);
     const order_by = root.get("order_by") orelse return output;
-    const keys = try compileDynamicSort(allocator, &output_schema, try definition_core.json.array(order_by));
+    const keys = try compileDynamicSort(
+        allocator,
+        &output_schema,
+        try definition_core.json.array(order_by),
+    );
     defer allocator.free(keys);
     return sortTableInPlace(allocator, output, .{ .keys = keys });
 }
@@ -4755,7 +4769,13 @@ test "union concatenates inputs in order and sorts ties by input then position" 
     };
     const allocator = std.testing.allocator;
     for (cases) |case| {
-        const source = try std.mem.replaceOwned(u8, allocator, union_execution_template, "@ORDER@", case.order);
+        const source = try std.mem.replaceOwned(
+            u8,
+            allocator,
+            union_execution_template,
+            "@ORDER@",
+            case.order,
+        );
         defer allocator.free(source);
         var tmp = std.testing.tmpDir(.{});
         defer tmp.cleanup();
@@ -4824,8 +4844,360 @@ test "a union streams before the lineage join only when it sorts by session firs
     };
     const allocator = std.testing.allocator;
     for (cases) |case| {
-        const source = try std.mem.replaceOwned(u8, allocator, union_lineage_template, "@ORDER@", case.order);
+        const source =
+            try std.mem.replaceOwned(u8, allocator, union_lineage_template, "@ORDER@", case.order);
         defer allocator.free(source);
         try std.testing.expectEqual(case.streams, try testDefinitionStreams(source));
+    }
+}
+
+const union_property_template =
+    \\{"schema":"seq-observation-definition/v1","id":"test/union-property",
+    \\ "requires":{"abi":"seq-observation-abi/v1","operators":["filter","scan","union"]},
+    \\ "parameters":{},"selectors":[],"inputs":[],
+    \\ "relations":[{"name":"messages","fields":["session_id","role","text"]}],
+    \\ "pipeline":[{"op":"scan","relation":"messages","as":"source"},
+    \\   {"op":"filter","input":"source","as":"assistant",
+    \\    "where":[{"field":"role","op":"exact","value":"assistant"}]},
+    \\   {"op":"filter","input":"source","as":"spoken",
+    \\    "where":[{"field":"role","op":"not-equal","value":"user"}]},
+    \\   {"op":"union","inputs":["assistant","spoken"],"as":"rows"@ORDER@}],
+    \\ "projections":{"rows":{"relation":"rows","schema":"test/union-property/v1",
+    \\   "fields":["session_id","role","text"],"renderers":["json"]}},
+    \\ "bounds":{"max_rows":1000,"max_output_bytes":65536,"max_fold_states":4}}
+;
+
+/// One `order_by` key as the oracle reads it, independently of the engine's sort.
+const OracleKey = struct {
+    column: usize,
+    descending: bool = false,
+    nulls_first: bool = false,
+};
+
+const UnionPropertyCase = struct {
+    order: []const u8,
+    keys: []const OracleKey,
+    session_first: bool,
+};
+
+const union_property_cases = [_]UnionPropertyCase{
+    .{ .order = "", .keys = &.{}, .session_first = false },
+    .{
+        .order = ",\"order_by\":[{\"field\":\"session_id\"}]",
+        .keys = &.{.{ .column = 0 }},
+        .session_first = true,
+    },
+    .{
+        .order = ",\"order_by\":[{\"field\":\"session_id\"},{\"field\":\"text\"}]",
+        .keys = &.{ .{ .column = 0 }, .{ .column = 2 } },
+        .session_first = true,
+    },
+    .{
+        .order = ",\"order_by\":[{\"field\":\"session_id\",\"direction\":\"desc\"}," ++
+            "{\"field\":\"text\",\"direction\":\"desc\",\"nulls\":\"first\"}]",
+        .keys = &.{
+            .{ .column = 0, .descending = true },
+            .{ .column = 2, .descending = true, .nulls_first = true },
+        },
+        .session_first = true,
+    },
+    .{
+        .order = ",\"order_by\":[{\"field\":\"text\"}]",
+        .keys = &.{.{ .column = 2 }},
+        .session_first = false,
+    },
+    .{
+        .order = ",\"order_by\":[{\"field\":\"text\",\"direction\":\"desc\"},{\"field\":\"role\"}]",
+        .keys = &.{ .{ .column = 2, .descending = true }, .{ .column = 1 } },
+        .session_first = false,
+    },
+    .{
+        .order = ",\"order_by\":[{\"field\":\"role\"}," ++
+            "{\"field\":\"session_id\",\"nulls\":\"first\"}]",
+        .keys = &.{ .{ .column = 1 }, .{ .column = 0, .nulls_first = true } },
+        .session_first = false,
+    },
+};
+
+const property_sessions = [_][]const u8{ "s3", "s1", "s0", "s2" };
+const property_roles = [_][]const u8{ "assistant", "user", "tool" };
+const property_texts = [_][]const u8{ "a", "b", "c" };
+
+fn propertyText(random: std.Random, choices: []const []const u8, allow_null: bool) execution.Value {
+    const index = random.uintLessThan(usize, choices.len + @intFromBool(allow_null));
+    return if (index == choices.len) .null else .{ .string = choices[index] };
+}
+
+fn oracleOrder(left: execution.Value, right: execution.Value, key: OracleKey) std.math.Order {
+    const left_null = left == .null;
+    const right_null = right == .null;
+    if (left_null and right_null) return .eq;
+    if (left_null) return if (key.nulls_first) .lt else .gt;
+    if (right_null) return if (key.nulls_first) .gt else .lt;
+    const order = std.mem.order(u8, left.string, right.string);
+    if (!key.descending) return order;
+    return switch (order) {
+        .lt => .gt,
+        .gt => .lt,
+        .eq => .eq,
+    };
+}
+
+fn oracleLess(
+    keys: []const OracleKey,
+    left: []const execution.Value,
+    right: []const execution.Value,
+) bool {
+    for (keys) |key| {
+        const order = oracleOrder(left[key.column], right[key.column], key);
+        if (order != .eq) return order == .lt;
+    }
+    return false;
+}
+
+/// The union law from apps/seq/README.md: rows of each input in input order,
+/// every row kept, then a stable sort by `order_by`. Computed without the engine.
+fn unionOracle(
+    allocator: std.mem.Allocator,
+    rows: []const execution.Value,
+    keys: []const OracleKey,
+) ![]execution.Value {
+    var expected: std.ArrayList(execution.Value) = .empty;
+    errdefer expected.deinit(allocator);
+    const count = rows.len / 3;
+    for (0..2) |input| {
+        for (0..count) |index| {
+            const row = rows[index * 3 ..][0..3];
+            const role = row[1].string;
+            const kept = if (input == 0)
+                std.mem.eql(u8, role, "assistant")
+            else
+                !std.mem.eql(u8, role, "user");
+            if (kept) try expected.appendSlice(allocator, row);
+        }
+    }
+    const values = try expected.toOwnedSlice(allocator);
+    var index: usize = 1;
+    while (index < values.len / 3) : (index += 1) {
+        var current = index;
+        while (current > 0 and oracleLess(
+            keys,
+            values[current * 3 ..][0..3],
+            values[(current - 1) * 3 ..][0..3],
+        )) : (current -= 1) {
+            var swap: [3]execution.Value = undefined;
+            @memcpy(&swap, values[current * 3 ..][0..3]);
+            @memcpy(values[current * 3 ..][0..3], values[(current - 1) * 3 ..][0..3]);
+            @memcpy(values[(current - 1) * 3 ..][0..3], &swap);
+        }
+    }
+    return values;
+}
+
+fn generatePropertyRows(
+    allocator: std.mem.Allocator,
+    random: std.Random,
+    session: ?[]const u8,
+) ![]execution.Value {
+    const count = random.uintLessThan(usize, 9);
+    const values = try allocator.alloc(execution.Value, count * 3);
+    for (0..count) |index| {
+        values[index * 3] = if (session) |name|
+            .{ .string = name }
+        else
+            propertyText(random, &property_sessions, true);
+        values[index * 3 + 1] = propertyText(random, &property_roles, false);
+        values[index * 3 + 2] = propertyText(random, &property_texts, true);
+    }
+    return values;
+}
+
+fn executeUnionRows(
+    allocator: std.mem.Allocator,
+    definition_plan: *const definition.Plan,
+    native_plan: *const plan.Plan,
+    rows: []execution.Value,
+) !Table {
+    var scans = [_]ScanInput{
+        .{ .stage_index = 0, .table = .{ .values = rows, .width = 3 }, .owned = false },
+    };
+    const result = try executeTarget(
+        allocator,
+        allocator,
+        definition_plan,
+        native_plan,
+        &expression_test_bindings,
+        .{},
+        native_plan.findStage("rows").?,
+        &scans,
+    );
+    return result.table;
+}
+
+const UnionPropertyPlan = struct {
+    tmp: std.testing.TmpDir,
+    closure: definition_core.closure.Closure,
+    definition_plan: definition.Plan,
+    native_plan: plan.Plan,
+
+    fn init(allocator: std.mem.Allocator, order: []const u8) !UnionPropertyPlan {
+        const source = try std.mem.replaceOwned(
+            u8,
+            allocator,
+            union_property_template,
+            "@ORDER@",
+            order,
+        );
+        defer allocator.free(source);
+        var tmp = std.testing.tmpDir(.{});
+        errdefer tmp.cleanup();
+        try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "definition.json", .data = source });
+        var closure = try definition_core.closure.loadFromDir(
+            std.testing.io,
+            allocator,
+            &tmp.dir,
+            "definition.json",
+            .{},
+        );
+        errdefer closure.deinit(allocator);
+        var definition_plan = try definition.compile(allocator, &closure, "definition.json");
+        errdefer definition_plan.deinit(allocator);
+        const native_plan = try plan.compile(allocator, &definition_plan);
+        return .{
+            .tmp = tmp,
+            .closure = closure,
+            .definition_plan = definition_plan,
+            .native_plan = native_plan,
+        };
+    }
+
+    fn deinit(self: *UnionPropertyPlan, allocator: std.mem.Allocator) void {
+        self.native_plan.deinit(allocator);
+        self.definition_plan.deinit(allocator);
+        self.closure.deinit(allocator);
+        self.tmp.cleanup();
+    }
+};
+
+test "union equals the stable order_by sort of its inputs in input order" {
+    const allocator = std.testing.allocator;
+    var prng = std.Random.DefaultPrng.init(0x0a11_0f_5eed);
+    for (union_property_cases) |case| {
+        var compiled = try UnionPropertyPlan.init(allocator, case.order);
+        defer compiled.deinit(allocator);
+        for (0..256) |_| {
+            const rows = try generatePropertyRows(allocator, prng.random(), null);
+            defer allocator.free(rows);
+            const expected = try unionOracle(allocator, rows, case.keys);
+            defer allocator.free(expected);
+            const actual = try executeUnionRows(
+                allocator,
+                &compiled.definition_plan,
+                &compiled.native_plan,
+                rows,
+            );
+            defer allocator.free(actual.values);
+            try std.testing.expectEqualDeep(expected, actual.values);
+        }
+    }
+}
+
+test "a session-first union streamed per session equals the materialized union" {
+    const allocator = std.testing.allocator;
+    var prng = std.Random.DefaultPrng.init(0x5e55_10_0de7);
+    for (union_property_cases) |case| {
+        if (!case.session_first) continue;
+        var compiled = try UnionPropertyPlan.init(allocator, case.order);
+        defer compiled.deinit(allocator);
+        const stage = compiled.native_plan.findStage("rows").?;
+        const key = (try unionSessionOrder(allocator, &compiled.native_plan, stage)).?;
+        for (0..256) |_| {
+            const random = prng.random();
+            var names = property_sessions;
+            random.shuffle([]const u8, &names);
+            const count = 1 + random.uintLessThan(usize, names.len);
+            var partitions: [property_sessions.len][]execution.Value = undefined;
+            var sessions: [property_sessions.len]?[]const u8 = undefined;
+            var whole: std.ArrayList(execution.Value) = .empty;
+            defer whole.deinit(allocator);
+            for (0..count) |index| {
+                partitions[index] = try generatePropertyRows(allocator, random, names[index]);
+                sessions[index] = names[index];
+                try whole.appendSlice(allocator, partitions[index]);
+            }
+            defer for (partitions[0..count]) |rows| allocator.free(rows);
+            const materialized = try executeUnionRows(
+                allocator,
+                &compiled.definition_plan,
+                &compiled.native_plan,
+                whole.items,
+            );
+            defer allocator.free(materialized.values);
+            const ranks = try rankPartitions(allocator, .{ .session = key }, sessions[0..count]);
+            defer allocator.free(ranks);
+            var streamed: std.ArrayList(execution.Value) = .empty;
+            defer streamed.deinit(allocator);
+            for (0..count) |rank| {
+                const partition = std.mem.indexOfScalar(usize, ranks, rank).?;
+                const local = try executeUnionRows(
+                    allocator,
+                    &compiled.definition_plan,
+                    &compiled.native_plan,
+                    partitions[partition],
+                );
+                defer allocator.free(local.values);
+                try streamed.appendSlice(allocator, local.values);
+            }
+            try std.testing.expectEqualDeep(materialized.values, streamed.items);
+        }
+    }
+}
+
+test "a cached union plan decodes to the compiled plan and executes identically" {
+    const allocator = std.testing.allocator;
+    var prng = std.Random.DefaultPrng.init(0xcac4_e0_5eed);
+    for (union_property_cases) |case| {
+        var compiled = try UnionPropertyPlan.init(allocator, case.order);
+        defer compiled.deinit(allocator);
+        var encoder = definition_core.cache.Encoder.init(allocator, 64 * 1024);
+        defer encoder.deinit();
+        try plan.encodeCache(&compiled.native_plan, &encoder);
+        const payload = try encoder.toOwnedSlice();
+        defer allocator.free(payload);
+        var decoder = definition_core.cache.Decoder.init(payload);
+        var cached = try plan.decodeCache(allocator, &decoder, &compiled.definition_plan);
+        defer cached.deinit(allocator);
+        try decoder.finish();
+        try std.testing.expectEqual(compiled.native_plan.stages.len, cached.stages.len);
+        for (compiled.native_plan.stages, cached.stages) |fresh, restored| {
+            try std.testing.expectEqualStrings(fresh.name, restored.name);
+            try std.testing.expectEqual(fresh.schema.columns.len, restored.schema.columns.len);
+            for (fresh.schema.columns, restored.schema.columns) |left, right| {
+                try std.testing.expectEqualStrings(left.name, right.name);
+                try std.testing.expectEqual(left.kind, right.kind);
+                try std.testing.expectEqual(left.nullable, right.nullable);
+            }
+        }
+        const stage = cached.stages[cached.findStage("rows").?].operation.generic;
+        try std.testing.expectEqual(definition.Operator.union_relations, stage.operator);
+        for (0..32) |_| {
+            const rows = try generatePropertyRows(allocator, prng.random(), null);
+            defer allocator.free(rows);
+            const fresh = try executeUnionRows(
+                allocator,
+                &compiled.definition_plan,
+                &compiled.native_plan,
+                rows,
+            );
+            defer allocator.free(fresh.values);
+            const restored = try executeUnionRows(
+                allocator,
+                &compiled.definition_plan,
+                &cached,
+                rows,
+            );
+            defer allocator.free(restored.values);
+            try std.testing.expectEqualDeep(fresh.values, restored.values);
+        }
     }
 }
