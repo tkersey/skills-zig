@@ -17,6 +17,7 @@ pub fn supports(operator: definition.Operator) bool {
         .sort,
         .top_k,
         .distinct,
+        .union_relations,
         .named_relation,
         .result_projection,
         => true,
@@ -525,6 +526,7 @@ fn compileStageBody(
         .join,
         .ordered_fold,
         .reachability,
+        .union_relations,
         => try compileGenericStage(
             allocator,
             definition_plan,
@@ -556,7 +558,37 @@ fn compileGenericStage(
         source,
     );
     defer input.deinit(allocator);
-    var schema = switch (source.operator) {
+    var schema = try genericStageSchema(
+        allocator,
+        definition_plan,
+        prior_stages,
+        source,
+        &input.schema,
+        object,
+    );
+    errdefer schema.deinit(allocator);
+    return .{
+        .source = input.source,
+        .operation = .{ .generic = .{
+            .operator = source.operator,
+            .canonical_config = try allocator.dupe(
+                u8,
+                source.canonical_config,
+            ),
+        } },
+        .schema = schema,
+    };
+}
+
+fn genericStageSchema(
+    allocator: std.mem.Allocator,
+    definition_plan: *const definition.Plan,
+    prior_stages: []const Stage,
+    source: definition.Step,
+    input: *const Schema,
+    object: std.json.ObjectMap,
+) !Schema {
+    return switch (source.operator) {
         .derive => if (object.get("preserve_input")) |raw|
             if (!try definition_core.json.boolean(raw))
                 try schemaFromDeclaredColumns(
@@ -568,7 +600,7 @@ fn compileGenericStage(
             else
                 try appendDeclaredColumns(
                     allocator,
-                    &input.schema,
+                    input,
                     try definition_core.json.array(
                         try definition_core.json.field(object, "fields"),
                     ),
@@ -576,7 +608,7 @@ fn compileGenericStage(
         else
             try appendDeclaredColumns(
                 allocator,
-                &input.schema,
+                input,
                 try definition_core.json.array(
                     try definition_core.json.field(object, "fields"),
                 ),
@@ -593,20 +625,52 @@ fn compileGenericStage(
                 try definition_core.json.field(object, "emit"),
             ),
         ),
+        .union_relations => try compileUnionSchema(
+            allocator,
+            definition_plan,
+            prior_stages,
+            source,
+            input,
+            object,
+        ),
         else => unreachable,
     };
+}
+
+/// A union's inputs must carry the same field names with the same kinds; the
+/// output keeps the first input's column order and is nullable wherever any
+/// input is. An `order_by`, when present, must name output fields.
+fn compileUnionSchema(
+    allocator: std.mem.Allocator,
+    definition_plan: *const definition.Plan,
+    prior_stages: []const Stage,
+    source: definition.Step,
+    first: *const Schema,
+    object: std.json.ObjectMap,
+) !Schema {
+    var schema = try cloneSchema(allocator, first);
     errdefer schema.deinit(allocator);
-    return .{
-        .source = input.source,
-        .operation = .{ .generic = .{
-            .operator = source.operator,
-            .canonical_config = try allocator.dupe(
-                u8,
-                source.canonical_config,
-            ),
-        } },
-        .schema = schema,
-    };
+    for (source.input_names[1..]) |name| {
+        const source_ref = try resolveSource(definition_plan, prior_stages, name);
+        var other = try cloneSourceSchema(allocator, definition_plan, prior_stages, source_ref);
+        defer other.deinit(allocator);
+        if (other.columns.len != schema.columns.len) {
+            return error.ObservationUnionSchemaMismatch;
+        }
+        for (other.columns) |column| {
+            const index = schema.find(column.name) orelse
+                return error.ObservationUnionSchemaMismatch;
+            if (schema.columns[index].kind != column.kind) {
+                return error.ObservationUnionSchemaMismatch;
+            }
+            schema.columns[index].nullable = schema.columns[index].nullable or column.nullable;
+        }
+    }
+    if (object.get("order_by")) |raw| {
+        const keys = try compileSortKeys(allocator, &schema, try definition_core.json.array(raw));
+        allocator.free(keys);
+    }
+    return schema;
 }
 
 fn schemaFromDeclaredColumns(
@@ -1135,9 +1199,18 @@ fn compileSort(
     schema: *const Schema,
     object: std.json.ObjectMap,
 ) !Sort {
-    const values = try definition_core.json.array(
-        try definition_core.json.field(object, "by"),
-    );
+    return .{ .keys = try compileSortKeys(
+        allocator,
+        schema,
+        try definition_core.json.array(try definition_core.json.field(object, "by")),
+    ) };
+}
+
+fn compileSortKeys(
+    allocator: std.mem.Allocator,
+    schema: *const Schema,
+    values: std.json.Array,
+) ![]SortKey {
     if (values.items.len == 0 or values.items.len > 64) {
         return error.InvalidObservationSortKeyCount;
     }
@@ -1172,7 +1245,7 @@ fn compileSort(
                 .last,
         };
     }
-    return .{ .keys = keys };
+    return keys;
 }
 
 fn compileDistinct(
@@ -1901,7 +1974,7 @@ fn validateCachedOperation(
             source_schema.?,
         ),
         .distinct => try validateCachedDistinct(stage, source_schema.?),
-        .derive, .join, .ordered_fold, .reachability => {
+        .derive, .join, .ordered_fold, .reachability, .union_relations => {
             const generic = switch (stage.operation) {
                 .generic => |value| value,
                 else => return error.CacheObservationOperationMismatch,
@@ -3081,4 +3154,106 @@ test "sort and distinct plans cache compiled field indices" {
         native_plan.stages[2].operation.top_k.limit.fixed,
     );
     try expectOrderCacheRoundTrip(&native_plan, &definition_plan);
+}
+
+const union_plan_template =
+    \\{"schema":"seq-observation-definition/v1","id":"test/union-plan",
+    \\ "requires":{"abi":"seq-observation-abi/v1","operators":["derive","filter","scan","union"]},
+    \\ "parameters":{},"selectors":[],"inputs":[],
+    \\ "relations":[{"name":"messages","fields":["session_id","role","text"]}],
+    \\ "pipeline":[{"op":"scan","relation":"messages","as":"m"},
+    \\   {"op":"derive","input":"m","as":"a","preserve_input":false,"fields":[@FIELDS@]},
+    \\   {"op":"filter","input":"m","as":"u",
+    \\    "where":[{"field":"role","op":"exact","value":"user"}]},
+    \\   {"op":"union","inputs":["a","u"],"as":"rows"@ORDER@}],
+    \\ "projections":{"rows":{"relation":"rows","schema":"test/union-plan/v1",
+    \\   "fields":["session_id"],"renderers":["json"]}},
+    \\ "bounds":{"max_rows":100,"max_output_bytes":4096,"max_fold_states":4}}
+;
+
+const union_plan_fields =
+    \\{"name":"role","type":"string","nullable":false,"expr":{"field":"role"}},
+    \\{"name":"session_id","type":"string","nullable":true,"expr":{"field":"session_id"}},
+    \\{"name":"text","type":"string","nullable":false,"expr":{"field":"text"}}
+;
+
+fn expectUnionPlan(fields: []const u8, order: []const u8) !void {
+    const allocator = std.testing.allocator;
+    const with_fields =
+        try std.mem.replaceOwned(u8, allocator, union_plan_template, "@FIELDS@", fields);
+    defer allocator.free(with_fields);
+    const source = try std.mem.replaceOwned(u8, allocator, with_fields, "@ORDER@", order);
+    defer allocator.free(source);
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "observation.json", .data = source });
+    var closure = try definition_core.closure.loadFromDir(
+        std.testing.io,
+        allocator,
+        &tmp.dir,
+        "observation.json",
+        .{},
+    );
+    defer closure.deinit(allocator);
+    var definition_plan = try definition.compile(allocator, &closure, "observation.json");
+    defer definition_plan.deinit(allocator);
+    var native_plan = try compile(allocator, &definition_plan);
+    defer native_plan.deinit(allocator);
+    const first = native_plan.stages[native_plan.findStage("a").?].schema;
+    const second = native_plan.stages[native_plan.findStage("u").?].schema;
+    const merged = native_plan.stages[native_plan.findStage("rows").?];
+    try std.testing.expectEqual(
+        definition.Operator.union_relations,
+        merged.operation.generic.operator,
+    );
+    try std.testing.expectEqual(first.columns.len, merged.schema.columns.len);
+    for (first.columns, merged.schema.columns) |column, output| {
+        try std.testing.expectEqualStrings(column.name, output.name);
+        try std.testing.expectEqual(column.kind, output.kind);
+        const other = second.columns[second.find(column.name).?];
+        try std.testing.expectEqual(column.nullable or other.nullable, output.nullable);
+    }
+}
+
+test "union keeps the first input's columns and is nullable wherever any input is" {
+    try expectUnionPlan(union_plan_fields, "");
+    try expectUnionPlan(
+        union_plan_fields,
+        \\,"order_by":[{"field":"session_id"},{"field":"text","direction":"desc"}]
+        ,
+    );
+}
+
+test "union rejects inputs whose fields differ and order keys it cannot sort by" {
+    const role =
+        \\{"name":"role","type":"string","nullable":false,"expr":{"field":"role"}},
+    ;
+    const session =
+        \\{"name":"session_id","type":"string","nullable":true,"expr":{"field":"session_id"}}
+    ;
+    const cases = [_][]const u8{
+        role ++ session ++
+            \\,{"name":"text","type":"integer","nullable":true,"expr":0}
+        ,
+        role ++ session,
+        role ++ session ++
+            \\,{"name":"body","type":"string","nullable":true,"expr":{"field":"text"}}
+        ,
+    };
+    for (cases) |fields| {
+        try std.testing.expectError(
+            error.ObservationUnionSchemaMismatch,
+            expectUnionPlan(fields, ""),
+        );
+    }
+    try std.testing.expectError(error.UnknownObservationSortField, expectUnionPlan(
+        union_plan_fields,
+        \\,"order_by":[{"field":"model"}]
+        ,
+    ));
+    try std.testing.expectError(error.InvalidObservationSortDirection, expectUnionPlan(
+        union_plan_fields,
+        \\,"order_by":[{"field":"text","direction":"down"}]
+        ,
+    ));
 }

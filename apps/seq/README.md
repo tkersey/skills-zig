@@ -171,8 +171,9 @@ A lineage definition streams (`partition-lineage-stream`) only when all of these
   keys are all equality keys that pair a field of that input with itself, and whose
   lineage relates rows and nodes by `session_id` and walks `parent_session_id`;
 - its local stages stay within one session: an `ordered_fold` is keyed by
-  `session_id` and its `order_by` starts with `session_id`, `distinct` and joins
-  are keyed by `session_id`, and a stage that outputs `session_id` copies it from
+  `session_id` and its `order_by` starts with `session_id`, a `union`'s
+  `order_by` starts with `session_id`, `distinct` and joins are keyed by
+  `session_id`, and a stage that outputs `session_id` copies it from
   `session_id`, a join from its left input;
 - its lineage graph input reaches the sessions scan through filters, projections,
   aliases, sorts, and input-preserving derives that do not define `session_id` or
@@ -194,13 +195,14 @@ fails with `ObservationStreamingPartitionOutOfOrder` rather than reduce a sessio
 before one of those. It hands the stages after the lineage join its rows and sessions in
 source-path order, as the materialized graph reads them, so row order,
 order-dependent stages, and the corpus digest agree across strategies. When the rows
-reaching the lineage join come from a local `ordered_fold` through stages that keep
-their order, they follow that fold's first sort key instead, session by session, as
-the materialized fold sorts them. Rows of session files
+reaching the lineage join come from a local `ordered_fold`, or a local `union` whose
+`order_by` starts with `session_id`, through stages that keep their order, they follow
+that stage's first sort key instead, session by session, as the materialized stage
+sorts them. Rows of session files
 without an identity form their own partitions, so a session-keyed local `distinct`
 or join keeps them apart where the materialized graph groups their null `session_id`
-values, and such a fold sorts each file's rows alone and keeps those files in
-source-path order where the materialized fold sorts all of their rows together.
+values, and such a fold or union sorts each file's rows alone and keeps those files in
+source-path order where the materialized stage sorts all of their rows together.
 
 Any other lineage definition runs on the materialized-graph strategy over the whole
 root; with `--path` or `--session-id` it fails with
@@ -330,6 +332,20 @@ integer byte limit, preserves null text, and stops before splitting a codepoint.
 Compare the prefix with its input to detect truncation. Capabilities advertise
 this through `derive` version 3 and `ordered-fold` version 2. Bounded excerpts
 are not automatic redaction or semantic contamination classification.
+
+`union` (capability version 1) concatenates two to sixteen relations into one,
+keeping every row: it never removes duplicates. Its inputs must carry the same
+field names with the same types; the output keeps the first input's field order
+and is nullable wherever any input is. Without `order_by`, rows follow input order
+and each input's own row order. With `order_by`, which takes the same keys as
+`ordered-fold`, rows are sorted by those keys, and equal rows keep input order and
+then each input's row order. Routing rows by `filter` into separate branches and
+merging them with `union` lets each branch handle only the rows it is written for.
+A union inside a streamed lineage prefix must sort by `session_id` first, as a local
+`ordered_fold` does, and then sets the streamed row order as such a fold does (see the
+streaming strategy above): sessions with an identity get the same rows in the same
+order under both strategies, while identity-less session files are sorted per file
+when streaming and together when materialized.
 
 ## Native surface
 
