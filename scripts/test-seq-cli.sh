@@ -193,12 +193,20 @@ pi_find=$("$binary" find-session --root apps/seq/src/v1/fixtures/pi \
   --session-id pi-fixture --format json)
 grep -Fq '"session_id":"pi-fixture"' <<<"$pi_find"
 
-if pi_usage_error=$("$binary" query --path "$pi_session" \
-  --spec '{"dataset":"token_events","select":["total_tokens"],"format":"json"}' 2>&1)
-then
-  exit 1
-fi
-grep -Fq '"code":"PiCumulativeTokenEventsUnavailable"' <<<"$pi_usage_error"
+pi_tokens=$("$binary" query --path "$pi_session" \
+  --spec '{"dataset":"token_events","select":["request_key","request_record","usage_model","usage_finality","quantity_state","has_total_usage","has_last_usage","input_tokens","cached_input_tokens","cache_creation_input_tokens","reasoning_output_tokens","total_tokens","last_total_tokens","total_total_tokens"],"format":"json"}')
+jq -e 'length == 4 and
+  map(.request_key) == ["a1@2026-10-01T10:00:03Z", "a2@2026-10-01T10:00:05Z",
+    "a3@2026-10-01T10:00:07Z", "a4@2026-10-01T10:00:08Z"] and
+  map(.quantity_state) == ["usable", "usable", "missing", "usable"] and
+  all(.[]; .request_record == null and .usage_model == "per-request" and
+    .usage_finality == "final" and .has_total_usage == false and
+    .total_total_tokens == null) and
+  (.[0] | .input_tokens == 15 and .cached_input_tokens == 2 and
+    .cache_creation_input_tokens == 3 and .reasoning_output_tokens == 1 and
+    .total_tokens == 19 and .last_total_tokens == 19) and
+  (.[2] | .has_last_usage == false and .total_tokens == null)' \
+  <<<"$pi_tokens" >/dev/null
 
 claude_fixtures=apps/seq/src/v1/fixtures/claude
 "$binary" capabilities --format json |

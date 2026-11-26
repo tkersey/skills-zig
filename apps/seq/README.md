@@ -454,11 +454,30 @@ only assistant requests with usage and may be partial when other requests omit
 it; turn counts do not prove request-level usage completeness. Totals remain
 null when no usage was observed. Standalone compaction/summary usage remains raw
 and is excluded from them.
-The lineage-aware `token-usage.json` definition requires Codex cumulative
-counters. Requests for Pi cumulative token events fail with
-`PiCumulativeTokenEventsUnavailable`; the definition does not establish Pi
-corpus totals, deduplicate copied fork history, or measure Pi billing. Do not
-present physical Pi session/turn sums as those quantities.
+
+`token_events` holds one per-request row for each persisted assistant message,
+with the Claude Code row contract: `usage_model = "per-request"`,
+`has_total_usage = false`, null `total_*` counters, and equal base and `last_*`
+counters on usable rows. `has_last_usage` reports a usage object.
+`quantity_state` is `usable`, `missing` (no usage or an absent counter),
+`unsupported` (usage that is not an object) or `invalid` (a negative,
+fractional or non-numeric counter, `reasoning` above `output`, `cacheWrite1h`
+above `cacheWrite`, `totalTokens` unequal to normalized input plus output, or
+no request identity); only usable rows carry counters.
+`cache_creation_input_tokens` is `cacheWrite`, and reasoning is null when not
+reported. `usage_finality` is `final` for a recorded stop reason other than
+`pending` or `deferred`, otherwise `provisional`. `request_key` is the entry
+`<id>@<timestamp>`. Pi's fork, clone and import paths copy both unchanged, and
+the timestamp separates eight-hex-digit entry IDs reused by unrelated sessions.
+Provider `responseId` values are not keys, because some OpenAI-compatible
+servers repeat them. `request_record` is null: Pi records no request evidence,
+forks copy history under `parentSession` without a boundary, and `/import` copies
+whole files. Seq before 1.7.0 rejected Pi `token_events` with
+`PiCumulativeTokenEventsUnavailable`. The lineage-aware `token-usage.json`
+definition requires Codex cumulative counters and returns no valid Pi total.
+Session and turn sums include copied fork history; deduplicate per-request rows by
+`request_key` instead of presenting physical Pi session/turn sums as corpus
+totals or billing.
 
 ### Claude Code transcripts
 

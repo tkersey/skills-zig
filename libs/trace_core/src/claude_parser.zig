@@ -1733,7 +1733,7 @@ pub const ClaudeParser = struct {
         }
     }
 
-    fn fillCounters(event: *core.TokenEventRecord, quantity: Quantity) void {
+    pub fn fillCounters(event: *core.TokenEventRecord, quantity: Quantity) void {
         event.input_tokens = quantity.input;
         event.cached_input_tokens = quantity.cached;
         event.output_tokens = quantity.output;

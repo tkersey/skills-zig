@@ -2,6 +2,7 @@ const std = @import("std");
 const jsonl_stream = @import("jsonl_core");
 pub const SessionInput = @import("session_input.zig").SessionInput;
 pub const claude_parser = @import("claude_parser.zig");
+const pi_tokens = @import("pi_tokens.zig");
 pub const iso_time = @import("iso_time.zig");
 const stringField = claude_parser.stringField;
 const objectField = claude_parser.objectField;
@@ -1416,10 +1417,12 @@ const PiParser = struct {
         }
         try applySessionTimestamp(self.allocator, &self.trace.session, record.timestamp);
         var context = self.parentContext(record.root);
+        var assistant: ?std.json.ObjectMap = null;
         const entry_type = record.root_type orelse "unknown";
         if (std.mem.eql(u8, entry_type, "message")) {
             if (objectField(record.root, "message")) |message| {
                 if (std.mem.eql(u8, stringField(message, "role") orelse "", "assistant")) {
+                    assistant = message;
                     try self.updateSettings(&context, .{
                         .model = stringField(message, "model"),
                         .provider = stringField(message, "provider"),
@@ -1432,11 +1435,45 @@ const PiParser = struct {
         }
         try self.rememberEntry(record, context);
         try self.appendOccurrence(record, context.turn_index);
+        if (assistant) |message| try self.appendTokenEvent(record, message, context);
+    }
+
+    /// Emits one per-request row for each persisted assistant message. Only
+    /// usable rows carry counters, matching the Claude per-request contract.
+    /// Pi records no request-side evidence: forks copy entries verbatim under a
+    /// `parentSession` header without a boundary, and `/import` copies whole
+    /// files. Neither authorship nor copying is provable, so `request_record`
+    /// stays null.
+    fn appendTokenEvent(
+        self: *PiParser,
+        record: ParsedRecord,
+        message: std.json.ObjectMap,
+        context: PiEntryContext,
+    ) !void {
+        if (self.summary or !self.options.include_token_events) return;
+        if (!self.options.include_occurrences) return error.TokenEventOccurrenceMissing;
+        std.debug.assert(self.trace.occurrences.items.len > 0);
+        var event = TokenEventRecord{
+            .occurrence_index = self.trace.occurrences.items.len - 1,
+            .turn_index = if (context.turn_index) |index| @intCast(index + 1) else null,
+            .usage_model = "per-request",
+            .usage_finality = if (pi_tokens.isFinal(message)) "final" else "provisional",
+        };
+        errdefer event.deinit(self.allocator);
+        event.request_key = try pi_tokens.requestKeyAlloc(self.allocator, record.root);
+        event.model = try dupOpt(self.allocator, self.settingsAt(context).model);
+        var quantity = pi_tokens.readQuantity(message);
+        // Without an identity a row cannot be deduplicated across copies, so
+        // its counters are withheld like a Claude response without a message ID.
+        if (event.request_key == null) quantity.state = .invalid;
+        event.has_last_usage = quantity.present;
+        event.quantity_state = @tagName(quantity.state);
+        if (quantity.usable()) claude_parser.ClaudeParser.fillCounters(&event, quantity);
+        try self.trace.token_events.append(self.allocator, event);
     }
 
     fn applyHeader(self: *PiParser, record: ParsedRecord) !void {
         std.debug.assert(isPiSessionHeader(record.root));
-        if (self.options.include_token_events) return error.PiCumulativeTokenEventsUnavailable;
         self.header_seen = true;
         self.version = intField(record.root, "version") orelse 1;
         const session = &self.trace.session;
@@ -5268,22 +5305,159 @@ test "Pi summary and selective full parsing preserve metadata without retaining 
     try std.testing.expectEqualStrings("Inspecting", projected.occurrences.items[4].text.?);
 }
 
-test "Pi explicitly rejects requested Codex cumulative token event tuples in both parse routes" {
-    try std.testing.expectError(
-        error.PiCumulativeTokenEventsUnavailable,
-        parseSessionTraceBytes(
-            std.testing.io,
-            std.testing.allocator,
-            "pi.jsonl",
-            pi_test_trace,
-            0,
-            .{ .include_token_events = true },
-        ),
+fn piTestTokens(source: []const u8) !CanonicalSessionTrace {
+    return parseSessionTraceBytes(
+        std.testing.io,
+        std.testing.allocator,
+        "pi.jsonl",
+        source,
+        0,
+        .{ .include_token_events = true, .include_occurrence_payloads = false },
     );
-    try std.testing.expectError(
-        error.PiCumulativeTokenEventsUnavailable,
-        piTestSummary(std.testing.allocator, pi_test_trace, .{ .include_token_events = true }),
+}
+
+fn expectPiCounters(event: TokenEventRecord, expected: [6]?i64) !void {
+    const base = [_]?i64{
+        event.input_tokens,  event.cached_input_tokens,     event.cache_creation_input_tokens,
+        event.output_tokens, event.reasoning_output_tokens, event.total_tokens,
+    };
+    const last = [_]?i64{
+        event.last_input_tokens,  event.last_cached_input_tokens,
+        event.last_output_tokens, event.last_reasoning_output_tokens,
+        event.last_total_tokens,
+    };
+    const expected_last = [_]?i64{
+        expected[0], expected[1], expected[3], expected[4], expected[5],
+    };
+    try std.testing.expectEqualSlices(?i64, &expected, &base);
+    try std.testing.expectEqualSlices(?i64, &expected_last, &last);
+}
+
+test "Pi token events emit one normalized per-request row per assistant message" {
+    const allocator = std.testing.allocator;
+    var trace = try piTestTokens(pi_test_trace);
+    defer trace.deinit(allocator);
+    const events = trace.token_events.items;
+    try std.testing.expectEqual(@as(usize, 4), events.len);
+    const lines = [_]usize{ 5, 7, 9, 10 };
+    const turns = [_]?i64{ 1, 1, 2, 1 };
+    const keys = [_][]const u8{
+        "a1@2026-10-01T10:00:03Z", "a2@2026-10-01T10:00:05Z",
+        "a3@2026-10-01T10:00:07Z", "a4@2026-10-01T10:00:08Z",
+    };
+    for (events, lines, turns, keys) |event, line, turn, key| {
+        const occurrence = trace.occurrences.items[event.occurrence_index];
+        try std.testing.expectEqual(line, occurrence.line_number);
+        try std.testing.expectEqual(turn, event.turn_index);
+        try std.testing.expectEqualStrings(key, event.request_key.?);
+        try std.testing.expectEqualStrings("per-request", event.usage_model.?);
+        try std.testing.expectEqualStrings("final", event.usage_finality.?);
+        try std.testing.expectEqualStrings("kimi", event.model.?);
+        try std.testing.expect(event.request_record == null and event.service_tier == null);
+        try std.testing.expect(!event.has_total_usage and event.persisted_ordinal == null);
+        try std.testing.expect(event.total_input_tokens == null and
+            event.total_cached_input_tokens == null and event.total_output_tokens == null and
+            event.total_reasoning_output_tokens == null and event.total_total_tokens == null);
+    }
+    try std.testing.expectEqualStrings("usable", events[0].quantity_state.?);
+    try std.testing.expect(events[0].has_last_usage);
+    try expectPiCounters(events[0], .{ 17, 3, 4, 2, 1, 19 });
+    try expectPiCounters(events[1], .{ 20, 0, 0, 4, null, 24 });
+    try expectPiCounters(events[3], .{ 30, 0, 0, 6, null, 36 });
+    try std.testing.expectEqualStrings("missing", events[2].quantity_state.?);
+    try std.testing.expect(!events[2].has_last_usage);
+    try expectPiCounters(events[2], @splat(null));
+    var summary = try piTestSummary(allocator, pi_test_trace, .{ .include_token_events = true });
+    defer summary.deinit(allocator);
+    try std.testing.expectEqual(@as(usize, 0), summary.token_events.items.len);
+    try std.testing.expectError(error.TokenEventOccurrenceMissing, parseSessionTraceBytes(
+        std.testing.io,
+        allocator,
+        "pi.jsonl",
+        pi_test_trace,
+        0,
+        .{ .include_token_events = true, .include_occurrences = false },
+    ));
+}
+
+test "Pi token events classify usage and exclude standalone summary usage" {
+    const source =
+        \\{"type":"session","version":3,"id":"pi-usage-states","timestamp":"2026-10-02T00:00:00Z"}
+        \\{"type":"message","id":"u1","parentId":null,"timestamp":"2026-10-02T00:00:01Z","message":{"role":"user","content":"q"}}
+        \\{"type":"message","id":"a1","parentId":"u1","timestamp":"2026-10-02T00:00:02Z","message":{"role":"assistant","content":[],"usage":{"input":1,"cacheRead":0,"cacheWrite":0,"output":3,"reasoning":4,"totalTokens":4},"stopReason":"stop"}}
+        \\{"type":"message","id":"a2","parentId":"a1","timestamp":"2026-10-02T00:00:03Z","message":{"role":"assistant","content":[],"usage":{"input":1,"cacheRead":2,"cacheWrite":0,"output":3,"totalTokens":4},"stopReason":"stop"}}
+        \\{"type":"message","id":"a3","parentId":"a2","timestamp":"2026-10-02T00:00:04Z","message":{"role":"assistant","content":[],"usage":{"input":-1,"cacheRead":0,"cacheWrite":0,"output":1,"totalTokens":0},"stopReason":"error"}}
+        \\{"type":"message","id":"a4","parentId":"a3","timestamp":"2026-10-02T00:00:05Z","message":{"role":"assistant","content":[],"usage":"redacted","stopReason":"stop"}}
+        \\{"type":"message","id":"a5","parentId":"a4","timestamp":"2026-10-02T00:00:06Z","message":{"role":"assistant","content":[]}}
+        \\{"type":"message","id":"a6","parentId":"a5","timestamp":"2026-10-02T00:00:07Z","message":{"role":"assistant","content":[],"usage":{"input":5,"cacheRead":6,"cacheWrite":7,"output":2,"totalTokens":20},"stopReason":"pending"}}
+        \\{"type":"compaction","id":"c1","parentId":"a6","timestamp":"2026-10-02T00:00:08Z","summary":"s","firstKeptEntryId":"u1","tokensBefore":9,"usage":{"input":9,"cacheRead":0,"cacheWrite":0,"output":1,"totalTokens":10}}
+        \\{"type":"branch_summary","id":"b1","parentId":"c1","timestamp":"2026-10-02T00:00:09Z","fromId":"a6","summary":"b","usage":{"input":9,"cacheRead":0,"cacheWrite":0,"output":1,"totalTokens":10}}
+        \\{"type":"custom_message","id":"x1","parentId":"b1","timestamp":"2026-10-02T00:00:10Z","customType":"note","content":"n","display":true}
+        \\{"type":"message","parentId":"x1","timestamp":"2026-10-02T00:00:11Z","message":{"role":"assistant","content":[],"usage":{"input":1,"cacheRead":0,"cacheWrite":0,"output":1,"totalTokens":2},"stopReason":"stop"}}
+        \\{"type":"message","id":"a8","parentId":"x1","timestamp":"2026-10-02T00:00:12Z","message":{"role":"assistant","content":[],"usage":{"input":1,"cacheRead":0,"cacheWrite":0,"output":1},"stopReason":"length"}}
+    ;
+    const allocator = std.testing.allocator;
+    var trace = try piTestTokens(source);
+    defer trace.deinit(allocator);
+    const events = trace.token_events.items;
+    const states = [_][]const u8{
+        "invalid", "invalid", "invalid", "unsupported", "missing", "usable", "invalid", "missing",
+    };
+    const finality = [_][]const u8{
+        "final", "final", "final", "final", "provisional", "provisional", "final", "final",
+    };
+    const has_usage = [_]bool{ true, true, true, false, false, true, true, true };
+    const lines = [_]usize{ 3, 4, 5, 6, 7, 8, 12, 13 };
+    try std.testing.expectEqual(states.len, events.len);
+    for (events, states, finality, has_usage, lines) |event, state, final, usage, line| {
+        try std.testing.expectEqualStrings(state, event.quantity_state.?);
+        try std.testing.expectEqualStrings(final, event.usage_finality.?);
+        try std.testing.expectEqual(usage, event.has_last_usage);
+        const occurrence = trace.occurrences.items[event.occurrence_index];
+        try std.testing.expectEqual(line, occurrence.line_number);
+        try std.testing.expect(event.request_record == null);
+        if (!std.mem.eql(u8, state, "usable")) try expectPiCounters(event, @splat(null));
+    }
+    try expectPiCounters(events[5], .{ 18, 6, 7, 2, null, 20 });
+    try std.testing.expect(events[6].request_key == null);
+    try std.testing.expectEqualStrings("a8@2026-10-02T00:00:12Z", events[7].request_key.?);
+}
+
+test "Pi request keys survive fork copies without claiming authorship" {
+    const user =
+        \\{"type":"message","id":"u1","parentId":null,"timestamp":"2026-10-03T00:00:01Z","message":{"role":"user","content":"q"}}
+    ;
+    const answer =
+        \\{"type":"message","id":"a1","parentId":"u1","timestamp":"2026-10-03T00:00:02Z","message":{"role":"assistant","content":[],"responseId":"chatcmpl-7","usage":{"input":1,"cacheRead":0,"cacheWrite":0,"output":1,"totalTokens":2},"stopReason":"stop"}}
+    ;
+    const original = "{\"type\":\"session\",\"version\":3,\"id\":\"pi-origin\"," ++
+        "\"timestamp\":\"2026-10-03T00:00:00Z\"}\n" ++ user ++ "\n" ++ answer;
+    const fork = "{\"type\":\"session\",\"version\":3,\"id\":\"pi-fork\"," ++
+        "\"timestamp\":\"2026-10-04T00:00:00Z\",\"parentSession\":\"/sessions/origin.jsonl\"}\n" ++
+        user ++ "\n" ++ answer ++ "\n" ++
+        \\{"type":"message","id":"a2","parentId":"a1","timestamp":"2026-10-04T00:00:01Z","message":{"role":"assistant","content":[],"responseId":"chatcmpl-7","usage":{"input":2,"cacheRead":0,"cacheWrite":0,"output":1,"totalTokens":3},"stopReason":"stop"}}
+    ;
+    const allocator = std.testing.allocator;
+    var origin_trace = try piTestTokens(original);
+    defer origin_trace.deinit(allocator);
+    var fork_trace = try piTestTokens(fork);
+    defer fork_trace.deinit(allocator);
+    try std.testing.expectEqual(@as(usize, 1), origin_trace.token_events.items.len);
+    try std.testing.expectEqual(@as(usize, 2), fork_trace.token_events.items.len);
+    const copied = fork_trace.token_events.items[0];
+    const authored = fork_trace.token_events.items[1];
+    try std.testing.expectEqualStrings(
+        origin_trace.token_events.items[0].request_key.?,
+        copied.request_key.?,
     );
+    try std.testing.expectEqualStrings("a1@2026-10-03T00:00:02Z", copied.request_key.?);
+    // A repeated provider response ID does not merge two distinct requests.
+    try std.testing.expectEqualStrings("a2@2026-10-04T00:00:01Z", authored.request_key.?);
+    for (fork_trace.token_events.items) |event| {
+        try std.testing.expect(event.request_record == null);
+        try std.testing.expectEqualStrings("usable", event.quantity_state.?);
+    }
+    try std.testing.expect(origin_trace.token_events.items[0].request_record == null);
 }
 
 test "Pi version two branch settings follow parent ancestry and session names can be cleared" {
@@ -5516,13 +5690,14 @@ fn checkPiTraceAllocation(allocator: std.mem.Allocator) !void {
         "pi.jsonl",
         pi_test_trace,
         0,
-        .{ .include_raw = true },
+        .{ .include_raw = true, .include_token_events = true },
     );
     defer full.deinit(allocator);
     var summary = try piTestSummary(allocator, pi_test_trace, .{});
     defer summary.deinit(allocator);
     try std.testing.expectEqualDeep(full.session, summary.session);
     try std.testing.expectEqual(@as(usize, 2), full.turns.items.len);
+    try std.testing.expectEqual(@as(usize, 4), full.token_events.items.len);
 }
 
 test "parseRawTraceEvent detects newer event_msg" {
@@ -6939,4 +7114,5 @@ test {
     _ = @import("claude_usage.zig");
     _ = @import("claude_turns.zig");
     _ = @import("claude_tokens.zig");
+    _ = pi_tokens;
 }

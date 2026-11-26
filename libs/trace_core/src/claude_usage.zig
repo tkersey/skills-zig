@@ -65,7 +65,7 @@ const counter_fields = [_][]const u8{
     "input_tokens", "cache_read_input_tokens", "cache_creation_input_tokens", "output_tokens",
 };
 
-fn counter(object: std.json.ObjectMap, key: []const u8) union(enum) {
+pub fn counter(object: std.json.ObjectMap, key: []const u8) union(enum) {
     absent,
     invalid,
     value: i64,
