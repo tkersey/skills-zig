@@ -1378,3 +1378,191 @@ test "session graph: contradictory parents for one worker are reported, not chos
     try testing.expect(std.mem.indexOf(u8, text, spawner) != null);
     try testing.expect(std.mem.indexOf(u8, text, child) != null);
 }
+
+const root_f = "d0000000-0000-4000-8000-000000000010";
+const flow_base = "projects/-work-flow/";
+const flow_run = flow_base ++ root_f ++ "/subagents/workflows/wf_0001/";
+const flow_files = embedTree("workflow/", &.{
+    flow_base ++ root_f ++ ".jsonl",
+    flow_base ++ root_f ++ "/subagents/agent-c1c2c3c4c5c600001.jsonl",
+    flow_base ++ root_f ++ "/subagents/agent-c1c2c3c4c5c600001.meta.json",
+    flow_run ++ "agent-c1c2c3c4c5c600002.jsonl",
+    flow_run ++ "agent-c1c2c3c4c5c600002.meta.json",
+    flow_run ++ "journal.jsonl",
+});
+const flow_journal = flow_files[5];
+
+const FlowCorpus = struct {
+    paths: std.ArrayList([]u8),
+    reads: native.DiscoveryReads = .{},
+
+    fn resolve(options: native.Options) !FlowCorpus {
+        var corpus = FlowCorpus{ .paths = .empty };
+        var effective = options;
+        effective.discovery_reads = &corpus.reads;
+        const cwd = std.Io.Dir.cwd();
+        corpus.paths = try native.resolveTargetPaths(allocator, testing.io, cwd, effective, false);
+        return corpus;
+    }
+
+    fn deinit(self: *FlowCorpus) void {
+        native.freePaths(allocator, &self.paths);
+    }
+
+    fn has(self: *const FlowCorpus, suffix: []const u8) bool {
+        for (self.paths.items) |path| if (std.mem.endsWith(u8, path, suffix)) return true;
+        return false;
+    }
+};
+
+fn runNative(
+    environment: *const std.process.Environ.Map,
+    command: native.Command,
+    argv: []const []const u8,
+) ![]u8 {
+    var output: std.Io.Writer.Allocating = .init(allocator);
+    defer output.deinit();
+    const cwd = std.Io.Dir.cwd();
+    const writer = &output.writer;
+    _ = try native.run(allocator, environment, command, argv, writer, testing.io, cwd, null);
+    return output.toOwnedSlice();
+}
+
+test "workflow: Claude corpus discovery excludes the journal and reads every transcript" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try support.writeTree(tmp.dir, &flow_files);
+    const config = try tmp.dir.realPathFileAlloc(testing.io, ".", allocator);
+    defer allocator.free(config);
+    const projects = try std.fs.path.join(allocator, &.{ config, "projects" });
+    defer allocator.free(projects);
+    var environment = std.process.Environ.Map.init(allocator);
+    defer environment.deinit();
+    try environment.put("CLAUDE_CONFIG_DIR", config);
+    const selections = [_]native.Options{
+        .{ .root = projects },
+        .{ .source = .claude_code, .environment = &environment },
+    };
+    for (selections) |options| {
+        var corpus = try FlowCorpus.resolve(options);
+        defer corpus.deinit();
+        try testing.expectEqual(@as(usize, 3), corpus.paths.items.len);
+        for ([_]usize{ 0, 1, 3 }) |index| try testing.expect(corpus.has(flow_files[index].path));
+        try testing.expect(!corpus.has(flow_journal.path));
+        try testing.expectEqual(@as(usize, 1), corpus.reads.workflow_journals_excluded);
+        try testing.expectEqual(@as(usize, 1), corpus.reads.opened);
+        try testing.expectEqual(flow_journal.bytes.len, corpus.reads.bytes);
+    }
+    const root_argv = [_][]const u8{ "--root", projects, "--format", "json" };
+    const sessions = try runNative(&environment, .sessions, &root_argv);
+    defer allocator.free(sessions);
+    const workflow_worker = "\"session_id\":\"" ++ root_f ++ "/agent-c1c2c3c4c5c600002\"";
+    try testing.expect(std.mem.indexOf(u8, sessions, workflow_worker) != null);
+    try testing.expectEqual(@as(usize, 3), std.mem.count(u8, sessions, "\"session_id\":"));
+    try testing.expect(std.mem.indexOf(u8, sessions, "journal.jsonl") == null);
+}
+
+test "workflow: an explicit journal path and other unclassifiable files still fail" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try support.writeTree(tmp.dir, &flow_files);
+    const config = try tmp.dir.realPathFileAlloc(testing.io, ".", allocator);
+    defer allocator.free(config);
+    const journal = try std.fs.path.join(allocator, &.{ config, flow_journal.path });
+    defer allocator.free(journal);
+    var environment = std.process.Environ.Map.init(allocator);
+    defer environment.deinit();
+    var by_path = try FlowCorpus.resolve(.{ .path = journal });
+    defer by_path.deinit();
+    try testing.expectEqual(@as(usize, 1), by_path.paths.items.len);
+    try testing.expectEqual(@as(usize, 0), by_path.reads.workflow_journals_excluded);
+    const unclassified = error.UnclassifiedSessionFormat;
+    const path_argv = [_][]const u8{ "--path", journal, "--format", "json" };
+    try testing.expectError(unclassified, runNative(&environment, .turns, &path_argv));
+    try support.writeTree(tmp.dir, &.{.{
+        .path = "projects/-work-other/stray.jsonl",
+        .bytes = "{\"type\":\"launched\"}\n",
+    }});
+    const projects = try std.fs.path.join(allocator, &.{ config, "projects" });
+    defer allocator.free(projects);
+    const root_argv = [_][]const u8{ "--root", projects, "--format", "json" };
+    try testing.expectError(unclassified, runNative(&environment, .sessions, &root_argv));
+}
+
+fn launchedLine(comptime line_bytes: usize) [line_bytes + 1]u8 {
+    const head = "{\"type\":\"launched\",\"pad\":\"";
+    const tail = "\"}";
+    var bytes: [line_bytes + 1]u8 = undefined;
+    @memcpy(bytes[0..head.len], head);
+    @memset(bytes[head.len .. line_bytes - tail.len], 'x');
+    @memcpy(bytes[line_bytes - tail.len .. line_bytes], tail);
+    bytes[line_bytes] = '\n';
+    return bytes;
+}
+
+test "workflow: journal-named files are excluded only with a bounded journal first record" {
+    const probe_max = native.workflow_journal_probe_bytes_max;
+    const at_bound = launchedLine(probe_max - 1);
+    const over_bound = launchedLine(probe_max);
+    const transcript = flow_files[0].bytes;
+    const launched = "{\"type\":\"launched\"}\n";
+    const other_session = "projects/-work-flow/not-a-session/subagents/workflows/wf_0001/";
+    const Case = struct { path: []const u8, bytes: []const u8, excluded: bool };
+    const cases = [_]Case{
+        .{ .path = flow_journal.path, .bytes = flow_journal.bytes, .excluded = true },
+        .{ .path = flow_journal.path, .bytes = &at_bound, .excluded = true },
+        .{ .path = flow_journal.path, .bytes = "{\"type\":\"launched\"}", .excluded = true },
+        .{ .path = flow_journal.path, .bytes = &over_bound, .excluded = false },
+        .{ .path = flow_journal.path, .bytes = "", .excluded = false },
+        .{ .path = flow_journal.path, .bytes = "\n" ++ launched, .excluded = false },
+        .{ .path = flow_journal.path, .bytes = "{\"type\":\"launched\"\n", .excluded = false },
+        .{ .path = flow_journal.path, .bytes = "{\"type\":\"paused\"}\n", .excluded = false },
+        .{ .path = flow_journal.path, .bytes = transcript, .excluded = false },
+        .{ .path = other_session ++ "journal.jsonl", .bytes = launched, .excluded = false },
+        .{ .path = flow_run ++ "agent-j.jsonl", .bytes = launched, .excluded = false },
+    };
+    for (cases) |case| {
+        var tmp = testing.tmpDir(.{});
+        defer tmp.cleanup();
+        try support.writeTree(tmp.dir, &.{
+            flow_files[0],
+            .{ .path = case.path, .bytes = case.bytes },
+        });
+        const projects = try tmp.dir.realPathFileAlloc(testing.io, "projects", allocator);
+        defer allocator.free(projects);
+        var corpus = try FlowCorpus.resolve(.{ .root = projects });
+        defer corpus.deinit();
+        try testing.expect(corpus.has(flow_files[0].path));
+        try testing.expectEqual(!case.excluded, corpus.has(case.path));
+        const excluded: usize = @intFromBool(case.excluded);
+        try testing.expectEqual(excluded, corpus.reads.workflow_journals_excluded);
+    }
+}
+
+test "workflow: Codex and Pi default roots keep journal-layout files" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const journal = root_f ++ "/subagents/workflows/wf_0001/journal.jsonl";
+    try support.writeTree(tmp.dir, &.{
+        .{ .path = "codex/sessions/" ++ journal, .bytes = flow_journal.bytes },
+        .{ .path = "pi/" ++ journal, .bytes = flow_journal.bytes },
+    });
+    const base = try tmp.dir.realPathFileAlloc(testing.io, ".", allocator);
+    defer allocator.free(base);
+    const codex = try std.fs.path.join(allocator, &.{ base, "codex" });
+    defer allocator.free(codex);
+    const pi = try std.fs.path.join(allocator, &.{ base, "pi" });
+    defer allocator.free(pi);
+    var environment = std.process.Environ.Map.init(allocator);
+    defer environment.deinit();
+    try environment.put("HOME", base);
+    try environment.put("CODEX_HOME", codex);
+    try environment.put("PI_CODING_AGENT_SESSION_DIR", pi);
+    for ([_]native.Source{ .codex, .pi }) |source| {
+        var corpus = try FlowCorpus.resolve(.{ .source = source, .environment = &environment });
+        defer corpus.deinit();
+        try testing.expectEqual(@as(usize, 1), corpus.paths.items.len);
+        try testing.expect(corpus.has(journal));
+        try testing.expectEqual(native.DiscoveryReads{}, corpus.reads);
+    }
+}

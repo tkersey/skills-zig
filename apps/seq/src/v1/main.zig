@@ -1263,13 +1263,11 @@ fn resolveGraphPaths(
         selectors.discovery_reads = discovery;
         return seq.native.resolveTargetPaths(allocator, io, dir, selectors, false);
     }
-    var paths = try seq.native.resolveTargetPaths(
-        allocator,
-        io,
-        dir,
-        graphDiscoverySelectors(args),
-        false,
-    );
+    // Corpus discovery clears every time and session selector, so these reads can
+    // only come from workflow journal probes.
+    var corpus_selectors = graphDiscoverySelectors(args);
+    corpus_selectors.discovery_reads = discovery;
+    var paths = try seq.native.resolveTargetPaths(allocator, io, dir, corpus_selectors, false);
     errdefer seq.native.freePaths(allocator, &paths);
     const selected_path = args.selectors.path orelse return paths;
     std.debug.assert(std.fs.path.isAbsolute(selected_path));
@@ -2706,6 +2704,11 @@ fn recordFamilyDiscovery(metrics: *PhysicalMetrics, family: seq.native.Discovery
         return error.ObservationMetricOverflow;
     metrics.discovery_opened = std.math.add(usize, metrics.discovery_opened, family.opened) catch
         return error.ObservationMetricOverflow;
+    metrics.claude.workflow_journals_excluded = std.math.add(
+        usize,
+        metrics.claude.workflow_journals_excluded,
+        family.workflow_journals_excluded,
+    ) catch return error.ObservationMetricOverflow;
 }
 
 fn recordDiscoveryBytes(metrics: *PhysicalMetrics, bytes: usize) !void {
@@ -4184,6 +4187,7 @@ const ClaudeLimitationCounts = struct {
     unlocated_spawn_count: usize = 0,
     worker_parent_unread: usize = 0,
     worker_parent_missing: usize = 0,
+    workflow_journals_excluded: usize = 0,
 
     fn add(self: *ClaudeLimitationCounts, file: seq.trace_adapter.ClaudeLimitations) !void {
         self.inline_sidechain_records = std.math.add(
@@ -4210,6 +4214,10 @@ const ClaudeLimitationCounts = struct {
             .{ .name = "claude_unlocated_spawn_count", .count = self.unlocated_spawn_count },
             .{ .name = "claude_worker_parent_unread", .count = self.worker_parent_unread },
             .{ .name = "claude_worker_parent_missing", .count = self.worker_parent_missing },
+            .{
+                .name = "claude_workflow_journals_excluded",
+                .count = self.workflow_journals_excluded,
+            },
         };
         for (entries) |entry| {
             if (entry.count == 0) continue;

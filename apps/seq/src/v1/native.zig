@@ -2084,6 +2084,9 @@ fn resolveTargets(
     };
     var paths = try collectTargetJsonlPaths(allocator, io, dir, root, options);
     errdefer freePaths(allocator, &paths);
+    if (facts.claude_candidates) {
+        try excludeClaudeWorkflowJournals(allocator, io, dir, &paths, options.discovery_reads);
+    }
     const archive = if (options.root == null and source == .codex)
         try archiveRootAlloc(allocator, root)
     else
@@ -2197,6 +2200,98 @@ fn modifiedBefore(io: std.Io, dir: std.Io.Dir, path: []const u8, since_ms: ?i64)
 
 pub fn isClaudeLayoutPath(path: []const u8) bool {
     return trace_core.claude_parser.PathIdentity.read(path).layoutNamed();
+}
+
+/// Claude Code opens each workflow journal with a short `launched` record. The probe
+/// reads at most this many bytes, newline included; a first line that does not fit is
+/// not recognized, so that file stays in the corpus and classifies as before.
+pub const workflow_journal_probe_bytes_max: usize = 4 * 1024;
+
+/// Removes Claude Code workflow journals from a resolved Claude corpus and counts them.
+/// Every other path keeps its order and its existing classification.
+fn excludeClaudeWorkflowJournals(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    dir: std.Io.Dir,
+    paths: *std.ArrayList([]u8),
+    reads: ?*DiscoveryReads,
+) !void {
+    // Swaps keep every owned path in the list until truncation, so a failed probe
+    // leaves the caller's cleanup exact.
+    var kept: usize = 0;
+    for (paths.items, 0..) |path, index| {
+        if (try isClaudeWorkflowJournal(allocator, io, dir, path, reads)) continue;
+        std.mem.swap([]u8, &paths.items[kept], &paths.items[index]);
+        kept += 1;
+    }
+    const excluded = paths.items.len - kept;
+    for (paths.items[kept..]) |path| allocator.free(path);
+    paths.items.len = kept;
+    const sink = reads orelse return;
+    sink.workflow_journals_excluded = std.math.add(
+        usize,
+        sink.workflow_journals_excluded,
+        excluded,
+    ) catch return error.ObservationMetricOverflow;
+}
+
+/// A workflow journal matches the journal layout and its first line is a journal record.
+fn isClaudeWorkflowJournal(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    dir: std.Io.Dir,
+    path: []const u8,
+    reads: ?*DiscoveryReads,
+) !bool {
+    if (!trace_core.claude_parser.isWorkflowJournalPath(path)) return false;
+    var buffer: [workflow_journal_probe_bytes_max]u8 = undefined;
+    const line = (try readWorkflowJournalFirstLine(io, dir, path, &buffer, reads)) orelse
+        return false;
+    const trimmed = std.mem.trim(u8, line, " \t\r");
+    const parsed = std.json.parseFromSlice(std.json.Value, allocator, trimmed, .{});
+    var document = parsed catch |err| switch (err) {
+        error.OutOfMemory => return err,
+        else => return false,
+    };
+    defer document.deinit();
+    const root = switch (document.value) {
+        .object => |object| object,
+        else => return false,
+    };
+    return trace_core.claude_parser.isWorkflowJournalRecord(root);
+}
+
+/// Returns null when the file cannot be opened or read, or its first line exceeds the
+/// buffer. Such a file stays in the corpus, where its body read reports any failure.
+/// Cancellation ends discovery.
+fn readWorkflowJournalFirstLine(
+    io: std.Io,
+    dir: std.Io.Dir,
+    path: []const u8,
+    buffer: []u8,
+    reads: ?*DiscoveryReads,
+) !?[]const u8 {
+    const opened = if (std.fs.path.isAbsolute(path))
+        std.Io.Dir.openFileAbsolute(io, path, .{})
+    else
+        dir.openFile(io, path, .{});
+    const file = opened catch |err| switch (err) {
+        error.Canceled => return err,
+        else => return null,
+    };
+    defer file.close(io);
+    var reader = file.reader(io, buffer);
+    const taken = reader.interface.takeDelimiter('\n');
+    std.debug.assert(reader.pos <= buffer.len);
+    if (reads) |sink| try sink.charge(@intCast(reader.pos));
+    return taken catch |err| switch (err) {
+        error.StreamTooLong => null,
+        error.ReadFailed => {
+            const read_error = reader.err orelse return null;
+            if (read_error == error.Canceled) return error.Canceled;
+            return null;
+        },
+    };
 }
 
 fn discoverClaudeIdentity(
@@ -3770,6 +3865,8 @@ test "default Codex discovery includes archives while explicit roots retain thei
 pub const DiscoveryReads = struct {
     bytes: usize = 0,
     opened: usize = 0,
+    /// Claude Code workflow journals that corpus resolution excluded.
+    workflow_journals_excluded: usize = 0,
 
     fn charge(self: *DiscoveryReads, bytes: usize) !void {
         self.bytes = std.math.add(usize, self.bytes, bytes) catch
